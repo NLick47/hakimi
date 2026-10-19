@@ -132,6 +132,7 @@ impl TlsContext {
             .await
             .map_err(ConnectError::from_io)?;
         let _ = tcp.set_nodelay(true);
+        crate::util::apply_tcp_keepalive(&tcp);
         let connector = TlsConnector::from(config);
         connector
             .connect(server_name, tcp)

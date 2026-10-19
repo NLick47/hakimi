@@ -122,7 +122,7 @@
       "img.poipiku.com",
       "cdn.poipiku.com"
     ],
-    "http1MaxConcurrent": 8
+    "http1MaxConcurrent": 32
   },
   "log": {
     "level": "info"

@@ -415,6 +415,7 @@ async fn connect_tcp_upstream(
     match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await {
         Ok(Ok(stream)) => {
             let _ = stream.set_nodelay(true);
+            crate::util::apply_tcp_keepalive(&stream);
             Ok(stream)
         }
         Ok(Err(error)) => Err((

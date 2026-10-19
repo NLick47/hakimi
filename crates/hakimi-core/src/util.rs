@@ -264,6 +264,13 @@ pub fn unix_now() -> u64 {
         .as_secs()
 }
 
+/// Keep long-lived upstream connections alive through NAT gateways and idle-timeout
+/// middleboxes. TCP-level only; HTTP/2 adds its own PING keep-alive on top.
+pub fn apply_tcp_keepalive(stream: &tokio::net::TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
+    let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive);
+}
+
 pub fn hex_upper(bytes: &[u8]) -> String {
     hex::encode_upper(bytes)
 }

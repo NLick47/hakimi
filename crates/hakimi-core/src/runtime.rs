@@ -276,6 +276,11 @@ impl HakimiRuntime {
         if self.started.load(Ordering::SeqCst) {
             return Ok(());
         }
+        // Cache writes are hints, not state: once the proxy runs, fsyncs leave the request
+        // path and the flusher picks them up. One-shot CLI commands keep eager writes.
+        self.cache
+            .clone()
+            .start_auto_flush(std::time::Duration::from_secs(5));
         let config = self.config.snapshot();
         let (shutdown_tx, _) = watch::channel(false);
         *self.shutdown.write() = Some(shutdown_tx.clone());
@@ -349,6 +354,8 @@ impl HakimiRuntime {
         if let Err(error) = self.system_proxy.restore() {
             tracing::warn!(error = %error, "failed to restore the system proxy");
         }
+        // Final flush so the last few seconds of routes survive the shutdown.
+        self.cache.flush_if_dirty();
         tracing::info!("hakimi runtime stopped");
         Ok(())
     }
@@ -624,6 +631,19 @@ impl HakimiRuntime {
             concurrency = limit,
             "warming upstream routes"
         );
+
+        // Prefetch shared ECH configs so the first browser request does not pay the
+        // HTTPS-RR DoH query inside the CONNECT path.
+        for group in config.enabled_groups() {
+            if group.ech_shared {
+                if let Some(domain) = group.primary_domain().map(ToOwned::to_owned) {
+                    let resolver = self.resolver.clone();
+                    tokio::spawn(async move {
+                        let _ = resolver.ech_config(&domain, true).await;
+                    });
+                }
+            }
+        }
 
         for domain in primaries {
             let permit = match semaphore.clone().acquire_owned().await {

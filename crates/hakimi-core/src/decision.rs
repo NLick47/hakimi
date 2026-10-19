@@ -123,6 +123,9 @@ struct DohExpansion {
     stale: bool,
 }
 
+/// Consume this many initial (catalog/cache) candidates before expanding with DoH.
+const EARLY_DOH_AFTER: usize = 3;
+
 /// Result of matching a host against the configured groups.
 pub enum Route {
     /// No interception: the caller should connect directly.
@@ -437,7 +440,13 @@ impl RouteCursor {
                 self.candidate_index += 1;
                 return Some(candidate);
             }
-            if !self.doh_loaded && self.candidates.len() < self.max {
+            // Expand with DoH once a few initial candidates have been consumed instead of
+            // only at full exhaustion: a stale or poisoned catalog would otherwise pay its
+            // whole serial timeout before DoH is ever consulted.
+            if !self.doh_loaded
+                && self.candidates.len() < self.max
+                && self.candidate_index >= EARLY_DOH_AFTER.min(self.candidates.len())
+            {
                 self.doh_loaded = true;
                 let engine = self.engine.clone();
                 let expansion = engine

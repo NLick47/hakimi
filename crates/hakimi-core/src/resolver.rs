@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
+use futures_util::future::{select, Either};
 use parking_lot::RwLock;
 use rand::Rng;
 use serde::Serialize;
@@ -577,57 +578,113 @@ impl Resolver {
             bail!("no DoH endpoint is configured");
         }
         let mut attempts = Vec::new();
-        for endpoint in endpoints {
+
+        // Primary and fallback race each other: the first successful answer wins, so a
+        // dead or slow primary costs nothing on cache misses instead of a full timeout.
+        // The dropped loser gets no health record; periodic health checks cover that.
+        if endpoints.len() >= 2 {
             let started = Instant::now();
-            match self.query_endpoint(&endpoint, domain, qtype).await {
-                Ok(answer) => {
-                    self.record_health(&endpoint, true, started.elapsed(), None);
-                    if qtype == TYPE_A || qtype == TYPE_AAAA {
-                        self.cache.put_doh_answer(CachedAnswer {
-                            domain: domain.to_string(),
-                            qtype,
-                            ips: answer.ips.clone(),
-                            hints: answer.hints.clone(),
-                            ech_config: answer
-                                .ech
-                                .as_ref()
-                                .map(|ech| base64::engine::general_purpose::STANDARD.encode(ech)),
-                            ttl_secs: answer.ttl,
-                            fetched_at: now(),
-                        });
-                    } else if qtype == TYPE_HTTPS {
-                        if let Some(ech) = &answer.ech {
-                            self.cache.put_ech(CachedEch {
-                                domain: domain.to_string(),
-                                ech_config: base64::engine::general_purpose::STANDARD.encode(ech),
-                                ttl_secs: answer.ttl,
-                                fetched_at: now(),
+            let fa = Box::pin(self.query_endpoint(&endpoints[0], domain, qtype));
+            let fb = Box::pin(self.query_endpoint(&endpoints[1], domain, qtype));
+            let winner: Option<(usize, ResolvedAnswer)> = match select(fa, fb).await {
+                Either::Left((Ok(answer), _)) => Some((0, answer)),
+                Either::Right((Ok(answer), _)) => Some((1, answer)),
+                Either::Left((Err(error_a), right)) => {
+                    attempts.push(DohAttemptError {
+                        endpoint: endpoints[0].name.clone(),
+                        source: endpoints[0].source,
+                        error: format!("{error_a:#}"),
+                    });
+                    self.record_health(
+                        &endpoints[0],
+                        false,
+                        started.elapsed(),
+                        Some(format!("{error_a:#}")),
+                    );
+                    match right.await {
+                        Ok(answer) => Some((1, answer)),
+                        Err(error_b) => {
+                            attempts.push(DohAttemptError {
+                                endpoint: endpoints[1].name.clone(),
+                                source: endpoints[1].source,
+                                error: format!("{error_b:#}"),
                             });
+                            self.record_health(
+                                &endpoints[1],
+                                false,
+                                started.elapsed(),
+                                Some(format!("{error_b:#}")),
+                            );
+                            None
                         }
-                        self.cache.put_doh_answer(CachedAnswer {
-                            domain: domain.to_string(),
-                            qtype,
-                            ips: Vec::new(),
-                            hints: answer.hints.clone(),
-                            ech_config: answer
-                                .ech
-                                .as_ref()
-                                .map(|ech| base64::engine::general_purpose::STANDARD.encode(ech)),
-                            ttl_secs: answer.ttl,
-                            fetched_at: now(),
-                        });
                     }
+                }
+                Either::Right((Err(error_b), left)) => {
+                    attempts.push(DohAttemptError {
+                        endpoint: endpoints[1].name.clone(),
+                        source: endpoints[1].source,
+                        error: format!("{error_b:#}"),
+                    });
+                    self.record_health(
+                        &endpoints[1],
+                        false,
+                        started.elapsed(),
+                        Some(format!("{error_b:#}")),
+                    );
+                    match left.await {
+                        Ok(answer) => Some((0, answer)),
+                        Err(error_a) => {
+                            attempts.push(DohAttemptError {
+                                endpoint: endpoints[0].name.clone(),
+                                source: endpoints[0].source,
+                                error: format!("{error_a:#}"),
+                            });
+                            self.record_health(
+                                &endpoints[0],
+                                false,
+                                started.elapsed(),
+                                Some(format!("{error_a:#}")),
+                            );
+                            None
+                        }
+                    }
+                }
+            };
+            if let Some((index, answer)) = winner {
+                let endpoint = &endpoints[index];
+                self.record_health(endpoint, true, started.elapsed(), None);
+                self.store_answer(domain, qtype, &answer);
+                return Ok(TypeQuery {
+                    answer,
+                    source: endpoint.source,
+                    endpoint: endpoint.name.clone(),
+                    fallback_used: index != 0,
+                    attempts,
+                });
+            }
+            // Both raced endpoints failed; the remaining ones are tried serially below.
+        }
+
+        for endpoint in endpoints
+            .iter()
+            .skip(if endpoints.len() >= 2 { 2 } else { 0 })
+        {
+            let started = Instant::now();
+            match self.query_endpoint(endpoint, domain, qtype).await {
+                Ok(answer) => {
+                    self.record_health(endpoint, true, started.elapsed(), None);
+                    self.store_answer(domain, qtype, &answer);
                     return Ok(TypeQuery {
                         answer,
                         source: endpoint.source,
-                        endpoint: endpoint.name,
+                        endpoint: endpoint.name.clone(),
                         fallback_used: !attempts.is_empty(),
                         attempts,
                     });
                 }
                 Err(error) => {
                     self.record_health(
-                        &endpoint,
+                        endpoint,
                         false,
                         started.elapsed(),
                         Some(format!("{error:#}")),
@@ -653,6 +710,45 @@ impl Resolver {
             .collect::<Vec<_>>()
             .join("; ");
         bail!("all DoH endpoints failed: {detail}")
+    }
+
+    /// Persist a successful resolution into the answer/ECH caches.
+    fn store_answer(&self, domain: &str, qtype: u16, answer: &ResolvedAnswer) {
+        if qtype == TYPE_A || qtype == TYPE_AAAA {
+            self.cache.put_doh_answer(CachedAnswer {
+                domain: domain.to_string(),
+                qtype,
+                ips: answer.ips.clone(),
+                hints: answer.hints.clone(),
+                ech_config: answer
+                    .ech
+                    .as_ref()
+                    .map(|ech| base64::engine::general_purpose::STANDARD.encode(ech)),
+                ttl_secs: answer.ttl,
+                fetched_at: now(),
+            });
+        } else if qtype == TYPE_HTTPS {
+            if let Some(ech) = &answer.ech {
+                self.cache.put_ech(CachedEch {
+                    domain: domain.to_string(),
+                    ech_config: base64::engine::general_purpose::STANDARD.encode(ech),
+                    ttl_secs: answer.ttl,
+                    fetched_at: now(),
+                });
+            }
+            self.cache.put_doh_answer(CachedAnswer {
+                domain: domain.to_string(),
+                qtype,
+                ips: Vec::new(),
+                hints: answer.hints.clone(),
+                ech_config: answer
+                    .ech
+                    .as_ref()
+                    .map(|ech| base64::engine::general_purpose::STANDARD.encode(ech)),
+                ttl_secs: answer.ttl,
+                fetched_at: now(),
+            });
+        }
     }
 
     async fn query_endpoint(

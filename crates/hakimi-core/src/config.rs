@@ -207,11 +207,13 @@ impl Default for AdvancedConfig {
             upstream_idle_secs: 300,
             upstream_max_idle_per_host: 16,
             http1_hosts: vec![
+                // pximg origins advertise h2 but throttle per connection; parallel h1
+                // connections each get their own TCP window and are faster in aggregate.
                 "*.pximg.net".to_string(),
                 "img.poipiku.com".to_string(),
                 "cdn.poipiku.com".to_string(),
             ],
-            http1_max_concurrent: 8,
+            http1_max_concurrent: 32,
         }
     }
 }

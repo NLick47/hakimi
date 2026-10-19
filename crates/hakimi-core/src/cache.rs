@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration as StdDuration;
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
@@ -85,7 +88,7 @@ pub struct CachedSni {
     pub saved_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct CacheData {
     last_good: HashMap<String, LastGoodEntry>,
@@ -110,6 +113,8 @@ pub struct CacheStats {
 pub struct CacheManager {
     path: PathBuf,
     data: RwLock<CacheData>,
+    dirty: AtomicBool,
+    auto_flush: AtomicBool,
 }
 
 impl CacheManager {
@@ -135,6 +140,8 @@ impl CacheManager {
         Ok(Self {
             path,
             data: RwLock::new(data),
+            dirty: AtomicBool::new(false),
+            auto_flush: AtomicBool::new(false),
         })
     }
 
@@ -151,6 +158,45 @@ impl CacheManager {
         if let Err(error) = atomic_write_json(&self.path, data) {
             tracing::warn!(error = %error, "failed to persist cache");
         }
+    }
+
+    /// Record a cache mutation. With the background flusher running this only flips a flag,
+    /// so request handling never waits on disk; otherwise it keeps the eager write.
+    fn mark_dirty(&self, data: &CacheData) {
+        if self.auto_flush.load(Ordering::SeqCst) {
+            self.dirty.store(true, Ordering::SeqCst);
+        } else {
+            self.persist_locked(data);
+            self.dirty.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Write once if anything changed since the last flush. The snapshot is taken under a
+    /// read lock and written outside every lock, so a slow disk never blocks lookups.
+    pub fn flush_if_dirty(&self) -> bool {
+        if !self.dirty.swap(false, Ordering::SeqCst) {
+            return false;
+        }
+        let snapshot = { self.data.read().clone() };
+        self.persist_locked(&snapshot);
+        true
+    }
+
+    /// Start the background flusher. Cache writes are hints, so a few seconds of latency is
+    /// fine while the fsyncs move off the request path entirely.
+    pub fn start_auto_flush(self: &Arc<Self>, interval: StdDuration) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!("no tokio runtime available; cache writes stay synchronous");
+            return;
+        };
+        self.auto_flush.store(true, Ordering::SeqCst);
+        let manager = self.clone();
+        handle.spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                manager.flush_if_dirty();
+            }
+        });
     }
 
     fn expire(data: &mut CacheData, now: DateTime<Utc>) {
@@ -188,13 +234,13 @@ impl CacheManager {
             }
         }
         data.last_good.insert(entry.domain.clone(), entry);
-        self.persist_locked(&data);
+        self.mark_dirty(&data);
     }
 
     pub fn remove_last_good(&self, domain: &str) {
         let mut data = self.data.write();
         if data.last_good.remove(domain).is_some() {
-            self.persist_locked(&data);
+            self.mark_dirty(&data);
         }
     }
 
@@ -217,7 +263,7 @@ impl CacheManager {
             }
         }
         if changed {
-            self.persist_locked(&data);
+            self.mark_dirty(&data);
         }
     }
 
@@ -226,7 +272,7 @@ impl CacheManager {
         let mut data = self.data.write();
         let removed = data.skip_once.remove(domain);
         if removed {
-            self.persist_locked(&data);
+            self.mark_dirty(&data);
         }
         removed
     }
@@ -247,7 +293,7 @@ impl CacheManager {
         let mut data = self.data.write();
         data.doh
             .insert(doh_key(&answer.domain, answer.qtype), answer);
-        self.persist_locked(&data);
+        self.mark_dirty(&data);
     }
 
     // ---- ECH -------------------------------------------------------------
@@ -267,7 +313,7 @@ impl CacheManager {
     pub fn put_ech(&self, entry: CachedEch) {
         let mut data = self.data.write();
         data.ech.insert(entry.domain.clone(), entry);
-        self.persist_locked(&data);
+        self.mark_dirty(&data);
     }
 
     // ---- fake SNI --------------------------------------------------------
@@ -295,7 +341,7 @@ impl CacheManager {
             }
         }
         data.sni.insert(key, entry);
-        self.persist_locked(&data);
+        self.mark_dirty(&data);
     }
 
     pub fn remove_sni(&self, group: &str, domain: &str, network_id: &str) {
@@ -305,7 +351,7 @@ impl CacheManager {
             .remove(&sni_key(group, domain, network_id))
             .is_some()
         {
-            self.persist_locked(&data);
+            self.mark_dirty(&data);
         }
     }
 
@@ -323,7 +369,7 @@ impl CacheManager {
     pub fn clear(&self) -> Result<()> {
         let mut data = self.data.write();
         *data = CacheData::default();
-        self.persist_locked(&data);
+        self.mark_dirty(&data);
         Ok(())
     }
 }

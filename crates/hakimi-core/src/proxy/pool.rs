@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context as _, Result};
 use bytes::Bytes;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use http::uri::Uri;
 use http::{Method, Request, Response, Uri as HttpUri};
 use http_body_util::{Either, Full};
@@ -112,6 +113,12 @@ impl Body for LimitedBody {
 
 const SYSTEM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WARM_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Candidates raced in parallel per batch while a cold connection hunts for a route.
+const RACE_SIZE: usize = 3;
+/// Delay between race batch member starts, so the first candidate usually wins on a
+/// healthy network and the race only costs extra handshakes when it is actually broken.
+const RACE_STAGGER: Duration = Duration::from_millis(200);
 
 #[derive(Default)]
 pub(crate) struct UpstreamStats {
@@ -438,6 +445,7 @@ impl RouteConnector {
                         .map_err(|_| anyhow!("TCP connect to {host}:{port} timed out"))?
                         .with_context(|| format!("TCP connect to {host}:{port} failed"))?;
                 let _ = stream.set_nodelay(true);
+                crate::util::apply_tcp_keepalive(&stream);
                 Ok(PooledIo {
                     io: Transport::Tcp(stream),
                     h2: false,
@@ -481,7 +489,16 @@ impl RouteConnector {
         }
 
         loop {
-            let Some(plan) = cursor.next_plan().await else {
+            // Pull a batch of plans and race them with a staggered start. A dead route
+            // no longer makes every following candidate wait out its full timeout.
+            let mut plans: Vec<ConnectPlan> = Vec::new();
+            for _ in 0..RACE_SIZE {
+                match cursor.next_plan().await {
+                    Some(plan) => plans.push(plan),
+                    None => break,
+                }
+            }
+            if plans.is_empty() {
                 let detail = cursor
                     .outcome()
                     .and_then(|outcome| outcome.diagnostics.detail.clone())
@@ -492,18 +509,40 @@ impl RouteConnector {
                     })
                     .unwrap_or_else(|| "no route candidate succeeded".into());
                 return Err(anyhow!("{detail}"));
-            };
-            let started = std::time::Instant::now();
-            match self.connect_plan(&plan, force_http1).await {
-                Ok(io) => {
-                    cursor.note_success(&plan, started.elapsed().as_millis() as u64);
-                    return Ok(io);
-                }
-                Err((reason, detail)) => {
-                    self.engine.forget_plan(&plan.domain, plan.port, plan.tls);
-                    cursor.note_failure(&plan, reason, detail);
+            }
+
+            type RaceResult = Result<(ConnectPlan, PooledIo, u64), (ConnectPlan, FailureReason, String)>;
+            let mut pending = FuturesUnordered::<
+                Pin<Box<dyn Future<Output = RaceResult> + Send>>,
+            >::new();
+            for (index, plan) in plans.into_iter().enumerate() {
+                let this = self.clone();
+                pending.push(Box::pin(async move {
+                    if index > 0 {
+                        tokio::time::sleep(RACE_STAGGER * index as u32).await;
+                    }
+                    let started = std::time::Instant::now();
+                    match this.connect_plan(&plan, force_http1).await {
+                        Ok(io) => Ok((plan, io, started.elapsed().as_millis() as u64)),
+                        Err((reason, detail)) => Err((plan, reason, detail)),
+                    }
+                }));
+            }
+
+            while let Some(result) = pending.next().await {
+                match result {
+                    Ok((plan, io, latency)) => {
+                        cursor.note_success(&plan, latency);
+                        // Dropping `pending` cancels the losing handshakes mid-flight.
+                        return Ok(io);
+                    }
+                    Err((plan, reason, detail)) => {
+                        self.engine.forget_plan(&plan.domain, plan.port, plan.tls);
+                        cursor.note_failure(&plan, reason, detail);
+                    }
                 }
             }
+            // The whole batch failed; the loop pulls the next batch from the cursor.
         }
     }
 
@@ -525,6 +564,7 @@ impl RouteConnector {
                     })?
                     .map_err(|error| (FailureReason::TcpRefused, error.to_string()))?;
             let _ = stream.set_nodelay(true);
+            crate::util::apply_tcp_keepalive(&stream);
             return Ok(PooledIo {
                 io: Transport::Tcp(stream),
                 h2: false,
@@ -570,39 +610,67 @@ impl RouteConnector {
         port: u16,
         force_http1: bool,
     ) -> Result<PooledIo> {
-        let addresses = tokio::net::lookup_host((host, port))
+        let addresses: Vec<std::net::IpAddr> = tokio::net::lookup_host((host, port))
             .await
-            .with_context(|| format!("resolving {host}:{port}"))?;
-        let mut last_error = None;
-        for address in addresses {
-            let result = tokio::time::timeout(SYSTEM_CONNECT_TIMEOUT, async {
-                if force_http1 {
-                    self.tls
-                        .connect_http1(address.ip(), port, host, TlsMode::Direct, None, None)
-                        .await
-                } else {
-                    self.tls
-                        .connect(address.ip(), port, host, TlsMode::Direct, None, None)
-                        .await
-                }
-            })
-            .await;
-            match result {
-                Ok(Ok(stream)) => {
-                    let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
-                    return Ok(PooledIo {
-                        io: Transport::Tls(Box::new(stream)),
-                        h2,
-                    });
-                }
-                Ok(Err(error)) => last_error = Some(error.detail()),
-                Err(_) => last_error = Some("TLS connection timed out".into()),
+            .with_context(|| format!("resolving {host}:{port}"))?
+            .map(|address| address.ip())
+            .collect();
+        // Staggered race across resolved addresses (Happy-Eyeballs style): a black-holed
+        // IPv6 route no longer delays the IPv4 fallback by a full timeout.
+        let mut index = 0;
+        loop {
+            let batch: Vec<std::net::IpAddr> =
+                addresses.iter().skip(index).take(RACE_SIZE).copied().collect();
+            index += batch.len();
+            if batch.is_empty() {
+                return Err(anyhow!("no address found for {host}"));
             }
+            type BypassResult = Result<PooledIo, String>;
+            let mut pending =
+                FuturesUnordered::<Pin<Box<dyn Future<Output = BypassResult> + Send>>>::new();
+            for (i, address) in batch.iter().enumerate() {
+                let this = self.clone();
+                let address = *address;
+                let host = host.to_string();
+                let force = force_http1;
+                pending.push(Box::pin(async move {
+                    if i > 0 {
+                        tokio::time::sleep(RACE_STAGGER * i as u32).await;
+                    }
+                    let result = tokio::time::timeout(SYSTEM_CONNECT_TIMEOUT, async {
+                        if force {
+                            this.tls
+                                .connect_http1(address, port, &host, TlsMode::Direct, None, None)
+                                .await
+                        } else {
+                            this.tls
+                                .connect(address, port, &host, TlsMode::Direct, None, None)
+                                .await
+                        }
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(stream)) => {
+                            let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
+                            Ok(PooledIo {
+                                io: Transport::Tls(Box::new(stream)),
+                                h2,
+                            })
+                        }
+                        Ok(Err(error)) => Err(error.detail()),
+                        Err(_) => Err("TLS connection timed out".into()),
+                    }
+                }));
+            }
+            let mut last_error = None;
+            while let Some(result) = pending.next().await {
+                match result {
+                    Ok(io) => return Ok(io),
+                    Err(detail) => last_error = Some(detail),
+                }
+            }
+            // The whole batch failed; try the next one.
         }
-        Err(anyhow!(
-            "{}",
-            last_error.unwrap_or_else(|| format!("no address found for {host}"))
-        ))
     }
 }
 
