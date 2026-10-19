@@ -232,6 +232,16 @@ impl RouteCursor {
             add_remote(&mut candidates, &mut seen);
         }
 
+        // Order by measured quality on this network: proven fast IPs lead, failures sink.
+        // Unknown addresses keep the catalog order, so a fresh start is still deterministic.
+        let rank = |candidate: &Candidate| -> f64 {
+            if skip_once && candidate.source == IpSource::Remote {
+                return 0.0;
+            }
+            engine.score_ip(&domain, candidate.ip)
+        };
+        candidates.sort_by(|a, b| rank(a).partial_cmp(&rank(b)).unwrap_or(std::cmp::Ordering::Equal));
+
         let mut modes = if tls {
             group.strategy.attempts().to_vec()
         } else {
@@ -482,6 +492,7 @@ impl RouteCursor {
             detail: Some(detail),
             latency_ms: None,
         });
+        self.engine.record_ip(&plan.domain, plan.ip, None, true);
     }
 
     /// Record a successful real connection (TLS + certificate validation already passed).
@@ -571,6 +582,33 @@ pub struct DecisionEngine {
     /// Last successful route per authority. New pooled connections start here, so a
     /// connection failure is the only event that triggers re-resolution.
     plan_cache: parking_lot::Mutex<HashMap<String, (Instant, ConnectPlan)>>,
+    /// Per (domain, IP) observations. Candidates are ordered by score, so a host picks the
+    /// address that has actually been fast on this network instead of a static list.
+    ip_scores: parking_lot::RwLock<HashMap<(String, IpAddr), IpScore>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct IpScore {
+    ewma_ms: f64,
+    successes: u32,
+    failures: u32,
+}
+
+impl IpScore {
+    /// Lower is better. Latency dominates; failures are penalised hard.
+    fn rank(&self) -> f64 {
+        if self.successes == 0 && self.failures == 0 {
+            return f64::MAX;
+        }
+        let total = (self.successes + self.failures) as f64;
+        let fail_rate = self.failures as f64 / total;
+        let base = if self.successes == 0 {
+            10_000.0
+        } else {
+            self.ewma_ms.max(1.0)
+        };
+        base * (1.0 + fail_rate * 8.0)
+    }
 }
 
 const PLAN_CACHE_MAX: usize = 2048;
@@ -592,6 +630,7 @@ impl DecisionEngine {
             prober,
             status,
             plan_cache: parking_lot::Mutex::new(HashMap::new()),
+            ip_scores: parking_lot::RwLock::new(HashMap::new()),
         })
     }
 
@@ -770,6 +809,38 @@ impl DecisionEngine {
         self.plan_cache.lock().remove(&plan_key(domain, port, tls));
     }
 
+    fn score_ip(&self, domain: &str, ip: IpAddr) -> f64 {
+        self.ip_scores
+            .read()
+            .get(&(domain.to_string(), ip))
+            .map(|score| score.rank())
+            .unwrap_or(f64::MAX)
+    }
+
+    fn record_ip(&self, domain: &str, ip: IpAddr, latency_ms: Option<u64>, failed: bool) {
+        let mut scores = self.ip_scores.write();
+        if scores.len() > 4096 {
+            scores.clear();
+        }
+        let entry = scores.entry((domain.to_string(), ip)).or_default();
+        if failed {
+            entry.failures += 1;
+            entry.ewma_ms = if entry.ewma_ms == 0.0 {
+                10_000.0
+            } else {
+                entry.ewma_ms * 0.7 + 10_000.0 * 0.3
+            };
+            return;
+        }
+        entry.successes += 1;
+        let sample = latency_ms.unwrap_or(500) as f64;
+        entry.ewma_ms = if entry.successes == 1 {
+            sample
+        } else {
+            entry.ewma_ms * 0.7 + sample * 0.3
+        };
+    }
+
     fn remember_plan(&self, plan: &ConnectPlan) {
         let key = plan_key(&plan.domain, plan.port, plan.tls);
         let mut cache = self.plan_cache.lock();
@@ -842,6 +913,7 @@ impl DecisionEngine {
             suggestions: Vec::new(),
         };
         self.remember_plan(plan);
+        self.record_ip(&plan.domain, plan.ip, Some(latency_ms), false);
         self.status.record(diagnostics.clone());
         tracing::info!(
             group = %plan.group_id,

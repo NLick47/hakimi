@@ -34,7 +34,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tower_service::Service;
 
 use crate::config::AppConfig;
@@ -160,6 +160,18 @@ pub struct UpstreamPool {
     stats: Arc<UpstreamStats>,
 }
 
+/// One route discovery per domain at a time: concurrent cold connections for the same host
+/// share a single probe instead of each racing its own candidate batch.
+struct Discovery {
+    inflight: Mutex<HashMap<String, Arc<Inflight>>>,
+}
+
+#[derive(Default)]
+struct Inflight {
+    notify: Notify,
+    result: tokio::sync::Mutex<Option<Result<ConnectPlan, String>>>,
+}
+
 impl UpstreamPool {
     pub fn new(engine: Arc<DecisionEngine>, tls: Arc<TlsContext>, config: &AppConfig) -> Arc<Self> {
         let stats = Arc::new(UpstreamStats::default());
@@ -186,11 +198,15 @@ impl UpstreamPool {
         )
         .unwrap_or_default();
         let http1_hosts = Arc::new(http1_hosts);
+        let discovery = Arc::new(Discovery {
+            inflight: Mutex::new(HashMap::new()),
+        });
         let auto_connector = RouteConnector {
             engine: engine.clone(),
             tls: tls.clone(),
             http1_only: false,
             http1_hosts: http1_hosts.clone(),
+            discovery: discovery.clone(),
             stats: stats.clone(),
         };
         let upgrade_connector = RouteConnector {
@@ -198,6 +214,7 @@ impl UpstreamPool {
             tls,
             http1_only: true,
             http1_hosts: http1_hosts.clone(),
+            discovery: discovery.clone(),
             stats: stats.clone(),
         };
         Arc::new(Self {
@@ -354,6 +371,7 @@ struct RouteConnector {
     tls: Arc<TlsContext>,
     http1_only: bool,
     http1_hosts: Arc<DomainMatcher>,
+    discovery: Arc<Discovery>,
     stats: Arc<UpstreamStats>,
 }
 
@@ -488,6 +506,60 @@ impl RouteConnector {
             }
         }
 
+        let key = format!("{}|{}|{}", cursor.domain(), cursor.port(), tls);
+        let (inflight, leader) = {
+            let mut map = self.discovery.inflight.lock();
+            if let Some(existing) = map.get(&key) {
+                (existing.clone(), false)
+            } else {
+                let entry = Arc::new(Inflight::default());
+                map.insert(key.clone(), entry.clone());
+                (entry, true)
+            }
+        };
+        if leader {
+            let outcome = self.race_plans(cursor, force_http1).await;
+            let shared = match &outcome {
+                Ok((plan, _)) => Ok(plan.clone()),
+                Err(error) => Err(error.clone()),
+            };
+            *inflight.result.lock().await = Some(shared);
+            inflight.notify.notify_waiters();
+            self.discovery.inflight.lock().remove(&key);
+            return outcome.map(|(_, io)| io).map_err(anyhow::Error::msg);
+        }
+
+        inflight.notify.notified().await;
+        let plan = {
+            let guard = inflight.result.lock().await;
+            match guard.as_ref() {
+                Some(Ok(plan)) => plan.clone(),
+                Some(Err(error)) => return Err(anyhow!("{error}")),
+                None => return Err(anyhow!("route discovery failed")),
+            }
+        };
+        // The leader already validated this plan; followers just open their own connection.
+        let started = std::time::Instant::now();
+        match self.connect_plan(&plan, force_http1).await {
+            Ok(io) => {
+                self.engine
+                    .note_tunnel_success(&plan, started.elapsed().as_millis() as u64);
+                Ok(io)
+            }
+            Err((_, detail)) => {
+                self.engine.forget_plan(&plan.domain, plan.port, plan.tls);
+                Err(anyhow!("{detail}"))
+            }
+        }
+    }
+
+    /// Race candidate batches until one connects. Only the single-flight leader runs this;
+    /// every other caller for the same domain waits for and reuses the winning plan.
+    async fn race_plans(
+        &self,
+        mut cursor: RouteCursor,
+        force_http1: bool,
+    ) -> std::result::Result<(ConnectPlan, PooledIo), String> {
         loop {
             // Pull a batch of plans and race them with a staggered start. A dead route
             // no longer makes every following candidate wait out its full timeout.
@@ -508,7 +580,7 @@ impl RouteConnector {
                             .map(|outcome| format!("{:?}", outcome.diagnostics.state))
                     })
                     .unwrap_or_else(|| "no route candidate succeeded".into());
-                return Err(anyhow!("{detail}"));
+                return Err(detail);
             }
 
             type RaceResult = Result<(ConnectPlan, PooledIo, u64), (ConnectPlan, FailureReason, String)>;
@@ -534,7 +606,7 @@ impl RouteConnector {
                     Ok((plan, io, latency)) => {
                         cursor.note_success(&plan, latency);
                         // Dropping `pending` cancels the losing handshakes mid-flight.
-                        return Ok(io);
+                        return Ok((plan, io));
                     }
                     Err((plan, reason, detail)) => {
                         self.engine.forget_plan(&plan.domain, plan.port, plan.tls);
@@ -618,12 +690,16 @@ impl RouteConnector {
         // Staggered race across resolved addresses (Happy-Eyeballs style): a black-holed
         // IPv6 route no longer delays the IPv4 fallback by a full timeout.
         let mut index = 0;
+        let mut last_error: Option<String> = None;
         loop {
             let batch: Vec<std::net::IpAddr> =
                 addresses.iter().skip(index).take(RACE_SIZE).copied().collect();
             index += batch.len();
             if batch.is_empty() {
-                return Err(anyhow!("no address found for {host}"));
+                return Err(anyhow!(
+                    "{}",
+                    last_error.unwrap_or_else(|| format!("no address found for {host}"))
+                ));
             }
             type BypassResult = Result<PooledIo, String>;
             let mut pending =
@@ -662,7 +738,6 @@ impl RouteConnector {
                     }
                 }));
             }
-            let mut last_error = None;
             while let Some(result) = pending.next().await {
                 match result {
                     Ok(io) => return Ok(io),
