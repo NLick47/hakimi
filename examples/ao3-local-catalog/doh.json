@@ -1,0 +1,21 @@
+{
+  "v": 1,
+  "doh": [
+    {
+      "name": "CleanBrowsing Family",
+      "url": "https://doh.cleanbrowsing.org/doh/family-filter/"
+    },
+    {
+      "name": "CleanBrowsing Adult",
+      "url": "https://doh.cleanbrowsing.org/doh/adult-filter/"
+    },
+    {
+      "name": "CleanBrowsing Security",
+      "url": "https://doh.cleanbrowsing.org/doh/security-filter/"
+    },
+    {
+      "name": "Applied Privacy",
+      "url": "https://doh.applied-privacy.net/query"
+    }
+  ]
+}

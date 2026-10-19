@@ -1,0 +1,55 @@
+{
+  "doh": {
+    "primary": "https://doh.cleanbrowsing.org/doh/security-filter/",
+    "fallback": "https://doh.applied-privacy.net/query",
+    "custom": []
+  },
+  "catalogs": {
+    "ip": "http://127.0.0.1:18470/ips.json",
+    "doh": "http://127.0.0.1:18470/doh.json",
+    "ipMirrors": [],
+    "dohMirrors": [],
+    "signaturePublicKey": null,
+    "signatureUrl": null,
+    "refreshHours": 6,
+    "timeoutSecs": 5
+  },
+  "proxy": {
+    "mode": "pac",
+    "port": 18471,
+    "bind": "127.0.0.1",
+    "takeover": false
+  },
+  "groups": [
+    {
+      "id": "ao3",
+      "name": "AO3",
+      "domains": [
+        "archiveofourown.org",
+        "www.archiveofourown.org",
+        "*.archiveofourown.org"
+      ],
+      "strategy": "sni",
+      "enabled": true,
+      "sni": "",
+      "experimental": false
+    }
+  ],
+  "catalogVersion": 0,
+  "advanced": {
+    "fakeSniCandidates": [
+      "",
+      "www.baidu.com",
+      "www.cloudflare.com",
+      "www.bing.com",
+      "www.apple.com"
+    ],
+    "maxCandidatesPerDomain": 8,
+    "ipTimeoutMs": 2000,
+    "lastGoodDays": 7,
+    "maxParallelProbes": 4
+  },
+  "log": {
+    "level": "info"
+  }
+}

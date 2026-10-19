@@ -1,0 +1,130 @@
+{
+  "v": 1,
+  "groups": {
+    "ao3": [
+      "archiveofourown.org",
+      "www.archiveofourown.org",
+      "*.archiveofourown.org"
+    ],
+    "github": [
+      "github.com",
+      "api.github.com",
+      "raw.githubusercontent.com",
+      "*.githubusercontent.com",
+      "githubassets.com",
+      "*.githubassets.com"
+    ],
+    "pixiv": [
+      "pixiv.net",
+      "www.pixiv.net",
+      "i.pximg.net",
+      "*.pximg.net"
+    ],
+    "poipiku": [
+      "poipiku.com",
+      "*.poipiku.com"
+    ],
+    "steam": [
+      "store.steampowered.com",
+      "steamcommunity.com",
+      "*.steamcommunity.com",
+      "*.steampowered.com",
+      "*.steamstatic.com"
+    ]
+  },
+  "ips": {
+    "archiveofourown.org": [
+      "104.20.9.2",
+      "104.20.8.2"
+    ],
+    "www.archiveofourown.org": [
+      "104.20.9.2",
+      "104.20.8.2"
+    ],
+    "github.com": [
+      "140.82.121.3",
+      "20.205.243.166"
+    ],
+    "api.github.com": [
+      "20.250.119.72",
+      "20.205.243.168"
+    ],
+    "raw.githubusercontent.com": [
+      "185.199.108.133",
+      "185.199.109.133",
+      "185.199.110.133",
+      "185.199.111.133"
+    ],
+    "*.githubusercontent.com": [
+      "185.199.108.133",
+      "185.199.109.133",
+      "185.199.110.133",
+      "185.199.111.133"
+    ],
+    "pixiv.net": [
+      "210.140.139.155",
+      "210.140.139.161",
+      "210.140.139.152",
+      "210.140.139.158"
+    ],
+    "www.pixiv.net": [
+      "210.140.139.155",
+      "210.140.139.161"
+    ],
+    "i.pximg.net": [
+      "210.140.139.129",
+      "210.140.139.130",
+      "210.140.139.131",
+      "210.140.139.132",
+      "210.140.139.133",
+      "210.140.139.134",
+      "210.140.139.135",
+      "210.140.139.136"
+    ],
+    "poipiku.com": [
+      "18.182.121.133",
+      "52.197.148.72"
+    ],
+    "www.poipiku.com": [
+      "18.182.121.133",
+      "52.197.148.72"
+    ],
+    "store.steampowered.com": [
+      "88.221.170.104"
+    ],
+    "steamcommunity.com": [
+      "88.221.168.230"
+    ],
+    "www.steamcommunity.com": [
+      "88.221.168.230"
+    ],
+    "cdn.steamstatic.com": [
+      "146.75.123.52"
+    ],
+    "store.steamstatic.com": [
+      "146.75.123.52"
+    ],
+    "community.steamstatic.com": [
+      "146.75.123.52"
+    ],
+    "github.githubassets.com": [
+      "185.199.108.215",
+      "185.199.109.215",
+      "185.199.110.215",
+      "185.199.111.215"
+    ],
+    "assets.githubassets.com": [
+      "185.199.108.154",
+      "185.199.109.154",
+      "185.199.110.154",
+      "185.199.111.154"
+    ]
+  },
+  "sni": {
+    "ao3": "",
+    "github": "",
+    "pixiv": "",
+    "poipiku": "",
+    "steam": ""
+  }
+}

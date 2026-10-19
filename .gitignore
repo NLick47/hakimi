@@ -1,0 +1,16 @@
+/target/
+/data/
+/.cargo/
+/.zcode/
+
+# Local browser/netlog artifacts used during performance testing
+/chrome-*.html
+/chrome-*.json
+/chrome.err
+/chrome-profile.tmp/
+*.tmp.*
+*.log
+*.pid
+
+# Intentionally excluded from the repository per the project owner's request.
+/README.md

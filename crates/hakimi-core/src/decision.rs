@@ -1,0 +1,1484 @@
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use tokio::net::TcpStream;
+
+use crate::cache::{CacheManager, LastGoodEntry};
+use crate::catalog::RemoteIpProvider;
+use crate::config::{AppConfig, ConfigManager, GroupConfig};
+use crate::domain::normalize_hostname;
+use crate::ip_tester::{ConnectError, ProbeSuccess, TlsContext};
+use crate::resolver::{DohResolution, EchOutcome, IpResolver};
+use crate::status::{AttemptRecord, DomainDiagnostics, State, StatusStore};
+use crate::strategy::{CacheStatus, DohSource, FailureReason, IpSource, Strategy, TlsMode};
+use crate::util::{network_id, now};
+
+#[derive(Debug, Clone)]
+pub struct ConnectPlan {
+    pub domain: String,
+    pub group_id: String,
+    pub ip: IpAddr,
+    pub port: u16,
+    pub mode: TlsMode,
+    /// Fake SNI used for upstream TLS. `None` means no SNI (or not applicable).
+    pub sni: Option<String>,
+    /// Raw ECHConfigList for `TlsMode::Ech`.
+    pub ech_config: Option<Vec<u8>>,
+    /// Whether this plan terminates TLS (false only for plaintext HTTP forwarding).
+    pub tls: bool,
+    /// Which candidate list produced this IP.
+    pub source: IpSource,
+}
+
+impl ConnectPlan {
+    fn identity(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.ech_config.hash(&mut hasher);
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            self.domain,
+            self.port,
+            self.tls,
+            self.ip,
+            self.mode.as_str(),
+            self.sni.as_deref().unwrap_or(""),
+            hasher.finish()
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DecisionOutcome {
+    pub plan: Option<ConnectPlan>,
+    pub diagnostics: DomainDiagnostics,
+}
+
+/// Network prober abstraction so decision rules can be unit-tested without sockets.
+#[async_trait]
+pub trait Prober: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    async fn probe_tls(
+        &self,
+        ip: IpAddr,
+        port: u16,
+        domain: &str,
+        mode: TlsMode,
+        sni: Option<&str>,
+        ech: Option<&[u8]>,
+        timeout: Duration,
+    ) -> std::result::Result<ProbeSuccess, ConnectError>;
+
+    async fn probe_tcp(
+        &self,
+        ip: IpAddr,
+        port: u16,
+        timeout: Duration,
+    ) -> std::result::Result<u64, ConnectError>;
+}
+
+#[async_trait]
+impl Prober for TlsContext {
+    async fn probe_tls(
+        &self,
+        ip: IpAddr,
+        port: u16,
+        domain: &str,
+        mode: TlsMode,
+        sni: Option<&str>,
+        ech: Option<&[u8]>,
+        timeout: Duration,
+    ) -> std::result::Result<ProbeSuccess, ConnectError> {
+        TlsContext::probe(self, ip, port, domain, mode, sni, ech, timeout).await
+    }
+
+    async fn probe_tcp(
+        &self,
+        ip: IpAddr,
+        port: u16,
+        timeout: Duration,
+    ) -> std::result::Result<u64, ConnectError> {
+        let started = Instant::now();
+        let stream = tokio::time::timeout(timeout, TcpStream::connect(SocketAddr::new(ip, port)))
+            .await
+            .map_err(|_| ConnectError::Timeout)??;
+        drop(stream);
+        Ok(started.elapsed().as_millis() as u64)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Candidate {
+    ip: IpAddr,
+    source: IpSource,
+}
+
+#[derive(Debug, Default)]
+struct DohExpansion {
+    source: Option<DohSource>,
+    error: Option<String>,
+    stale: bool,
+}
+
+/// Result of matching a host against the configured groups.
+pub enum Route {
+    /// No interception: the caller should connect directly.
+    Bypass(DecisionOutcome),
+    /// The host belongs to a group but cannot be routed (invalid config, CA-independent error).
+    Blocked(DecisionOutcome),
+    /// The host belongs to an enabled group. Plans are produced lazily and without probing:
+    /// the real upstream TLS handshake is the probe, so the hot path never pays for two
+    /// handshakes per connection.
+    Group(Box<RouteCursor>),
+}
+
+/// Lazy, probe-free route generator. It implements the exact candidate order from the
+/// design (cache/remote -> DoH -> stale DoH, then direct -> ECH -> fake SNI) but only
+/// resolves DoH and ECH when the earlier candidates are exhausted.
+///
+/// The caller attempts each returned plan for real and reports the outcome with
+/// [`RouteCursor::note_failure`] / [`RouteCursor::note_success`]. Because the real
+/// connection performs the same TCP + TLS + certificate validation a probe would, this
+/// removes the duplicate handshake from the proxy hot path without weakening validation.
+pub struct RouteCursor {
+    engine: Arc<DecisionEngine>,
+    domain: String,
+    port: u16,
+    tls: bool,
+    group: GroupConfig,
+    config: AppConfig,
+    network: String,
+    max: usize,
+    candidates: Vec<Candidate>,
+    seen: HashSet<IpAddr>,
+    candidate_index: usize,
+    doh_loaded: bool,
+    doh: DohExpansion,
+    skip_once: bool,
+    remote_available: bool,
+    modes: Vec<TlsMode>,
+    mode_index: usize,
+    ech_config: Option<Vec<u8>>,
+    ech_checked: bool,
+    ech_error: Option<String>,
+    sni_candidates: Vec<Option<String>>,
+    sni_index: usize,
+    attempts: Vec<AttemptRecord>,
+    last_reason: Option<FailureReason>,
+    last_detail: Option<String>,
+    skipped: HashSet<String>,
+    finished: bool,
+    failure: Option<DecisionOutcome>,
+}
+
+impl RouteCursor {
+    fn new(
+        engine: Arc<DecisionEngine>,
+        domain: String,
+        port: u16,
+        tls: bool,
+        group: GroupConfig,
+        config: AppConfig,
+    ) -> Self {
+        let network = network_id();
+        let max = config.advanced.max_candidates_per_domain;
+        let skip_once = engine.cache.take_skip_once(&domain);
+        let last_good = engine
+            .cache
+            .last_good(&domain, config.advanced.last_good_days);
+        let remote = engine.remote.remote_ips(&domain);
+        let remote_available = engine.remote.has_ip_catalog();
+
+        let mut candidates: Vec<Candidate> = Vec::new();
+        let mut seen = HashSet::new();
+        let add_remote = |candidates: &mut Vec<Candidate>, seen: &mut HashSet<IpAddr>| {
+            if let Some((_, ips)) = &remote {
+                for ip in ips {
+                    if candidates.len() >= max {
+                        break;
+                    }
+                    if seen.insert(*ip) {
+                        candidates.push(Candidate {
+                            ip: *ip,
+                            source: IpSource::Remote,
+                        });
+                    }
+                }
+            }
+        };
+        let add_cache = |candidates: &mut Vec<Candidate>, seen: &mut HashSet<IpAddr>| {
+            if let Some(entry) = &last_good {
+                if candidates.len() < max && seen.insert(entry.ip) {
+                    candidates.push(Candidate {
+                        ip: entry.ip,
+                        source: IpSource::Cache,
+                    });
+                }
+            }
+        };
+        // 8.1 / 8.2: after a catalog update the new remote IPs are attempted before the
+        // last-good cache; otherwise the cache is tried first.
+        if skip_once {
+            add_remote(&mut candidates, &mut seen);
+            add_cache(&mut candidates, &mut seen);
+        } else {
+            add_cache(&mut candidates, &mut seen);
+            add_remote(&mut candidates, &mut seen);
+        }
+
+        let mut modes = if tls {
+            group.strategy.attempts().to_vec()
+        } else {
+            vec![TlsMode::Direct]
+        };
+        // Use the last-known-good strategy as the first attempt. Without this, a site that
+        // only works with fake SNI pays a failed direct/ECH pass on every process start
+        // (and every catalog-triggered re-plan), which is especially visible for image
+        // hosts. `auto` still falls back to the normal order on failure.
+        if tls && group.strategy == Strategy::Auto {
+            if let Some(preferred) = last_good
+                .as_ref()
+                .map(|entry| mode_for_strategy(entry.strategy))
+            {
+                if modes.contains(&preferred) && modes.first() != Some(&preferred) {
+                    modes.retain(|mode| *mode != preferred);
+                    modes.insert(0, preferred);
+                }
+            }
+        }
+        let sni_candidates = if tls && modes.contains(&TlsMode::FakeSni) {
+            engine.sni_candidates(&config, &group, &domain, &network)
+        } else {
+            Vec::new()
+        };
+
+        Self {
+            engine,
+            domain,
+            port,
+            tls,
+            group,
+            config,
+            network,
+            max,
+            candidates,
+            seen,
+            candidate_index: 0,
+            doh_loaded: false,
+            doh: DohExpansion::default(),
+            skip_once,
+            remote_available,
+            modes,
+            mode_index: 0,
+            ech_config: None,
+            ech_checked: false,
+            ech_error: None,
+            sni_candidates,
+            sni_index: 0,
+            attempts: Vec::new(),
+            last_reason: None,
+            last_detail: None,
+            skipped: HashSet::new(),
+            finished: false,
+            failure: None,
+        }
+    }
+
+    pub fn group_id(&self) -> &str {
+        &self.group.id
+    }
+
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// True when a catalog update asked this domain to try its new remote IPs before
+    /// any cached route.
+    pub fn skip_once(&self) -> bool {
+        self.skip_once
+    }
+
+    /// Skip an already-attempted plan (for example one taken from the plan cache).
+    pub fn skip_plan(&mut self, plan: &ConnectPlan) {
+        self.skipped.insert(plan.identity());
+    }
+
+    pub fn outcome(&self) -> Option<&DecisionOutcome> {
+        self.failure.as_ref()
+    }
+
+    /// Produce the next plan in strict priority order. `None` means every strategy and
+    /// candidate was exhausted; a failure diagnostic has been recorded in that case.
+    pub async fn next_plan(&mut self) -> Option<ConnectPlan> {
+        if self.finished {
+            return None;
+        }
+        loop {
+            if self.mode_index >= self.modes.len() {
+                self.finish_failure();
+                return None;
+            }
+            let mode = self.modes[self.mode_index];
+
+            if mode == TlsMode::Ech && !self.ech_checked {
+                self.ech_checked = true;
+                match self
+                    .engine
+                    .resolver
+                    .doh_ech_config(&self.domain, self.group.ech_shared)
+                    .await
+                {
+                    Ok(EchOutcome {
+                        config,
+                        source,
+                        stale,
+                        ..
+                    }) => {
+                        self.ech_config = Some(config);
+                        if self.doh.source.is_none() {
+                            self.doh.source = Some(source);
+                        }
+                        self.doh.stale |= stale;
+                    }
+                    Err(error) => {
+                        self.ech_error = Some(format!("{error:#}"));
+                    }
+                }
+                if self.ech_config.is_none() && self.group.strategy == Strategy::Ech {
+                    self.last_reason = Some(FailureReason::EchUnavailable);
+                    self.last_detail = self
+                        .ech_error
+                        .clone()
+                        .or_else(|| Some("no ECHConfig available".into()));
+                    self.finish_failure();
+                    return None;
+                }
+            }
+            if mode == TlsMode::Ech && self.ech_config.is_none() {
+                self.advance_mode();
+                continue;
+            }
+
+            if mode == TlsMode::FakeSni && self.tls {
+                if self.sni_index >= self.sni_candidates.len() {
+                    self.advance_mode();
+                    continue;
+                }
+                let sni = self.sni_candidates[self.sni_index].clone();
+                if let Some(candidate) = self.next_candidate().await {
+                    let plan = self.build_plan(candidate, mode, sni, None);
+                    if self.take_skipped(&plan) {
+                        continue;
+                    }
+                    return Some(plan);
+                }
+                self.sni_index += 1;
+                self.candidate_index = 0;
+                continue;
+            }
+
+            if let Some(candidate) = self.next_candidate().await {
+                let ech = if mode == TlsMode::Ech {
+                    self.ech_config.clone()
+                } else {
+                    None
+                };
+                let plan = self.build_plan(candidate, mode, None, ech);
+                if self.take_skipped(&plan) {
+                    continue;
+                }
+                return Some(plan);
+            }
+            self.advance_mode();
+        }
+    }
+
+    fn advance_mode(&mut self) {
+        self.mode_index += 1;
+        self.candidate_index = 0;
+        self.sni_index = 0;
+    }
+
+    fn build_plan(
+        &self,
+        candidate: Candidate,
+        mode: TlsMode,
+        sni: Option<String>,
+        ech: Option<Vec<u8>>,
+    ) -> ConnectPlan {
+        ConnectPlan {
+            domain: self.domain.clone(),
+            group_id: self.group.id.clone(),
+            ip: candidate.ip,
+            port: self.port,
+            mode,
+            sni,
+            ech_config: ech,
+            tls: self.tls,
+            source: candidate.source,
+        }
+    }
+
+    fn take_skipped(&mut self, plan: &ConnectPlan) -> bool {
+        self.skipped.remove(&plan.identity())
+    }
+
+    async fn next_candidate(&mut self) -> Option<Candidate> {
+        loop {
+            if self.candidate_index < self.candidates.len() {
+                let candidate = self.candidates[self.candidate_index].clone();
+                self.candidate_index += 1;
+                return Some(candidate);
+            }
+            if !self.doh_loaded && self.candidates.len() < self.max {
+                self.doh_loaded = true;
+                let engine = self.engine.clone();
+                let expansion = engine
+                    .expand_doh(&self.domain, &mut self.candidates, &mut self.seen, self.max)
+                    .await;
+                merge_expansion(&mut self.doh, expansion);
+                if self.candidate_index < self.candidates.len() {
+                    continue;
+                }
+            }
+            return None;
+        }
+    }
+
+    /// Record a failed real connection attempt. The caller then asks for the next plan.
+    pub fn note_failure(&mut self, plan: &ConnectPlan, reason: FailureReason, detail: String) {
+        tracing::debug!(
+            domain = %plan.domain,
+            ip = %plan.ip,
+            mode = %plan.mode,
+            reason = %reason,
+            detail = %detail,
+            "upstream candidate failed"
+        );
+        self.last_reason = Some(reason);
+        self.last_detail = Some(detail.clone());
+        self.attempts.push(AttemptRecord {
+            strategy: plan.mode,
+            ip: plan.ip,
+            source: plan.source,
+            sni: plan.sni.clone(),
+            error: Some(reason),
+            detail: Some(detail),
+            latency_ms: None,
+        });
+    }
+
+    /// Record a successful real connection (TLS + certificate validation already passed).
+    pub fn note_success(&mut self, plan: &ConnectPlan, latency_ms: u64) -> DecisionOutcome {
+        let diagnostics = self.engine.record_success(
+            plan,
+            latency_ms,
+            std::mem::take(&mut self.attempts),
+            &self.doh,
+            &self.config,
+        );
+        if plan.mode == TlsMode::FakeSni {
+            self.engine.cache.put_sni(crate::cache::CachedSni {
+                group: self.group.id.clone(),
+                domain: self.domain.clone(),
+                network_id: self.network.clone(),
+                sni: plan.sni.clone(),
+                saved_at: now(),
+            });
+        }
+        self.finished = true;
+        DecisionOutcome {
+            plan: Some(plan.clone()),
+            diagnostics,
+        }
+    }
+
+    fn finish_failure(&mut self) {
+        if self.failure.is_some() {
+            return;
+        }
+        self.finished = true;
+        let reason = if let Some(reason) = self.last_reason {
+            reason
+        } else if self.group.strategy == Strategy::Ech && self.ech_config.is_none() {
+            FailureReason::EchUnavailable
+        } else if self.doh.error.is_some() {
+            FailureReason::DohFailed
+        } else if !self.remote_available {
+            FailureReason::RemoteCatalogUnavailable
+        } else {
+            FailureReason::NoCandidate
+        };
+        let mut detail = Vec::new();
+        if let Some(error) = &self.doh.error {
+            detail.push(format!("DoH: {error}"));
+        }
+        if let Some(error) = &self.ech_error {
+            detail.push(format!("ECH: {error}"));
+        }
+        if let Some(error) = &self.last_detail {
+            detail.push(error.clone());
+        }
+        if !self.remote_available {
+            detail.push("remote IP catalog is not loaded".into());
+        }
+        if self.skip_once {
+            detail.push("last-good cache was skipped once after a catalog update".into());
+        }
+        let diagnostics = self.engine.failure_diagnostics(
+            &self.group,
+            &self.domain,
+            &self.config,
+            reason,
+            std::mem::take(&mut self.attempts),
+            &self.doh,
+            if detail.is_empty() {
+                None
+            } else {
+                Some(detail.join("; "))
+            },
+        );
+        self.failure = Some(DecisionOutcome {
+            plan: None,
+            diagnostics,
+        });
+    }
+}
+
+pub struct DecisionEngine {
+    pub config: Arc<ConfigManager>,
+    pub cache: Arc<CacheManager>,
+    pub remote: Arc<dyn RemoteIpProvider>,
+    pub resolver: Arc<dyn IpResolver>,
+    pub prober: Arc<dyn Prober>,
+    pub status: Arc<StatusStore>,
+    /// Last successful route per authority. New pooled connections start here, so a
+    /// connection failure is the only event that triggers re-resolution.
+    plan_cache: parking_lot::Mutex<HashMap<String, (Instant, ConnectPlan)>>,
+}
+
+const PLAN_CACHE_MAX: usize = 2048;
+
+impl DecisionEngine {
+    pub fn new(
+        config: Arc<ConfigManager>,
+        cache: Arc<CacheManager>,
+        remote: Arc<dyn RemoteIpProvider>,
+        resolver: Arc<dyn IpResolver>,
+        prober: Arc<dyn Prober>,
+        status: Arc<StatusStore>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            config,
+            cache,
+            remote,
+            resolver,
+            prober,
+            status,
+            plan_cache: parking_lot::Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub async fn decide_https(self: &Arc<Self>, domain: &str) -> DecisionOutcome {
+        self.decide(domain, 443, true).await
+    }
+
+    /// Decide how to reach `domain` by actually probing candidates. This is used by
+    /// diagnostics and background checks; the proxy hot path uses [`Self::route`] and lets
+    /// the real upstream connection perform validation instead.
+    ///
+    /// `tls` is false for plaintext HTTP, which can only use direct TCP (ECH and fake SNI
+    /// are TLS-only).
+    pub async fn decide(self: &Arc<Self>, domain: &str, port: u16, tls: bool) -> DecisionOutcome {
+        let timeout = Duration::from_millis(self.config.snapshot().advanced.ip_timeout_ms);
+        match self.route(domain, port, tls) {
+            Route::Bypass(outcome) | Route::Blocked(outcome) => outcome,
+            Route::Group(mut cursor) => loop {
+                let Some(plan) = cursor.next_plan().await else {
+                    return cursor
+                        .outcome()
+                        .cloned()
+                        .unwrap_or_else(|| self.internal_failure(domain));
+                };
+                let result = if plan.tls {
+                    self.prober
+                        .probe_tls(
+                            plan.ip,
+                            plan.port,
+                            &plan.domain,
+                            plan.mode,
+                            plan.sni.as_deref(),
+                            plan.ech_config.as_deref(),
+                            timeout,
+                        )
+                        .await
+                        .map(|probe| probe.latency_ms)
+                } else {
+                    self.prober.probe_tcp(plan.ip, plan.port, timeout).await
+                };
+                match result {
+                    Ok(latency_ms) => return cursor.note_success(&plan, latency_ms),
+                    Err(error) => {
+                        cursor.note_failure(&plan, error.reason(), error.detail());
+                    }
+                }
+            },
+        }
+    }
+
+    /// Match a host to its group and return a lazy, probe-free plan generator.
+    ///
+    /// The caller is expected to attempt each plan for real. A successful TLS handshake
+    /// validates the certificate exactly like [`Self::decide`], but costs only one
+    /// handshake instead of a probe plus the actual connection.
+    pub fn route(self: &Arc<Self>, domain: &str, port: u16, tls: bool) -> Route {
+        let config = self.config.snapshot();
+        let normalized = match normalize_hostname(domain) {
+            Ok(domain) => domain,
+            Err(error) => {
+                return Route::Blocked(self.config_failure(
+                    None,
+                    domain,
+                    &config,
+                    FailureReason::ConfigInvalid,
+                    format!("invalid domain: {error}"),
+                ))
+            }
+        };
+        let matcher = self.config.matcher();
+        let Some(group_id) = matcher.match_host(&normalized).map(ToOwned::to_owned) else {
+            return Route::Bypass(DecisionOutcome {
+                plan: None,
+                diagnostics: DomainDiagnostics {
+                    group: None,
+                    domain: normalized,
+                    state: State::Direct,
+                    strategy: None,
+                    configured_strategy: None,
+                    ip: None,
+                    ip_source: None,
+                    doh_source: None,
+                    latency_ms: None,
+                    last_check: now(),
+                    catalog_version: config.catalog_version,
+                    cache: CacheStatus::None,
+                    error: None,
+                    detail: Some(
+                        "domain is not covered by any group; traffic is connected directly".into(),
+                    ),
+                    attempts: Vec::new(),
+                    suggestions: Vec::new(),
+                },
+            });
+        };
+        let Some(group) = config.group(&group_id).cloned() else {
+            return Route::Blocked(self.config_failure(
+                Some(group_id),
+                &normalized,
+                &config,
+                FailureReason::ConfigInvalid,
+                "matched group no longer exists in the configuration".into(),
+            ));
+        };
+        if !group.enabled {
+            return Route::Bypass(self.state_only(
+                &group,
+                &normalized,
+                &config,
+                State::Disabled,
+                "group is disabled; traffic is not intercepted",
+            ));
+        }
+        if self.status.paused() {
+            return Route::Bypass(self.state_only(
+                &group,
+                &normalized,
+                &config,
+                State::Paused,
+                "hakimi is paused; traffic is not intercepted",
+            ));
+        }
+        self.status.mark_checking(
+            Some(group.id.clone()),
+            &normalized,
+            Some(group.strategy),
+            config.catalog_version,
+        );
+        Route::Group(Box::new(RouteCursor::new(
+            self.clone(),
+            normalized,
+            port,
+            tls,
+            group,
+            config,
+        )))
+    }
+
+    /// Last successful plan for a new connection. Established pooled connections never
+    /// consult this, so it only affects cold connections and raw CONNECT tunnels.
+    pub fn cached_plan(&self, domain: &str, port: u16, tls: bool) -> Option<ConnectPlan> {
+        let key = plan_key(domain, port, tls);
+        let ttl = Duration::from_secs(self.config.snapshot().advanced.plan_cache_secs);
+        let mut cache = self.plan_cache.lock();
+        let (at, plan) = cache.get(&key)?;
+        if at.elapsed() >= ttl {
+            cache.remove(&key);
+            return None;
+        }
+        let plan = plan.clone();
+        drop(cache);
+
+        // A catalog update marks affected domains skipOnce: do not reuse the old route
+        // before the new remote IPs have been attempted.
+        if self.cache.has_skip_once(&plan.domain) {
+            return None;
+        }
+        let config = self.config.snapshot();
+        let matcher = self.config.matcher();
+        let group_id = matcher.match_host(&plan.domain)?.to_string();
+        let group = config.group(&group_id)?;
+        if !group.enabled || self.status.paused() {
+            return None;
+        }
+        if tls {
+            if !group.strategy.attempts().contains(&plan.mode) {
+                return None;
+            }
+        } else if plan.mode != TlsMode::Direct {
+            return None;
+        }
+        Some(plan)
+    }
+
+    pub fn forget_plan(&self, domain: &str, port: u16, tls: bool) {
+        self.plan_cache.lock().remove(&plan_key(domain, port, tls));
+    }
+
+    fn remember_plan(&self, plan: &ConnectPlan) {
+        let key = plan_key(&plan.domain, plan.port, plan.tls);
+        let mut cache = self.plan_cache.lock();
+        if cache.len() > PLAN_CACHE_MAX {
+            let ttl = Duration::from_secs(self.config.snapshot().advanced.plan_cache_secs);
+            cache.retain(|_, (at, _)| at.elapsed() < ttl);
+        }
+        cache.insert(key, (Instant::now(), plan.clone()));
+    }
+
+    /// Record a raw-tunnel success (TCP only; the browser's own TLS handshake validates the
+    /// certificate end to end).
+    pub fn note_tunnel_success(&self, plan: &ConnectPlan, latency_ms: u64) {
+        let config = self.config.snapshot();
+        self.record_success(
+            plan,
+            latency_ms,
+            Vec::new(),
+            &DohExpansion::default(),
+            &config,
+        );
+    }
+
+    fn record_success(
+        &self,
+        plan: &ConnectPlan,
+        latency_ms: u64,
+        attempts: Vec<AttemptRecord>,
+        doh: &DohExpansion,
+        config: &AppConfig,
+    ) -> DomainDiagnostics {
+        self.cache.put_last_good(LastGoodEntry {
+            domain: plan.domain.clone(),
+            ip: plan.ip,
+            strategy: plan.mode.cache_strategy(),
+            source: plan.source,
+            network_id: network_id(),
+            saved_at: now(),
+            catalog_version: config.catalog_version,
+        });
+        let cache_status = match plan.source {
+            IpSource::Cache => CacheStatus::Fresh,
+            IpSource::DohCache => CacheStatus::Stale,
+            IpSource::Remote | IpSource::Doh => CacheStatus::None,
+        };
+        let doh_source = match plan.source {
+            IpSource::Doh | IpSource::DohCache => doh.source,
+            _ => None,
+        };
+        let diagnostics = DomainDiagnostics {
+            group: Some(plan.group_id.clone()),
+            domain: plan.domain.clone(),
+            state: if plan.mode == TlsMode::Direct {
+                State::Direct
+            } else {
+                State::Normal
+            },
+            strategy: Some(plan.mode),
+            configured_strategy: config.group(&plan.group_id).map(|group| group.strategy),
+            ip: Some(plan.ip),
+            ip_source: Some(plan.source),
+            doh_source,
+            latency_ms: Some(latency_ms),
+            last_check: now(),
+            catalog_version: config.catalog_version,
+            cache: cache_status,
+            error: None,
+            detail: None,
+            attempts,
+            suggestions: Vec::new(),
+        };
+        self.remember_plan(plan);
+        self.status.record(diagnostics.clone());
+        tracing::info!(
+            group = %plan.group_id,
+            domain = %plan.domain,
+            ip = %plan.ip,
+            mode = %plan.mode,
+            source = %plan.source,
+            latency_ms,
+            "resolved connection strategy"
+        );
+        diagnostics
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn failure_diagnostics(
+        &self,
+        group: &GroupConfig,
+        domain: &str,
+        config: &AppConfig,
+        reason: FailureReason,
+        attempts: Vec<AttemptRecord>,
+        doh: &DohExpansion,
+        detail: Option<String>,
+    ) -> DomainDiagnostics {
+        let mut suggestions = vec![reason.suggestion().to_string()];
+        if !self.remote.has_ip_catalog() {
+            let extra = "No remote IP catalog is loaded; configure catalogs.ip or wait for the next refresh.";
+            if !suggestions.iter().any(|item| item == extra) {
+                suggestions.push(extra.to_string());
+            }
+        }
+        if let Some(error) = &doh.error {
+            suggestions.push(format!("DoH error: {error}"));
+        }
+        let diagnostics = DomainDiagnostics {
+            group: Some(group.id.clone()),
+            domain: domain.to_string(),
+            state: State::Failed,
+            strategy: None,
+            configured_strategy: Some(group.strategy),
+            ip: None,
+            ip_source: None,
+            doh_source: doh.source,
+            latency_ms: None,
+            last_check: now(),
+            catalog_version: config.catalog_version,
+            cache: if doh.stale {
+                CacheStatus::Stale
+            } else {
+                CacheStatus::None
+            },
+            error: Some(reason),
+            detail,
+            attempts,
+            suggestions,
+        };
+        self.status.record(diagnostics.clone());
+        tracing::warn!(
+            group = %group.id,
+            domain = %domain,
+            reason = %reason,
+            "all connection strategies failed"
+        );
+        diagnostics
+    }
+
+    fn internal_failure(&self, domain: &str) -> DecisionOutcome {
+        let config = self.config.snapshot();
+        self.config_failure(
+            None,
+            domain,
+            &config,
+            FailureReason::Internal,
+            "route generator ended without a result".into(),
+        )
+    }
+
+    async fn expand_doh(
+        &self,
+        domain: &str,
+        candidates: &mut Vec<Candidate>,
+        seen: &mut HashSet<IpAddr>,
+        max: usize,
+    ) -> DohExpansion {
+        match self.resolver.doh_ips(domain).await {
+            Ok(DohResolution {
+                ips,
+                hints,
+                source,
+                stale,
+                ..
+            }) => {
+                let candidate_source = if stale {
+                    IpSource::DohCache
+                } else {
+                    IpSource::Doh
+                };
+                for ip in ips.into_iter().chain(hints) {
+                    if candidates.len() >= max {
+                        break;
+                    }
+                    if seen.insert(ip) {
+                        candidates.push(Candidate {
+                            ip,
+                            source: candidate_source,
+                        });
+                    }
+                }
+                DohExpansion {
+                    source: Some(source),
+                    error: None,
+                    stale,
+                }
+            }
+            Err(error) => DohExpansion {
+                source: None,
+                error: Some(format!("{error:#}")),
+                stale: false,
+            },
+        }
+    }
+
+    fn sni_candidates(
+        &self,
+        config: &AppConfig,
+        group: &GroupConfig,
+        domain: &str,
+        network: &str,
+    ) -> Vec<Option<String>> {
+        let mut out: Vec<Option<String>> = Vec::new();
+        let mut push = |candidate: Option<String>| {
+            let normalized = candidate.and_then(|value| {
+                if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value.to_ascii_lowercase())
+                }
+            });
+            if !out.contains(&normalized) {
+                out.push(normalized);
+            }
+        };
+        if let Some(cached) = self.cache.sni(&group.id, domain, network) {
+            push(cached.sni);
+        }
+        if let Some(remote) = self.remote.remote_sni(&group.id) {
+            push(Some(remote));
+        }
+        if let Some(configured) = &group.sni {
+            push(Some(configured.clone()));
+        }
+        for candidate in &config.advanced.fake_sni_candidates {
+            push(Some(candidate.clone()));
+        }
+        if out.is_empty() {
+            out.push(None);
+        }
+        out
+    }
+
+    fn config_failure(
+        &self,
+        group: Option<String>,
+        domain: &str,
+        config: &AppConfig,
+        reason: FailureReason,
+        detail: String,
+    ) -> DecisionOutcome {
+        let diagnostics = DomainDiagnostics {
+            group,
+            domain: domain.to_string(),
+            state: State::Failed,
+            strategy: None,
+            configured_strategy: None,
+            ip: None,
+            ip_source: None,
+            doh_source: None,
+            latency_ms: None,
+            last_check: now(),
+            catalog_version: config.catalog_version,
+            cache: CacheStatus::None,
+            error: Some(reason),
+            detail: Some(detail),
+            attempts: Vec::new(),
+            suggestions: vec![reason.suggestion().to_string()],
+        };
+        self.status.record(diagnostics.clone());
+        DecisionOutcome {
+            plan: None,
+            diagnostics,
+        }
+    }
+
+    fn state_only(
+        &self,
+        group: &GroupConfig,
+        domain: &str,
+        config: &AppConfig,
+        state: State,
+        detail: &str,
+    ) -> DecisionOutcome {
+        let diagnostics = DomainDiagnostics {
+            group: Some(group.id.clone()),
+            domain: domain.to_string(),
+            state,
+            strategy: None,
+            configured_strategy: Some(group.strategy),
+            ip: None,
+            ip_source: None,
+            doh_source: None,
+            latency_ms: None,
+            last_check: now(),
+            catalog_version: config.catalog_version,
+            cache: CacheStatus::None,
+            error: None,
+            detail: Some(detail.to_string()),
+            attempts: Vec::new(),
+            suggestions: Vec::new(),
+        };
+        DecisionOutcome {
+            plan: None,
+            diagnostics,
+        }
+    }
+}
+
+fn merge_expansion(target: &mut DohExpansion, expansion: DohExpansion) {
+    if target.source.is_none() {
+        target.source = expansion.source;
+    }
+    if target.error.is_none() {
+        target.error = expansion.error;
+    }
+    target.stale |= expansion.stale;
+}
+
+fn mode_for_strategy(strategy: Strategy) -> TlsMode {
+    match strategy {
+        Strategy::Direct => TlsMode::Direct,
+        Strategy::Ech => TlsMode::Ech,
+        Strategy::FakeSni => TlsMode::FakeSni,
+        Strategy::Auto => TlsMode::Direct,
+    }
+}
+
+fn plan_key(domain: &str, port: u16, tls: bool) -> String {
+    format!(
+        "{}|{port}|{tls}",
+        domain.trim().trim_end_matches('.').to_ascii_lowercase()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::CacheManager;
+    use crate::catalog::RemoteIpProvider;
+    use crate::config::ConfigManager;
+    use crate::paths::Paths;
+    use crate::resolver::DohResolution;
+    use crate::status::StatusStore;
+    use crate::strategy::DohSource;
+    use anyhow::Result;
+    use parking_lot::Mutex;
+    use std::collections::VecDeque;
+
+    #[derive(Default)]
+    struct FakeRemote {
+        ips: Mutex<Option<Vec<IpAddr>>>,
+        sni: Mutex<Option<String>>,
+        catalog: Mutex<bool>,
+    }
+
+    impl RemoteIpProvider for FakeRemote {
+        fn remote_ips(&self, _domain: &str) -> Option<(String, Vec<IpAddr>)> {
+            self.ips
+                .lock()
+                .clone()
+                .map(|ips| ("example.com".to_string(), ips))
+        }
+        fn remote_sni(&self, _group_id: &str) -> Option<String> {
+            self.sni.lock().clone()
+        }
+        fn has_ip_catalog(&self) -> bool {
+            *self.catalog.lock()
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeResolver {
+        answers: Mutex<VecDeque<Result<DohResolution, String>>>,
+    }
+
+    #[async_trait]
+    impl IpResolver for FakeResolver {
+        async fn doh_ips(&self, _domain: &str) -> Result<DohResolution> {
+            match self.answers.lock().pop_front() {
+                Some(Ok(answer)) => Ok(answer),
+                Some(Err(error)) => Err(anyhow::anyhow!(error)),
+                None => Err(anyhow::anyhow!("no answer queued")),
+            }
+        }
+
+        async fn doh_ech_config(&self, _domain: &str, _allow_shared: bool) -> Result<EchOutcome> {
+            Err(anyhow::anyhow!("no ECH"))
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeProber {
+        working: Mutex<HashSet<IpAddr>>,
+        working_fake_sni: Mutex<HashSet<(IpAddr, Option<String>)>>,
+        calls: Mutex<Vec<(IpAddr, TlsMode, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl Prober for FakeProber {
+        async fn probe_tls(
+            &self,
+            ip: IpAddr,
+            _port: u16,
+            _domain: &str,
+            mode: TlsMode,
+            sni: Option<&str>,
+            _ech: Option<&[u8]>,
+            _timeout: Duration,
+        ) -> std::result::Result<ProbeSuccess, ConnectError> {
+            self.calls
+                .lock()
+                .push((ip, mode, sni.map(ToOwned::to_owned)));
+            let works = match mode {
+                TlsMode::FakeSni => self
+                    .working_fake_sni
+                    .lock()
+                    .contains(&(ip, sni.map(ToOwned::to_owned))),
+                _ => self.working.lock().contains(&ip),
+            };
+            if works {
+                Ok(ProbeSuccess {
+                    latency_ms: 10,
+                    alpn: None,
+                })
+            } else {
+                Err(ConnectError::TlsReset("blocked".into()))
+            }
+        }
+
+        async fn probe_tcp(
+            &self,
+            ip: IpAddr,
+            _port: u16,
+            _timeout: Duration,
+        ) -> std::result::Result<u64, ConnectError> {
+            if self.working.lock().contains(&ip) {
+                Ok(5)
+            } else {
+                Err(ConnectError::TcpRefused)
+            }
+        }
+    }
+
+    struct Harness {
+        _dir: tempfile::TempDir,
+        engine: Arc<DecisionEngine>,
+        cache: Arc<CacheManager>,
+        remote: Arc<FakeRemote>,
+        prober: Arc<FakeProber>,
+        resolver: Arc<FakeResolver>,
+    }
+
+    fn harness(group_domains: &[&str], strategy: Strategy) -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        paths.ensure().unwrap();
+        let config = Arc::new(ConfigManager::load_or_create(&paths).unwrap());
+        config
+            .upsert_group(GroupConfig {
+                id: "test".into(),
+                name: "Test".into(),
+                domains: group_domains.iter().map(|d| d.to_string()).collect(),
+                strategy,
+                enabled: true,
+                sni: None,
+                experimental: false,
+                ech_shared: false,
+            })
+            .unwrap();
+        let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
+        let remote = Arc::new(FakeRemote::default());
+        let prober = Arc::new(FakeProber::default());
+        let resolver = Arc::new(FakeResolver::default());
+        let status = Arc::new(StatusStore::new());
+        let engine = DecisionEngine::new(
+            config,
+            cache.clone(),
+            remote.clone(),
+            resolver.clone(),
+            prober.clone(),
+            status,
+        );
+        Harness {
+            _dir: dir,
+            engine,
+            cache,
+            remote,
+            prober,
+            resolver,
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_tries_remote_before_doh() {
+        let harness = harness(&["example.com"], Strategy::Auto);
+        *harness.remote.catalog.lock() = true;
+        *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+        harness
+            .prober
+            .working
+            .lock()
+            .insert("1.1.1.1".parse().unwrap());
+        let outcome = harness.engine.decide_https("example.com").await;
+        let plan = outcome.plan.unwrap();
+        assert_eq!(plan.ip.to_string(), "1.1.1.1");
+        assert_eq!(plan.mode, TlsMode::Direct);
+        assert_eq!(outcome.diagnostics.ip_source, Some(IpSource::Remote));
+        assert!(harness.resolver.answers.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn route_cursor_needs_no_probe_and_caches_the_plan() {
+        let harness = harness(&["example.com"], Strategy::Direct);
+        *harness.remote.catalog.lock() = true;
+        *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+        let mut cursor = match harness.engine.route("example.com", 443, true) {
+            Route::Group(cursor) => cursor,
+            _ => panic!("expected a group route"),
+        };
+        let plan = cursor.next_plan().await.expect("a direct plan");
+        assert_eq!(plan.mode, TlsMode::Direct);
+        assert_eq!(plan.ip.to_string(), "1.1.1.1");
+        assert!(harness.prober.calls.lock().is_empty());
+
+        let outcome = cursor.note_success(&plan, 7);
+        assert_eq!(outcome.diagnostics.state, State::Direct);
+        let cached = harness
+            .engine
+            .cached_plan("example.com", 443, true)
+            .expect("successful plan should be cached");
+        assert_eq!(cached.ip, plan.ip);
+        assert_eq!(cached.source, IpSource::Remote);
+        assert!(harness.prober.calls.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_plan_is_invalidated_when_strategy_changes() {
+        let harness = harness(&["example.com"], Strategy::Auto);
+        *harness.remote.catalog.lock() = true;
+        *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+        harness
+            .prober
+            .working
+            .lock()
+            .insert("1.1.1.1".parse().unwrap());
+        let outcome = harness.engine.decide_https("example.com").await;
+        assert!(outcome.plan.is_some());
+        assert!(harness
+            .engine
+            .cached_plan("example.com", 443, true)
+            .is_some());
+
+        harness
+            .engine
+            .config
+            .set_group_strategy("test", Strategy::FakeSni)
+            .unwrap();
+        assert!(harness
+            .engine
+            .cached_plan("example.com", 443, true)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn last_good_strategy_is_tried_first() {
+        let harness = harness(&["example.com"], Strategy::Auto);
+        *harness.remote.catalog.lock() = true;
+        *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+        harness.cache.put_last_good(LastGoodEntry {
+            domain: "example.com".into(),
+            ip: "1.1.1.1".parse().unwrap(),
+            strategy: Strategy::FakeSni,
+            source: IpSource::Cache,
+            network_id: network_id(),
+            saved_at: now(),
+            catalog_version: 1,
+        });
+        let mut cursor = match harness.engine.route("example.com", 443, true) {
+            Route::Group(cursor) => cursor,
+            _ => panic!("expected a group route"),
+        };
+        let plan = cursor.next_plan().await.expect("a plan");
+        assert_eq!(plan.mode, TlsMode::FakeSni);
+    }
+
+    #[tokio::test]
+    async fn catalog_update_bypasses_cached_plan_once() {
+        let harness = harness(&["example.com"], Strategy::Auto);
+        *harness.remote.catalog.lock() = true;
+        *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+        harness
+            .prober
+            .working
+            .lock()
+            .insert("1.1.1.1".parse().unwrap());
+        assert!(harness
+            .engine
+            .decide_https("example.com")
+            .await
+            .plan
+            .is_some());
+        assert!(harness
+            .engine
+            .cached_plan("example.com", 443, true)
+            .is_some());
+
+        harness.cache.mark_skip_once(["example.com"]);
+        assert!(harness
+            .engine
+            .cached_plan("example.com", 443, true)
+            .is_none());
+        let mut cursor = match harness.engine.route("example.com", 443, true) {
+            Route::Group(cursor) => cursor,
+            _ => panic!("expected a group route"),
+        };
+        assert!(cursor.skip_once());
+        let plan = cursor.next_plan().await.expect("remote plan");
+        assert_eq!(plan.source, IpSource::Remote);
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_second_remote_ip_in_order() {
+        let harness = harness(&["example.com"], Strategy::Direct);
+        *harness.remote.catalog.lock() = true;
+        *harness.remote.ips.lock() =
+            Some(vec!["1.1.1.1".parse().unwrap(), "8.8.8.8".parse().unwrap()]);
+        harness
+            .prober
+            .working
+            .lock()
+            .insert("8.8.8.8".parse().unwrap());
+        let outcome = harness.engine.decide_https("example.com").await;
+        assert_eq!(outcome.plan.unwrap().ip.to_string(), "8.8.8.8");
+        let calls = harness.prober.calls.lock();
+        assert_eq!(calls[0].0.to_string(), "1.1.1.1");
+        assert_eq!(calls[1].0.to_string(), "8.8.8.8");
+    }
+
+    #[tokio::test]
+    async fn doh_is_used_after_initial_candidates_fail() {
+        let harness = harness(&["example.com"], Strategy::Direct);
+        *harness.remote.catalog.lock() = true;
+        *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+        harness
+            .prober
+            .working
+            .lock()
+            .insert("9.9.9.9".parse().unwrap());
+        harness.resolver.answers.lock().push_back(Ok(DohResolution {
+            ips: vec!["9.9.9.9".parse().unwrap()],
+            hints: Vec::new(),
+            source: DohSource::Primary,
+            endpoint: "primary".into(),
+            stale: false,
+            ttl: 60,
+            fallback_used: false,
+        }));
+        let outcome = harness.engine.decide_https("example.com").await;
+        let plan = outcome.plan.unwrap();
+        assert_eq!(plan.ip.to_string(), "9.9.9.9");
+        assert_eq!(outcome.diagnostics.ip_source, Some(IpSource::Doh));
+        assert_eq!(outcome.diagnostics.doh_source, Some(DohSource::Primary));
+    }
+
+    #[tokio::test]
+    async fn skip_once_prefers_new_remote_ip() {
+        let harness = harness(&["example.com"], Strategy::Direct);
+        *harness.remote.catalog.lock() = true;
+        *harness.remote.ips.lock() = Some(vec!["8.8.8.8".parse().unwrap()]);
+        harness.cache.put_last_good(LastGoodEntry {
+            domain: "example.com".into(),
+            ip: "1.1.1.1".parse().unwrap(),
+            strategy: Strategy::Direct,
+            source: IpSource::Remote,
+            network_id: network_id(),
+            saved_at: now(),
+            catalog_version: 1,
+        });
+        harness.cache.mark_skip_once(["example.com"]);
+        harness
+            .prober
+            .working
+            .lock()
+            .insert("1.1.1.1".parse().unwrap());
+        harness
+            .prober
+            .working
+            .lock()
+            .insert("8.8.8.8".parse().unwrap());
+        let outcome = harness.engine.decide_https("example.com").await;
+        assert_eq!(outcome.plan.unwrap().ip.to_string(), "8.8.8.8");
+        assert!(!harness.cache.has_skip_once("example.com"));
+    }
+
+    #[tokio::test]
+    async fn auto_falls_back_to_fake_sni_and_caches_it() {
+        let harness = harness(&["example.com"], Strategy::Auto);
+        *harness.remote.catalog.lock() = true;
+        *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+        let ip: IpAddr = "1.1.1.1".parse().unwrap();
+        harness
+            .prober
+            .working_fake_sni
+            .lock()
+            .insert((ip, Some("www.baidu.com".into())));
+        let outcome = harness.engine.decide_https("example.com").await;
+        let plan = outcome.plan.expect("fake SNI should succeed");
+        assert_eq!(plan.mode, TlsMode::FakeSni);
+        assert_eq!(plan.sni.as_deref(), Some("www.baidu.com"));
+        let cached = harness
+            .cache
+            .sni("test", "example.com", &network_id())
+            .expect("winning SNI should be cached");
+        assert_eq!(cached.sni.as_deref(), Some("www.baidu.com"));
+    }
+
+    #[tokio::test]
+    async fn failure_returns_reasons_and_attempts() {
+        let harness = harness(&["example.com"], Strategy::Direct);
+        *harness.remote.catalog.lock() = true;
+        *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+        let outcome = harness.engine.decide_https("example.com").await;
+        assert!(outcome.plan.is_none());
+        assert_eq!(outcome.diagnostics.state, State::Failed);
+        assert_eq!(outcome.diagnostics.attempts.len(), 1);
+        assert_eq!(
+            outcome.diagnostics.attempts[0].error,
+            Some(FailureReason::TlsReset)
+        );
+    }
+}

@@ -1,0 +1,20 @@
+[package]
+name = "hakimi-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "hakimi"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+anyhow.workspace = true
+hakimi-core = { path = "../hakimi-core" }
+parking_lot.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

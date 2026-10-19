@@ -1,0 +1,130 @@
+{
+  "doh": {
+    "primary": "https://doh.cleanbrowsing.org/doh/security-filter/",
+    "fallback": "https://doh.applied-privacy.net/query",
+    "custom": []
+  },
+  "catalogs": {
+    "ip": "http://127.0.0.1:18470/ips.json",
+    "doh": "http://127.0.0.1:18470/doh.json",
+    "ipMirrors": [],
+    "dohMirrors": [],
+    "signaturePublicKey": null,
+    "signatureUrl": null,
+    "refreshHours": 6,
+    "timeoutSecs": 5
+  },
+  "proxy": {
+    "mode": "off",
+    "port": 18472,
+    "bind": "127.0.0.1",
+    "takeover": false
+  },
+  "groups": [
+    {
+      "id": "ao3",
+      "name": "AO3",
+      "domains": [
+        "archiveofourown.org",
+        "www.archiveofourown.org",
+        "*.archiveofourown.org"
+      ],
+      "strategy": "sni",
+      "enabled": true,
+      "sni": "",
+      "experimental": false,
+      "echShared": false
+    },
+    {
+      "id": "github",
+      "name": "GitHub",
+      "domains": [
+        "github.com",
+        "api.github.com",
+        "raw.githubusercontent.com",
+        "*.githubusercontent.com",
+        "*.githubassets.com"
+      ],
+      "strategy": "auto",
+      "enabled": true,
+      "sni": "",
+      "experimental": false,
+      "echShared": false
+    },
+    {
+      "id": "pixiv",
+      "name": "Pixiv",
+      "domains": [
+        "pixiv.net",
+        "www.pixiv.net",
+        "i.pximg.net",
+        "s.pximg.net",
+        "booth.pximg.net",
+        "*.pximg.net"
+      ],
+      "strategy": "auto",
+      "enabled": true,
+      "sni": "",
+      "experimental": false,
+      "echShared": true
+    },
+    {
+      "id": "poipiku",
+      "name": "Poipiku",
+      "domains": [
+        "poipiku.com",
+        "img.poipiku.com",
+        "cdn.poipiku.com",
+        "*.poipiku.com"
+      ],
+      "strategy": "direct",
+      "enabled": true,
+      "sni": "",
+      "experimental": false,
+      "echShared": false
+    },
+    {
+      "id": "steam",
+      "name": "Steam",
+      "domains": [
+        "store.steampowered.com",
+        "steamcommunity.com",
+        "*.steamcommunity.com",
+        "*.steampowered.com",
+        "*.steamstatic.com"
+      ],
+      "strategy": "auto",
+      "enabled": true,
+      "sni": "",
+      "experimental": false,
+      "echShared": false
+    }
+  ],
+  "catalogVersion": 0,
+  "advanced": {
+    "fakeSniCandidates": [
+      "",
+      "www.baidu.com",
+      "www.cloudflare.com",
+      "www.bing.com",
+      "www.apple.com"
+    ],
+    "maxCandidatesPerDomain": 8,
+    "ipTimeoutMs": 2000,
+    "lastGoodDays": 7,
+    "prewarm": true,
+    "prewarmConcurrency": 8,
+    "planCacheSecs": 600,
+    "upstreamIdleSecs": 300,
+    "upstreamMaxIdlePerHost": 16,
+    "http1Hosts": [
+      "*.pximg.net",
+      "img.poipiku.com",
+      "cdn.poipiku.com"
+    ],
+    "http1MaxConcurrent": 8
+  },
+  "log": {
+    "level": "info"
+  }
+}

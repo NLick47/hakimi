@@ -1,0 +1,23 @@
+{
+  "v": 1,
+  "groups": {
+    "ao3": [
+      "archiveofourown.org",
+      "www.archiveofourown.org",
+      "*.archiveofourown.org"
+    ]
+  },
+  "ips": {
+    "archiveofourown.org": [
+      "104.20.9.2",
+      "104.20.8.2"
+    ],
+    "www.archiveofourown.org": [
+      "104.20.9.2",
+      "104.20.8.2"
+    ]
+  },
+  "sni": {
+    "ao3": ""
+  }
+}
