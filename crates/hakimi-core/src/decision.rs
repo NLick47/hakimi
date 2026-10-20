@@ -839,7 +839,7 @@ impl DecisionEngine {
             .unwrap_or(f64::MAX)
     }
 
-    fn record_ip(&self, domain: &str, ip: IpAddr, latency_ms: Option<u64>, failed: bool) {
+    fn record_ip(&self, domain: &str, ip: IpAddr, latency_ms: Option<u64>, failed: bool) -> bool {
         let mut scores = self.ip_scores.write();
         if scores.len() > 4096 {
             scores.clear();
@@ -852,15 +852,20 @@ impl DecisionEngine {
             } else {
                 entry.ewma_ms * 0.7 + 10_000.0 * 0.3
             };
-            return;
+            return false;
         }
         entry.successes += 1;
         let sample = latency_ms.unwrap_or(500) as f64;
+        // A sample far worse than the established average means the proven route
+        // degraded (network flap, congestion). Signal the caller to re-race.
+        let degraded =
+            entry.successes > 2 && sample > 800.0 && entry.ewma_ms > 0.0 && sample > entry.ewma_ms * 2.5;
         entry.ewma_ms = if entry.successes == 1 {
             sample
         } else {
             entry.ewma_ms * 0.7 + sample * 0.3
         };
+        degraded
     }
 
     fn remember_plan(&self, plan: &ConnectPlan) {
@@ -934,8 +939,20 @@ impl DecisionEngine {
             attempts,
             suggestions: Vec::new(),
         };
+        let degraded = self.record_ip(&plan.domain, plan.ip, Some(latency_ms), false);
         self.remember_plan(plan);
-        self.record_ip(&plan.domain, plan.ip, Some(latency_ms), false);
+        if degraded {
+            // The proven route suddenly got slow: drop the cached plan so the next
+            // connection re-races the routes instead of staying pinned to it.
+            tracing::info!(
+                domain = %plan.domain,
+                latency_ms,
+                "route degraded; re-racing routes on the next connection"
+            );
+            self.plan_cache
+                .lock()
+                .remove(&plan_key(&plan.domain, plan.port, plan.tls));
+        }
         self.status.record(diagnostics.clone());
         tracing::info!(
             group = %plan.group_id,
