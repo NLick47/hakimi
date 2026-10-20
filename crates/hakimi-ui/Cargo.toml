@@ -1,0 +1,19 @@
+[package]
+name = "hakimi-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "hakimi desktop UI: Slint, Fluent style, one switch and a site list"
+build = "build.rs"
+
+[dependencies]
+slint = "1.16"
+hakimi-core = { path = "../hakimi-core" }
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+open = "5"
+
+[build-dependencies]
+slint-build = "1.16"

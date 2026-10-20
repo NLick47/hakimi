@@ -4,6 +4,7 @@ members = [
     "crates/hakimi-core",
     "crates/hakimi-cli",
     "crates/hakimi-ffi",
+    "crates/hakimi-ui",
 ]
 
 [workspace.package]
