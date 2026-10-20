@@ -329,7 +329,7 @@ pub(crate) fn settings_rows(status: &Value) -> Vec<SettingsEntry> {
         ("尚未生成本地证书".to_string(), String::new(), 0, 0)
     };
 
-    let rows = vec![
+    let mut rows = vec![
         SettingsEntry {
             title: "网络".into(),
             subtitle: "监听端口 · PAC · 加密 DNS".into(),
@@ -337,6 +337,7 @@ pub(crate) fn settings_rows(status: &Value) -> Vec<SettingsEntry> {
             action_label: SharedString::new(),
             action_kind: 0,
             action_tone: 0,
+            first: false,
             last: false,
         },
         SettingsEntry {
@@ -346,6 +347,7 @@ pub(crate) fn settings_rows(status: &Value) -> Vec<SettingsEntry> {
             action_label: SharedString::from(cert_action),
             action_kind: cert_kind,
             action_tone: cert_tone,
+            first: false,
             last: false,
         },
         SettingsEntry {
@@ -355,6 +357,7 @@ pub(crate) fn settings_rows(status: &Value) -> Vec<SettingsEntry> {
             action_label: SharedString::new(),
             action_kind: 0,
             action_tone: 0,
+            first: false,
             last: false,
         },
         SettingsEntry {
@@ -364,6 +367,7 @@ pub(crate) fn settings_rows(status: &Value) -> Vec<SettingsEntry> {
             action_label: SharedString::new(),
             action_kind: 0,
             action_tone: 0,
+            first: false,
             last: false,
         },
         SettingsEntry {
@@ -373,9 +377,15 @@ pub(crate) fn settings_rows(status: &Value) -> Vec<SettingsEntry> {
             action_label: SharedString::new(),
             action_kind: 0,
             action_tone: 0,
+            first: false,
             last: true,
         },
     ];
+    let total = rows.len();
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.first = index == 0;
+        row.last = index + 1 == total;
+    }
     rows
 }
 
@@ -490,6 +500,7 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
             action_label: entry.action_label,
             action_kind: entry.action_kind,
             action_tone: entry.action_tone,
+            first: entry.first,
             last: entry.last,
         })
         .collect();

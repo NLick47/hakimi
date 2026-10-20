@@ -29,6 +29,7 @@ export struct SettingsEntry {
     action-label: string,
     action-kind: int,
     action-tone: int,
+    first: bool,
     last: bool,
 }
 
@@ -669,7 +670,6 @@ export component AppWindow inherits Window {
                     alignment: start;
 
                     Rectangle {
-                        height: root.settings.length * 60px;
                         border-radius: 14px;
                         background: rgba(255, 255, 255, 0.88);
                         border-width: 0.5px;
@@ -680,7 +680,6 @@ export component AppWindow inherits Window {
                             spacing: 0px;
 
                             for entry in root.settings: Rectangle {
-                                height: 60px;
                                 background: settings-touch.has-hover ? rgba(24, 119, 210, 0.045) : transparent;
                                 animate background { duration: 150ms; }
 
@@ -688,7 +687,16 @@ export component AppWindow inherits Window {
                                     clicked => { }
                                 }
 
+                                VerticalLayout {
+                                    spacing: 0px;
+
+                                    if !entry.first: Rectangle {
+                                        height: 1px;
+                                        background: rgba(110, 132, 156, 0.20);
+                                    }
+
                                 HorizontalLayout {
+                                    height: 60px;
                                     padding: 11px;
                                     padding-left: 16px;
                                     padding-right: 16px;
@@ -824,18 +832,6 @@ export component AppWindow inherits Window {
                                     }
                                 }
 
-                                // hairline between rows, inset to the text column
-                                if !entry.last: Rectangle {
-                                    height: 1px;
-                                    y: parent.height - 1px;
-                                    background: transparent;
-
-                                    Rectangle {
-                                        x: 61px;
-                                        width: parent.width - 61px - 16px;
-                                        height: parent.height;
-                                        background: rgba(110, 132, 156, 0.22);
-                                    }
                                 }
                             }
                         }
