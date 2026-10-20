@@ -578,10 +578,13 @@ export component AppWindow inherits Window {
                                         }
                                     }
 
-                                    // expanded domains
-                                    if site.open: Rectangle {
-                                        height: site.domains.length * 28px + 1px;
-                                        background: rgba(130, 150, 172, 0.05);
+                                    // expanded domains: always present, animated
+                                    // between zero height and full height
+                                    Rectangle {
+                                        height: site.open ? site.domains.length * 28px + 1px : 0px;
+                                        clip: true;
+                                        background: rgba(24, 119, 210, 0.035);
+                                        animate height { duration: 220ms; easing: ease-out; }
 
                                         VerticalLayout {
                                             spacing: 0px;

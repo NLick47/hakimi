@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use std::time::Duration;
 use anyhow::Result;
 use hakimi_core::runtime::HakimiRuntime;
 use serde_json::Value;
-use slint::{Color, ModelRc, SharedString, VecModel, Weak};
+use slint::{Color, Model, ModelRc, SharedString, VecModel, Weak};
 
 slint::include_modules!();
 
@@ -68,6 +69,7 @@ fn color(hex: &str) -> Color {
 
 // Plain-data snapshots cross the thread boundary; Slint types are built on the UI thread.
 
+#[derive(Clone, PartialEq)]
 struct DomainData {
     host: String,
     status: String,
@@ -75,6 +77,7 @@ struct DomainData {
     latency: String,
 }
 
+#[derive(Clone, PartialEq)]
 struct SiteData {
     id: String,
     name: String,
@@ -88,6 +91,35 @@ struct SiteData {
     last: bool,
     url: String,
     domains: Vec<DomainData>,
+}
+
+fn build_site_entry(site: &SiteData) -> SiteEntry {
+    let domains: Vec<DomainEntry> = site
+        .domains
+        .iter()
+        .map(|row| DomainEntry {
+            host: SharedString::from(row.host.clone()),
+            status: SharedString::from(row.status.clone()),
+            status_color: color(row.status_hex),
+            latency: SharedString::from(row.latency.clone()),
+        })
+        .collect();
+    SiteEntry {
+        id: SharedString::from(site.id.clone()),
+        name: SharedString::from(site.name.clone()),
+        icon: ASSETS
+            .with(|assets| assets.borrow().get(&site.icon_key).cloned())
+            .unwrap_or_default(),
+        initial: SharedString::from(site.initial.clone()),
+        tile_color: color(site.tile_hex),
+        summary: SharedString::from(site.summary.clone()),
+        enabled: site.enabled,
+        open: site.open,
+        first: site.first,
+        last: site.last,
+        url: SharedString::from(site.url.clone()),
+        domains: ModelRc::new(VecModel::from(domains)),
+    }
 }
 
 /// Muted brand-ish tiles for groups without a real favicon.
@@ -288,6 +320,87 @@ pub(crate) fn build_snapshot(
 thread_local! {
     static ASSETS: std::cell::RefCell<HashMap<String, slint::Image>> =
         std::cell::RefCell::new(HashMap::new());
+    // Persistent models live on the UI thread so refreshes can be per-row:
+    // unchanged rows keep their identity, so hover state, running animations
+    // and the scroll position all survive, and no-op snapshots cost nothing.
+    static SITES_MODEL: std::cell::RefCell<Option<Rc<VecModel<SiteEntry>>>> =
+        const { std::cell::RefCell::new(None) };
+    static SETTINGS_MODEL: std::cell::RefCell<Option<Rc<VecModel<SettingsEntry>>>> =
+        const { std::cell::RefCell::new(None) };
+    static PREV_STATE: std::cell::RefCell<Option<UiState>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The plain-data snapshot used to decide whether the UI needs touching at all.
+#[derive(Clone, PartialEq)]
+struct UiState {
+    sites: Vec<SiteData>,
+    subtitle: String,
+    running: bool,
+    ca: (bool, bool, bool),
+}
+
+/// Applies a snapshot to the window, updating only what actually changed.
+fn apply_ui_update(
+    app: &AppWindow,
+    sites: Vec<SiteData>,
+    subtitle: String,
+    running: bool,
+    ca: (bool, bool, bool),
+) {
+    let next = UiState {
+        sites: sites.clone(),
+        subtitle: subtitle.clone(),
+        running,
+        ca,
+    };
+    let prev = PREV_STATE.with(|slot| slot.borrow().clone());
+    if prev.as_ref() == Some(&next) {
+        return;
+    }
+
+    let prev_sites = prev.as_ref().map(|state| state.sites.clone()).unwrap_or_default();
+    if prev_sites != sites {
+        SITES_MODEL.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let model = slot.get_or_insert_with(|| {
+                let model = Rc::new(VecModel::default());
+                app.set_sites(ModelRc::new(model.clone()));
+                model
+            });
+            if prev_sites.len() != sites.len() {
+                let entries: Vec<SiteEntry> = sites.iter().map(build_site_entry).collect();
+                model.set_vec(entries);
+            } else {
+                for index in 0..sites.len() {
+                    if prev_sites[index] != sites[index] {
+                        model.set_row_data(index, build_site_entry(&sites[index]));
+                    }
+                }
+            }
+        });
+    }
+
+    if prev.as_ref().map(|state| state.ca) != Some(ca) {
+        SETTINGS_MODEL.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let model = slot.get_or_insert_with(|| {
+                let model = Rc::new(VecModel::default());
+                app.set_settings(ModelRc::new(model.clone()));
+                model
+            });
+            model.set_vec(settings_rows(ca));
+        });
+    }
+
+    if prev.as_ref().map(|state| state.running) != Some(running) {
+        app.set_running(running);
+    }
+    if prev.as_ref().map(|state| state.subtitle.clone()).as_ref() != Some(&subtitle) {
+        app.set_status_subtitle(SharedString::from(subtitle));
+    }
+
+    PREV_STATE.with(|slot| *slot.borrow_mut() = Some(next));
 }
 
 pub(crate) fn load_assets() {
@@ -304,20 +417,8 @@ pub(crate) fn load_assets() {
 
 /// Settings sections. The certificate row mirrors the live CA status so the
 /// user can trust the local CA without leaving the app.
-pub(crate) fn settings_rows(status: &Value) -> Vec<SettingsEntry> {
-    let ca = status.get("ca");
-    let installed = ca
-        .and_then(|ca| ca.get("installed"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let supported = ca
-        .and_then(|ca| ca.get("supported"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let present = ca
-        .and_then(|ca| ca.get("present"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+pub(crate) fn settings_rows(ca: (bool, bool, bool)) -> Vec<SettingsEntry> {
+    let (present, supported, installed) = ca;
 
     let (cert_subtitle, cert_action, cert_kind, cert_tone) = if !supported {
         ("当前系统不支持自动安装".to_string(), String::new(), 0, 0)
@@ -459,51 +560,14 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     }
 
     let (sites, subtitle) = build_snapshot(&status, &config, &expanded, running);
-    let entries: Vec<SiteEntry> = sites
-        .into_iter()
-        .map(|site| {
-            let domains: Vec<DomainEntry> = site
-                .domains
-                .into_iter()
-                .map(|row| DomainEntry {
-                    host: SharedString::from(row.host),
-                    status: SharedString::from(row.status),
-                    status_color: color(row.status_hex),
-                    latency: SharedString::from(row.latency),
-                })
-                .collect();
-            SiteEntry {
-                id: SharedString::from(site.id),
-                name: SharedString::from(site.name),
-                icon: ASSETS
-                    .with(|assets| assets.borrow().get(&site.icon_key).cloned())
-                    .unwrap_or_default(),
-                initial: SharedString::from(site.initial),
-                tile_color: color(site.tile_hex),
-                summary: SharedString::from(site.summary),
-                enabled: site.enabled,
-                open: site.open,
-                first: site.first,
-                last: site.last,
-                url: SharedString::from(site.url),
-                domains: ModelRc::new(VecModel::from(domains)),
-            }
-        })
-        .collect();
-
-    let settings: Vec<SettingsEntry> = settings_rows(&status)
-        .into_iter()
-        .map(|entry| SettingsEntry {
-            title: entry.title,
-            subtitle: entry.subtitle,
-            icon_kind: entry.icon_kind,
-            action_label: entry.action_label,
-            action_kind: entry.action_kind,
-            action_tone: entry.action_tone,
-            first: entry.first,
-            last: entry.last,
-        })
-        .collect();
+    let entries: Vec<SiteEntry> = sites.iter().map(build_site_entry).collect();
+    let ca = &status["ca"];
+    let ca_state = (
+        ca.get("present").and_then(Value::as_bool).unwrap_or(false),
+        ca.get("supported").and_then(Value::as_bool).unwrap_or(false),
+        ca.get("installed").and_then(Value::as_bool).unwrap_or(false),
+    );
+    let settings = settings_rows(ca_state);
 
     app.set_sites(ModelRc::new(VecModel::from(entries)));
     app.set_settings(ModelRc::new(VecModel::from(settings)));
@@ -697,52 +761,25 @@ fn worker_loop(
             let config = runtime.config_json();
             let running = runtime.is_started() && !runtime.status().paused();
             let (sites, subtitle) = build_snapshot(&status, &config, &expanded, running);
+            let ca = &status["ca"];
+            let ca_state = (
+                ca.get("present").and_then(Value::as_bool).unwrap_or(false),
+                ca.get("supported").and_then(Value::as_bool).unwrap_or(false),
+                ca.get("installed").and_then(Value::as_bool).unwrap_or(false),
+            );
             let handle = weak.clone();
-            // Slint types hold an Rc, so they are built on the UI thread from plain data.
+            // Slint types hold an Rc, so they are built on the UI thread from plain
+            // data. The UI thread diffs against its previous state and touches only
+            // what changed, so unchanged frames cost nothing.
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(app) = handle.upgrade() else {
                     return;
                 };
-                let entries: Vec<SiteEntry> = sites
-                    .into_iter()
-                    .map(|site| {
-                        let domains: Vec<DomainEntry> = site
-                            .domains
-                            .into_iter()
-                            .map(|row| DomainEntry {
-                                host: SharedString::from(row.host),
-                                status: SharedString::from(row.status),
-                                status_color: color(row.status_hex),
-                                latency: SharedString::from(row.latency),
-                            })
-                            .collect();
-                        SiteEntry {
-                            id: SharedString::from(site.id),
-                            name: SharedString::from(site.name),
-                            icon: ASSETS
-                                .with(|assets| assets.borrow().get(&site.icon_key).cloned())
-                                .unwrap_or_default(),
-                            initial: SharedString::from(site.initial),
-                            tile_color: color(site.tile_hex),
-                            summary: SharedString::from(site.summary),
-                            enabled: site.enabled,
-                            open: site.open,
-                            first: site.first,
-                            last: site.last,
-                            url: SharedString::from(site.url),
-                            domains: ModelRc::new(VecModel::from(domains)),
-                        }
-                    })
-                    .collect();
-                let settings = settings_rows(&status);
-                app.set_sites(ModelRc::new(VecModel::from(entries)));
-                app.set_settings(ModelRc::new(VecModel::from(settings)));
-                app.set_status_subtitle(SharedString::from(subtitle));
-                app.set_running(running);
+                apply_ui_update(&app, sites, subtitle, running, ca_state);
             });
 
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(1200)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
                 _ = tokio::signal::ctrl_c() => {}
             }
         }
