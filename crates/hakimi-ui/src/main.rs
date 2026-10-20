@@ -654,6 +654,13 @@ fn refresh(app: &AppWindow, runtime: &Arc<HakimiRuntime>, expanded: &HashSet<Str
     }
     let proxy_ok = PROXY_OK.with(|t| t.get());
 
+    // A gated resume completes itself the moment the environment passes.
+    if PENDING_RESUME.with(|t| t.get()) && ca_state.2 && proxy_ok {
+        runtime.resume();
+        PENDING_RESUME.with(|t| t.set(false));
+        app.set_show_onboarding(false);
+    }
+
     apply_ui_update(app, sites, subtitle, running, ca_state);
     app.set_ca_installed(ca_state.2);
     app.set_ca_error(SharedString::from(ca_error.clone()));
@@ -671,6 +678,9 @@ thread_local! {
     static PROXY_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static LAST_APPLY: std::cell::RefCell<Option<std::time::Instant>> =
         const { std::cell::RefCell::new(None) };
+    // Set when the user asked to accelerate but the environment check failed;
+    // refresh() completes the resume as soon as the environment passes.
+    static PENDING_RESUME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn cached_config(revision: u64, fetch: impl FnOnce() -> Value) -> Value {
@@ -775,12 +785,25 @@ fn main() -> Result<()> {
             if runtime.is_started() && !runtime.status().paused() {
                 runtime.pause();
             } else {
-                runtime.resume();
-                // Environment gate: turning acceleration on with a broken setup
-                // would silently do nothing for accelerated sites — guide instead.
+                // Environment gate with a FRESH check (the cached property can be
+                // up to a second old): a broken setup must not accelerate at all.
+                let ca_ok = runtime.ca().status().installed;
+                let proxy_ok = runtime.system_proxy_healthy();
+                if ca_ok && proxy_ok {
+                    runtime.resume();
+                    PENDING_RESUME.with(|t| t.set(false));
+                } else {
+                    // Refuse to accelerate; the fix page takes over and the resume
+                    // happens automatically once the environment passes.
+                    PENDING_RESUME.with(|t| t.set(true));
+                }
                 if let Some(app) = weak.upgrade() {
-                    if !app.get_ca_installed() || !app.get_proxy_ok() {
-                        app.set_show_onboarding(true);
+                    app.set_show_onboarding(!ca_ok || !proxy_ok);
+                    app.set_ca_installed(ca_ok);
+                    if !ca_ok {
+                        app.set_ca_error(SharedString::from(
+                            "本地证书未受信任：加速站点将无法建立可信连接",
+                        ));
                     }
                 }
             }
@@ -858,6 +881,7 @@ fn main() -> Result<()> {
     {
         let weak = app.as_weak();
         app.on_finish_onboarding(move || {
+            PENDING_RESUME.with(|t| t.set(false));
             if let Some(app) = weak.upgrade() {
                 app.set_show_onboarding(false);
                 app.set_ob_installing(false);
