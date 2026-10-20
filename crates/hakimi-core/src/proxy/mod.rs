@@ -191,6 +191,14 @@ async fn handle_request(mut req: Request<Incoming>, ctx: Arc<ProxyContext>) -> R
             "/hakimi/health" => {
                 return text_response(StatusCode::OK, "text/plain; charset=utf-8", "ok");
             }
+            "/hakimi/pause" if req.method() == Method::POST => {
+                ctx.status.set_paused(true);
+                return json_response(serde_json::json!({ "paused": true }));
+            }
+            "/hakimi/resume" if req.method() == Method::POST => {
+                ctx.status.set_paused(false);
+                return json_response(serde_json::json!({ "paused": false }));
+            }
             _ => {}
         }
     }
