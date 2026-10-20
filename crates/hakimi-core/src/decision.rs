@@ -138,9 +138,13 @@ pub enum Route {
     Group(Box<RouteCursor>),
 }
 
-/// Lazy, probe-free route generator. It implements the exact candidate order from the
-/// design (cache/remote -> DoH -> stale DoH, then direct -> ECH -> fake SNI) but only
-/// resolves DoH and ECH when the earlier candidates are exhausted.
+/// Lazy, probe-free route generator. The design's candidate order (cache/remote ->
+/// DoH -> stale DoH) is unchanged, but in `auto` mode the TLS routes no longer run as
+/// strict priority blocks: the generator walks rounds over the candidate list, pairing
+/// one IP with every configured route (direct, ECH, fake SNI). The connection race then
+/// compares routes instead of stopping at the first route that merely works — a slow
+/// direct connection loses to a faster accelerated one, and `last_good` remembers which
+/// route won. Only DoH and ECH resolution stay lazy.
 ///
 /// The caller attempts each returned plan for real and reports the outcome with
 /// [`RouteCursor::note_failure`] / [`RouteCursor::note_success`]. Because the real
@@ -164,6 +168,7 @@ pub struct RouteCursor {
     remote_available: bool,
     modes: Vec<TlsMode>,
     mode_index: usize,
+    current: Option<Candidate>,
     ech_config: Option<Vec<u8>>,
     ech_checked: bool,
     ech_error: Option<String>,
@@ -286,6 +291,7 @@ impl RouteCursor {
             remote_available,
             modes,
             mode_index: 0,
+            current: None,
             ech_config: None,
             ech_checked: false,
             ech_error: None,
@@ -327,16 +333,34 @@ impl RouteCursor {
         self.failure.as_ref()
     }
 
-    /// Produce the next plan in strict priority order. `None` means every strategy and
-    /// candidate was exhausted; a failure diagnostic has been recorded in that case.
+    /// Produce the next plan in round-robin order. Each round pairs one candidate IP
+    /// with every configured TLS route, so the connection race compares routes instead
+    /// of stopping at the first route that merely works. `None` means every strategy
+    /// and candidate was exhausted; a failure diagnostic has been recorded in that case.
     pub async fn next_plan(&mut self) -> Option<ConnectPlan> {
         if self.finished {
             return None;
         }
         loop {
-            if self.mode_index >= self.modes.len() {
+            if self.finished {
+                return None;
+            }
+            if self.modes.is_empty() {
                 self.finish_failure();
                 return None;
+            }
+            // Advance to the next candidate when the round is done (or not started).
+            if self.current.is_none() || self.mode_index >= self.modes.len() {
+                match self.next_candidate().await {
+                    Some(candidate) => {
+                        self.current = Some(candidate);
+                        self.mode_index = 0;
+                    }
+                    None => {
+                        self.finish_failure();
+                        return None;
+                    }
+                }
             }
             let mode = self.modes[self.mode_index];
 
@@ -364,59 +388,57 @@ impl RouteCursor {
                         self.ech_error = Some(format!("{error:#}"));
                     }
                 }
-                if self.ech_config.is_none() && self.group.strategy == Strategy::Ech {
-                    self.last_reason = Some(FailureReason::EchUnavailable);
-                    self.last_detail = self
-                        .ech_error
-                        .clone()
-                        .or_else(|| Some("no ECHConfig available".into()));
-                    self.finish_failure();
-                    return None;
-                }
-            }
-            if mode == TlsMode::Ech && self.ech_config.is_none() {
-                self.advance_mode();
-                continue;
-            }
-
-            if mode == TlsMode::FakeSni && self.tls {
-                if self.sni_index >= self.sni_candidates.len() {
-                    self.advance_mode();
+                if self.ech_config.is_none() {
+                    if self.group.strategy == Strategy::Ech {
+                        self.last_reason = Some(FailureReason::EchUnavailable);
+                        self.last_detail = self
+                            .ech_error
+                            .clone()
+                            .or_else(|| Some("no ECHConfig available".into()));
+                        self.finish_failure();
+                        return None;
+                    }
+                    // Drop the ECH route for every round; the mode index now points
+                    // at the next mode, so do not advance again.
+                    self.modes.retain(|m| *m != TlsMode::Ech);
                     continue;
                 }
-                let sni = self.sni_candidates[self.sni_index].clone();
-                if let Some(candidate) = self.next_candidate().await {
-                    let plan = self.build_plan(candidate, mode, sni, None);
-                    if self.take_skipped(&plan) {
-                        continue;
-                    }
-                    return Some(plan);
-                }
-                self.sni_index += 1;
-                self.candidate_index = 0;
-                continue;
             }
 
-            if let Some(candidate) = self.next_candidate().await {
-                let ech = if mode == TlsMode::Ech {
-                    self.ech_config.clone()
-                } else {
-                    None
-                };
-                let plan = self.build_plan(candidate, mode, None, ech);
+            let Some(candidate) = self.current.clone() else {
+                self.finish_failure();
+                return None;
+            };
+
+            if mode == TlsMode::FakeSni {
+                if self.sni_index >= self.sni_candidates.len() {
+                    // Every fake-SNI host was tried: drop the route for every round.
+                    self.modes.retain(|m| *m != TlsMode::FakeSni);
+                    continue;
+                }
+                // Stay on this mode until the whole SNI list has been paired with
+                // the current candidate, mirroring the old SNI-major sweep.
+                let sni = self.sni_candidates[self.sni_index].clone();
+                self.sni_index += 1;
+                let plan = self.build_plan(candidate, mode, sni, None);
                 if self.take_skipped(&plan) {
                     continue;
                 }
                 return Some(plan);
             }
-            self.advance_mode();
-        }
-    }
 
-    fn advance_mode(&mut self) {
-        self.mode_index += 1;
-        self.candidate_index = 0;
-        self.sni_index = 0;
+            self.mode_index += 1;
+            let ech = if mode == TlsMode::Ech {
+                self.ech_config.clone()
+            } else {
+                None
+            };
+            let plan = self.build_plan(candidate, mode, None, ech);
+            if self.take_skipped(&plan) {
+                continue;
+            }
+            return Some(plan);
+        }
     }
 
     fn build_plan(
@@ -1071,6 +1093,9 @@ impl DecisionEngine {
         if out.is_empty() {
             out.push(None);
         }
+        // Real fake-SNI hosts race first; a `None` entry (no SNI replacement) is
+        // effectively a duplicate of the direct route on the same IP, so it goes last.
+        out.sort_by_key(|entry| entry.is_none());
         out
     }
 
@@ -1524,6 +1549,32 @@ mod tests {
         let outcome = harness.engine.decide_https("example.com").await;
         assert_eq!(outcome.plan.unwrap().ip.to_string(), "8.8.8.8");
         assert!(!harness.cache.has_skip_once("example.com"));
+    }
+
+    #[tokio::test]
+    async fn auto_interleaves_the_accelerated_route_after_direct() {
+        // Even when direct works, the accelerated route must be the very next
+        // plan so the connection race can pick the faster one.
+        let harness = harness(&["example.com"], Strategy::Auto);
+        *harness.remote.catalog.lock() = true;
+        *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+        let ip: IpAddr = "1.1.1.1".parse().unwrap();
+        harness
+            .prober
+            .working_fake_sni
+            .lock()
+            .insert((ip, Some("www.baidu.com".into())));
+        match harness.engine.route("example.com", 443, true) {
+            Route::Group(mut cursor) => {
+                let first = cursor.next_plan().await.unwrap();
+                assert_eq!(first.mode, TlsMode::Direct);
+                let second = cursor.next_plan().await.unwrap();
+                assert_eq!(second.mode, TlsMode::FakeSni);
+                assert_eq!(second.ip, ip);
+                assert_eq!(second.sni.as_deref(), Some("www.baidu.com"));
+            }
+            _ => panic!("expected a group cursor"),
+        }
     }
 
     #[tokio::test]
