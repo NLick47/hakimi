@@ -2,28 +2,15 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use hakimi_core::runtime::HakimiRuntime;
 use serde_json::Value;
-use slint::{Color, Model, ModelRc, SharedString, VecModel, Weak};
+use slint::{Color, Model, ModelRc, SharedString, VecModel};
 
 slint::include_modules!();
-
-
-enum Command {
-    ToggleMaster,
-    ToggleGroup(String, bool),
-    SelectAll(bool),
-    ToggleExpand(String),
-    ProbeAll,
-    Open(String),
-    SettingsAction(i32),
-}
 
 pub(crate) fn data_dir() -> Option<PathBuf> {
     std::env::var_os("HAKIMI_DATA_DIR").map(PathBuf::from)
@@ -606,6 +593,42 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     Ok(())
 }
 
+/// Re-reads the world and applies it to the window. Runs on the UI thread;
+/// the diff in apply_ui_update makes a no-op refresh nearly free.
+fn refresh(app: &AppWindow, runtime: &HakimiRuntime, expanded: &HashSet<String>) {
+    let status = runtime.status_json();
+    let revision = runtime.config_revision();
+    let config = cached_config(revision, || runtime.config_json());
+    let running = runtime.is_started() && !runtime.status().paused();
+    let (sites, subtitle) = build_snapshot(&status, &config, expanded, running);
+    let ca = &status["ca"];
+    let ca_state = (
+        ca.get("present").and_then(Value::as_bool).unwrap_or(false),
+        ca.get("supported").and_then(Value::as_bool).unwrap_or(false),
+        ca.get("installed").and_then(Value::as_bool).unwrap_or(false),
+    );
+    apply_ui_update(app, sites, subtitle, running, ca_state);
+}
+
+thread_local! {
+    static CONFIG_CACHE: std::cell::RefCell<Option<(u64, Value)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn cached_config(revision: u64, fetch: impl FnOnce() -> Value) -> Value {
+    CONFIG_CACHE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        match slot.as_ref() {
+            Some((cached_revision, config)) if *cached_revision == revision => config.clone(),
+            _ => {
+                let config = fetch();
+                *slot = Some((revision, config.clone()));
+                config
+            }
+        }
+    })
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if let Some(index) = args.iter().position(|arg| arg == "--shot") {
@@ -624,189 +647,173 @@ fn main() -> Result<()> {
     }
 
     use_light_appearance();
+
+    // The runtime lives on the UI thread: every interaction is a direct
+    // synchronous call, so a click applies within the same frame. Only the
+    // genuinely async parts (serving the proxy, waiting for shutdown) run on a
+    // dedicated tokio runtime in the background.
+    let runtime = HakimiRuntime::new(data_dir())?;
+    runtime.resume();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let spawner = rt.handle().clone();
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let background = {
+        let runtime = runtime.clone();
+        let shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            rt.block_on(async move {
+                if let Err(error) = runtime.start().await {
+                    eprintln!("hakimi-ui failed to start the proxy: {error:#}");
+                }
+                shutdown.notified().await;
+                let _ = runtime.stop().await;
+            });
+        })
+    };
+
     let app = AppWindow::new()?;
     load_assets();
-    let (tx, rx) = channel::<Command>();
 
-    app.on_toggle_master({
-        let tx = tx.clone();
-        move || {
-            let _ = tx.send(Command::ToggleMaster);
-        }
-    });
-    app.on_toggle_group({
-        let tx = tx.clone();
-        move |id, enabled| {
-            let _ = tx.send(Command::ToggleGroup(id.to_string(), enabled));
-        }
-    });
-    app.on_select_all({
-        let tx = tx.clone();
-        move |enabled| {
-            let _ = tx.send(Command::SelectAll(enabled));
-        }
-    });
-    app.on_toggle_open({
-        let tx = tx.clone();
-        move |id| {
-            let _ = tx.send(Command::ToggleExpand(id.to_string()));
-        }
-    });
-    app.on_probe_all({
-        let tx = tx.clone();
-        move || {
-            let _ = tx.send(Command::ProbeAll);
-        }
-    });
-    app.on_open_site({
-        let tx = tx.clone();
-        move |url| {
-            let _ = tx.send(Command::Open(url.to_string()));
-        }
-    });
-    app.on_settings_action({
-        let tx = tx.clone();
-        move |kind| {
-            let _ = tx.send(Command::SettingsAction(kind as i32));
-        }
-    });
+    let expanded: Rc<std::cell::RefCell<HashSet<String>>> =
+        Rc::new(std::cell::RefCell::new(HashSet::new()));
+    if let Ok(id) = std::env::var("HAKIMI_UI_EXPAND") {
+        expanded.borrow_mut().insert(id);
+    }
 
-    let weak = app.as_weak();
-    let shutdown = Arc::new(AtomicBool::new(false));
+    // -- callbacks: direct calls, applied in the same frame --
+    {
+        let runtime = runtime.clone();
+        let expanded = expanded.clone();
+        let weak = app.as_weak();
+        app.on_toggle_master(move || {
+            if runtime.is_started() && !runtime.status().paused() {
+                runtime.pause();
+            } else {
+                runtime.resume();
+            }
+            if let Some(app) = weak.upgrade() {
+                refresh(&app, &runtime, &expanded.borrow());
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        let expanded = expanded.clone();
+        let weak = app.as_weak();
+        app.on_toggle_group(move |id, enabled| {
+            let _ = runtime.set_group_enabled(id.as_str(), enabled);
+            if let Some(app) = weak.upgrade() {
+                refresh(&app, &runtime, &expanded.borrow());
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        let expanded = expanded.clone();
+        let weak = app.as_weak();
+        app.on_select_all(move |enabled| {
+            let _ = runtime.config().mutate(|config| {
+                for group in &mut config.groups {
+                    group.enabled = enabled;
+                }
+                Ok(())
+            });
+            if let Some(app) = weak.upgrade() {
+                refresh(&app, &runtime, &expanded.borrow());
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        let expanded = expanded.clone();
+        let weak = app.as_weak();
+        app.on_toggle_open(move |id| {
+            let mut set = expanded.borrow_mut();
+            let id = id.to_string();
+            if !set.remove(&id) {
+                set.insert(id);
+            }
+            drop(set);
+            if let Some(app) = weak.upgrade() {
+                refresh(&app, &runtime, &expanded.borrow());
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        let spawner = spawner.clone();
+        app.on_probe_all(move || {
+            let config = runtime.config().snapshot();
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
+            let mut seen = HashSet::new();
+            for group in config.enabled_groups() {
+                for host in group.exact_domains() {
+                    if !seen.insert(host.to_string()) {
+                        continue;
+                    }
+                    let permit = semaphore.clone();
+                    let runtime = runtime.clone();
+                    let host = host.to_string();
+                    spawner.spawn(async move {
+                        let _permit = permit.acquire_owned().await;
+                        let _ = runtime.probe_domain(&host).await;
+                    });
+                }
+            }
+        });
+    }
+    app.on_open_site(|url| {
+        std::thread::spawn(move || {
+            let _ = open::that(url.to_string());
+        });
+    });
+    {
+        let runtime = runtime.clone();
+        app.on_settings_action(move |kind| {
+            // Installing may raise a system password prompt; keep that off the
+            // UI thread. The periodic refresh picks the new status up.
+            let runtime = runtime.clone();
+            std::thread::spawn(move || match kind {
+                1 => {
+                    let _ = runtime.ca_install();
+                }
+                2 => {
+                    let _ = runtime.ca_uninstall();
+                }
+                _ => {}
+            });
+        });
+    }
+
+    // Periodic refresh picks up background activity (probe results, EWMA latency).
+    let timer = slint::Timer::default();
+    {
+        let runtime = runtime.clone();
+        let expanded = expanded.clone();
+        let weak = app.as_weak();
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(1000),
+            move || {
+                if let Some(app) = weak.upgrade() {
+                    refresh(&app, &runtime, &expanded.borrow());
+                }
+            },
+        );
+    }
+
+    refresh(&app, &runtime, &expanded.borrow());
     if std::env::var("HAKIMI_UI_PAGE").as_deref() == Ok("1") {
         app.set_page(1);
     }
-    let worker_shutdown = shutdown.clone();
-    let worker = std::thread::spawn(move || {
-        if let Err(error) = worker_loop(rx, weak, worker_shutdown) {
-            eprintln!("hakimi-ui worker failed: {error:#}");
-        }
-    });
-
     app.run()?;
-    // Stop the runtime so it can restore the OS proxy settings it took over.
-    shutdown.store(true, Ordering::SeqCst);
-    let _ = worker.join();
+
+    // Quitting stops the proxy and restores the system proxy state.
+    drop(timer);
+    shutdown.notify_one();
+    let _ = background.join();
     Ok(())
-}
-
-fn worker_loop(
-    rx: Receiver<Command>,
-    weak: Weak<AppWindow>,
-    shutdown: Arc<AtomicBool>,
-) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async move {
-        let runtime = HakimiRuntime::new(data_dir())?;
-        runtime.clone().start().await?;
-        runtime.resume();
-        let mut expanded: HashSet<String> = HashSet::new();
-        if let Ok(id) = std::env::var("HAKIMI_UI_EXPAND") {
-            expanded.insert(id);
-        }
-        // The configuration rarely changes: cache its JSON and only re-serialize
-        // when the config revision moves.
-        let mut config_cache: Option<(u64, Value)> = None;
-
-        while !shutdown.load(Ordering::SeqCst) {
-            while let Ok(command) = rx.try_recv() {
-                match command {
-                    Command::ToggleMaster => {
-                        if runtime.is_started() && !runtime.status().paused() {
-                            runtime.pause();
-                        } else {
-                            runtime.resume();
-                        }
-                    }
-                    Command::ToggleGroup(id, enabled) => {
-                        let _ = runtime.set_group_enabled(&id, enabled);
-                    }
-                    Command::SelectAll(enabled) => {
-                        let _ = runtime.config().mutate(|config| {
-                            for group in &mut config.groups {
-                                group.enabled = enabled;
-                            }
-                            Ok(())
-                        });
-                    }
-                    Command::ToggleExpand(id) => {
-                        if !expanded.remove(&id) {
-                            expanded.insert(id);
-                        }
-                    }
-                    Command::ProbeAll => {
-                        let config = runtime.config().snapshot();
-                        let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
-                        let mut seen = HashSet::new();
-                        for group in config.enabled_groups() {
-                            for host in group.exact_domains() {
-                                if !seen.insert(host.to_string()) {
-                                    continue;
-                                }
-                                let permit = semaphore.clone().acquire_owned().await?;
-                                let runtime = runtime.clone();
-                                let host = host.to_string();
-                                tokio::spawn(async move {
-                                    let _permit = permit;
-                                    let _ = runtime.probe_domain(&host).await;
-                                });
-                            }
-                        }
-                    }
-                    Command::Open(url) => {
-                        let _ = open::that(url);
-                    }
-                    Command::SettingsAction(kind) => match kind {
-                        1 => {
-                            // Installing the CA may raise a system password prompt.
-                            let _ = runtime.ca_install();
-                        }
-                        2 => {
-                            let _ = runtime.ca_uninstall();
-                        }
-                        _ => {}
-                    },
-                }
-            }
-
-            let status = runtime.status_json();
-            let revision = runtime.config_revision();
-            let config = match &config_cache {
-                Some((cached_rev, cached)) if *cached_rev == revision => cached.clone(),
-                _ => {
-                    let config = runtime.config_json();
-                    config_cache = Some((revision, config.clone()));
-                    config
-                }
-            };
-            let running = runtime.is_started() && !runtime.status().paused();
-            let (sites, subtitle) = build_snapshot(&status, &config, &expanded, running);
-            let ca = &status["ca"];
-            let ca_state = (
-                ca.get("present").and_then(Value::as_bool).unwrap_or(false),
-                ca.get("supported").and_then(Value::as_bool).unwrap_or(false),
-                ca.get("installed").and_then(Value::as_bool).unwrap_or(false),
-            );
-            let handle = weak.clone();
-            // Slint types hold an Rc, so they are built on the UI thread from plain
-            // data. The UI thread diffs against its previous state and touches only
-            // what changed, so unchanged frames cost nothing.
-            let _ = slint::invoke_from_event_loop(move || {
-                let Some(app) = handle.upgrade() else {
-                    return;
-                };
-                apply_ui_update(&app, sites, subtitle, running, ca_state);
-            });
-
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
-                _ = tokio::signal::ctrl_c() => {}
-            }
-        }
-
-        runtime.clone().stop().await?;
-        Ok(())
-    })
 }
