@@ -1,5 +1,8 @@
 import { ScrollView } from "std-widgets.slint";
 
+// Desktop-native palette: neutral window, solid surfaces, hairline borders.
+// No gradients, no translucency, small radii.
+
 export struct DomainEntry {
     host: string,
     status: string,
@@ -40,21 +43,21 @@ component ActionButton inherits Rectangle {
     in property <bool> emphasis: true;
     callback clicked();
 
-    height: 34px;
-    min-width: 96px;
-    border-radius: 9px;
+    height: 32px;
+    min-width: 92px;
+    border-radius: 6px;
     border-width: emphasis ? 0px : 1px;
-    border-color: emphasis ? transparent : rgba(192, 70, 63, 0.32);
+    border-color: emphasis ? transparent : #D6DBE0;
     background: emphasis
-        ? (touch.pressed ? #10589F : touch.has-hover ? #146EC8 : #1877D2)
-        : (touch.pressed ? rgba(192, 70, 63, 0.09) : touch.has-hover ? rgba(192, 70, 63, 0.05) : rgba(255, 255, 255, 0.9));
-    animate background { duration: 140ms; easing: ease-out; }
+        ? (touch.pressed ? #005BA6 : touch.has-hover ? #0B72BE : #0067C0)
+        : (touch.pressed ? #ECEEF0 : touch.has-hover ? #F2F4F6 : #FFFFFF);
+    animate background { duration: 100ms; }
 
     Text {
         text: root.label;
         font-size: 13px;
-        font-weight: 500;
-        color: emphasis ? #FFFFFF : #C0463F;
+        font-weight: 400;
+        color: emphasis ? #FFFFFF : #C0392B;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
@@ -67,66 +70,40 @@ component ActionButton inherits Rectangle {
 component PowerBadge inherits Rectangle {
     in property <bool> active;
 
-    width: 42px;
-    height: 42px;
-    border-radius: 21px;
-    background: active ? #1877D2 : rgba(120, 134, 150, 0.12);
-    animate background { duration: 240ms; easing: ease-out; }
-
-    // soft halo makes the running state read as "lit"
-    Rectangle {
-        width: parent.width + 6px;
-        height: parent.height + 6px;
-        x: -3px;
-        y: -3px;
-        border-radius: parent.border-radius + 3px;
-        border-width: 1px;
-        border-color: rgba(24, 119, 210, 0.28);
-        opacity: root.active ? 1 : 0;
-        animate opacity { duration: 240ms; }
-    }
-
-    // inner highlight keeps the badge from reading flat
-    Rectangle {
-        width: parent.width - 2px;
-        height: parent.height - 2px;
-        x: 1px;
-        y: 1px;
-        border-radius: parent.border-radius - 1px;
-        border-width: 1px;
-        border-color: active ? rgba(255, 255, 255, 0.24) : rgba(255, 255, 255, 0.6);
-    }
+    width: 36px;
+    height: 36px;
+    border-radius: 18px;
+    background: active ? #0067C0 : #E9ECEF;
 
     Path {
-        width: 19px;
-        height: 19px;
+        width: 17px;
+        height: 17px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        commands: "M 14.6 5.3 A 6.8 6.8 0 1 1 4.4 5.3 M 9.5 1.6 L 9.5 9.5";
-        stroke: active ? #FFFFFF : #7A8794;
-        stroke-width: 1.8px;
+        commands: "M 13.2 4.8 A 6.2 6.2 0 1 1 4.8 4.8 M 9 1.5 L 9 8.8";
+        stroke: active ? #FFFFFF : #6B7680;
+        stroke-width: 1.7px;
         stroke-line-cap: round;
-        animate stroke { duration: 240ms; }
     }
 }
 
 component BackIcon inherits Rectangle {
     callback clicked();
 
-    width: 28px;
-    height: 28px;
-    border-radius: 14px;
-    background: touch.has-hover ? rgba(24, 119, 210, 0.10) : transparent;
-    animate background { duration: 140ms; }
+    width: 26px;
+    height: 26px;
+    border-radius: 5px;
+    background: touch.has-hover ? #E9EBEE : transparent;
+    animate background { duration: 100ms; }
 
     Path {
-        width: 16px;
-        height: 16px;
+        width: 15px;
+        height: 15px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        commands: "M 10 3 L 4.5 8 L 10 13";
-        stroke: #1877D2;
-        stroke-width: 1.7px;
+        commands: "M 9.5 3 L 4.5 7.5 L 9.5 12";
+        stroke: #3B434C;
+        stroke-width: 1.5px;
         stroke-line-cap: round;
         stroke-line-join: round;
     }
@@ -140,27 +117,27 @@ component CheckSquare inherits Rectangle {
     in property <bool> checked;
     callback toggled();
 
-    width: 18px;
-    height: 18px;
-    border-radius: 5px;
-    border-width: 1.3px;
-    border-color: checked || touch.has-hover ? #1877D2 : #A8B2BE;
-    background: checked ? #1877D2 : #FFFFFF;
-    animate background { duration: 140ms; easing: ease-out; }
-    animate border-color { duration: 140ms; }
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: checked || touch.has-hover ? #0067C0 : #9AA3AC;
+    background: checked ? #0067C0 : #FFFFFF;
+    animate background { duration: 100ms; }
+    animate border-color { duration: 100ms; }
 
     Path {
-        width: 10px;
-        height: 10px;
+        width: 9px;
+        height: 9px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        commands: "M 1 5.4 L 4 8.2 L 9 2.4";
+        commands: "M 1 4.9 L 3.7 7.4 L 8 2.2";
         stroke: #FFFFFF;
-        stroke-width: 1.9px;
+        stroke-width: 1.7px;
         stroke-line-cap: round;
         stroke-line-join: round;
         opacity: checked ? 1 : 0;
-        animate opacity { duration: 140ms; }
+        animate opacity { duration: 100ms; }
     }
 
     touch := TouchArea {
@@ -170,61 +147,61 @@ component CheckSquare inherits Rectangle {
 
 component Chevron inherits Rectangle {
     in property <bool> open;
-    width: 12px;
-    height: 12px;
+    width: 10px;
+    height: 10px;
 
     Path {
-        width: 12px;
-        height: 12px;
-        commands: "M 4.5 2.5 L 9 7 L 4.5 11.5";
-        stroke: root.open ? #5C6672 : #AEB7C2;
-        stroke-width: 1.5px;
+        width: 10px;
+        height: 10px;
+        commands: "M 3.8 2.2 L 7.8 5.8 L 3.8 9.4";
+        stroke: root.open ? #5C6670 : #98A1AB;
+        stroke-width: 1.4px;
         stroke-line-cap: round;
         stroke-line-join: round;
         opacity: root.open ? 0 : 1;
-        animate opacity { duration: 150ms; }
+        animate opacity { duration: 120ms; }
     }
     Path {
-        width: 12px;
-        height: 12px;
-        commands: "M 2.5 5 L 6 8.5 L 9.5 5";
-        stroke: #5C6672;
-        stroke-width: 1.5px;
+        width: 10px;
+        height: 10px;
+        commands: "M 2.2 3.8 L 5.4 6.8 L 8.6 3.8";
+        stroke: #5C6670;
+        stroke-width: 1.4px;
         stroke-line-cap: round;
         stroke-line-join: round;
         opacity: root.open ? 1 : 0;
-        animate opacity { duration: 150ms; }
+        animate opacity { duration: 120ms; }
     }
 }
 
 component GearIcon inherits Rectangle {
     callback clicked();
-    width: 30px;
-    height: 30px;
-    border-radius: 15px;
-    background: touch.has-hover ? rgba(255, 255, 255, 0.9) : transparent;
-    animate background { duration: 140ms; }
+    width: 28px;
+    height: 28px;
+    border-radius: 5px;
+    background: touch.has-hover ? #E9EBEE : transparent;
+    animate background { duration: 100ms; }
 
     Path {
-        width: 18px;
-        height: 18px;
+        width: 17px;
+        height: 17px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        commands: "M 14 9 A 5 5 0 1 0 4 9 A 5 5 0 1 0 14 9 M 11 9 A 2 2 0 1 0 7 9 A 2 2 0 1 0 11 9";
-        stroke: touch.has-hover ? #1877D2 : #5C6672;
-        stroke-width: 1.5px;
-        animate stroke { duration: 140ms; }
+        commands: "M 13.2 8.5 A 4.7 4.7 0 1 0 3.8 8.5 A 4.7 4.7 0 1 0 13.2 8.5 M 10.4 8.5 A 1.9 1.9 0 1 0 6.6 8.5 A 1.9 1.9 0 1 0 10.4 8.5";
+        stroke: touch.has-hover ? #3B434C : #5C6670;
+        stroke-width: 1.4px;
+        animate stroke { duration: 100ms; }
     }
     Path {
-        width: 18px;
-        height: 18px;
+        width: 17px;
+        height: 17px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        commands: "M 14 9 L 15.6 9 M 12.54 12.54 L 13.7 13.7 M 9 14 L 9 15.6 M 5.46 12.54 L 4.3 13.7 M 4 9 L 2.4 9 M 5.46 5.46 L 4.3 4.3 M 9 4 L 9 2.4 M 12.54 5.46 L 13.7 4.3";
-        stroke: touch.has-hover ? #1877D2 : #5C6672;
-        stroke-width: 2.2px;
+        commands: "M 13.2 8.5 L 14.7 8.5 M 11.9 11.8 L 13 12.9 M 8.5 13.2 L 8.5 14.7 M 5.1 11.8 L 4 12.9 M 3.8 8.5 L 2.3 8.5 M 5.1 5.2 L 4 4.1 M 8.5 3.8 L 8.5 2.3 M 11.9 5.2 L 13 4.1";
+        stroke: touch.has-hover ? #3B434C : #5C6670;
+        stroke-width: 2px;
         stroke-line-cap: round;
-        animate stroke { duration: 140ms; }
+        animate stroke { duration: 100ms; }
     }
 
     touch := TouchArea {
@@ -237,15 +214,15 @@ component TextButton inherits Rectangle {
     callback clicked();
     height: 24px;
     min-width: 40px;
-    border-radius: 6px;
-    background: touch.has-hover ? rgba(24, 119, 210, 0.08) : transparent;
-    animate background { duration: 140ms; }
+    border-radius: 5px;
+    background: touch.has-hover ? #E9EBEE : transparent;
+    animate background { duration: 100ms; }
 
     Text {
         text: root.label;
-        font-size: 12px;
-        color: touch.has-hover ? #1877D2 : #6B7684;
-        animate color { duration: 140ms; }
+        font-size: 12.5px;
+        color: touch.has-hover ? #0067C0 : #5C6670;
+        animate color { duration: 100ms; }
         horizontal-alignment: center;
         vertical-alignment: center;
     }
@@ -261,7 +238,7 @@ export component AppWindow inherits Window {
     title: "hakimi";
     width: 540px;
     height: 640px;
-    background: #DDE6F0;
+    background: #F3F4F5;
 
     in property <[SiteEntry]> sites;
     in property <[SettingsEntry]> settings;
@@ -280,49 +257,41 @@ export component AppWindow inherits Window {
     VerticalLayout {
         spacing: 0px;
 
-        // ---- top bar ----
+        // ---- toolbar ----
         Rectangle {
-            height: 44px;
-            background: rgba(255, 255, 255, 0.40);
+            height: 42px;
+            background: #F3F4F5;
 
-            // light from the top edge
-            Rectangle {
-                width: parent.width;
-                height: parent.height;
-                background: @linear-gradient(180deg, rgba(255, 255, 255, 0.50), rgba(255, 255, 255, 0));
-            }
-
-            // hairline separating the bar from the content
             Rectangle {
                 width: parent.width;
                 height: 1px;
                 y: parent.height - 1px;
-                background: rgba(110, 132, 156, 0.18);
+                background: #E1E4E8;
             }
 
             HorizontalLayout {
                 padding-left: 16px;
                 padding-right: 10px;
-                spacing: 10px;
+                spacing: 9px;
 
                 Rectangle {
-                    width: 30px;
+                    width: 28px;
                     height: parent.height;
 
                     if root.page == 0: Rectangle {
-                        width: 23px;
-                        height: 23px;
+                        width: 20px;
+                        height: 20px;
                         x: (parent.width - self.width) / 2;
                         y: (parent.height - self.height) / 2;
-                        border-radius: 7px;
-                        background: #1877D2;
+                        border-radius: 5px;
+                        background: #0067C0;
 
                         Path {
-                            width: 12px;
-                            height: 12px;
+                            width: 11px;
+                            height: 11px;
                             x: (parent.width - self.width) / 2;
                             y: (parent.height - self.height) / 2;
-                            commands: "M 7.2 0.6 L 2 6.8 L 5.4 6.8 L 4.5 11.4 L 9.9 4.6 L 6.3 4.6 Z";
+                            commands: "M 6.6 0.5 L 1.8 6.2 L 4.9 6.2 L 4.1 10.5 L 9.1 4.3 L 5.7 4.3 Z";
                             fill: #FFFFFF;
                         }
                     }
@@ -340,14 +309,13 @@ export component AppWindow inherits Window {
 
                     if root.page == 1: Text {
                         text: "设置";
-                        font-size: 14px;
-                        font-weight: 500;
-                        color: #26303C;
+                        font-size: 13.5px;
+                        color: #1B1F24;
                     }
                 }
 
                 Rectangle {
-                    width: 34px;
+                    width: 30px;
                     height: parent.height;
 
                     if root.page == 0: GearIcon {
@@ -360,29 +328,27 @@ export component AppWindow inherits Window {
         }
 
         if root.page == 0: VerticalLayout {
-            padding-left: 18px;
-            padding-right: 18px;
-            padding-top: 16px;
+            padding-left: 20px;
+            padding-right: 20px;
+            padding-top: 18px;
             padding-bottom: 16px;
             spacing: 0px;
 
-            // ---- status card ----
+            // ---- status ----
             Rectangle {
-                height: 86px;
-                background: root.running ? rgba(24, 119, 210, 0.07) : rgba(255, 255, 255, 0.84);
-                border-radius: 14px;
-                border-width: 0.5px;
-                border-color: root.running ? rgba(24, 119, 210, 0.26) : rgba(130, 150, 172, 0.18);
-                animate background { duration: 260ms; easing: ease-out; }
-                animate border-color { duration: 260ms; }
+                height: 76px;
+                background: #FFFFFF;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: #E1E4E8;
 
                 HorizontalLayout {
                     padding-left: 16px;
-                    padding-right: 16px;
-                    spacing: 13px;
+                    padding-right: 14px;
+                    spacing: 12px;
 
                     Rectangle {
-                        width: 42px;
+                        width: 36px;
                         height: parent.height;
                         PowerBadge {
                             y: (parent.height - self.height) / 2;
@@ -393,24 +359,23 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         horizontal-stretch: 1;
                         alignment: center;
-                        spacing: 4px;
+                        spacing: 3px;
 
                         Text {
                             text: root.running ? "加速已开启" : "加速已暂停";
-                            font-size: 15.5px;
-                            font-weight: 500;
-                            color: #1F2733;
+                            font-size: 14.5px;
+                            color: #1B1F24;
                         }
                         Text {
                             text: root.status-subtitle;
                             font-size: 12px;
-                            color: #7A8794;
+                            color: #6B7480;
                             overflow: elide;
                         }
                     }
 
                     Rectangle {
-                        width: 100px;
+                        width: 96px;
                         height: parent.height;
                         ActionButton {
                             width: parent.width;
@@ -425,13 +390,13 @@ export component AppWindow inherits Window {
 
             // ---- section header ----
             Rectangle {
-                height: 42px;
+                height: 40px;
 
                 HorizontalLayout {
-                    padding-left: 2px;
-                    padding-right: 2px;
+                    padding-left: 1px;
+                    padding-right: 1px;
                     padding-top: 14px;
-                    padding-bottom: 4px;
+                    padding-bottom: 5px;
                     alignment: space-between;
 
                     VerticalLayout {
@@ -439,8 +404,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "站点";
                             font-size: 12.5px;
-                            font-weight: 500;
-                            color: #6B7684;
+                            color: #5C6670;
                         }
                     }
 
@@ -463,26 +427,39 @@ export component AppWindow inherits Window {
                     alignment: start;
 
                     Rectangle {
-                        border-radius: 14px;
-                        background: rgba(255, 255, 255, 0.88);
-                        border-width: 0.5px;
-                        border-color: rgba(130, 150, 172, 0.18);
+                        border-radius: 8px;
+                        background: #FFFFFF;
+                        border-width: 1px;
+                        border-color: #E1E4E8;
                         clip: true;
 
                         VerticalLayout {
                             spacing: 0px;
 
                             for site in root.sites: Rectangle {
-                                background: site.open ? rgba(24, 119, 210, 0.035)
-                                    : (row-touch.has-hover ? rgba(24, 119, 210, 0.045) : transparent);
-                                animate background { duration: 150ms; }
+                                background: site.open ? #FAFBFC
+                                    : (row-touch.has-hover ? #F4F6F8 : #FFFFFF);
+                                animate background { duration: 100ms; }
 
                                 VerticalLayout {
                                     spacing: 0px;
 
+                                    // separator above the row (skip the first one)
+                                    if !site.first: Rectangle {
+                                        height: 1px;
+                                        background: transparent;
+
+                                        Rectangle {
+                                            x: 76px;
+                                            width: parent.width - 76px;
+                                            height: parent.height;
+                                            background: #ECEEF0;
+                                        }
+                                    }
+
                                     // row
                                     Rectangle {
-                                        height: 54px;
+                                        height: 50px;
 
                                         // below the layout so the checkbox and the
                                         // 访问 button keep their own clicks
@@ -493,10 +470,10 @@ export component AppWindow inherits Window {
                                         HorizontalLayout {
                                             padding-left: 14px;
                                             padding-right: 12px;
-                                            spacing: 11px;
+                                            spacing: 10px;
 
                                             Rectangle {
-                                                width: 18px;
+                                                width: 16px;
                                                 height: parent.height;
                                                 CheckSquare {
                                                     y: (parent.height - self.height) / 2;
@@ -506,30 +483,29 @@ export component AppWindow inherits Window {
                                             }
 
                                             Rectangle {
-                                                width: 30px;
+                                                width: 26px;
                                                 height: parent.height;
 
                                                 Rectangle {
-                                                    width: 30px;
-                                                    height: 30px;
+                                                    width: 26px;
+                                                    height: 26px;
                                                     y: (parent.height - self.height) / 2;
-                                                    border-radius: 9px;
-                                                    background: site.icon.width > 0 ? rgba(255, 255, 255, 0.98) : site.tile-color;
-                                                    border-width: 0.5px;
-                                                    border-color: site.icon.width > 0 ? rgba(130, 150, 172, 0.22) : transparent;
+                                                    border-radius: 6px;
+                                                    background: site.icon.width > 0 ? #FFFFFF : site.tile-color;
+                                                    border-width: 1px;
+                                                    border-color: site.icon.width > 0 ? #E4E7EA : transparent;
                                                     clip: true;
 
                                                     if site.icon.width > 0: Image {
-                                                        width: 19px;
-                                                        height: 19px;
+                                                        width: 17px;
+                                                        height: 17px;
                                                         x: (parent.width - self.width) / 2;
                                                         y: (parent.height - self.height) / 2;
                                                         source: site.icon;
                                                     }
                                                     if site.icon.width == 0: Text {
                                                         text: site.initial;
-                                                        font-size: 13px;
-                                                        font-weight: 500;
+                                                        font-size: 12px;
                                                         color: #FFFFFF;
                                                         horizontal-alignment: center;
                                                         vertical-alignment: center;
@@ -544,14 +520,13 @@ export component AppWindow inherits Window {
 
                                                 Text {
                                                     text: site.name;
-                                                    font-size: 13.5px;
-                                                    font-weight: 500;
-                                                    color: #1F2733;
+                                                    font-size: 13px;
+                                                    color: #1B1F24;
                                                 }
                                                 Text {
                                                     text: site.summary;
                                                     font-size: 11.5px;
-                                                    color: #7C8794;
+                                                    color: #6B7480;
                                                     overflow: elide;
                                                 }
                                             }
@@ -568,7 +543,7 @@ export component AppWindow inherits Window {
                                             }
 
                                             Rectangle {
-                                                width: 12px;
+                                                width: 10px;
                                                 height: parent.height;
                                                 Chevron {
                                                     y: (parent.height - self.height) / 2;
@@ -581,25 +556,25 @@ export component AppWindow inherits Window {
                                     // expanded domains: always present, animated
                                     // between zero height and full height
                                     Rectangle {
-                                        height: site.open ? site.domains.length * 28px + 1px : 0px;
+                                        height: site.open ? site.domains.length * 26px + 1px : 0px;
                                         clip: true;
-                                        background: rgba(24, 119, 210, 0.035);
-                                        animate height { duration: 220ms; easing: ease-out; }
+                                        background: #FAFBFC;
+                                        animate height { duration: 200ms; easing: ease-out; }
 
                                         VerticalLayout {
                                             spacing: 0px;
 
-                                            Rectangle { height: 1px; background: rgba(24, 119, 210, 0.14); }
+                                            Rectangle { height: 1px; background: #ECEEF0; }
 
                                             for d in site.domains: Rectangle {
-                                                height: 28px;
-                                                background: domain-touch.has-hover ? rgba(24, 119, 210, 0.05) : transparent;
-                                                animate background { duration: 140ms; }
+                                                height: 26px;
+                                                background: domain-touch.has-hover ? #F1F3F5 : transparent;
+                                                animate background { duration: 100ms; }
 
                                                 HorizontalLayout {
                                                     // aligned under the site name column
-                                                    padding-left: 84px;
-                                                    padding-right: 16px;
+                                                    padding-left: 76px;
+                                                    padding-right: 14px;
                                                     spacing: 10px;
 
                                                     Text {
@@ -607,7 +582,7 @@ export component AppWindow inherits Window {
                                                         horizontal-stretch: 1;
                                                         font-size: 11.5px;
                                                         font-family: "Menlo";
-                                                        color: #4A5560;
+                                                        color: #3B434C;
                                                         overflow: elide;
                                                         vertical-alignment: center;
                                                     }
@@ -622,10 +597,10 @@ export component AppWindow inherits Window {
                                                     }
                                                     Text {
                                                         text: d.latency;
-                                                        width: 56px;
+                                                        width: 54px;
                                                         font-size: 11.5px;
                                                         font-family: "Menlo";
-                                                        color: #7A8794;
+                                                        color: #6B7480;
                                                         horizontal-alignment: right;
                                                         vertical-alignment: center;
                                                     }
@@ -634,19 +609,6 @@ export component AppWindow inherits Window {
                                                 domain-touch := TouchArea { }
                                             }
                                         }
-                                    }
-                                }
-
-                                // hairline between rows, inset to the text column
-                                if !site.last: Rectangle {
-                                    height: 1px;
-                                    background: transparent;
-
-                                    Rectangle {
-                                        x: 84px;
-                                        width: parent.width - 84px;
-                                        height: parent.height;
-                                        background: rgba(110, 132, 156, 0.22);
                                     }
                                 }
                             }
@@ -659,10 +621,10 @@ export component AppWindow inherits Window {
         }
 
         if root.page == 1: VerticalLayout {
-            padding-left: 18px;
-            padding-right: 18px;
+            padding-left: 20px;
+            padding-right: 20px;
             padding-bottom: 16px;
-            padding-top: 14px;
+            padding-top: 16px;
 
             ScrollView {
                 vertical-stretch: 1;
@@ -673,18 +635,18 @@ export component AppWindow inherits Window {
                     alignment: start;
 
                     Rectangle {
-                        border-radius: 14px;
-                        background: rgba(255, 255, 255, 0.88);
-                        border-width: 0.5px;
-                        border-color: rgba(130, 150, 172, 0.18);
+                        border-radius: 8px;
+                        background: #FFFFFF;
+                        border-width: 1px;
+                        border-color: #E1E4E8;
                         clip: true;
 
                         VerticalLayout {
                             spacing: 0px;
 
                             for entry in root.settings: Rectangle {
-                                background: settings-touch.has-hover ? rgba(24, 119, 210, 0.045) : transparent;
-                                animate background { duration: 150ms; }
+                                background: settings-touch.has-hover ? #F4F6F8 : #FFFFFF;
+                                animate background { duration: 100ms; }
 
                                 settings-touch := TouchArea {
                                     clicked => { }
@@ -695,146 +657,150 @@ export component AppWindow inherits Window {
 
                                     if !entry.first: Rectangle {
                                         height: 1px;
-                                        background: rgba(110, 132, 156, 0.20);
-                                    }
-
-                                HorizontalLayout {
-                                    height: 60px;
-                                    padding: 11px;
-                                    padding-left: 16px;
-                                    padding-right: 16px;
-                                    spacing: 13px;
-
-                                    Rectangle {
-                                        width: 32px;
-                                        height: parent.height;
-                                        border-radius: 9px;
-                                        background: rgba(24, 119, 210, 0.10);
+                                        background: transparent;
 
                                         Rectangle {
-                                            width: 16px;
-                                            height: 16px;
-                                            x: (parent.width - self.width) / 2;
-                                            y: (parent.height - self.height) / 2;
-
-                                            if entry.icon-kind == 0: Path {
-                                                commands: "M 15 8.5 A 6 6 0 1 0 3 8.5 A 6 6 0 1 0 15 8.5 M 3 8.5 L 15 8.5 M 9 2.5 C 6.5 5 6.5 12 9 14.5 M 9 2.5 C 11.5 5 11.5 12 9 14.5";
-                                                stroke: #1877D2;
-                                                stroke-width: 1.2px;
-                                            }
-                                            if entry.icon-kind == 1: Rectangle {
-                                                y: 7px;
-                                                width: 11px;
-                                                height: 9px;
-                                                border-radius: 2px;
-                                                border-width: 1.3px;
-                                                border-color: #1877D2;
-                                            }
-                                            if entry.icon-kind == 1: Path {
-                                                commands: "M 5.5 8 L 5.5 5.5 A 3 3 0 0 1 11.5 5.5 L 11.5 8";
-                                                stroke: #1877D2;
-                                                stroke-width: 1.3px;
-                                            }
-                                            if entry.icon-kind == 2: Rectangle {
-                                                x: 0;
-                                                y: 2px;
-                                                width: 7px;
-                                                height: 13px;
-                                                border-radius: 2px;
-                                                border-width: 1.3px;
-                                                border-color: #1877D2;
-                                            }
-                                            if entry.icon-kind == 2: Rectangle {
-                                                x: 9px;
-                                                y: 2px;
-                                                width: 7px;
-                                                height: 13px;
-                                                border-radius: 2px;
-                                                border-width: 1.3px;
-                                                border-color: rgba(24, 119, 210, 0.45);
-                                            }
-                                            if entry.icon-kind == 3: Path {
-                                                commands: "M 2 4.5 A 7 2.4 0 1 0 16 4.5 A 7 2.4 0 1 0 2 4.5 M 2 4.5 L 2 12.5 C 2 13.9 4.7 15 9 15 C 13.3 15 16 13.9 16 12.5 L 16 4.5 M 2 8.5 C 2 9.9 4.7 11 9 11 C 13.3 11 16 9.9 16 8.5";
-                                                stroke: #1877D2;
-                                                stroke-width: 1.1px;
-                                            }
-                                            if entry.icon-kind == 4: Path {
-                                                commands: "M 15.5 9 A 6.5 6.5 0 1 0 2.5 9 A 6.5 6.5 0 1 0 15.5 9 M 9 8.2 L 9 12.4 M 9 5.4 L 9 5.6";
-                                                stroke: #1877D2;
-                                                stroke-width: 1.4px;
-                                            }
+                                            x: 59px;
+                                            width: parent.width - 59px;
+                                            height: parent.height;
+                                            background: #ECEEF0;
                                         }
                                     }
 
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        alignment: center;
-                                        spacing: 2px;
-
-                                        Text {
-                                            text: entry.title;
-                                            font-size: 13.5px;
-                                            font-weight: 500;
-                                            color: #1F2733;
-                                        }
-                                        Text {
-                                            text: entry.subtitle;
-                                            font-size: 11.5px;
-                                            color: #8A95A2;
-                                            overflow: elide;
-                                        }
-                                    }
-
-                                    if entry.action-label != "": Rectangle {
-                                        width: 78px;
-                                        height: parent.height;
+                                    HorizontalLayout {
+                                        height: 58px;
+                                        padding: 11px;
+                                        padding-left: 16px;
+                                        padding-right: 16px;
+                                        spacing: 12px;
 
                                         Rectangle {
-                                            width: 70px;
-                                            height: 28px;
-                                            x: (parent.width - self.width) / 2;
-                                            y: (parent.height - self.height) / 2;
-                                            border-radius: 7px;
-                                            background: entry.action-tone == 1
-                                                ? (button-touch.has-hover ? rgba(192, 70, 63, 0.12) : rgba(192, 70, 63, 0.06))
-                                                : (button-touch.has-hover ? rgba(24, 119, 210, 0.14) : rgba(24, 119, 210, 0.08));
-                                            border-width: 0.5px;
-                                            border-color: entry.action-tone == 1
-                                                ? rgba(192, 70, 63, 0.30)
-                                                : rgba(24, 119, 210, 0.30);
-                                            animate background { duration: 140ms; }
+                                            width: 30px;
+                                            height: parent.height;
+                                            border-radius: 6px;
+                                            background: #EDF3FA;
+
+                                            Rectangle {
+                                                width: 15px;
+                                                height: 15px;
+                                                x: (parent.width - self.width) / 2;
+                                                y: (parent.height - self.height) / 2;
+
+                                                if entry.icon-kind == 0: Path {
+                                                    commands: "M 15 8.5 A 6 6 0 1 0 3 8.5 A 6 6 0 1 0 15 8.5 M 3 8.5 L 15 8.5 M 9 2.5 C 6.5 5 6.5 12 9 14.5 M 9 2.5 C 11.5 5 11.5 12 9 14.5";
+                                                    stroke: #0067C0;
+                                                    stroke-width: 1.2px;
+                                                }
+                                                if entry.icon-kind == 1: Rectangle {
+                                                    y: 7px;
+                                                    width: 11px;
+                                                    height: 9px;
+                                                    border-radius: 2px;
+                                                    border-width: 1.2px;
+                                                    border-color: #0067C0;
+                                                }
+                                                if entry.icon-kind == 1: Path {
+                                                    commands: "M 5.5 8 L 5.5 5.5 A 3 3 0 0 1 11.5 5.5 L 11.5 8";
+                                                    stroke: #0067C0;
+                                                    stroke-width: 1.2px;
+                                                }
+                                                if entry.icon-kind == 2: Rectangle {
+                                                    x: 0;
+                                                    y: 2px;
+                                                    width: 7px;
+                                                    height: 13px;
+                                                    border-radius: 2px;
+                                                    border-width: 1.2px;
+                                                    border-color: #0067C0;
+                                                }
+                                                if entry.icon-kind == 2: Rectangle {
+                                                    x: 9px;
+                                                    y: 2px;
+                                                    width: 7px;
+                                                    height: 13px;
+                                                    border-radius: 2px;
+                                                    border-width: 1.2px;
+                                                    border-color: rgba(0, 103, 192, 0.45);
+                                                }
+                                                if entry.icon-kind == 3: Path {
+                                                    commands: "M 2 4.5 A 7 2.4 0 1 0 16 4.5 A 7 2.4 0 1 0 2 4.5 M 2 4.5 L 2 12.5 C 2 13.9 4.7 15 9 15 C 13.3 15 16 13.9 16 12.5 L 16 4.5 M 2 8.5 C 2 9.9 4.7 11 9 11 C 13.3 11 16 9.9 16 8.5";
+                                                    stroke: #0067C0;
+                                                    stroke-width: 1.1px;
+                                                }
+                                                if entry.icon-kind == 4: Path {
+                                                    commands: "M 15.5 9 A 6.5 6.5 0 1 0 2.5 9 A 6.5 6.5 0 1 0 15.5 9 M 9 8.2 L 9 12.4 M 9 5.4 L 9 5.6";
+                                                    stroke: #0067C0;
+                                                    stroke-width: 1.4px;
+                                                }
+                                            }
+                                        }
+
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            alignment: center;
+                                            spacing: 2px;
 
                                             Text {
-                                                text: entry.action-label;
-                                                font-size: 12px;
-                                                font-weight: 500;
-                                                color: entry.action-tone == 1 ? #C0463F : #1877D2;
-                                                horizontal-alignment: center;
-                                                vertical-alignment: center;
+                                                text: entry.title;
+                                                font-size: 13px;
+                                                color: #1B1F24;
                                             }
+                                            Text {
+                                                text: entry.subtitle;
+                                                font-size: 11.5px;
+                                                color: #6B7480;
+                                                overflow: elide;
+                                            }
+                                        }
 
-                                            button-touch := TouchArea {
-                                                clicked => { root.settings-action(entry.action-kind); }
+                                        if entry.action-label != "": Rectangle {
+                                            width: 74px;
+                                            height: parent.height;
+
+                                            Rectangle {
+                                                width: 66px;
+                                                height: 27px;
+                                                x: (parent.width - self.width) / 2;
+                                                y: (parent.height - self.height) / 2;
+                                                border-radius: 5px;
+                                                background: entry.action-tone == 1
+                                                    ? (button-touch.has-hover ? #F9ECEB : #FFFFFF)
+                                                    : (button-touch.has-hover ? #EDF3FA : #FFFFFF);
+                                                border-width: 1px;
+                                                border-color: entry.action-tone == 1
+                                                    ? #E4C7C5
+                                                    : #C5D9EC;
+                                                animate background { duration: 100ms; }
+
+                                                Text {
+                                                    text: entry.action-label;
+                                                    font-size: 12px;
+                                                    color: entry.action-tone == 1 ? #C0392B : #0067C0;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+
+                                                button-touch := TouchArea {
+                                                    clicked => { root.settings-action(entry.action-kind); }
+                                                }
+                                            }
+                                        }
+
+                                        Rectangle {
+                                            width: 10px;
+                                            height: parent.height;
+                                            Path {
+                                                width: 10px;
+                                                height: 10px;
+                                                y: (parent.height - self.height) / 2;
+                                                commands: "M 3.8 2.2 L 7.8 5.8 L 3.8 9.4";
+                                                stroke: #98A1AB;
+                                                stroke-width: 1.4px;
+                                                stroke-line-cap: round;
+                                                stroke-line-join: round;
                                             }
                                         }
                                     }
-
-                                    Rectangle {
-                                        width: 12px;
-                                        height: parent.height;
-                                        Path {
-                                            width: 12px;
-                                            height: 12px;
-                                            y: (parent.height - self.height) / 2;
-                                            commands: "M 4.5 2.5 L 9 7 L 4.5 11.5";
-                                            stroke: #AEB7C2;
-                                            stroke-width: 1.5px;
-                                            stroke-line-cap: round;
-                                            stroke-line-join: round;
-                                        }
-                                    }
-                                }
-
                                 }
                             }
                         }
