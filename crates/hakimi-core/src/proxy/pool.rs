@@ -115,10 +115,10 @@ const SYSTEM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WARM_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Candidates raced in parallel per batch while a cold connection hunts for a route.
-const RACE_SIZE: usize = 3;
+const RACE_SIZE: usize = 8;
 /// Delay between race batch member starts, so the first candidate usually wins on a
 /// healthy network and the race only costs extra handshakes when it is actually broken.
-const RACE_STAGGER: Duration = Duration::from_millis(200);
+const RACE_STAGGER: Duration = Duration::from_millis(150);
 
 #[derive(Default)]
 pub(crate) struct UpstreamStats {
@@ -561,8 +561,11 @@ impl RouteConnector {
         force_http1: bool,
     ) -> std::result::Result<(ConnectPlan, PooledIo), String> {
         loop {
-            // Pull a batch of plans and race them with a staggered start. A dead route
-            // no longer makes every following candidate wait out its full timeout.
+            // Pull a batch of plans and race them. The first plan (the learned-best
+            // route) gets a short head start; every other route fires together, so a
+            // batch of failing candidates costs one timeout in parallel instead of
+            // RACE_SIZE timeouts serially. A dead route no longer makes every
+            // following candidate wait out its full timeout.
             let mut plans: Vec<ConnectPlan> = Vec::new();
             for _ in 0..RACE_SIZE {
                 match cursor.next_plan().await {
@@ -590,8 +593,10 @@ impl RouteConnector {
             for (index, plan) in plans.into_iter().enumerate() {
                 let this = self.clone();
                 pending.push(Box::pin(async move {
+                    // The priority route starts immediately; the rest share one short
+                    // head-start delay so the race still prefers it when close.
                     if index > 0 {
-                        tokio::time::sleep(RACE_STAGGER * index as u32).await;
+                        tokio::time::sleep(RACE_STAGGER).await;
                     }
                     let started = std::time::Instant::now();
                     match this.connect_plan(&plan, force_http1).await {
