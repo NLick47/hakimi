@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -629,16 +630,8 @@ fn refresh(app: &AppWindow, runtime: &Arc<HakimiRuntime>, expanded: &HashSet<Str
         ca.get("installed").and_then(Value::as_bool).unwrap_or(false),
     );
     apply_ui_update(app, sites, subtitle, running, ca_state);
-
-    // Environment state machine: probe, transition, execute, mirror.
-    let env = ui_state::probe_env(runtime);
-    MODEL.with(|m| {
-        let mut model = m.borrow_mut();
-        let effects = model.env_changed(env);
-        ui_state::execute(&effects, runtime);
-        ui_state::maybe_self_heal(runtime, &model);
-        ui_state::sync_window(&model, app);
-    });
+    // Environment state comes from the probe thread; the window already
+    // mirrors the model, so there is nothing else to do here.
 }
 
 fn cached_config(revision: u64, fetch: impl FnOnce() -> Value) -> Value {
@@ -705,11 +698,12 @@ fn main() -> Result<()> {
     // dedicated tokio runtime in the background.
     let runtime = HakimiRuntime::new(data_dir())?;
 
-    // The state machine decides the startup posture; `start_deferring_proxy`
-    // keeps OS-proxy policy out of the runtime — the effects own it.
+    // The state machine decides the startup posture. This one synchronous
+    // probe is the only environment check on the UI thread; after this, the
+    // probe thread streams results in. The proxy effects map onto the start
+    // mode because they need the PAC URL, which only exists post-bind.
     let startup_effects = MODEL.with(|m| m.borrow_mut().startup(ui_state::probe_env(&runtime)));
-    ui_state::execute(&startup_effects, &runtime);
-    let ca_ok = startup_effects.resume;
+    let start_mode = ui_state::execute_startup(&startup_effects, &runtime);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -721,7 +715,10 @@ fn main() -> Result<()> {
         let shutdown = shutdown.clone();
         std::thread::spawn(move || {
             rt.block_on(async move {
-                let start_result = runtime.start_deferring_proxy().await;
+                let start_result = match start_mode {
+                    ui_state::StartMode::Takeover => runtime.start().await,
+                    ui_state::StartMode::Deferred => runtime.start_deferring_proxy().await,
+                };
                 if let Err(error) = start_result {
                     eprintln!("hakimi-ui failed to start the proxy: {error:#}");
                 }
@@ -746,7 +743,12 @@ fn main() -> Result<()> {
         let expanded = expanded.clone();
         let weak = app.as_weak();
         app.on_toggle_master(move || {
-            let effects = MODEL.with(|m| m.borrow_mut().toggle(ui_state::probe_env(&runtime)));
+            // Use the last known environment (fresh within a second of the
+            // probe stream) so the click never waits on a subprocess.
+            let effects = MODEL.with(|m| {
+                let env = m.borrow().env().clone();
+                m.borrow_mut().toggle(env)
+            });
             ui_state::execute(&effects, &runtime);
             if let Some(app) = weak.upgrade() {
                 MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
@@ -865,6 +867,39 @@ fn main() -> Result<()> {
         });
     }
 
+    // The environment probe is an input stream: it runs off the UI thread (it
+    // spawns `security` and `networksetup`) and posts results through the
+    // event loop, where the state machine transitions and the window mirrors.
+    let probe_stop = Arc::new(AtomicBool::new(false));
+    {
+        let probe_stop = probe_stop.clone();
+        let probe_runtime = runtime.clone();
+        let weak = app.as_weak();
+        std::thread::spawn(move || {
+            while !probe_stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1000));
+                if probe_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let env = ui_state::probe_env(&probe_runtime);
+                let runtime = probe_runtime.clone();
+                let weak = weak.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(app) = weak.upgrade() else {
+                        return;
+                    };
+                    MODEL.with(|m| {
+                        let mut model = m.borrow_mut();
+                        let effects = model.env_changed(env);
+                        ui_state::execute(&effects, &runtime);
+                        ui_state::maybe_self_heal(&runtime, &model);
+                        ui_state::sync_window(&model, &app);
+                    });
+                });
+            }
+        });
+    }
+
     // Periodic refresh picks up background activity (probe results, EWMA latency).
     let timer = slint::Timer::default();
     {
@@ -890,6 +925,7 @@ fn main() -> Result<()> {
 
     // Quitting stops the proxy and restores the system proxy state.
     drop(timer);
+    probe_stop.store(true, Ordering::SeqCst);
     shutdown.notify_one();
     let _ = background.join();
     Ok(())

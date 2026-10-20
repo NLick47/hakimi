@@ -34,8 +34,12 @@ pub struct EnvState {
 }
 
 impl EnvState {
-    pub fn healthy(&self) -> bool {
-        self.ca_ok && self.proxy_ok
+    /// Whether acceleration may run at all. The CA trust is the only
+    /// prerequisite the app cannot fix itself (it needs the user to confirm a
+    /// system dialog); the system proxy is applied by the effects as part of
+    /// entering Running, so it is not part of the gate.
+    pub fn allows_acceleration(&self) -> bool {
+        self.ca_ok
     }
 }
 
@@ -103,7 +107,7 @@ impl AppModel {
     /// App launch: an unhealthy environment blocks acceleration right away.
     pub fn startup(&mut self, env: EnvState) -> Effects {
         self.env = env;
-        self.accel = if self.env.healthy() {
+        self.accel = if self.env.allows_acceleration() {
             AccelState::Running
         } else {
             AccelState::AwaitingEnvironment
@@ -118,23 +122,23 @@ impl AppModel {
         self.accel = match self.accel {
             AccelState::Running => AccelState::Stopped,
             AccelState::Stopped | AccelState::AwaitingEnvironment => {
-                if self.env.healthy() {
+                if self.env.allows_acceleration() {
                     AccelState::Running
                 } else {
                     AccelState::AwaitingEnvironment
                 }
             }
         };
-        self.effects()
+        self.effects_apply_if_needed()
     }
 
     /// Periodic environment probe. A pending resume completes itself the
     /// moment the environment passes.
     pub fn env_changed(&mut self, env: EnvState) -> Effects {
         self.env = env;
-        if self.accel == AccelState::AwaitingEnvironment && self.env.healthy() {
+        if self.accel == AccelState::AwaitingEnvironment && self.env.allows_acceleration() {
             self.accel = AccelState::Running;
-            return self.effects();
+            return self.effects_apply_if_needed();
         }
         Effects::default()
     }
@@ -162,12 +166,65 @@ impl AppModel {
     }
 
     fn effects(&self) -> Effects {
+        self.effects_with(Effects::running)
+    }
+
+    /// Same as [`Self::effects`], but the proxy apply is skipped when the
+    /// system proxy is already healthy — turning acceleration on must not
+    /// re-run `networksetup` for a PAC that is already in place.
+    fn effects_apply_if_needed(&self) -> Effects {
         match self.accel {
-            AccelState::Running => Effects::running(),
+            AccelState::Running => {
+                let mut effects = Effects::running();
+                effects.apply_proxy = !self.env.proxy_ok;
+                effects
+            }
+            _ => self.effects(),
+        }
+    }
+
+    fn effects_with(&self, running: impl Fn() -> Effects) -> Effects {
+        match self.accel {
+            AccelState::Running => running(),
             AccelState::Stopped => Effects::stopped(),
             AccelState::AwaitingEnvironment => Effects::awaiting(),
         }
     }
+}
+
+/// How the runtime should treat the OS proxy at startup. The proxy effects of
+/// the startup transition cannot run before the proxy is bound (the PAC URL is
+/// unknown then), so they are handed to the startup sequence instead of being
+/// executed like any other transition.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StartMode {
+    /// Normal launch: the runtime applies the PAC takeover itself, post-bind.
+    Takeover,
+    /// Gated launch: leave the OS proxy alone and clear a stale takeover.
+    Deferred,
+}
+
+/// Pure mapping from the startup effects to the runtime's start mode. The
+/// proxy effects need the PAC URL, which only exists post-bind, so they are
+/// folded into how the runtime starts instead of being executed now.
+pub fn start_mode(effects: &Effects) -> StartMode {
+    if effects.apply_proxy {
+        StartMode::Takeover
+    } else {
+        StartMode::Deferred
+    }
+}
+
+/// Execute the startup transition: pause/resume run now; the proxy effects are
+/// mapped onto the [`StartMode`] the runtime starts with.
+pub fn execute_startup(effects: &Effects, runtime: &HakimiRuntime) -> StartMode {
+    if effects.resume {
+        runtime.resume();
+    }
+    if effects.pause {
+        runtime.pause();
+    }
+    start_mode(effects)
 }
 
 /// Execute the effects of a transition. The only place that drives the runtime
@@ -216,9 +273,10 @@ thread_local! {
     static LAST_APPLY: RefCell<Option<Instant>> = const { RefCell::new(None) };
 }
 
-/// Probe the environment. The CA check is cheap enough to run every time; the
-/// proxy health spawns `networksetup`, so it is probed every 10th call and the
-/// cached value is used in between.
+/// Probe the environment. Spawns subprocesses (`security`, `networksetup`),
+/// so it must run OFF the UI thread — callers post the result back through the
+/// event loop. The proxy health is probed every 10th call and cached in
+/// between.
 pub fn probe_env(runtime: &HakimiRuntime) -> EnvState {
     let ca = runtime.ca().status();
     let tick = TICK.with(|t| {
@@ -283,6 +341,14 @@ mod tests {
         assert_eq!(model.accel(), AccelState::AwaitingEnvironment);
         assert!(model.fix_page());
         assert!(effects.pause && effects.disable_proxy && !effects.resume);
+        assert_eq!(start_mode(&effects), StartMode::Deferred);
+    }
+
+    #[test]
+    fn startup_with_healthy_environment_maps_to_takeover() {
+        let mut model = AppModel::default();
+        let effects = model.startup(env(true));
+        assert_eq!(start_mode(&effects), StartMode::Takeover);
     }
 
     #[test]
@@ -317,7 +383,14 @@ mod tests {
         assert_eq!(effects, Effects::default(), "still broken: nothing to do");
         assert_eq!(model.accel(), AccelState::AwaitingEnvironment);
 
-        let effects = model.env_changed(env(true));
+        // The PAC was disabled while gated, so the proxy_ok half of the env is
+        // still false — entering Running re-applies it.
+        let fixed = EnvState {
+            ca_ok: true,
+            ca_error: String::new(),
+            proxy_ok: false,
+        };
+        let effects = model.env_changed(fixed);
         assert_eq!(model.accel(), AccelState::Running);
         assert!(effects.resume && effects.apply_proxy);
     }
@@ -333,6 +406,19 @@ mod tests {
         // env passing later must NOT auto-start a dismissed resume
         model.env_changed(env(true));
         assert_eq!(model.accel(), AccelState::Stopped);
+    }
+
+    #[test]
+    fn turning_on_does_not_reapply_an_healthy_proxy() {
+        let mut model = AppModel::default();
+        model.startup(env(true));
+        model.toggle(env(true)); // → Stopped
+        let effects = model.toggle(env(true)); // → Running again
+        assert!(effects.resume);
+        assert!(
+            !effects.apply_proxy,
+            "a healthy PAC must not be re-applied on every toggle"
+        );
     }
 
     #[test]
