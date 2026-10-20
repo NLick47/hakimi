@@ -28,28 +28,77 @@ export struct SettingsEntry {
 
 // -- custom controls ---------------------------------------------------------
 
-component AppSwitch inherits Rectangle {
-    in property <bool> checked;
-    callback toggled();
+component ActionButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> emphasis: true;
+    callback clicked();
 
-    width: 40px;
-    height: 21px;
-    border-radius: 11px;
-    background: checked ? #1877D2 : rgba(100, 115, 130, 0.3);
-    animate background { duration: 160ms; }
+    height: 32px;
+    min-width: 92px;
+    border-radius: 8px;
+    border-width: emphasis ? 0px : 1px;
+    border-color: emphasis ? transparent : rgba(24, 119, 210, 0.45);
+    background: emphasis
+        ? (touch.pressed ? #0E5EAE : touch.has-hover ? #146EC8 : #1877D2)
+        : (touch.pressed ? rgba(24, 119, 210, 0.14) : touch.has-hover ? rgba(24, 119, 210, 0.08) : transparent);
+    animate background { duration: 120ms; }
 
-    Rectangle {
-        width: 13px;
-        height: 13px;
-        border-radius: 7px;
-        background: #FCFCFD;
-        y: (parent.height - self.height) / 2;
-        x: checked ? parent.width - self.width - 4px : 4px;
-        animate x { duration: 160ms; easing: ease-out; }
+    Text {
+        text: root.label;
+        font-size: 13px;
+        font-weight: 500;
+        color: emphasis ? #FFFFFF : #1877D2;
+        horizontal-alignment: center;
+        vertical-alignment: center;
     }
 
-    TouchArea {
-        clicked => { root.toggled(); }
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+component StatusBadge inherits Rectangle {
+    in property <bool> active;
+
+    width: 40px;
+    height: 40px;
+    border-radius: 11px;
+    background: active ? rgba(24, 119, 210, 0.10) : rgba(108, 123, 138, 0.10);
+    animate background { duration: 160ms; }
+
+    Path {
+        width: 19px;
+        height: 19px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        commands: "M 14.6 5.3 A 6.8 6.8 0 1 1 4.4 5.3 M 9.5 1.6 L 9.5 9.5";
+        stroke: active ? #1877D2 : #7A8794;
+        stroke-width: 1.8px;
+        animate stroke { duration: 160ms; }
+    }
+}
+
+component BackIcon inherits Rectangle {
+    callback clicked();
+
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    background: touch.has-hover ? rgba(24, 119, 210, 0.09) : transparent;
+    animate background { duration: 120ms; }
+
+    Path {
+        width: 16px;
+        height: 16px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        commands: "M 10 3 L 4.5 8 L 10 13";
+        stroke: #1877D2;
+        stroke-width: 1.7px;
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
     }
 }
 
@@ -94,8 +143,6 @@ component Chevron inherits Rectangle {
         commands: "M 4 2.5 L 8.5 7 L 4 11.5";
         stroke: #9AA5B1;
         stroke-width: 1.5px;
-        opacity: 1;
-        animate opacity { duration: 120ms; }
     }
     if open: Path {
         width: 12px;
@@ -103,28 +150,36 @@ component Chevron inherits Rectangle {
         commands: "M 2.5 4 L 7 8.5 L 11.5 4";
         stroke: #7A8794;
         stroke-width: 1.5px;
-        opacity: 1;
-        animate opacity { duration: 120ms; }
     }
 }
 
 component GearIcon inherits Rectangle {
     callback clicked();
-    in property <bool> hovered-out;
-    width: 26px;
-    height: 26px;
+    width: 28px;
+    height: 28px;
     border-radius: 7px;
     background: touch.has-hover ? rgba(24, 119, 210, 0.09) : transparent;
     animate background { duration: 120ms; }
 
+    // cog: body circle + short stub teeth (not rays) + inner hole
     Path {
-        width: 19px;
-        height: 19px;
+        width: 18px;
+        height: 18px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        commands: "M 12.6 9.5 A 2.6 2.6 0 1 0 7.4 9.5 A 2.6 2.6 0 1 0 12.6 9.5 M 9.5 2.5 L 9.5 4.7 M 9.5 14.3 L 9.5 16.5 M 2.5 9.5 L 4.7 9.5 M 14.3 9.5 L 16.5 9.5 M 4.7 4.7 L 6.3 6.3 M 12.7 12.7 L 14.3 14.3 M 14.3 4.7 L 12.7 6.3 M 6.3 12.7 L 4.7 14.3";
-        stroke: touch.has-hover ? #1877D2 : #7A8794;
-        stroke-width: 1.4px;
+        commands: "M 14 9 A 5 5 0 1 0 4 9 A 5 5 0 1 0 14 9 M 11 9 A 2 2 0 1 0 7 9 A 2 2 0 1 0 11 9";
+        stroke: touch.has-hover ? #1877D2 : #6B7684;
+        stroke-width: 1.5px;
+        animate stroke { duration: 120ms; }
+    }
+    Path {
+        width: 18px;
+        height: 18px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        commands: "M 14 9 L 15.6 9 M 12.54 12.54 L 13.7 13.7 M 9 14 L 9 15.6 M 5.46 12.54 L 4.3 13.7 M 4 9 L 2.4 9 M 5.46 5.46 L 4.3 4.3 M 9 4 L 9 2.4 M 12.54 5.46 L 13.7 4.3";
+        stroke: touch.has-hover ? #1877D2 : #6B7684;
+        stroke-width: 2.2px;
         animate stroke { duration: 120ms; }
     }
 
@@ -136,9 +191,9 @@ component GearIcon inherits Rectangle {
 component TextButton inherits Rectangle {
     in property <string> label;
     callback clicked();
-    height: 22px;
-    min-width: 30px;
-    border-radius: 5px;
+    height: 26px;
+    min-width: 40px;
+    border-radius: 6px;
     background: touch.has-hover ? rgba(24, 119, 210, 0.07) : transparent;
     animate background { duration: 120ms; }
 
@@ -251,7 +306,8 @@ component SettingsRow inherits Rectangle {
 
         Rectangle {
             width: 12px;
-            Chevron { open: false; }
+            height: parent.height;
+            Chevron { y: (parent.height - self.height) / 2; open: false; }
         }
     }
 
@@ -289,43 +345,61 @@ export component AppWindow inherits Window {
 
             HorizontalLayout {
                 padding-left: 18px;
-                padding-right: 14px;
-                padding-top: 10px;
-                padding-bottom: 4px;
-                spacing: 9px;
-                alignment: space-between;
+                padding-right: 12px;
+                spacing: 8px;
 
-                HorizontalLayout {
-                    spacing: 9px;
-                    alignment: start;
+                // left: logo (home) or back (settings)
+                Rectangle {
+                    width: 28px;
+                    height: parent.height;
 
-                    Rectangle {
-                        width: 26px;
-                        height: 26px;
+                    if root.page == 0: Rectangle {
+                        width: 24px;
+                        height: 24px;
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
                         border-radius: 7px;
                         background: #1877D2;
 
                         Path {
-                            width: 14px;
-                            height: 14px;
+                            width: 13px;
+                            height: 13px;
                             x: (parent.width - self.width) / 2;
                             y: (parent.height - self.height) / 2;
-                            commands: "M 2 7.5 L 9 1 L 9 5.5 L 12 5.5 L 12 9.5 L 9 9.5 L 9 14 Z";
+                            commands: "M 7.6 0.8 L 2.2 7.6 L 5.9 7.6 L 5 12.4 L 10.8 5.2 L 6.9 5.2 Z";
                             fill: #FFFFFF;
                         }
                     }
 
-                    Text {
-                        text: "hakimi";
-                        font-size: 14.5px;
-                        font-weight: 500;
-                        color: #1A1A1A;
-                        vertical-alignment: center;
+                    if root.page == 1: BackIcon {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        clicked => { root.page = 0; }
                     }
                 }
 
-                GearIcon {
-                    clicked => { root.page = root.page == 0 ? 1 : 0; }
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+
+                    Text {
+                        text: root.page == 0 ? "hakimi" : "设置";
+                        font-size: 14.5px;
+                        font-weight: 500;
+                        color: #1A1A1A;
+                    }
+                }
+
+                // right: gear (home only)
+                Rectangle {
+                    width: 32px;
+                    height: parent.height;
+
+                    if root.page == 0: GearIcon {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        clicked => { root.page = 1; }
+                    }
                 }
             }
         }
@@ -336,10 +410,10 @@ export component AppWindow inherits Window {
             padding-bottom: 14px;
             spacing: 0px;
 
-            // master switch card
+            // acceleration status / primary action
             Rectangle {
-                height: 72px;
-                background: rgba(255, 255, 255, 0.75);
+                height: 80px;
+                background: rgba(255, 255, 255, 0.82);
                 border-radius: 12px;
                 border-width: 0.5px;
                 border-color: rgba(140, 160, 180, 0.25);
@@ -348,57 +422,77 @@ export component AppWindow inherits Window {
                     padding-left: 16px;
                     padding-right: 16px;
                     spacing: 12px;
-                    alignment: space-between;
+
+                    // badge cell, fixed center
+                    Rectangle {
+                        width: 40px;
+                        height: parent.height;
+                        StatusBadge {
+                            y: (parent.height - self.height) / 2;
+                            active: root.running;
+                        }
+                    }
 
                     VerticalLayout {
+                        horizontal-stretch: 1;
                         alignment: center;
                         spacing: 3px;
 
                         Text {
-                            text: root.running ? "加速已开启" : "加速已关闭";
-                            font-size: 15px;
-                            font-weight: 500;
+                            text: root.running ? "加速已开启" : "加速未开启";
+                            font-size: 15.5px;
+                            font-weight: 600;
                             color: #1A1A1A;
                         }
                         Text {
                             text: root.status-subtitle;
-                            font-size: 12px;
+                            font-size: 12.5px;
                             color: #7A8794;
+                            overflow: elide;
                         }
                     }
 
-                    AppSwitch {
-                        checked: root.running;
-                        toggled => { root.toggle-master(); }
+                    // action cell, fixed center
+                    Rectangle {
+                        width: 96px;
+                        height: parent.height;
+                        ActionButton {
+                            width: parent.width;
+                            y: (parent.height - self.height) / 2;
+                            label: root.running ? "停止加速" : "开启加速";
+                            emphasis: !root.running;
+                            clicked => { root.toggle-master(); }
+                        }
                     }
                 }
             }
 
             // section header
             Rectangle {
-                height: 32px;
+                height: 40px;
 
                 HorizontalLayout {
                     padding-left: 2px;
                     padding-right: 2px;
-                    padding-top: 8px;
-                    padding-bottom: 2px;
-                    spacing: 2px;
+                    padding-top: 10px;
+                    padding-bottom: 4px;
                     alignment: space-between;
 
-                    Text {
-                        text: "站点";
-                        font-size: 13px;
-                        font-weight: 500;
-                        color: #4A5560;
-                        vertical-alignment: center;
+                    VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: "站点";
+                            font-size: 13px;
+                            font-weight: 500;
+                            color: #4A5560;
+                        }
                     }
 
                     HorizontalLayout {
-                        spacing: 2px;
-                        TextButton { label: "测速"; clicked => { root.probe-all(); } }
-                        TextButton { label: "全选"; clicked => { root.select-all(true); } }
-                        TextButton { label: "清除"; clicked => { root.select-all(false); } }
+                        spacing: 0px;
+                        TextButton { label: "测速"; min-width: 44px; clicked => { root.probe-all(); } }
+                        TextButton { label: "全选"; min-width: 44px; clicked => { root.select-all(true); } }
+                        TextButton { label: "清除"; min-width: 44px; clicked => { root.select-all(false); } }
                     }
                 }
             }
@@ -420,60 +514,73 @@ export component AppWindow inherits Window {
                         animate background { duration: 140ms; }
                         animate border-color { duration: 140ms; }
 
-                        TouchArea {
-                            clicked => { root.toggle-open(site.id); }
-                        }
-
                         VerticalLayout {
-                            // header row
+                            // header row: every control sits in a full-height cell,
+                            // centered explicitly so nothing drifts
                             Rectangle {
                                 height: 52px;
+                                background: header-touch.has-hover && !site.open ? rgba(24, 119, 210, 0.025) : transparent;
+                                animate background { duration: 120ms; }
 
                                 HorizontalLayout {
                                     padding-left: 14px;
-                                    padding-right: 14px;
-                                    spacing: 12px;
-                                    alignment: space-between;
+                                    padding-right: 12px;
+                                    spacing: 10px;
 
-                                    CheckSquare {
-                                        checked: site.enabled;
-                                        toggled => { root.toggle-group(site.id, !site.enabled); }
-                                    }
-
+                                    // checkbox cell
                                     Rectangle {
-                                        width: 32px;
-                                        height: 32px;
-                                        border-radius: 8px;
-                                        background: site.icon.width > 0 ? #FFFFFF : site.tile-color;
-                                        border-width: 0.5px;
-                                        border-color: site.icon.width > 0 ? rgba(120, 140, 160, 0.25) : transparent;
-                                        clip: true;
-
-                                        if site.icon.width > 0: Image {
-                                            width: 22px;
-                                            height: 22px;
-                                            x: (parent.width - self.width) / 2;
+                                        width: 18px;
+                                        height: parent.height;
+                                        CheckSquare {
                                             y: (parent.height - self.height) / 2;
-                                            source: site.icon;
-                                        }
-                                        if site.icon.width == 0: Text {
-                                            text: site.initial;
-                                            font-size: 14px;
-                                            font-weight: 500;
-                                            color: #FFFFFF;
-                                            horizontal-alignment: center;
-                                            vertical-alignment: center;
+                                            checked: site.enabled;
+                                            toggled => { root.toggle-group(site.id, !site.enabled); }
                                         }
                                     }
 
+                                    // icon tile cell
+                                    Rectangle {
+                                        width: 30px;
+                                        height: parent.height;
+
+                                        Rectangle {
+                                            width: 30px;
+                                            height: 30px;
+                                            y: (parent.height - self.height) / 2;
+                                            border-radius: 8px;
+                                            background: site.icon.width > 0 ? #FFFFFF : site.tile-color;
+                                            border-width: 0.5px;
+                                            border-color: site.icon.width > 0 ? rgba(120, 140, 160, 0.25) : transparent;
+                                            clip: true;
+
+                                            if site.icon.width > 0: Image {
+                                                width: 20px;
+                                                height: 20px;
+                                                x: (parent.width - self.width) / 2;
+                                                y: (parent.height - self.height) / 2;
+                                                source: site.icon;
+                                            }
+                                            if site.icon.width == 0: Text {
+                                                text: site.initial;
+                                                font-size: 13.5px;
+                                                font-weight: 500;
+                                                color: #FFFFFF;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+
+                                    // name + summary
                                     VerticalLayout {
                                         horizontal-stretch: 1;
                                         alignment: center;
-                                        spacing: 1px;
+                                        spacing: 2px;
 
                                         Text {
                                             text: site.name;
                                             font-size: 13.5px;
+                                            font-weight: 500;
                                             color: #1A1A1A;
                                         }
                                         Text {
@@ -484,66 +591,77 @@ export component AppWindow inherits Window {
                                         }
                                     }
 
+                                    // open-in-browser cell
                                     Rectangle {
-                                        width: 40px;
+                                        width: 44px;
+                                        height: parent.height;
                                         TextButton {
+                                            width: parent.width;
+                                            y: (parent.height - self.height) / 2;
                                             label: "访问";
                                             clicked => { root.open-site(site.url); }
                                         }
                                     }
 
+                                    // chevron cell
                                     Rectangle {
                                         width: 12px;
-                                        Chevron { open: site.open; }
+                                        height: parent.height;
+                                        Chevron {
+                                            y: (parent.height - self.height) / 2;
+                                            open: site.open;
+                                        }
                                     }
+                                }
+
+                                header-touch := TouchArea {
+                                    clicked => { root.toggle-open(site.id); }
                                 }
                             }
 
                             // expanded domain list
                             if site.open: Rectangle {
-                                height: site.domains.length * 27px + 1px;
+                                height: site.domains.length * 28px + 1px;
                                 background: transparent;
 
                                 VerticalLayout {
                                     Rectangle { height: 1px; background: rgba(140, 160, 180, 0.18); }
 
                                     for d in site.domains: Rectangle {
-                                        height: 27px;
+                                        height: 28px;
 
                                         HorizontalLayout {
-                                            padding-left: 62px;
-                                            padding-right: 14px;
+                                            // 14 + 18 + 10 = 42 aligns with the icon tile's left edge
+                                            padding-left: 72px;
+                                            padding-right: 16px;
                                             spacing: 8px;
-                                            alignment: space-between;
 
                                             Text {
                                                 text: d.host;
-                                                font-size: 12.5px;
+                                                horizontal-stretch: 1;
+                                                font-size: 12px;
                                                 font-family: "Menlo";
                                                 color: #525E6A;
                                                 overflow: elide;
                                                 vertical-alignment: center;
                                             }
 
-                                            HorizontalLayout {
-                                                spacing: 8px;
-                                                alignment: end;
-
-                                                Text {
-                                                    text: d.status;
-                                                    font-size: 11.5px;
-                                                    color: d.status-color;
-                                                    vertical-alignment: center;
-                                                }
-                                                Text {
-                                                    text: d.latency;
-                                                    font-size: 11.5px;
-                                                    font-family: "Menlo";
-                                                    color: #7A8794;
-                                                    width: 46px;
-                                                    horizontal-alignment: right;
-                                                    vertical-alignment: center;
-                                                }
+                                            Text {
+                                                text: d.status;
+                                                width: 44px;
+                                                font-size: 11.5px;
+                                                color: d.status-color;
+                                                horizontal-alignment: right;
+                                                vertical-alignment: center;
+                                            }
+                                            Text {
+                                                text: d.latency;
+                                                width: 56px;
+                                                font-size: 11.5px;
+                                                font-family: "Menlo";
+                                                color: #7A8794;
+                                                horizontal-alignment: right;
+                                                vertical-alignment: center;
                                             }
                                         }
                                     }
@@ -561,40 +679,7 @@ export component AppWindow inherits Window {
             padding-left: 18px;
             padding-right: 18px;
             padding-bottom: 14px;
-
-            // back + title
-            Rectangle {
-                height: 40px;
-
-                HorizontalLayout {
-                    padding: 6px;
-                    spacing: 9px;
-                    alignment: start;
-
-                    Rectangle {
-                        width: 22px;
-                        Path {
-                            width: 14px;
-                            height: 14px;
-                            y: 4px;
-                            commands: "M 9 2 L 3.5 7.5 L 9 13";
-                            stroke: #1877D2;
-                            stroke-width: 1.8px;
-                        }
-                        TouchArea {
-                            clicked => { root.page = 0; }
-                        }
-                    }
-
-                    Text {
-                        text: "高级设置";
-                        font-size: 15px;
-                        font-weight: 500;
-                        color: #1A1A1A;
-                        vertical-alignment: center;
-                    }
-                }
-            }
+            padding-top: 6px;
 
             ScrollView {
                 vertical-stretch: 1;
