@@ -136,7 +136,8 @@ impl CertificateAuthority {
             }
         }
         let material = self.material.read();
-        let (supported, installed, error) = match trust_status(&material.fingerprint_sha1) {
+        let (supported, installed, error) =
+            match trust_status(&material.fingerprint_sha1, &self.paths.ca_cert_file()) {
             Ok(outcome) => outcome,
             Err(error) => (trust_supported(), false, Some(format!("{error:#}"))),
         };
@@ -622,7 +623,7 @@ fn keychain_path() -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn trust_status(sha1_hex: &str) -> Result<(bool, bool, Option<String>)> {
+fn trust_status(sha1_hex: &str, cert_path: &Path) -> Result<(bool, bool, Option<String>)> {
     let keychain = keychain_path();
     let output = Command::new("security")
         .args([
@@ -637,7 +638,29 @@ fn trust_status(sha1_hex: &str) -> Result<(bool, bool, Option<String>)> {
         .context("running security find-certificate")?;
     let text = String::from_utf8_lossy(&output.stdout).to_uppercase();
     let needle = sha1_hex.to_uppercase();
-    Ok((true, text.contains(&needle), None))
+    let present = text.contains(&needle);
+    if !present {
+        return Ok((true, false, None));
+    }
+    // The certificate being in the keychain is not trust: a cancelled trust
+    // dialog leaves it imported but untrusted. Verify what the system actually
+    // believes before reporting "installed and trusted".
+    let verify = Command::new("security")
+        .args(["verify-cert", "-c", &cert_path.display().to_string(), "-p", "ssl"])
+        .output()
+        .context("running security verify-cert")?;
+    if verify.status.success() {
+        Ok((true, true, None))
+    } else {
+        Ok((
+            true,
+            false,
+            Some(
+                "the certificate is imported but not trusted; run install again and confirm the dialog"
+                    .into(),
+            ),
+        ))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -653,6 +676,15 @@ fn install_cert(_der: &[u8], pem_path: &Path) -> Result<()> {
             "security add-trusted-cert failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
+    }
+    // The trust dialog can be cancelled: the certificate imports but the trust
+    // setting never lands. Only report success when the system really trusts it.
+    let verify = Command::new("security")
+        .args(["verify-cert", "-c", &pem, "-p", "ssl"])
+        .output()
+        .context("running security verify-cert")?;
+    if !verify.status.success() {
+        bail!("the certificate was imported but the trust dialog was not confirmed; run install again");
     }
     Ok(())
 }
