@@ -25,6 +25,7 @@ pub mod domain;
 pub mod ip_tester;
 pub mod logging;
 pub mod pac;
+pub mod instance;
 pub mod paths;
 pub mod proxy;
 pub mod resolver;

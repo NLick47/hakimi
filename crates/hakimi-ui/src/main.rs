@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use hakimi_core::instance::{InstanceLock, InstanceLockError};
 use hakimi_core::runtime::HakimiRuntime;
 use serde_json::Value;
 use slint::{Color, Model, ModelRc, SharedString, VecModel};
@@ -645,6 +646,31 @@ fn main() -> Result<()> {
         let running = args.iter().any(|arg| arg == "--running");
         return shot(&prefix, page, running);
     }
+
+    // Single instance: a second long-running app would fight over the proxy port.
+    let instance_dir = match data_dir() {
+        Some(dir) => dir,
+        None => hakimi_core::paths::Paths::default_location()?.root().to_path_buf(),
+    };
+    let _instance_lock = match InstanceLock::acquire(&instance_dir) {
+        Ok(lock) => lock,
+        Err(InstanceLockError::AlreadyRunning { .. }) => {
+            // Visible feedback instead of a silently dead second launch.
+            let notice = AlreadyRunningWindow::new()?;
+            notice.show()?;
+            let timer = slint::Timer::default();
+            timer.start(
+                slint::TimerMode::SingleShot,
+                Duration::from_millis(2500),
+                || {
+                    let _ = slint::quit_event_loop();
+                },
+            );
+            notice.run()?;
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     use_light_appearance();
 

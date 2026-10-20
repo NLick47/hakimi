@@ -146,6 +146,10 @@ async fn main() -> Result<()> {
             no_takeover,
             paused,
         } => {
+            // Long-running instance: take the single-instance lock for the whole
+            // lifetime, so a second serve (or the UI) cannot fight over the port.
+            let _instance_lock =
+                hakimi_core::instance::InstanceLock::acquire(runtime.paths().root())?;
             if no_takeover {
                 runtime.config().mutate(|config| {
                     config.proxy.takeover = false;

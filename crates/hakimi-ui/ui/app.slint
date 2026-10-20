@@ -36,6 +36,32 @@ export struct SettingsEntry {
     last: bool,
 }
 
+export component AlreadyRunningWindow inherits Window {
+    title: "hakimi";
+    width: 340px;
+    height: 120px;
+    background: #FFFFFF;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 6px;
+
+        Text {
+            text: "hakimi 已经在运行";
+            font-size: 14px;
+            font-weight: 600;
+            color: #1B1F24;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "请使用已打开的窗口";
+            font-size: 12px;
+            color: #6B7480;
+            horizontal-alignment: center;
+        }
+    }
+}
+
 // -- controls ----------------------------------------------------------------
 
 component ActionButton inherits Rectangle {
