@@ -318,8 +318,17 @@ impl HakimiRuntime {
 
         if config.proxy.mode == ProxyMode::Off {
             let _ = self.system_proxy.restore();
+            *self.proxy_error.write() = None;
         } else if config.proxy.takeover {
-            let _ = self.apply_system_proxy_inner();
+            if let Err(error) = self.apply_system_proxy_inner() {
+                // A silent failure here leaves the user "accelerating" without a proxy
+                // and with no way to notice; surface it in the status instead.
+                tracing::error!(error = %error, "failed to apply the system proxy");
+                *self.proxy_error.write() =
+                    Some(format!("system proxy apply failed: {error:#}"));
+            } else {
+                *self.proxy_error.write() = None;
+            }
         }
 
         let ca_status = self.ca.status();
