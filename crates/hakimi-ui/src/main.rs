@@ -13,6 +13,8 @@ use slint::{Color, Model, ModelRc, SharedString, VecModel};
 
 slint::include_modules!();
 
+mod ui_state;
+
 pub(crate) fn data_dir() -> Option<PathBuf> {
     std::env::var_os("HAKIMI_DATA_DIR").map(PathBuf::from)
 }
@@ -575,14 +577,14 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     app.set_page(page);
     // Offscreen states for reviewing the environment-check UI.
     let broken = std::env::var("HAKIMI_UI_BROKEN").is_ok();
-    let force_fix_page = std::env::var("HAKIMI_UI_ONBOARDING").is_ok();
-    app.set_ca_installed(!broken);
-    if broken {
+    let fix_page = std::env::var("HAKIMI_UI_FIXPAGE").is_ok();
+    app.set_ca_installed(!broken && !fix_page);
+    if broken || fix_page {
         app.set_ca_error(SharedString::from(
             "证书已导入但未受信任：请重新安装并在系统对话框中确认",
         ));
     }
-    app.set_show_onboarding(force_fix_page);
+    app.set_show_onboarding(fix_page);
     app.show()?;
 
     // let the first render pass settle
@@ -604,6 +606,14 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     Ok(())
 }
 
+thread_local! {
+    static CONFIG_CACHE: std::cell::RefCell<Option<(u64, Value)>> =
+        const { std::cell::RefCell::new(None) };
+    // The acceleration state machine lives on the UI thread.
+    static MODEL: std::cell::RefCell<ui_state::AppModel> =
+        std::cell::RefCell::new(ui_state::AppModel::default());
+}
+
 /// Re-reads the world and applies it to the window. Runs on the UI thread;
 /// the diff in apply_ui_update makes a no-op refresh nearly free.
 fn refresh(app: &AppWindow, runtime: &Arc<HakimiRuntime>, expanded: &HashSet<String>) {
@@ -618,69 +628,17 @@ fn refresh(app: &AppWindow, runtime: &Arc<HakimiRuntime>, expanded: &HashSet<Str
         ca.get("supported").and_then(Value::as_bool).unwrap_or(false),
         ca.get("installed").and_then(Value::as_bool).unwrap_or(false),
     );
-    let ca_error = ca
-        .get("error")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-
-    // System proxy health: subprocess-backed (networksetup), so probe it every
-    // 10th refresh and auto re-apply at most once per 30 seconds when broken.
-    let tick = REFRESH_TICK.with(|t| {
-        let value = t.get() + 1;
-        t.set(value);
-        value
-    });
-    if tick % 10 == 1 {
-        let ok = runtime.system_proxy_healthy();
-        PROXY_OK.with(|t| t.set(ok));
-        if !ok {
-            let cooldown_over = LAST_APPLY.with(|t| {
-                t.borrow()
-                    .map(|at| at.elapsed())
-                    .unwrap_or(Duration::from_secs(3600))
-                    > Duration::from_secs(30)
-            });
-            if cooldown_over {
-                LAST_APPLY.with(|t| *t.borrow_mut() = Some(std::time::Instant::now()));
-                let runtime = runtime.clone();
-                std::thread::spawn(move || {
-                    if let Err(error) = runtime.apply_system_proxy() {
-                        eprintln!("hakimi-ui: auto re-apply of the system proxy failed: {error:#}");
-                    }
-                });
-            }
-        }
-    }
-    let proxy_ok = PROXY_OK.with(|t| t.get());
-
-    // A gated resume completes itself the moment the environment passes.
-    if PENDING_RESUME.with(|t| t.get()) && ca_state.2 && proxy_ok {
-        runtime.resume();
-        PENDING_RESUME.with(|t| t.set(false));
-        app.set_show_onboarding(false);
-    }
-
     apply_ui_update(app, sites, subtitle, running, ca_state);
-    app.set_ca_installed(ca_state.2);
-    app.set_ca_error(SharedString::from(ca_error.clone()));
-    app.set_proxy_ok(proxy_ok);
-    if ca_state.2 || !ca_error.is_empty() {
-        // Install finished (or failed loudly): the wait-for-dialog state can go.
-        app.set_ob_installing(false);
-    }
-}
 
-thread_local! {
-    static CONFIG_CACHE: std::cell::RefCell<Option<(u64, Value)>> =
-        const { std::cell::RefCell::new(None) };
-    static REFRESH_TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static PROXY_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-    static LAST_APPLY: std::cell::RefCell<Option<std::time::Instant>> =
-        const { std::cell::RefCell::new(None) };
-    // Set when the user asked to accelerate but the environment check failed;
-    // refresh() completes the resume as soon as the environment passes.
-    static PENDING_RESUME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Environment state machine: probe, transition, execute, mirror.
+    let env = ui_state::probe_env(runtime);
+    MODEL.with(|m| {
+        let mut model = m.borrow_mut();
+        let effects = model.env_changed(env);
+        ui_state::execute(&effects, runtime);
+        ui_state::maybe_self_heal(runtime, &model);
+        ui_state::sync_window(&model, app);
+    });
 }
 
 fn cached_config(revision: u64, fetch: impl FnOnce() -> Value) -> Value {
@@ -746,7 +704,12 @@ fn main() -> Result<()> {
     // genuinely async parts (serving the proxy, waiting for shutdown) run on a
     // dedicated tokio runtime in the background.
     let runtime = HakimiRuntime::new(data_dir())?;
-    runtime.resume();
+
+    // The state machine decides the startup posture; `start_deferring_proxy`
+    // keeps OS-proxy policy out of the runtime — the effects own it.
+    let startup_effects = MODEL.with(|m| m.borrow_mut().startup(ui_state::probe_env(&runtime)));
+    ui_state::execute(&startup_effects, &runtime);
+    let ca_ok = startup_effects.resume;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -758,7 +721,8 @@ fn main() -> Result<()> {
         let shutdown = shutdown.clone();
         std::thread::spawn(move || {
             rt.block_on(async move {
-                if let Err(error) = runtime.start().await {
+                let start_result = runtime.start_deferring_proxy().await;
+                if let Err(error) = start_result {
                     eprintln!("hakimi-ui failed to start the proxy: {error:#}");
                 }
                 shutdown.notified().await;
@@ -782,32 +746,10 @@ fn main() -> Result<()> {
         let expanded = expanded.clone();
         let weak = app.as_weak();
         app.on_toggle_master(move || {
-            if runtime.is_started() && !runtime.status().paused() {
-                runtime.pause();
-            } else {
-                // Environment gate with a FRESH check (the cached property can be
-                // up to a second old): a broken setup must not accelerate at all.
-                let ca_ok = runtime.ca().status().installed;
-                let proxy_ok = runtime.system_proxy_healthy();
-                if ca_ok && proxy_ok {
-                    runtime.resume();
-                    PENDING_RESUME.with(|t| t.set(false));
-                } else {
-                    // Refuse to accelerate; the fix page takes over and the resume
-                    // happens automatically once the environment passes.
-                    PENDING_RESUME.with(|t| t.set(true));
-                }
-                if let Some(app) = weak.upgrade() {
-                    app.set_show_onboarding(!ca_ok || !proxy_ok);
-                    app.set_ca_installed(ca_ok);
-                    if !ca_ok {
-                        app.set_ca_error(SharedString::from(
-                            "本地证书未受信任：加速站点将无法建立可信连接",
-                        ));
-                    }
-                }
-            }
+            let effects = MODEL.with(|m| m.borrow_mut().toggle(ui_state::probe_env(&runtime)));
+            ui_state::execute(&effects, &runtime);
             if let Some(app) = weak.upgrade() {
+                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
                 refresh(&app, &runtime, &expanded.borrow());
             }
         });
@@ -879,12 +821,13 @@ fn main() -> Result<()> {
         });
     }
     {
+        let runtime = runtime.clone();
         let weak = app.as_weak();
         app.on_finish_onboarding(move || {
-            PENDING_RESUME.with(|t| t.set(false));
+            let effects = MODEL.with(|m| m.borrow_mut().dismiss_fix());
+            ui_state::execute(&effects, &runtime);
             if let Some(app) = weak.upgrade() {
-                app.set_show_onboarding(false);
-                app.set_ob_installing(false);
+                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
             }
         });
     }

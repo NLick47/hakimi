@@ -279,6 +279,18 @@ impl HakimiRuntime {
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<()> {
+        self.start_inner(true).await
+    }
+
+    /// Like [`Self::start`], but leaves the OS proxy untouched: used when the
+    /// startup environment check failed, so a broken setup does not take over
+    /// the user's network. A stale takeover from a previous run is still rolled
+    /// back, so browsing keeps working (direct) while the environment is fixed.
+    pub async fn start_deferring_proxy(self: &Arc<Self>) -> Result<()> {
+        self.start_inner(false).await
+    }
+
+    async fn start_inner(self: &Arc<Self>, apply_proxy: bool) -> Result<()> {
         if self.started.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -319,6 +331,12 @@ impl HakimiRuntime {
         if config.proxy.mode == ProxyMode::Off {
             let _ = self.system_proxy.restore();
             *self.proxy_error.write() = None;
+        } else if !apply_proxy {
+            // The caller (the UI state machine) owns OS-proxy policy; the only
+            // thing handled here is a stale takeover of ours from a previous
+            // run — this is the first moment `pac_url()` is known (post-bind).
+            tracing::info!("started without applying the system proxy");
+            self.disable_system_proxy();
         } else if config.proxy.takeover {
             if let Err(error) = self.apply_system_proxy_inner() {
                 // A silent failure here leaves the user "accelerating" without a proxy
@@ -386,6 +404,18 @@ impl HakimiRuntime {
             return true;
         };
         self.system_proxy.pac_health(&url)
+    }
+
+    /// Disable a PAC takeover that points at this instance. Only this
+    /// instance's own PAC is touched; a user-configured proxy is left alone.
+    pub fn disable_system_proxy(&self) {
+        let Some(url) = self.pac_url() else {
+            return;
+        };
+        if self.system_proxy.pac_health(&url) {
+            tracing::info!("stale PAC takeover found; switching it off");
+            self.system_proxy.pac_disable();
+        }
     }
 
     pub fn apply_system_proxy(&self) -> Result<SystemProxyStatus> {

@@ -123,6 +123,13 @@ impl SystemProxyManager {
         platform_pac_health(expected_url)
     }
 
+    /// Switch every network service's automatic proxy off. Used when a stale
+    /// takeover points at a paused/broken instance: browsing keeps working
+    /// directly while the environment is being fixed.
+    pub fn pac_disable(&self) {
+        platform_pac_disable();
+    }
+
     pub fn saved_state_exists(&self) -> bool {
         self.state_path.exists()
     }
@@ -228,6 +235,17 @@ fn platform_pac_health(expected_url: &str) -> bool {
         return false;
     };
     url == expected_url
+}
+
+#[cfg(windows)]
+fn platform_pac_disable() {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
+    use winreg::RegKey;
+    if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(INTERNET_SETTINGS, KEY_WRITE)
+    {
+        let _ = key.delete_value("AutoConfigURL");
+    }
 }
 
 #[cfg(windows)]
@@ -407,6 +425,15 @@ fn platform_pac_health(expected_url: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+fn platform_pac_disable() {
+    if let Ok(services) = list_network_services() {
+        for service in services {
+            let _ = run_networksetup(&["-setautoproxystate", &service, "off"]);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn platform_restore(state: &SavedState) -> Result<()> {
     for service in &state.mac_services {
         let _ = run_networksetup(&["-setautoproxystate", service, "off"]);
@@ -476,6 +503,9 @@ fn platform_restore(_state: &SavedState) -> Result<()> {
 fn platform_pac_health(_expected_url: &str) -> bool {
     true
 }
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn platform_pac_disable() {}
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn platform_current(_mode: Option<ProxyMode>) -> Result<CurrentProxy> {
