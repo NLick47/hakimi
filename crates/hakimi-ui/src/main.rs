@@ -573,6 +573,16 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     app.set_status_subtitle(SharedString::from(subtitle));
     app.set_running(running);
     app.set_page(page);
+    // Offscreen states for reviewing the environment-check UI.
+    let broken = std::env::var("HAKIMI_UI_BROKEN").is_ok();
+    let force_fix_page = std::env::var("HAKIMI_UI_ONBOARDING").is_ok();
+    app.set_ca_installed(!broken);
+    if broken {
+        app.set_ca_error(SharedString::from(
+            "证书已导入但未受信任：请重新安装并在系统对话框中确认",
+        ));
+    }
+    app.set_show_onboarding(force_fix_page);
     app.show()?;
 
     // let the first render pass settle
@@ -596,7 +606,7 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
 
 /// Re-reads the world and applies it to the window. Runs on the UI thread;
 /// the diff in apply_ui_update makes a no-op refresh nearly free.
-fn refresh(app: &AppWindow, runtime: &HakimiRuntime, expanded: &HashSet<String>) {
+fn refresh(app: &AppWindow, runtime: &Arc<HakimiRuntime>, expanded: &HashSet<String>) {
     let status = runtime.status_json();
     let revision = runtime.config_revision();
     let config = cached_config(revision, || runtime.config_json());
@@ -608,11 +618,58 @@ fn refresh(app: &AppWindow, runtime: &HakimiRuntime, expanded: &HashSet<String>)
         ca.get("supported").and_then(Value::as_bool).unwrap_or(false),
         ca.get("installed").and_then(Value::as_bool).unwrap_or(false),
     );
+    let ca_error = ca
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    // System proxy health: subprocess-backed (networksetup), so probe it every
+    // 10th refresh and auto re-apply at most once per 30 seconds when broken.
+    let tick = REFRESH_TICK.with(|t| {
+        let value = t.get() + 1;
+        t.set(value);
+        value
+    });
+    if tick % 10 == 1 {
+        let ok = runtime.system_proxy_healthy();
+        PROXY_OK.with(|t| t.set(ok));
+        if !ok {
+            let cooldown_over = LAST_APPLY.with(|t| {
+                t.borrow()
+                    .map(|at| at.elapsed())
+                    .unwrap_or(Duration::from_secs(3600))
+                    > Duration::from_secs(30)
+            });
+            if cooldown_over {
+                LAST_APPLY.with(|t| *t.borrow_mut() = Some(std::time::Instant::now()));
+                let runtime = runtime.clone();
+                std::thread::spawn(move || {
+                    if let Err(error) = runtime.apply_system_proxy() {
+                        eprintln!("hakimi-ui: auto re-apply of the system proxy failed: {error:#}");
+                    }
+                });
+            }
+        }
+    }
+    let proxy_ok = PROXY_OK.with(|t| t.get());
+
     apply_ui_update(app, sites, subtitle, running, ca_state);
+    app.set_ca_installed(ca_state.2);
+    app.set_ca_error(SharedString::from(ca_error.clone()));
+    app.set_proxy_ok(proxy_ok);
+    if ca_state.2 || !ca_error.is_empty() {
+        // Install finished (or failed loudly): the wait-for-dialog state can go.
+        app.set_ob_installing(false);
+    }
 }
 
 thread_local! {
     static CONFIG_CACHE: std::cell::RefCell<Option<(u64, Value)>> =
+        const { std::cell::RefCell::new(None) };
+    static REFRESH_TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static PROXY_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static LAST_APPLY: std::cell::RefCell<Option<std::time::Instant>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -719,6 +776,13 @@ fn main() -> Result<()> {
                 runtime.pause();
             } else {
                 runtime.resume();
+                // Environment gate: turning acceleration on with a broken setup
+                // would silently do nothing for accelerated sites — guide instead.
+                if let Some(app) = weak.upgrade() {
+                    if !app.get_ca_installed() || !app.get_proxy_ok() {
+                        app.set_show_onboarding(true);
+                    }
+                }
             }
             if let Some(app) = weak.upgrade() {
                 refresh(&app, &runtime, &expanded.borrow());
@@ -789,6 +853,26 @@ fn main() -> Result<()> {
                     });
                 }
             }
+        });
+    }
+    {
+        let weak = app.as_weak();
+        app.on_finish_onboarding(move || {
+            if let Some(app) = weak.upgrade() {
+                app.set_show_onboarding(false);
+                app.set_ob_installing(false);
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        app.on_reapply_proxy(move || {
+            let runtime = runtime.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = runtime.apply_system_proxy() {
+                    eprintln!("hakimi-ui: manual system proxy re-apply failed: {error:#}");
+                }
+            });
         });
     }
     app.on_open_site(|url| {

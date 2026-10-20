@@ -375,6 +375,19 @@ impl HakimiRuntime {
         Ok(())
     }
 
+    /// Environment check for the acceleration toggle: the PAC must actually be
+    /// enabled on a network service, not merely present as a URL.
+    pub fn system_proxy_healthy(&self) -> bool {
+        let config = self.config.snapshot();
+        if config.proxy.mode == ProxyMode::Off || !config.proxy.takeover {
+            return true;
+        }
+        let Some(url) = self.pac_url() else {
+            return true;
+        };
+        self.system_proxy.pac_health(&url)
+    }
+
     pub fn apply_system_proxy(&self) -> Result<SystemProxyStatus> {
         self.apply_system_proxy_inner()
     }

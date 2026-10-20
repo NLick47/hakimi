@@ -271,8 +271,17 @@ export component AppWindow inherits Window {
     in property <string> status-subtitle: "正在启动";
     in property <bool> running: false;
     in-out property <int> page: 0;
+    // Environment check (CA trust + system proxy). The fix page takes over the
+    // window until everything passes; the main page shows a warning banner too.
+    in-out property <bool> show-onboarding: false;
+    in property <bool> ca-installed: false;
+    in property <string> ca-error;
+    in property <bool> proxy-ok: true;
+    in-out property <bool> ob-installing: false;
 
     callback toggle-master();
+    callback finish-onboarding();
+    callback reapply-proxy();
     callback toggle-group(string, bool);
     callback select-all(bool);
     callback probe-all();
@@ -284,7 +293,7 @@ export component AppWindow inherits Window {
         spacing: 0px;
 
         // ---- toolbar ----
-        Rectangle {
+        if !root.show-onboarding: Rectangle {
             height: 42px;
             background: #F3F4F5;
 
@@ -353,12 +362,40 @@ export component AppWindow inherits Window {
             }
         }
 
-        if root.page == 0: VerticalLayout {
+        if !root.show-onboarding && root.page == 0: VerticalLayout {
             padding-left: 20px;
             padding-right: 20px;
             padding-top: 18px;
             padding-bottom: 16px;
             spacing: 0px;
+
+            // ---- environment warning ----
+            if !root.ca-installed || !root.proxy-ok: Rectangle {
+                height: 38px;
+                background: #FFF6E5;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: #F0DFC0;
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 8px;
+                    spacing: 8px;
+                    alignment: center;
+
+                    Text {
+                        text: "环境检查未通过：部分加速可能不生效";
+                        font-size: 12px;
+                        color: #8A6116;
+                        horizontal-stretch: 1;
+                    }
+                    TextButton {
+                        label: "去修复";
+                        clicked => { root.show-onboarding = true; }
+                    }
+                }
+            }
+            if !root.ca-installed || !root.proxy-ok: Rectangle { height: 10px; }
 
             // ---- status ----
             Rectangle {
@@ -646,7 +683,156 @@ export component AppWindow inherits Window {
             }
         }
 
-        if root.page == 1: VerticalLayout {
+        if root.show-onboarding: VerticalLayout {
+            padding: 24px;
+            alignment: center;
+
+            Rectangle {
+                background: #FFFFFF;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: #E1E4E8;
+
+                VerticalLayout {
+                    padding: 24px;
+                    spacing: 12px;
+
+                    Text {
+                        text: "环境检查未通过";
+                        font-size: 17px;
+                        font-weight: 600;
+                        color: #1B1F24;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "加速前需要修复以下问题，修复后即可正常加速。";
+                        font-size: 12.5px;
+                        color: #5C6670;
+                        horizontal-alignment: center;
+                    }
+
+                    Rectangle { height: 1px; background: #ECEEF0; }
+
+                    // -- certificate trust --
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Rectangle {
+                            width: 30px;
+                            height: 30px;
+                            border-radius: 6px;
+                            background: root.ca-installed ? #E8F4EC : #EDF3FA;
+                            Text {
+                                text: root.ca-installed ? "✓" : "!";
+                                font-size: 14px;
+                                font-weight: 600;
+                                color: root.ca-installed ? #1B7F4D : #0067C0;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            spacing: 2px;
+                            Text {
+                                text: root.ca-installed ? "证书已安装并受信任" : "本地证书未受信任";
+                                font-size: 13px;
+                                color: #1B1F24;
+                            }
+                            Text {
+                                text: root.ca-installed ? "加速站点可以建立可信连接" : (root.ca-error != "" ? root.ca-error : "ECH / 伪造 SNI 加速依赖本地证书的信任");
+                                font-size: 11.5px;
+                                color: root.ca-installed ? #6B7480 : #C0392B;
+                                wrap: word-wrap;
+                            }
+                        }
+                        Rectangle {
+                            width: 96px;
+                            height: 30px;
+                            if !root.ca-installed: ActionButton {
+                                width: parent.width;
+                                y: (parent.height - self.height) / 2;
+                                label: root.ob-installing ? "等待确认…" : "安装证书";
+                                clicked => {
+                                    root.ob-installing = true;
+                                    root.settings-action(1);
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: #ECEEF0; }
+
+                    // -- system proxy --
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Rectangle {
+                            width: 30px;
+                            height: 30px;
+                            border-radius: 6px;
+                            background: root.proxy-ok ? #E8F4EC : #EDF3FA;
+                            Text {
+                                text: root.proxy-ok ? "✓" : "!";
+                                font-size: 14px;
+                                font-weight: 600;
+                                color: root.proxy-ok ? #1B7F4D : #0067C0;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            spacing: 2px;
+                            Text {
+                                text: root.proxy-ok ? "系统代理已生效" : "系统代理未生效";
+                                font-size: 13px;
+                                color: #1B1F24;
+                            }
+                            Text {
+                                text: root.proxy-ok ? "浏览器流量会经过 hakimi" : "点击修复后自动重新应用 PAC 设置";
+                                font-size: 11.5px;
+                                color: root.proxy-ok ? #6B7480 : #C0392B;
+                            }
+                        }
+                        Rectangle {
+                            width: 96px;
+                            height: 30px;
+                            if !root.proxy-ok: ActionButton {
+                                width: parent.width;
+                                y: (parent.height - self.height) / 2;
+                                label: "重新应用";
+                                clicked => { root.reapply-proxy(); }
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: #ECEEF0; }
+
+                    if root.ca-installed && root.proxy-ok: VerticalLayout {
+                        spacing: 10px;
+                        Text {
+                            text: "✓ 环境检查已通过";
+                            font-size: 13.5px;
+                            color: #1B7F4D;
+                            horizontal-alignment: center;
+                        }
+                        ActionButton {
+                            width: 200px;
+                            label: "返回加速";
+                            clicked => { root.finish-onboarding(); }
+                        }
+                    }
+
+                    TextButton {
+                        label: "暂不处理，返回主页";
+                        clicked => { root.finish-onboarding(); }
+                    }
+                }
+            }
+        }
+
+        if !root.show-onboarding && root.page == 1: VerticalLayout {
             padding-left: 20px;
             padding-right: 20px;
             padding-bottom: 16px;

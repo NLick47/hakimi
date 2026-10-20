@@ -117,6 +117,12 @@ impl SystemProxyManager {
         Ok(status)
     }
 
+    /// True when at least one network service has the expected PAC URL *and* the
+    /// enabled flag set — the URL alone does not route traffic.
+    pub fn pac_health(&self, expected_url: &str) -> bool {
+        platform_pac_health(expected_url)
+    }
+
     pub fn saved_state_exists(&self) -> bool {
         self.state_path.exists()
     }
@@ -207,6 +213,21 @@ fn platform_apply_http(_state_path: &Path, proxy: SocketAddr) -> Result<()> {
         .context("enabling fixed proxy")?;
     notify_proxy_changed();
     Ok(())
+}
+
+#[cfg(windows)]
+fn platform_pac_health(expected_url: &str) -> bool {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    use winreg::RegKey;
+    let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(INTERNET_SETTINGS, KEY_READ)
+    else {
+        return false;
+    };
+    let Ok(url) = key.get_value::<String, _>("AutoConfigURL") else {
+        return false;
+    };
+    url == expected_url
 }
 
 #[cfg(windows)]
@@ -367,6 +388,25 @@ fn platform_apply_http(_state_path: &Path, proxy: SocketAddr) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+fn platform_pac_health(expected_url: &str) -> bool {
+    let Ok(services) = list_network_services() else {
+        return false;
+    };
+    services.iter().any(|service| {
+        let Ok(output) = std::process::Command::new("networksetup")
+            .args(["-getautoproxyurl", service])
+            .output()
+        else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        // A matching URL alone is not enough: the enabled flag is what actually
+        // routes traffic through the PAC.
+        text.contains("Enabled: Yes") && text.contains(expected_url)
+    })
+}
+
+#[cfg(target_os = "macos")]
 fn platform_restore(state: &SavedState) -> Result<()> {
     for service in &state.mac_services {
         let _ = run_networksetup(&["-setautoproxystate", service, "off"]);
@@ -430,6 +470,11 @@ fn platform_apply_http(_state_path: &Path, _proxy: SocketAddr) -> Result<()> {
 #[cfg(not(any(windows, target_os = "macos")))]
 fn platform_restore(_state: &SavedState) -> Result<()> {
     Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn platform_pac_health(_expected_url: &str) -> bool {
+    true
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
