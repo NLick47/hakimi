@@ -249,6 +249,12 @@ impl HakimiRuntime {
         serde_json::to_value(self.config.snapshot()).unwrap_or(serde_json::Value::Null)
     }
 
+    /// Bumped on every configuration mutation, so pollers can reuse a cached
+    /// [`Self::config_json`] instead of re-serializing every tick.
+    pub fn config_revision(&self) -> u64 {
+        self.config.revision()
+    }
+
     pub fn status_json(&self) -> serde_json::Value {
         self.status_provider.snapshot_json()
     }

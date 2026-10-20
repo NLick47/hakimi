@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -623,6 +624,7 @@ pub fn validate_catalog_url(raw: &str, label: &str) -> Result<()> {
 pub struct ConfigManager {
     path: PathBuf,
     inner: RwLock<Inner>,
+    revision: AtomicU64,
 }
 
 struct Inner {
@@ -661,7 +663,14 @@ impl ConfigManager {
         Ok(Self {
             path,
             inner: RwLock::new(Inner { config, matcher }),
+            revision: AtomicU64::new(1),
         })
+    }
+
+    /// Monotonically increases on every mutation, so pollers can skip
+    /// re-reading the configuration when nothing changed.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
     }
 
     pub fn path(&self) -> &Path {
@@ -683,6 +692,8 @@ impl ConfigManager {
         let mut guard = self.inner.write();
         guard.config = config;
         guard.matcher = matcher;
+        drop(guard);
+        self.revision.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 

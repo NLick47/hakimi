@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose,
@@ -60,6 +61,9 @@ pub struct CertificateAuthority {
     provider: Arc<rustls::crypto::CryptoProvider>,
     material: RwLock<Arc<CaMaterial>>,
     leaves: RwLock<HashMap<String, Arc<LeafEntry>>>,
+    // Trust status costs a `security find-certificate` subprocess on macOS;
+    // it only changes when the user (de)installs, so cache it briefly.
+    status_cache: Mutex<Option<(Instant, CaStatus)>>,
 }
 
 impl CertificateAuthority {
@@ -81,6 +85,7 @@ impl CertificateAuthority {
             provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
             material: RwLock::new(Arc::new(material)),
             leaves: RwLock::new(HashMap::new()),
+            status_cache: Mutex::new(None),
         }))
     }
 
@@ -123,12 +128,19 @@ impl CertificateAuthority {
     }
 
     pub fn status(&self) -> CaStatus {
+        const STATUS_TTL: Duration = Duration::from_secs(3);
+        let mut cache = self.status_cache.lock();
+        if let Some((at, status)) = cache.as_ref() {
+            if at.elapsed() < STATUS_TTL {
+                return status.clone();
+            }
+        }
         let material = self.material.read();
         let (supported, installed, error) = match trust_status(&material.fingerprint_sha1) {
             Ok(outcome) => outcome,
             Err(error) => (trust_supported(), false, Some(format!("{error:#}"))),
         };
-        CaStatus {
+        let status = CaStatus {
             present: true,
             supported,
             installed,
@@ -140,19 +152,23 @@ impl CertificateAuthority {
             not_after: Some(material.not_after.clone()),
             error,
             note: trust_note(),
-        }
+        };
+        *cache = Some((Instant::now(), status.clone()));
+        status
     }
 
     /// Install the CA into the current user's trust store.
     pub fn install(&self) -> Result<CaStatus> {
         let der = self.material.read().der.clone();
         install_cert(&der, &self.paths.ca_cert_file())?;
+        *self.status_cache.lock() = None;
         Ok(self.status())
     }
 
     pub fn uninstall(&self) -> Result<CaStatus> {
         let sha1 = self.material.read().fingerprint_sha1.clone();
         uninstall_by_sha1(&sha1)?;
+        *self.status_cache.lock() = None;
         Ok(self.status())
     }
 

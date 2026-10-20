@@ -341,6 +341,8 @@ struct UiState {
 }
 
 /// Applies a snapshot to the window, updating only what actually changed.
+/// The snapshot is consumed (moved) so an unchanged tick costs one comparison
+/// and zero clones.
 fn apply_ui_update(
     app: &AppWindow,
     sites: Vec<SiteData>,
@@ -348,19 +350,18 @@ fn apply_ui_update(
     running: bool,
     ca: (bool, bool, bool),
 ) {
-    let next = UiState {
-        sites: sites.clone(),
-        subtitle: subtitle.clone(),
-        running,
-        ca,
-    };
-    let prev = PREV_STATE.with(|slot| slot.borrow().clone());
-    if prev.as_ref() == Some(&next) {
+    let unchanged = PREV_STATE.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|prev| {
+            prev.sites == sites && prev.subtitle == subtitle && prev.running == running && prev.ca == ca
+        })
+    });
+    if unchanged {
         return;
     }
 
-    let prev_sites = prev.as_ref().map(|state| state.sites.clone()).unwrap_or_default();
-    if prev_sites != sites {
+    let prev = PREV_STATE.with(|slot| slot.borrow_mut().take());
+    let prev_sites: Option<&[SiteData]> = prev.as_ref().map(|state| state.sites.as_slice());
+    if prev_sites != Some(sites.as_slice()) {
         SITES_MODEL.with(|cell| {
             let mut slot = cell.borrow_mut();
             let model = slot.get_or_insert_with(|| {
@@ -368,14 +369,17 @@ fn apply_ui_update(
                 app.set_sites(ModelRc::new(model.clone()));
                 model
             });
-            if prev_sites.len() != sites.len() {
-                let entries: Vec<SiteEntry> = sites.iter().map(build_site_entry).collect();
-                model.set_vec(entries);
-            } else {
-                for index in 0..sites.len() {
-                    if prev_sites[index] != sites[index] {
-                        model.set_row_data(index, build_site_entry(&sites[index]));
+            match prev_sites {
+                Some(old) if old.len() == sites.len() => {
+                    for index in 0..sites.len() {
+                        if old[index] != sites[index] {
+                            model.set_row_data(index, build_site_entry(&sites[index]));
+                        }
                     }
+                }
+                _ => {
+                    let entries: Vec<SiteEntry> = sites.iter().map(build_site_entry).collect();
+                    model.set_vec(entries);
                 }
             }
         });
@@ -396,11 +400,18 @@ fn apply_ui_update(
     if prev.as_ref().map(|state| state.running) != Some(running) {
         app.set_running(running);
     }
-    if prev.as_ref().map(|state| state.subtitle.clone()).as_ref() != Some(&subtitle) {
-        app.set_status_subtitle(SharedString::from(subtitle));
+    if prev.as_ref().map(|state| state.subtitle.as_str()) != Some(subtitle.as_str()) {
+        app.set_status_subtitle(SharedString::from(subtitle.clone()));
     }
 
-    PREV_STATE.with(|slot| *slot.borrow_mut() = Some(next));
+    PREV_STATE.with(|slot| {
+        *slot.borrow_mut() = Some(UiState {
+            sites,
+            subtitle,
+            running,
+            ca,
+        });
+    });
 }
 
 pub(crate) fn load_assets() {
@@ -695,6 +706,9 @@ fn worker_loop(
         if let Ok(id) = std::env::var("HAKIMI_UI_EXPAND") {
             expanded.insert(id);
         }
+        // The configuration rarely changes: cache its JSON and only re-serialize
+        // when the config revision moves.
+        let mut config_cache: Option<(u64, Value)> = None;
 
         while !shutdown.load(Ordering::SeqCst) {
             while let Ok(command) = rx.try_recv() {
@@ -758,7 +772,15 @@ fn worker_loop(
             }
 
             let status = runtime.status_json();
-            let config = runtime.config_json();
+            let revision = runtime.config_revision();
+            let config = match &config_cache {
+                Some((cached_rev, cached)) if *cached_rev == revision => cached.clone(),
+                _ => {
+                    let config = runtime.config_json();
+                    config_cache = Some((revision, config.clone()));
+                    config
+                }
+            };
             let running = runtime.is_started() && !runtime.status().paused();
             let (sites, subtitle) = build_snapshot(&status, &config, &expanded, running);
             let ca = &status["ca"];

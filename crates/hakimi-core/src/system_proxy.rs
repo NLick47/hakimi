@@ -5,9 +5,11 @@ use std::path::Path;
 use anyhow::bail;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ProxyMode;
+use std::time::Instant;
 use crate::util::{atomic_write_json, now, read_json};
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,24 +46,30 @@ struct SavedState {
 /// change, so a crash still allows the next start to restore it.
 pub struct SystemProxyManager {
     state_path: std::path::PathBuf,
+    // `networksetup` subprocess queries are expensive on macOS; the status only
+    // changes when this manager (or the user) touches the proxy, so cache it.
+    status_cache: Mutex<Option<(Instant, Option<ProxyMode>, Option<String>, SystemProxyStatus)>>,
 }
 
 impl SystemProxyManager {
     pub fn new(state_path: impl Into<std::path::PathBuf>) -> Self {
         Self {
             state_path: state_path.into(),
+            status_cache: Mutex::new(None),
         }
     }
 
     pub fn apply_pac(&self, pac_url: &str) -> Result<SystemProxyStatus> {
         self.save_original()?;
         platform_apply_pac(&self.state_path, pac_url)?;
+        *self.status_cache.lock() = None;
         self.status(Some(ProxyMode::Pac), Some(pac_url.to_string()))
     }
 
     pub fn apply_http(&self, proxy: SocketAddr) -> Result<SystemProxyStatus> {
         self.save_original()?;
         platform_apply_http(&self.state_path, proxy)?;
+        *self.status_cache.lock() = None;
         self.status(Some(ProxyMode::Http), Some(proxy.to_string()))
     }
 
@@ -72,6 +80,7 @@ impl SystemProxyManager {
         let state: SavedState = read_json(&self.state_path).unwrap_or_default();
         platform_restore(&state)?;
         std::fs::remove_file(&self.state_path).ok();
+        *self.status_cache.lock() = None;
         Ok(true)
     }
 
@@ -80,19 +89,32 @@ impl SystemProxyManager {
         mode: Option<ProxyMode>,
         expected: Option<String>,
     ) -> Result<SystemProxyStatus> {
+        const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+        {
+            let cache = self.status_cache.lock();
+            if let Some((at, cached_mode, cached_expected, status)) = cache.as_ref() {
+                if at.elapsed() < STATUS_TTL && *cached_mode == mode && *cached_expected == expected
+                {
+                    return Ok(status.clone());
+                }
+            }
+        }
         let CurrentProxy { supported, current } = platform_current(mode)?;
         let applied = match (&current, &expected) {
             (Some(current), Some(expected)) => current.contains(expected),
             _ => false,
         };
-        Ok(SystemProxyStatus {
+        let status = SystemProxyStatus {
             supported,
             mode: mode.map(mode_name).unwrap_or("off").to_string(),
             applied,
-            expected,
+            expected: expected.clone(),
             current,
             error: None,
-        })
+        };
+        *self.status_cache.lock() =
+            Some((std::time::Instant::now(), mode, expected, status.clone()));
+        Ok(status)
     }
 
     pub fn saved_state_exists(&self) -> bool {
