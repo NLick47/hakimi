@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
@@ -73,7 +74,28 @@ impl DomainPattern {
 
 /// Normalize a DNS host name to lowercase ASCII (IDNA) without a trailing dot.
 pub fn normalize_hostname(input: &str) -> Result<String> {
-    let mut host = input.trim().to_ascii_lowercase();
+    normalize_hostname_cow(input).map(Cow::into_owned)
+}
+
+/// Normalize a host name, borrowing the input when it is already canonical.
+///
+/// The fast path is deliberately strict and validates labels before returning
+/// a borrow, so it accepts exactly the inputs the owned path would accept
+/// unchanged. Uppercase, IDNA, trailing-dot, and empty/colon inputs fall
+/// through to the existing slow path.
+pub fn normalize_hostname_cow(input: &str) -> Result<Cow<'_, str>> {
+    let trimmed = input.trim();
+    if !trimmed.is_empty()
+        && trimmed.is_ascii()
+        && !trimmed.ends_with('.')
+        && !trimmed.contains(':')
+        && !trimmed.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        validate_ascii_hostname(trimmed)?;
+        return Ok(Cow::Borrowed(trimmed));
+    }
+
+    let mut host = trimmed.to_ascii_lowercase();
     if host.ends_with('.') {
         host.pop();
     }
@@ -83,14 +105,19 @@ pub fn normalize_hostname(input: &str) -> Result<String> {
     if host.contains(':') {
         bail!("`{input}` is not a domain name");
     }
-    // Fast path: an ASCII host needs no IDNA processing. The label checks below
-    // reject the same invalid characters, and this runs on every request twice.
+    // An ASCII host needs no IDNA processing. The label checks below reject
+    // the same invalid characters, and this runs on every request twice.
     let ascii = if host.is_ascii() {
         host
     } else {
         idna::domain_to_ascii(&host)
             .map_err(|err| anyhow::anyhow!("invalid internationalized domain `{input}`: {err:?}"))?
     };
+    validate_ascii_hostname(&ascii)?;
+    Ok(Cow::Owned(ascii))
+}
+
+fn validate_ascii_hostname(ascii: &str) -> Result<()> {
     if ascii.len() > 253 {
         bail!("domain name is longer than 253 characters");
     }
@@ -111,7 +138,7 @@ pub fn normalize_hostname(input: &str) -> Result<String> {
             bail!("domain label `{label}` contains unsupported characters");
         }
     }
-    Ok(ascii)
+    Ok(())
 }
 
 /// Host of a pasted URL: `https://user@www.example.com:443/path?q#f` yields
@@ -323,6 +350,31 @@ mod tests {
             .unwrap()
             .matches("A.Example.COM"));
         assert!(DomainPattern::parse("bad*pattern.com").is_err());
+    }
+
+    #[test]
+    fn cow_normalization_borrows_canonical_hosts_only() {
+        assert!(matches!(
+            normalize_hostname_cow("example.com"),
+            Ok(Cow::Borrowed("example.com"))
+        ));
+        assert!(matches!(
+            normalize_hostname_cow(" example.com "),
+            Ok(Cow::Borrowed("example.com"))
+        ));
+        assert!(matches!(
+            normalize_hostname_cow("Example.com"),
+            Ok(Cow::Owned(host)) if host == "example.com"
+        ));
+        assert!(matches!(
+            normalize_hostname_cow("example.com."),
+            Ok(Cow::Owned(host)) if host == "example.com"
+        ));
+        assert!(matches!(
+            normalize_hostname_cow("bücher.example"),
+            Ok(Cow::Owned(host)) if host == "xn--bcher-kva.example"
+        ));
+        assert!(normalize_hostname_cow("bad domain.example").is_err());
     }
 
     #[test]

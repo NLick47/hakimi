@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -17,7 +18,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
 use crate::decision::{ConnectPlan, Route, RouteCursor};
-use crate::domain::{is_ip_literal, normalize_hostname};
+use crate::domain::{is_ip_literal, normalize_hostname_cow};
 use crate::strategy::{FailureReason, Strategy, TlsMode};
 use crate::util::parse_authority;
 
@@ -80,7 +81,12 @@ pub(super) async fn handle_connect(
     let host = if is_ip {
         host
     } else {
-        normalize_hostname(&host).unwrap_or(host)
+        match normalize_hostname_cow(&host) {
+            Ok(Cow::Owned(normalized)) => normalized,
+            // Borrowed means the parsed host was already canonical; keep the
+            // existing allocation instead of making a second identical String.
+            Ok(Cow::Borrowed(_)) | Err(_) => host,
+        }
     };
 
     let (config, matcher) = ctx.config.snapshot_and_matcher();
