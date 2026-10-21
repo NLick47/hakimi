@@ -482,6 +482,443 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static PREV_STATE: std::cell::RefCell<Option<UiState>> =
         const { std::cell::RefCell::new(None) };
+    // The window exists only while it is shown. Closing it drops the component
+    // and its renderer; the tray rebuilds a fresh one from the same runtime.
+    static WINDOW: std::cell::RefCell<Option<WindowShell>> =
+        const { std::cell::RefCell::new(None) };
+    static NEXT_WINDOW_ID: Cell<u64> = const { Cell::new(0) };
+    // UI state that must survive a window rebuild.
+    static PAGE_STATE: Cell<i32> = const { Cell::new(0) };
+    static SITES_EXPANDED_STATE: Cell<bool> = const { Cell::new(false) };
+    static WINDOW_STATE: std::cell::RefCell<Option<(slint::PhysicalPosition, slint::PhysicalSize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct WindowShell {
+    app: AppWindow,
+    /// Keeps the visible window fresh; dropped together with the window. The
+    /// field is never read: holding it is what keeps the timer registered.
+    _timer: slint::Timer,
+    id: u64,
+    /// Set by the timer when the close transition has been handled. A tray
+    /// click that races the queued drop rebuilds instead of revealing a
+    /// window that is about to disappear.
+    closing: Rc<Cell<bool>>,
+}
+
+/// Everything a window (re)build needs from the process.
+#[derive(Clone)]
+struct UiContext {
+    runtime: Arc<HakimiRuntime>,
+    spawner: tokio::runtime::Handle,
+    expanded: Rc<std::cell::RefCell<HashSet<String>>>,
+    sweep: Arc<SweepState>,
+}
+
+/// Wires every window callback. Called for the initial window and again each
+/// time the tray recreates it after a close, so no callback may capture the
+/// window by value.
+fn wire_window(app: &AppWindow, ctx: &UiContext) {
+    let runtime = ctx.runtime.clone();
+    let spawner = ctx.spawner.clone();
+    let expanded = ctx.expanded.clone();
+    let sweep = ctx.sweep.clone();
+
+    // -- callbacks: direct calls, applied in the same frame --
+    {
+        let weak = app.as_weak();
+        app.on_open_fix(move || {
+            // Remember the manual visit in the model: the periodic environment
+            // sync derives the page from state and would otherwise slam it shut
+            // on the very next tick.
+            MODEL.with(|m| m.borrow_mut().open_fix());
+            if let Some(app) = weak.upgrade() {
+                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        let expanded = expanded.clone();
+        let weak = app.as_weak();
+        let sweep = sweep.clone();
+        app.on_toggle_master(move || {
+            // Turning acceleration on with nothing selected would claim to run
+            // an empty set. Leave the switch off; the subtitle explains why.
+            let turning_on =
+                MODEL.with(|m| m.borrow().accel() != ui_state::AccelState::Running);
+            if turning_on && !runtime.config().snapshot().groups.iter().any(|g| g.enabled) {
+                return;
+            }
+            // Use the last known environment (fresh within a second of the
+            // probe stream) so the click never waits on a subprocess.
+            let effects = MODEL.with(|m| {
+                let env = m.borrow().env().clone();
+                m.borrow_mut().toggle(env)
+            });
+            ui_state::execute(&effects, &runtime);
+            if let Some(app) = weak.upgrade() {
+                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
+                refresh(&app, &runtime, &expanded.borrow(), &sweep);
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        let expanded = expanded.clone();
+        let weak = app.as_weak();
+        let sweep = sweep.clone();
+        app.on_toggle_group(move |id, enabled| {
+            // Selection only changes the acceleration set. Probing is an
+            // explicit action ("检测选中"), never a side effect of a checkbox.
+            let _ = runtime.set_group_enabled(id.as_str(), enabled);
+            if let Some(app) = weak.upgrade() {
+                refresh(&app, &runtime, &expanded.borrow(), &sweep);
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        let expanded = expanded.clone();
+        let weak = app.as_weak();
+        let sweep = sweep.clone();
+        app.on_select_all(move |enabled| {
+            // Select-all only changes the set; it never starts a test.
+            let _ = runtime.config().mutate(|config| {
+                for group in &mut config.groups {
+                    group.enabled = enabled;
+                }
+                Ok(())
+            });
+            if !enabled {
+                // Nothing is selected: stop claiming acceleration.
+                let effects = MODEL.with(|m| m.borrow_mut().stop());
+                ui_state::execute(&effects, &runtime);
+            }
+            if let Some(app) = weak.upgrade() {
+                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
+                refresh(&app, &runtime, &expanded.borrow(), &sweep);
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        let expanded = expanded.clone();
+        let weak = app.as_weak();
+        let sweep = sweep.clone();
+        app.on_toggle_open(move |id| {
+            let mut set = expanded.borrow_mut();
+            let id = id.to_string();
+            if !set.remove(&id) {
+                set.insert(id);
+            }
+            drop(set);
+            if let Some(app) = weak.upgrade() {
+                refresh(&app, &runtime, &expanded.borrow(), &sweep);
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        let spawner = spawner.clone();
+        let expanded = expanded.clone();
+        let weak = app.as_weak();
+        let sweep = sweep.clone();
+        app.on_probe_selected(move || {
+            // One atomic sweep on the runtime: the UI only flips the phase and
+            // awaits completion, no per-domain bookkeeping here.
+            sweep.running.store(true, Ordering::SeqCst);
+            if let Some(app) = weak.upgrade() {
+                // Flip the rows to 检测中 now; the sweep runs off-thread.
+                refresh(&app, &runtime, &expanded.borrow(), &sweep);
+            }
+            let runtime = runtime.clone();
+            let done = sweep.clone();
+            spawner.spawn(async move {
+                runtime.probe_sweep().await;
+                done.running.store(false, Ordering::SeqCst);
+                done.commit_once.store(true, Ordering::SeqCst);
+            });
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        let weak = app.as_weak();
+        app.on_finish_onboarding(move || {
+            let effects = MODEL.with(|m| m.borrow_mut().dismiss_fix());
+            ui_state::execute(&effects, &runtime);
+            if let Some(app) = weak.upgrade() {
+                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        app.on_reapply_proxy(move || {
+            let runtime = runtime.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = runtime.apply_system_proxy() {
+                    eprintln!("hakimi-ui: manual system proxy re-apply failed: {error:#}");
+                }
+            });
+        });
+    }
+    app.on_open_site(|url| {
+        std::thread::spawn(move || {
+            let _ = open::that(url.to_string());
+        });
+    });
+    {
+        let runtime = runtime.clone();
+        let expanded = expanded.clone();
+        let weak = app.as_weak();
+        let sweep = sweep.clone();
+        app.on_settings_action(move |kind| {
+            let Some(app) = weak.upgrade() else { return };
+            // Installing may raise a system password prompt; keep that off the
+            // UI thread. The outcome is posted back as one of three short
+            // states, so a dismissed dialog can never read as success.
+            app.set_ca_busy(true);
+            app.set_ca_action_error(SharedString::new());
+            app.set_ob_installing(true);
+            tracing::info!(kind, "ca action requested");
+
+            let runtime = runtime.clone();
+            // The expanded-row set is an Rc owned by the UI thread; carry a
+            // plain copy across so the refresh keeps the same rows open.
+            let open_ids: Vec<String> = expanded.borrow().iter().cloned().collect();
+            let weak = app.as_weak();
+            let sweep = sweep.clone();
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let outcome = match kind {
+                    1 => ca_outcome(runtime.ca_install().map(|status| status.installed), true),
+                    2 => ca_outcome(runtime.ca_uninstall().map(|status| status.installed), false),
+                    3 => ca_outcome(runtime.ca_repair().map(|status| status.installed), true),
+                    _ => CaOutcome::Done,
+                };
+                tracing::info!(
+                    kind,
+                    outcome = ?outcome,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "ca action finished"
+                );
+                let message = outcome.message();
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(app) = weak.upgrade() else { return };
+                    app.set_ca_busy(false);
+                    app.set_ob_installing(false);
+                    if let Some(message) = message {
+                        app.set_ca_action_error(SharedString::from(message));
+                    }
+                    // Re-read the trust state now instead of waiting a tick.
+                    let open: HashSet<String> = open_ids.into_iter().collect();
+                    refresh(&app, &runtime, &open, &sweep);
+                });
+            });
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        let expanded = expanded.clone();
+        let weak = app.as_weak();
+        let sweep = sweep.clone();
+        app.on_save_string(move |key, value| {
+            let key = key.to_string();
+            let value = value.trim().to_string();
+            let error = apply_setting_string(&runtime, &key, &value);
+            if let Some(app) = weak.upgrade() {
+                let failed = error.is_some();
+                app.set_cfg_error(SharedString::from(error.unwrap_or_default()));
+                // Lets the offending field draw a red border instead of only
+                // showing a message at the bottom of the page.
+                app.set_cfg_error_key(SharedString::from(if failed {
+                    key.clone()
+                } else {
+                    String::new()
+                }));
+                refresh(&app, &runtime, &expanded.borrow(), &sweep);
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        app.on_open_data_dir(move || {
+            let dir = runtime.paths().root().to_path_buf();
+            std::thread::spawn(move || {
+                let _ = open::that(dir);
+            });
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        let weak = app.as_weak();
+        app.on_open_editor(move |id| {
+            let Some(app) = weak.upgrade() else { return };
+            let config = runtime.config().snapshot();
+            let builtins = builtin_group_ids();
+            match config.group(id.as_str()) {
+                Some(group) => {
+                    app.set_editor_is_new(false);
+                    app.set_editor_id(SharedString::from(group.id.clone()));
+                    app.set_editor_name(SharedString::from(group.name.clone()));
+                    app.set_editor_domains(SharedString::from(group.domains.join("\n")));
+                    app.set_editor_strategy(editor_strategy_index(group.strategy));
+                    app.set_editor_sni(SharedString::from(group.sni.clone().unwrap_or_default()));
+                    app.set_editor_deletable(!builtins.contains(&group.id));
+                }
+                None => {
+                    app.set_editor_is_new(true);
+                    app.set_editor_id(SharedString::new());
+                    app.set_editor_name(SharedString::new());
+                    app.set_editor_domains(SharedString::new());
+                    app.set_editor_strategy(0);
+                    app.set_editor_sni(SharedString::new());
+                    app.set_editor_deletable(false);
+                }
+            }
+            app.set_editor_error(SharedString::new());
+            app.set_editor_open(true);
+        });
+    }
+    {
+        let weak = app.as_weak();
+        app.on_close_editor(move || {
+            if let Some(app) = weak.upgrade() {
+                app.set_editor_open(false);
+                app.set_editor_error(SharedString::new());
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        let expanded = expanded.clone();
+        let sweep = sweep.clone();
+        let weak = app.as_weak();
+        app.on_save_editor(move || {
+            let Some(app) = weak.upgrade() else { return };
+            let result = save_site(&runtime, &app);
+            match result {
+                Ok(()) => {
+                    app.set_editor_open(false);
+                    app.set_editor_error(SharedString::new());
+                    refresh(&app, &runtime, &expanded.borrow(), &sweep);
+                }
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "site save rejected");
+                    app.set_editor_error(SharedString::from(format!("{error:#}")));
+                }
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        let expanded = expanded.clone();
+        let weak = app.as_weak();
+        let sweep = sweep.clone();
+        app.on_delete_site(move |id| {
+            let Some(app) = weak.upgrade() else { return };
+            match runtime.remove_group(id.as_str()) {
+                Ok(_) => {
+                    tracing::info!(id = %id, "site removed");
+                    app.set_editor_open(false);
+                    app.set_editor_error(SharedString::new());
+                    refresh(&app, &runtime, &expanded.borrow(), &sweep);
+                }
+                Err(error) => app.set_editor_error(SharedString::from(format!("{error:#}"))),
+            }
+        });
+    }
+}
+
+/// Builds a window and its 1-second refresh timer. The shell owns both; when
+/// the user closes the window the component is dropped, releasing the renderer
+/// and every UI allocation while the proxy runtime keeps running.
+fn build_window(ctx: &UiContext) -> Result<WindowShell> {
+    let app = AppWindow::new()?;
+    load_assets();
+    app.set_cfg_data_dir(SharedString::from(
+        ctx.runtime.paths().root().display().to_string(),
+    ));
+    app.set_cfg_version(SharedString::from(env!("CARGO_PKG_VERSION")));
+
+    wire_window(&app, ctx);
+
+    // Restore the UI state the previous window left behind.
+    app.set_page(PAGE_STATE.with(Cell::get));
+    app.set_sites_expanded(SITES_EXPANDED_STATE.with(Cell::get));
+    if let Some((position, size)) = WINDOW_STATE.with(|slot| slot.borrow().as_ref().cloned()) {
+        app.window().set_position(position);
+        app.window().set_size(size);
+    }
+
+    MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
+    refresh(&app, &ctx.runtime, &ctx.expanded.borrow(), &ctx.sweep);
+
+    let id = NEXT_WINDOW_ID.with(|next| {
+        let id = next.get() + 1;
+        next.set(id);
+        id
+    });
+    let closing = Rc::new(Cell::new(false));
+    let timer = slint::Timer::default();
+    {
+        let weak = app.as_weak();
+        let runtime = ctx.runtime.clone();
+        let expanded = ctx.expanded.clone();
+        let sweep = ctx.sweep.clone();
+        let closing = closing.clone();
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(1000),
+            move || {
+                let Some(app) = weak.upgrade() else {
+                    return;
+                };
+                let window = app.window();
+                if window.is_minimized() {
+                    // A minimized window keeps its taskbar entry and state;
+                    // there is nothing to paint, so just skip the refresh.
+                    return;
+                }
+                if !window.is_visible() {
+                    if !closing.replace(true) {
+                        // Closed to the tray: remember the window geometry and
+                        // the UI state, then free the rows/caches. The
+                        // component itself is dropped after this callback
+                        // returns; the runtime and the tray stay alive.
+                        PAGE_STATE.with(|page| page.set(app.get_page()));
+                        SITES_EXPANDED_STATE.with(|flag| flag.set(app.get_sites_expanded()));
+                        WINDOW_STATE.with(|slot| {
+                            *slot.borrow_mut() = Some((window.position(), window.size()));
+                        });
+                        release_ui_caches(&app);
+                        let _ = slint::invoke_from_event_loop(move || {
+                            WINDOW.with(|slot| {
+                                // A tray click may have raced the drop and
+                                // built a newer window; never clear that one.
+                                let stale = slot
+                                    .borrow()
+                                    .as_ref()
+                                    .is_some_and(|shell| shell.id == id);
+                                if stale {
+                                    *slot.borrow_mut() = None;
+                                }
+                            });
+                        });
+                    }
+                    return;
+                }
+                refresh(&app, &runtime, &expanded.borrow(), &sweep);
+            },
+        );
+    }
+    Ok(WindowShell {
+        app,
+        _timer: timer,
+        id,
+        closing,
+    })
 }
 
 /// Bundled site logos, matched against a group id. Exact ids and `<key>-…`
@@ -1336,374 +1773,130 @@ fn main() -> Result<()> {
         })
     };
 
-    let app = AppWindow::new()?;
-    load_assets();
-    app.set_cfg_data_dir(SharedString::from(runtime.paths().root().display().to_string()));
-    app.set_cfg_version(SharedString::from(env!("CARGO_PKG_VERSION")));
-
     let expanded: Rc<std::cell::RefCell<HashSet<String>>> =
         Rc::new(std::cell::RefCell::new(HashSet::new()));
     if let Ok(id) = std::env::var("HAKIMI_UI_EXPAND") {
         expanded.borrow_mut().insert(id);
     }
+    if std::env::var("HAKIMI_UI_PAGE").as_deref() == Ok("1") {
+        PAGE_STATE.with(|page| page.set(1));
+    }
+
+    let ctx = UiContext {
+        runtime: runtime.clone(),
+        spawner: spawner.clone(),
+        expanded: expanded.clone(),
+        sweep: sweep.clone(),
+    };
 
     // System tray: keeps the app alive with the window closed, and mirrors the
     // window actions. The tray must be created on the main thread.
     let tray = TrayRoot::new()?;
     tray.on_show_main({
-        let weak = app.as_weak();
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let sweep = sweep.clone();
+        let ctx = ctx.clone();
         move || {
-            if let Some(app) = weak.upgrade() {
-                // The rows and icons were released while the window was
-                // hidden; reload and rebuild them before revealing it so the
-                // first frame is complete.
-                load_assets();
-                reveal_window(&app);
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
+            let existing = WINDOW.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|shell| (shell.closing.clone(), shell.app.as_weak()))
+            });
+            if let Some((closing, weak)) = existing {
+                if !closing.get() {
+                    if let Some(app) = weak.upgrade() {
+                        load_assets();
+                        reveal_window(&app);
+                        refresh(&app, &ctx.runtime, &ctx.expanded.borrow(), &ctx.sweep);
+                    }
+                    return;
+                }
+            }
+            // No live window (closed to the tray, or closing): build one.
+            match build_window(&ctx) {
+                Ok(shell) => {
+                    if let Err(error) = shell.app.show() {
+                        eprintln!("hakimi-ui: showing the window failed: {error}");
+                        return;
+                    }
+                    WINDOW.with(|slot| *slot.borrow_mut() = Some(shell));
+                }
+                Err(error) => eprintln!("hakimi-ui: rebuilding the window failed: {error:#}"),
             }
         }
     });
     tray.on_toggle_master({
-        let weak = app.as_weak();
+        let ctx = ctx.clone();
         move || {
-            if let Some(app) = weak.upgrade() {
-                app.invoke_toggle_master();
+            let existing = WINDOW.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|shell| (shell.closing.clone(), shell.app.as_weak()))
+            });
+            if let Some((closing, weak)) = existing {
+                if !closing.get() {
+                    if let Some(app) = weak.upgrade() {
+                        app.invoke_toggle_master();
+                        return;
+                    }
+                }
             }
-        }
-    });
-    tray.on_probe_selected({
-        let weak = app.as_weak();
-        move || {
-            if let Some(app) = weak.upgrade() {
-                app.invoke_probe_selected();
-            }
-        }
-    });
-    tray.on_quit(|| {
-        // Quitting goes through the normal path below: run() returns, the
-        // background thread stops the proxy and restores the system proxy.
-        let _ = slint::quit_event_loop();
-    });
-    TRAY.with(|slot| *slot.borrow_mut() = Some(tray));
-
-    // -- callbacks: direct calls, applied in the same frame --
-    {
-        let weak = app.as_weak();
-        app.on_open_fix(move || {
-            // Remember the manual visit in the model: the periodic environment
-            // sync derives the page from state and would otherwise slam it shut
-            // on the very next tick.
-            MODEL.with(|m| m.borrow_mut().open_fix());
-            if let Some(app) = weak.upgrade() {
-                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_toggle_master(move || {
-            // Turning acceleration on with nothing selected would claim to run
-            // an empty set. Leave the switch off; the subtitle explains why.
+            // No window: drive the same state machine directly.
+            let runtime = ctx.runtime.clone();
             let turning_on =
                 MODEL.with(|m| m.borrow().accel() != ui_state::AccelState::Running);
             if turning_on && !runtime.config().snapshot().groups.iter().any(|g| g.enabled) {
                 return;
             }
-            // Use the last known environment (fresh within a second of the
-            // probe stream) so the click never waits on a subprocess.
             let effects = MODEL.with(|m| {
                 let env = m.borrow().env().clone();
                 m.borrow_mut().toggle(env)
             });
             ui_state::execute(&effects, &runtime);
-            if let Some(app) = weak.upgrade() {
-                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_toggle_group(move |id, enabled| {
-            // Selection only changes the acceleration set. Probing is an
-            // explicit action ("检测选中"), never a side effect of a checkbox.
-            let _ = runtime.set_group_enabled(id.as_str(), enabled);
-            if let Some(app) = weak.upgrade() {
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_select_all(move |enabled| {
-            // Select-all only changes the set; it never starts a test.
-            let _ = runtime.config().mutate(|config| {
-                for group in &mut config.groups {
-                    group.enabled = enabled;
-                }
-                Ok(())
-            });
-            if !enabled {
-                // Nothing is selected: stop claiming acceleration.
-                let effects = MODEL.with(|m| m.borrow_mut().stop());
-                ui_state::execute(&effects, &runtime);
-            }
-            if let Some(app) = weak.upgrade() {
-                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_toggle_open(move |id| {
-            let mut set = expanded.borrow_mut();
-            let id = id.to_string();
-            if !set.remove(&id) {
-                set.insert(id);
-            }
-            drop(set);
-            if let Some(app) = weak.upgrade() {
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let spawner = spawner.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_probe_selected(move || {
-            // One atomic sweep on the runtime: the UI only flips the phase and
-            // awaits completion, no per-domain bookkeeping here.
-            sweep.running.store(true, Ordering::SeqCst);
-            if let Some(app) = weak.upgrade() {
-                // Flip the rows to 检测中 now; the sweep runs off-thread.
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
-            }
-            let runtime = runtime.clone();
-            let done = sweep.clone();
-            spawner.spawn(async move {
-                runtime.probe_sweep().await;
-                done.running.store(false, Ordering::SeqCst);
-                done.commit_once.store(true, Ordering::SeqCst);
-            });
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let weak = app.as_weak();
-        app.on_finish_onboarding(move || {
-            let effects = MODEL.with(|m| m.borrow_mut().dismiss_fix());
-            ui_state::execute(&effects, &runtime);
-            if let Some(app) = weak.upgrade() {
-                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        app.on_reapply_proxy(move || {
-            let runtime = runtime.clone();
-            std::thread::spawn(move || {
-                if let Err(error) = runtime.apply_system_proxy() {
-                    eprintln!("hakimi-ui: manual system proxy re-apply failed: {error:#}");
+            let running = runtime.is_started() && !runtime.status().paused();
+            TRAY.with(|slot| {
+                if let Some(tray) = slot.borrow().as_ref() {
+                    tray.set_running(running);
                 }
             });
-        });
-    }
-    app.on_open_site(|url| {
-        std::thread::spawn(move || {
-            let _ = open::that(url.to_string());
-        });
+        }
     });
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_settings_action(move |kind| {
-            let Some(app) = weak.upgrade() else { return };
-            // Installing may raise a system password prompt; keep that off the
-            // UI thread. The outcome is posted back as one of three short
-            // states, so a dismissed dialog can never read as success.
-            app.set_ca_busy(true);
-            app.set_ca_action_error(SharedString::new());
-            app.set_ob_installing(true);
-            tracing::info!(kind, "ca action requested");
-
-            let runtime = runtime.clone();
-            // The expanded-row set is an Rc owned by the UI thread; carry a
-            // plain copy across so the refresh keeps the same rows open.
-            let open_ids: Vec<String> = expanded.borrow().iter().cloned().collect();
-            let weak = app.as_weak();
-            let sweep = sweep.clone();
-            std::thread::spawn(move || {
-                let started = std::time::Instant::now();
-                let outcome = match kind {
-                    1 => ca_outcome(runtime.ca_install().map(|status| status.installed), true),
-                    2 => ca_outcome(runtime.ca_uninstall().map(|status| status.installed), false),
-                    3 => ca_outcome(runtime.ca_repair().map(|status| status.installed), true),
-                    _ => CaOutcome::Done,
-                };
-                tracing::info!(
-                    kind,
-                    outcome = ?outcome,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "ca action finished"
-                );
-                let message = outcome.message();
-                let _ = slint::invoke_from_event_loop(move || {
-                    let Some(app) = weak.upgrade() else { return };
-                    app.set_ca_busy(false);
-                    app.set_ob_installing(false);
-                    if let Some(message) = message {
-                        app.set_ca_action_error(SharedString::from(message));
+    tray.on_probe_selected({
+        let ctx = ctx.clone();
+        move || {
+            let existing = WINDOW.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|shell| (shell.closing.clone(), shell.app.as_weak()))
+            });
+            if let Some((closing, weak)) = existing {
+                if !closing.get() {
+                    if let Some(app) = weak.upgrade() {
+                        app.invoke_probe_selected();
+                        return;
                     }
-                    // Re-read the trust state now instead of waiting a tick.
-                    let open: HashSet<String> = open_ids.into_iter().collect();
-                    refresh(&app, &runtime, &open, &sweep);
-                });
+                }
+            }
+            // No window: run the sweep directly; the status store still
+            // records every result for the next window.
+            let runtime = ctx.runtime.clone();
+            ctx.spawner.spawn(async move {
+                runtime.probe_sweep().await;
             });
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_save_string(move |key, value| {
-            let key = key.to_string();
-            let value = value.trim().to_string();
-            let error = apply_setting_string(&runtime, &key, &value);
-            if let Some(app) = weak.upgrade() {
-                let failed = error.is_some();
-                app.set_cfg_error(SharedString::from(error.unwrap_or_default()));
-                // Lets the offending field draw a red border instead of only
-                // showing a message at the bottom of the page.
-                app.set_cfg_error_key(SharedString::from(if failed {
-                    key.clone()
-                } else {
-                    String::new()
-                }));
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        app.on_open_data_dir(move || {
-            let dir = runtime.paths().root().to_path_buf();
-            std::thread::spawn(move || {
-                let _ = open::that(dir);
-            });
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let weak = app.as_weak();
-        app.on_open_editor(move |id| {
-            let Some(app) = weak.upgrade() else { return };
-            let config = runtime.config().snapshot();
-            let builtins = builtin_group_ids();
-            match config.group(id.as_str()) {
-                Some(group) => {
-                    app.set_editor_is_new(false);
-                    app.set_editor_id(SharedString::from(group.id.clone()));
-                    app.set_editor_name(SharedString::from(group.name.clone()));
-                    app.set_editor_domains(SharedString::from(group.domains.join("\n")));
-                    app.set_editor_strategy(editor_strategy_index(group.strategy));
-                    app.set_editor_sni(SharedString::from(group.sni.clone().unwrap_or_default()));
-                    app.set_editor_deletable(!builtins.contains(&group.id));
-                }
-                None => {
-                    app.set_editor_is_new(true);
-                    app.set_editor_id(SharedString::new());
-                    app.set_editor_name(SharedString::new());
-                    app.set_editor_domains(SharedString::new());
-                    app.set_editor_strategy(0);
-                    app.set_editor_sni(SharedString::new());
-                    app.set_editor_deletable(false);
-                }
-            }
-            app.set_editor_error(SharedString::new());
-            app.set_editor_open(true);
-        });
-    }
-    {
-        let weak = app.as_weak();
-        app.on_close_editor(move || {
-            if let Some(app) = weak.upgrade() {
-                app.set_editor_open(false);
-                app.set_editor_error(SharedString::new());
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let sweep = sweep.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_save_editor(move || {
-            let Some(app) = weak.upgrade() else { return };
-            let result = save_site(&runtime, &app);
-            match result {
-                Ok(()) => {
-                    app.set_editor_open(false);
-                    app.set_editor_error(SharedString::new());
-                    refresh(&app, &runtime, &expanded.borrow(), &sweep);
-                }
-                Err(error) => {
-                    tracing::warn!(error = %format!("{error:#}"), "site save rejected");
-                    app.set_editor_error(SharedString::from(format!("{error:#}")));
-                }
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_delete_site(move |id| {
-            let Some(app) = weak.upgrade() else { return };
-            match runtime.remove_group(id.as_str()) {
-                Ok(_) => {
-                    tracing::info!(id = %id, "site removed");
-                    app.set_editor_open(false);
-                    app.set_editor_error(SharedString::new());
-                    refresh(&app, &runtime, &expanded.borrow(), &sweep);
-                }
-                Err(error) => app.set_editor_error(SharedString::from(format!("{error:#}"))),
-            }
-        });
-    }
+        }
+    });
+    tray.on_quit(|| {
+        // Quitting goes through the normal path below: run_event_loop returns,
+        // the background thread stops the proxy and restores the system proxy.
+        let _ = slint::quit_event_loop();
+    });
+    TRAY.with(|slot| *slot.borrow_mut() = Some(tray));
 
-    // The environment probe is an input stream: it runs off the UI thread (it
-    // spawns `security` and `networksetup`) and posts results through the
-    // event loop, where the state machine transitions and the window mirrors.
+    // The environment probe is an input stream: it runs off the UI thread and
+    // posts results through the event loop. The state machine and the proxy
+    // keep working even when no window exists.
     let probe_stop = Arc::new(AtomicBool::new(false));
     {
         let probe_stop = probe_stop.clone();
         let probe_runtime = runtime.clone();
-        let weak = app.as_weak();
         std::thread::spawn(move || {
             while !probe_stop.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(1000));
@@ -1712,64 +1905,45 @@ fn main() -> Result<()> {
                 }
                 let env = ui_state::probe_env(&probe_runtime);
                 let runtime = probe_runtime.clone();
-                let weak = weak.clone();
                 let _ = slint::invoke_from_event_loop(move || {
-                    let Some(app) = weak.upgrade() else {
-                        return;
-                    };
                     MODEL.with(|m| {
                         let mut model = m.borrow_mut();
                         let effects = model.env_changed(env);
                         ui_state::execute(&effects, &runtime);
-                        ui_state::sync_window(&model, &app);
                     });
+                    let running = runtime.is_started() && !runtime.status().paused();
+                    let has_window = WINDOW.with(|slot| {
+                        let slot = slot.borrow();
+                        if let Some(shell) = slot.as_ref() {
+                            MODEL.with(|m| ui_state::sync_window(&m.borrow(), &shell.app));
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if !has_window {
+                        TRAY.with(|slot| {
+                            if let Some(tray) = slot.borrow().as_ref() {
+                                tray.set_running(running);
+                            }
+                        });
+                    }
                 });
             }
         });
     }
 
-    // Periodic refresh picks up background activity (probe results, EWMA
-    // latency). A window parked in the tray has nothing to repaint: skip the
-    // refresh and, on the hide transition, release the UI-owned rows/caches.
-    // The proxy keeps its memory and keeps serving; forcing the process
-    // working set out would only cause page faults and latency spikes.
-    let timer = slint::Timer::default();
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        let was_visible = Rc::new(Cell::new(true));
-        timer.start(
-            slint::TimerMode::Repeated,
-            Duration::from_millis(1000),
-            move || {
-                let Some(app) = weak.upgrade() else {
-                    return;
-                };
-                if !app.window().is_visible() {
-                    if was_visible.replace(false) {
-                        release_ui_caches(&app);
-                    }
-                    return;
-                }
-                if !was_visible.replace(true) {
-                    // Shown again: rebuild what release_ui_caches dropped.
-                    load_assets();
-                }
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
-            },
-        );
-    }
-
-    refresh(&app, &runtime, &expanded.borrow(), &sweep);
-    if std::env::var("HAKIMI_UI_PAGE").as_deref() == Ok("1") {
-        app.set_page(1);
-    }
-    app.run()?;
+    // The initial window. `run_event_loop` keeps running while the tray icon
+    // exists; closing the window drops the component without stopping it.
+    let shell = build_window(&ctx)?;
+    shell.app.show()?;
+    WINDOW.with(|slot| *slot.borrow_mut() = Some(shell));
+    slint::run_event_loop()?;
 
     // Quitting stops the proxy and restores the system proxy state.
-    drop(timer);
+    WINDOW.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
     probe_stop.store(true, Ordering::SeqCst);
     shutdown.notify_one();
     let _ = background.join();
