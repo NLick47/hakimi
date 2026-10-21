@@ -32,7 +32,7 @@ use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -165,10 +165,12 @@ pub struct UpstreamPool {
     upgrade: Client<RouteConnector, UpstreamBody>,
     recovery: Client<RouteConnector, UpstreamBody>,
     engine: Arc<DecisionEngine>,
-    slow_hosts: Mutex<HashMap<String, Instant>>,
+    /// Read on every request, written only after a slow/failed response.
+    slow_hosts: RwLock<HashMap<String, Instant>>,
     http1_hosts: Arc<DomainMatcher>,
     http1_limit: usize,
-    http1_slots: Mutex<HashMap<String, Arc<Semaphore>>>,
+    /// Read for every image-host request; written only when a new host appears.
+    http1_slots: RwLock<HashMap<String, Arc<Semaphore>>>,
     stats: Arc<UpstreamStats>,
 }
 
@@ -280,10 +282,10 @@ impl UpstreamPool {
             // instead of reusing the stalled one.
             recovery: build_client(config, auto_connector, 0),
             engine,
-            slow_hosts: Mutex::new(HashMap::new()),
+            slow_hosts: RwLock::new(HashMap::new()),
             http1_hosts,
             http1_limit: config.advanced.http1_max_concurrent.max(1),
-            http1_slots: Mutex::new(HashMap::new()),
+            http1_slots: RwLock::new(HashMap::new()),
             stats,
         })
     }
@@ -422,20 +424,17 @@ impl UpstreamPool {
     }
 
     fn is_slow(&self, host: &str) -> bool {
-        let mut hosts = self.slow_hosts.lock();
-        match hosts.get(host).copied() {
-            Some(at) if at.elapsed() < SLOW_ROUTE_TTL => true,
-            Some(_) => {
-                hosts.remove(host);
-                false
-            }
-            None => false,
-        }
+        // Expired entries are harmless until the next write; leaving them in
+        // place keeps this read path from needing a write lock or an upgrade.
+        self.slow_hosts
+            .read()
+            .get(host)
+            .is_some_and(|at| at.elapsed() < SLOW_ROUTE_TTL)
     }
 
     fn mark_slow(&self, host: &str) {
         let now = Instant::now();
-        let mut hosts = self.slow_hosts.lock();
+        let mut hosts = self.slow_hosts.write();
         if hosts.len() >= 256 {
             hosts.retain(|_, at| now.duration_since(*at) < SLOW_ROUTE_TTL);
             if hosts.len() >= 256 {
@@ -446,14 +445,21 @@ impl UpstreamPool {
     }
 
     fn host_slots(&self, host: &str) -> Arc<Semaphore> {
-        let mut slots = self.http1_slots.lock();
+        // Hot path: every image request already has a slot after the first
+        // one. Read it without taking the write lock or allocating a key.
+        if let Some(slot) = self.http1_slots.read().get(host) {
+            return slot.clone();
+        }
+        let mut slots = self.http1_slots.write();
+        if let Some(slot) = slots.get(host) {
+            return slot.clone();
+        }
         if slots.len() > 1024 {
             slots.retain(|_, slot| Arc::strong_count(slot) > 1);
         }
-        slots
-            .entry(host.to_ascii_lowercase())
-            .or_insert_with(|| Arc::new(Semaphore::new(self.http1_limit)))
-            .clone()
+        let slot = Arc::new(Semaphore::new(self.http1_limit));
+        slots.insert(host.to_owned(), slot.clone());
+        slot
     }
 
     /// Warm one exact host: a HEAD request makes hyper establish (or reuse) the pooled
@@ -652,13 +658,17 @@ impl RouteConnector {
         tls: bool,
         force_http1: bool,
     ) -> Result<PooledIo> {
+        // Configuration snapshots are cheap but not free; a cold race can try
+        // many candidates. Read the timeout once per new connection, not once
+        // per candidate attempt.
+        let timeout = self.candidate_timeout();
         // A previously successful route wins. If it fails, it is forgotten and the lazy
         // candidate generator continues with the normal priority order. After a catalog
         // update the cursor tells us to try the new remote IPs first.
         if !cursor.skip_once() {
             if let Some(plan) = self.engine.cached_plan(cursor.domain(), cursor.port(), tls) {
                 let started = std::time::Instant::now();
-                match self.connect_plan(&plan, force_http1).await {
+                match self.connect_plan(&plan, force_http1, timeout).await {
                     Ok(io) => {
                         cursor.note_success(&plan, started.elapsed().as_millis() as u64);
                         return Ok(io);
@@ -691,7 +701,7 @@ impl RouteConnector {
                 key: key.clone(),
                 entry: inflight.clone(),
             };
-            let outcome = self.race_plans(cursor, force_http1).await;
+            let outcome = self.race_plans(cursor, force_http1, timeout).await;
             let shared = match &outcome {
                 Ok((plan, _)) => Ok(plan.clone()),
                 Err(error) => Err(error.clone()),
@@ -720,7 +730,7 @@ impl RouteConnector {
         };
         // The leader already validated this plan; followers just open their own connection.
         let started = std::time::Instant::now();
-        match self.connect_plan(&plan, force_http1).await {
+        match self.connect_plan(&plan, force_http1, timeout).await {
             Ok(io) => {
                 self.engine
                     .note_tunnel_success(&plan, started.elapsed().as_millis() as u64);
@@ -746,6 +756,7 @@ impl RouteConnector {
         &self,
         mut cursor: RouteCursor,
         force_http1: bool,
+        timeout: Duration,
     ) -> std::result::Result<(ConnectPlan, PooledIo), String> {
         type RaceResult =
             Result<(ConnectPlan, PooledIo, u64), (ConnectPlan, FailureReason, String)>;
@@ -792,7 +803,7 @@ impl RouteConnector {
                             tokio::time::sleep(delay).await;
                         }
                         let started = Instant::now();
-                        match this.connect_plan(&plan, force_http1).await {
+                        match this.connect_plan(&plan, force_http1, timeout).await {
                             Ok(io) => Ok((plan, io, started.elapsed().as_millis() as u64)),
                             Err((reason, detail)) => Err((plan, reason, detail)),
                         }
@@ -818,19 +829,19 @@ impl RouteConnector {
         &self,
         plan: &ConnectPlan,
         force_http1: bool,
+        timeout: Duration,
     ) -> std::result::Result<PooledIo, (FailureReason, String)> {
         let address = SocketAddr::new(plan.ip, plan.port);
         if !plan.tls {
-            let stream =
-                tokio::time::timeout(self.candidate_timeout(), TcpStream::connect(address))
-                    .await
-                    .map_err(|_| {
-                        (
-                            FailureReason::TcpTimeout,
-                            format!("TCP connect to {address} timed out"),
-                        )
-                    })?
-                    .map_err(|error| (FailureReason::TcpRefused, error.to_string()))?;
+            let stream = tokio::time::timeout(timeout, TcpStream::connect(address))
+                .await
+                .map_err(|_| {
+                    (
+                        FailureReason::TcpTimeout,
+                        format!("TCP connect to {address} timed out"),
+                    )
+                })?
+                .map_err(|error| (FailureReason::TcpRefused, error.to_string()))?;
             let _ = stream.set_nodelay(true);
             crate::util::apply_tcp_keepalive(&stream);
             return Ok(PooledIo {
@@ -843,15 +854,15 @@ impl RouteConnector {
         let ech = plan.ech_config.as_deref();
         let connector = self.tls.clone();
         let mode = plan.mode;
-        let domain = plan.domain.clone();
-        let result = tokio::time::timeout(self.candidate_timeout(), async move {
+        let domain = plan.domain.as_str();
+        let result = tokio::time::timeout(timeout, async move {
             if self.http1_only || force_http1 {
                 connector
-                    .connect_http1(plan.ip, plan.port, &domain, mode, sni, ech)
+                    .connect_http1(plan.ip, plan.port, domain, mode, sni, ech)
                     .await
             } else {
                 connector
-                    .connect(plan.ip, plan.port, &domain, mode, sni, ech)
+                    .connect(plan.ip, plan.port, domain, mode, sni, ech)
                     .await
             }
         })

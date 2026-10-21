@@ -83,8 +83,7 @@ pub(super) async fn handle_connect(
         normalize_hostname(&host).unwrap_or(host)
     };
 
-    let config = ctx.config.snapshot();
-    let matcher = ctx.config.matcher();
+    let (config, matcher) = ctx.config.snapshot_and_matcher();
     let group_id = if is_ip {
         None
     } else {

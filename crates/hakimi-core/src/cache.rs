@@ -426,6 +426,14 @@ impl CacheManager {
 
     /// Consume the one-shot skip flag for a domain.
     pub fn take_skip_once(&self, domain: &str) -> bool {
+        // This runs once per new route cursor. The set is empty for almost all
+        // connections, so do not take the cache's global write lock just to
+        // discover that. A concurrent catalog refresh can insert between the
+        // two locks; that only means this connection does not consume the new
+        // flag, which is the same race the previous single-lock version had.
+        if !self.data.read().skip_once.contains(domain) {
+            return false;
+        }
         let mut data = self.data.write();
         let removed = data.skip_once.remove(domain);
         if removed {

@@ -339,7 +339,12 @@ impl DecisionEngine {
         let (snapshot, degraded) = {
             let mut scores = self.ip_scores.write();
             let (is_new, snapshot, degraded) = {
-                let by_ip = scores.entry(domain.to_string()).or_default();
+                // Most outcomes update a domain that is already known; avoid
+                // allocating a fresh key until the entry is actually missing.
+                let by_ip = match scores.get_mut(domain) {
+                    Some(by_ip) => by_ip,
+                    None => scores.entry(domain.to_string()).or_default(),
+                };
                 let is_new = !by_ip.contains_key(&ip);
                 let entry = by_ip.entry(ip).or_default();
                 let degraded;
