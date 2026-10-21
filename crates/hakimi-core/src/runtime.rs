@@ -380,7 +380,13 @@ impl HakimiRuntime {
 
         if config.proxy.mode != ProxyMode::Off {
             let status_provider = self.status_provider.clone();
-            let status_json = Arc::new(move || status_provider.snapshot_json());
+            let status_json = Arc::new(move |every: bool| {
+                if every {
+                    status_provider.snapshot_json_full()
+                } else {
+                    status_provider.snapshot_json()
+                }
+            });
             let ctx = ProxyContext::new(
                 self.engine.clone(),
                 self.ca.clone(),

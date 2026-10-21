@@ -172,7 +172,7 @@ async fn spawn_proxy(
     );
     let upstream =
         hakimi_core::proxy::UpstreamPool::new(engine.clone(), tls.clone(), &config.snapshot());
-    let status_json = Arc::new(|| serde_json::json!({"app": "hakimi"}));
+    let status_json = Arc::new(|_every: bool| serde_json::json!({"app": "hakimi"}));
     let ctx = ProxyContext::new(
         engine,
         ca,

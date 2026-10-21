@@ -59,7 +59,9 @@ pub struct ProxyContext {
     pub resolver: Arc<Resolver>,
     pub tls: Arc<TlsContext>,
     pub upstream: Arc<UpstreamPool>,
-    pub status_json: Arc<dyn Fn() -> serde_json::Value + Send + Sync>,
+    /// The status snapshot. The flag asks for every known domain instead of
+    /// the ones the groups show; the polled view is the small one.
+    pub status_json: Arc<dyn Fn(bool) -> serde_json::Value + Send + Sync>,
     proxy_addr: OnceLock<SocketAddr>,
 }
 
@@ -75,7 +77,7 @@ impl ProxyContext {
         resolver: Arc<Resolver>,
         tls: Arc<TlsContext>,
         upstream: Arc<UpstreamPool>,
-        status_json: Arc<dyn Fn() -> serde_json::Value + Send + Sync>,
+        status_json: Arc<dyn Fn(bool) -> serde_json::Value + Send + Sync>,
     ) -> Arc<Self> {
         Arc::new(Self {
             engine,
@@ -197,7 +199,13 @@ async fn handle_request(mut req: Request<Incoming>, ctx: Arc<ProxyContext>) -> R
                 );
             }
             "/hakimi/status" => {
-                let value = (ctx.status_json)();
+                // `?all=1` returns every known domain; the plain view only
+                // carries the domains the groups show.
+                let every = req
+                    .uri()
+                    .query()
+                    .is_some_and(|query| query.split('&').any(|part| part == "all=1"));
+                let value = (ctx.status_json)(every);
                 return json_response(value);
             }
             "/hakimi/health" => {

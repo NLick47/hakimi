@@ -39,7 +39,14 @@ async fn serves_pac_and_status_endpoints() {
         tls.clone(),
         status.clone(),
     );
-    let status_json = Arc::new(|| json!({"app": "hakimi", "test": true}));
+    // The endpoint asks for the small view unless the caller wants every
+    // known domain.
+    let asked_for_every = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = asked_for_every.clone();
+    let status_json = Arc::new(move |every: bool| {
+        flag.store(every, std::sync::atomic::Ordering::SeqCst);
+        json!({"app": "hakimi", "test": true})
+    });
     let upstream = UpstreamPool::new(engine.clone(), tls.clone(), &config.snapshot());
     let ctx = ProxyContext::new(
         engine,
@@ -83,6 +90,24 @@ async fn serves_pac_and_status_endpoints() {
         .await
         .unwrap();
     assert_eq!(status["test"], true);
+    assert!(
+        !asked_for_every.load(std::sync::atomic::Ordering::SeqCst),
+        "the plain view must stay small"
+    );
+
+    let status: serde_json::Value = client
+        .get(format!("{base}/hakimi/status?all=1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["test"], true);
+    assert!(
+        asked_for_every.load(std::sync::atomic::Ordering::SeqCst),
+        "the diagnostics ask for every known domain"
+    );
 
     handle.stop().await;
 }
