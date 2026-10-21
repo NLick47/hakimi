@@ -832,6 +832,7 @@ impl Resolver {
         if let Some(client) = self.clients.read().get(&key) {
             return Ok(client.clone());
         }
+        crate::util::install_crypto_provider();
         let mut builder = reqwest::Client::builder()
             .timeout(timeout)
             .connect_timeout(timeout)

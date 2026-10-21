@@ -157,6 +157,7 @@ impl CatalogManager {
         config: Arc<ConfigManager>,
         cache: Arc<CacheManager>,
     ) -> Result<Arc<Self>> {
+        crate::util::install_crypto_provider();
         let client = reqwest::Client::builder()
             .user_agent(format!("hakimi/{}", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::limited(5))

@@ -207,6 +207,7 @@ impl Drop for ProxySyncGuard {
 
 impl HakimiRuntime {
     pub fn new(data_dir: Option<PathBuf>) -> Result<Arc<Self>> {
+        crate::util::install_crypto_provider();
         let paths = match data_dir {
             Some(path) => Paths::new(path),
             None => Paths::default_location()?,
@@ -331,6 +332,11 @@ impl HakimiRuntime {
 
     pub fn status_json(&self) -> serde_json::Value {
         self.status_provider.snapshot_json()
+    }
+
+    /// Cheap, lock-free health read used by the Android service supervisor.
+    pub fn is_proxy_running(&self) -> bool {
+        self.proxy_running.load(Ordering::SeqCst)
     }
 
     pub fn is_started(&self) -> bool {

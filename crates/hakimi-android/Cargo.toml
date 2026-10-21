@@ -1,0 +1,19 @@
+[package]
+name = "hakimi-android"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "JNI shell for the hakimi Android probe and VPN service"
+
+[lib]
+name = "hakimi_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow.workspace = true
+hakimi-core = { path = "../hakimi-core" }
+jni = "0.21"
+parking_lot.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

@@ -13,42 +13,85 @@ use serde::Serialize;
 /// Atomically replace `path` with `bytes`.
 ///
 /// The temporary file lives in the destination directory so the final rename stays on the
-/// same filesystem. `tempfile::NamedTempFile::persist` replaces existing files on Windows too.
+/// same filesystem, and the rename atomically replaces an existing file on Windows too.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .with_context(|| format!("{} has no parent directory", path.display()))?;
-    std::fs::create_dir_all(parent)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("creating temporary file in {}", parent.display()))?;
-    tmp.write_all(bytes)?;
-    tmp.as_file_mut().sync_all()?;
-    tmp.persist(path)
-        .map_err(|err| err.error)
-        .with_context(|| format!("persisting {}", path.display()))?;
-    Ok(())
+    write_atomic(path, bytes, false)
 }
 
-/// Like [`atomic_write`], but the temporary file is made private before it is renamed into
-/// place, so there is no window where a secret is world-readable on Unix.
+/// Like [`atomic_write`], but the temporary file is created with mode 0600 on Unix, so there
+/// is no window where a secret is world-readable.
 pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic(path, bytes, true)
+}
+
+fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
     let parent = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
     std::fs::create_dir_all(parent)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("creating temporary file in {}", parent.display()))?;
-    tmp.write_all(bytes)?;
-    tmp.as_file_mut().sync_all()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600));
+    for attempt in 0..8 {
+        let tmp = sibling_temp_path(path, attempt);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+        let mut file = match options.open(&tmp) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("creating temporary file next to {}", path.display())
+                })
+            }
+        };
+        let result = (|| -> Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, path)
+                .with_context(|| format!("persisting {}", path.display()))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        return result;
     }
-    tmp.persist(path)
-        .map_err(|err| err.error)
-        .with_context(|| format!("persisting {}", path.display()))?;
-    Ok(())
+    bail!(
+        "could not create a unique temporary file next to {}",
+        path.display()
+    )
+}
+
+fn sibling_temp_path(path: &Path, attempt: u32) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tmp".to_string());
+    path.with_file_name(format!(
+        ".{file}.{}.{sequence}.{attempt}.tmp",
+        std::process::id()
+    ))
+}
+
+/// Install aws-lc-rs as the process-wide rustls provider.
+///
+/// reqwest is built with `rustls-tls-*-no-provider` so the dependency graph contains a single
+/// crypto backend instead of also compiling ring. rustls resolves the provider when a client
+/// is constructed, so this must run before the first reqwest client is built.
+pub fn install_crypto_provider() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
 }
 
 pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -70,11 +113,11 @@ pub fn now_rfc3339() -> String {
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
+    hex::encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes).as_ref())
 }
 
 pub fn sha1_hex(bytes: &[u8]) -> String {
-    hex::encode(ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, bytes).as_ref())
+    hex::encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY, bytes).as_ref())
 }
 
 /// Accept base64 (standard or URL-safe, padded or not) or hex.

@@ -22,6 +22,8 @@ use crate::paths::Paths;
 use self::material::{build_leaf_config, generate_and_save, load_material, CaMaterial};
 use self::trust::{install_cert, trust_note, trust_status, trust_supported, uninstall_by_sha1};
 
+pub use self::trust::set_android_ca_trusted;
+
 mod material;
 mod trust;
 
@@ -236,6 +238,13 @@ impl CertificateAuthority {
         self.probe_and_cache(cached)
     }
 
+    /// Drop the cached trust result. Android shells call this after updating
+    /// the user-CA trust flag so the next status probe reflects it immediately
+    /// instead of waiting out the status TTL.
+    pub fn invalidate_status(&self) {
+        *self.status_cache.lock() = None;
+    }
+
     /// Authoritative status for CA operations and their result reporting. Waits
     /// for any concurrent background probe, then performs a fresh one.
     fn status_now(&self) -> CaStatus {
@@ -251,9 +260,10 @@ impl CertificateAuthority {
     /// Probe the trust store and update the snapshot. Callers must hold
     /// `probe_lock`; `cached` is the previous snapshot used only for logging.
     fn probe_and_cache(&self, cached: Option<CaStatus>) -> CaStatus {
-        let (fingerprint_sha1, fingerprint_sha256, not_before, not_after) = {
+        let (subject, fingerprint_sha1, fingerprint_sha256, not_before, not_after) = {
             let material = self.material.read();
             (
+                material.subject.clone(),
                 material.fingerprint_sha1.clone(),
                 material.fingerprint_sha256.clone(),
                 material.not_before.clone(),
@@ -293,7 +303,7 @@ impl CertificateAuthority {
             present: true,
             supported,
             installed,
-            subject: Some(format!("CN={CA_COMMON_NAME}")),
+            subject: Some(subject),
             fingerprint_sha1: Some(fingerprint_sha1),
             fingerprint_sha256: Some(fingerprint_sha256),
             cert_path: Some(self.paths.ca_cert_file().display().to_string()),
@@ -314,7 +324,7 @@ impl CertificateAuthority {
             present: true,
             supported: trust_supported(),
             installed,
-            subject: Some(format!("CN={CA_COMMON_NAME}")),
+            subject: Some(material.subject.clone()),
             fingerprint_sha1: Some(material.fingerprint_sha1.clone()),
             fingerprint_sha256: Some(material.fingerprint_sha256.clone()),
             cert_path: Some(self.paths.ca_cert_file().display().to_string()),

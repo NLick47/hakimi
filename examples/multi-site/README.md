@@ -8,7 +8,7 @@ Local test data used for the live PAC validation.
 |---|---|---|---|
 | ao3 | archiveofourown.org, www, `*.archiveofourown.org` | `sni` (`sni: ""`) | Cloudflare `104.20.9.2`, `104.20.8.2` |
 | github | github.com, api, raw, `*.githubusercontent.com`, `*.githubassets.com` | `auto` | direct works: `20.205.243.166`, `20.250.119.72`, `185.199.108-111.133/.215/.154` |
-| pixiv | pixiv.net, www, i.pximg.net, `*.pximg.net` | `auto`, `echShared: true` | main/www use Cloudflare `172.64.145.17`, `104.18.42.239` for ECH; origin `210.140.139.155/.161` as SNI fallback; i.pximg origin `.129-.136` |
+| pixiv | pixiv.net, www, `*.pixiv.net`, i.pximg.net, `*.pximg.net` | `auto`, `echShared: true` | main/www/login (accounts, oauth.secure, app-api, embed) use Cloudflare `172.64.145.17`, `104.18.42.239` for ECH; origin `210.140.139.155/.161` as SNI fallback; i.pximg origin `.129-.136` |
 | poipiku | poipiku.com, `*.poipiku.com` | `direct` | AWS `18.182.121.133`, `52.197.148.72` |
 | steam | store, community, wildcards | `auto` | store direct `88.221.170.104`; community SNI `88.221.168.230`; static `146.75.123.52` |
 
@@ -17,6 +17,10 @@ Local test data used for the live PAC validation.
 fetched through the configured DoH/fallback AliDNS and cached. This is the same approach used by
 the Piku project. Bare `pixiv.net` and `i.pximg.net` are not CF-fronted, so `auto` falls back to
 fake SNI (empty) for those.
+
+The login/OAuth subdomains (`accounts.pixiv.net`, `oauth.secure.pixiv.net`, `app-api.pixiv.net`)
+are Cloudflare-fronted too and reuse the same two Cloudflare IPs. Without explicit catalog entries
+the system/DoH answers for them are frequently poisoned, so the catalog pins those IPs.
 
 ## Use
 

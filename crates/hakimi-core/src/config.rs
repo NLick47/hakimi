@@ -16,6 +16,9 @@ pub const MAX_GROUPS: usize = 128;
 pub const MAX_DOMAINS_PER_GROUP: usize = 512;
 pub const MAX_TOTAL_DOMAINS: usize = 5000;
 pub const MAX_CUSTOM_DOH: usize = 32;
+/// Bumped when `default_groups()` gains a domain that existing configs must
+/// also receive. Each bump needs a matching step in `migrate_defaults`.
+pub const CURRENT_DEFAULTS_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -27,6 +30,8 @@ pub struct AppConfig {
     /// Monotonic local catalog revision. Incremented when accepted remote IP catalog content
     /// changes; cached IPs remember the revision that produced them.
     pub catalog_version: u64,
+    /// Built-in defaults revision this config has been migrated to.
+    pub defaults_version: u32,
     pub advanced: AdvancedConfig,
     pub log: LogConfig,
 }
@@ -39,6 +44,7 @@ impl Default for AppConfig {
             proxy: ProxyConfig::default(),
             groups: default_groups(),
             catalog_version: 0,
+            defaults_version: CURRENT_DEFAULTS_VERSION,
             advanced: AdvancedConfig::default(),
             log: LogConfig::default(),
         }
@@ -350,6 +356,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
                 &[
                     "pixiv.net",
                     "www.pixiv.net",
+                    "*.pixiv.net",
                     "i.pximg.net",
                     "s.pximg.net",
                     "booth.pximg.net",
@@ -717,6 +724,27 @@ fn merge_missing_defaults(config: &mut AppConfig) -> usize {
     changed
 }
 
+/// Apply domain additions that built-in groups gained after this config was
+/// written. `merge_missing_defaults` only handles whole groups; domains need a
+/// version marker because a user may have edited a built-in group's domain
+/// list on purpose.
+fn migrate_defaults(config: &mut AppConfig) -> usize {
+    let mut changed = 0;
+    if config.defaults_version < 1 {
+        // The pixiv login/OAuth flow runs on subdomains that the old preset
+        // did not intercept (it listed only the bare and www hosts).
+        if let Some(group) = config.groups.iter_mut().find(|group| group.id == "pixiv") {
+            if !group.domains.iter().any(|domain| domain == "*.pixiv.net") {
+                group.domains.push("*.pixiv.net".to_string());
+                changed += 1;
+            }
+        }
+        config.defaults_version = CURRENT_DEFAULTS_VERSION;
+        changed += 1;
+    }
+    changed
+}
+
 /// Thread-safe configuration holder that keeps the derived domain matcher in sync.
 pub struct ConfigManager {
     path: PathBuf,
@@ -751,8 +779,16 @@ impl ConfigManager {
         // added to the defaults. Built-in groups cannot be deleted from the UI,
         // so a missing id means "predates this site", not "user removed it".
         let restored = merge_missing_defaults(&mut config);
-        if restored > 0 {
-            tracing::info!(restored, "updated built-in site defaults in the config");
+        // Domain additions cannot use the same "missing id" test: users may
+        // edit a built-in group's domain list, so a version marker decides
+        // which migrations have already run.
+        let migrated = migrate_defaults(&mut config);
+        if restored + migrated > 0 {
+            tracing::info!(
+                restored,
+                migrated,
+                "updated built-in site defaults in the config"
+            );
             atomic_write_json(&path, &config)?;
         }
         Self::new(path, config)
@@ -1081,5 +1117,44 @@ mod tests {
         assert!(config.validate().is_err());
         config.groups[0].homepage = Some("https://example.com/".into());
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn default_pixiv_group_covers_login_subdomains() {
+        let config = AppConfig::default();
+        let matcher = config.matcher().unwrap();
+        assert_eq!(matcher.match_host("accounts.pixiv.net"), Some("pixiv"));
+        assert_eq!(
+            matcher.match_host("oauth.secure.pixiv.net"),
+            Some("pixiv")
+        );
+        assert_eq!(matcher.match_host("app-api.pixiv.net"), Some("pixiv"));
+    }
+
+    #[test]
+    fn older_configs_gain_pixiv_login_domains() {
+        let mut config = AppConfig::default();
+        config.defaults_version = 0;
+        let pixiv = config
+            .groups
+            .iter_mut()
+            .find(|group| group.id == "pixiv")
+            .unwrap();
+        pixiv.domains.retain(|domain| domain != "*.pixiv.net");
+
+        assert_eq!(migrate_defaults(&mut config), 2);
+        assert_eq!(config.defaults_version, CURRENT_DEFAULTS_VERSION);
+        assert!(config
+            .group("pixiv")
+            .unwrap()
+            .domains
+            .iter()
+            .any(|domain| domain == "*.pixiv.net"));
+    }
+
+    #[test]
+    fn defaults_migration_is_idempotent() {
+        let mut config = AppConfig::default();
+        assert_eq!(migrate_defaults(&mut config), 0);
     }
 }

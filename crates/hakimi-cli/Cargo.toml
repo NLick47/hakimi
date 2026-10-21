@@ -15,4 +15,4 @@ clap.workspace = true
 hakimi-core = { path = "../hakimi-core" }
 reqwest.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }

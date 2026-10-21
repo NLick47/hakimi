@@ -36,6 +36,13 @@ struct SavedState {
     proxy_override: Option<String>,
     #[serde(default)]
     mac_services: Vec<String>,
+    /// WinINet's per-connection flags captured before the first takeover.
+    /// The legacy registry values are not authoritative on Windows: WinINet
+    /// reconciles them with `Connections\DefaultConnectionSettings` on every
+    /// settings reload, so a restore that only rewrites the legacy values can
+    /// be undone by the next notification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    win_proxy_flags: Option<u32>,
     #[serde(default)]
     applied_at: Option<DateTime<Utc>>,
 }
@@ -235,6 +242,7 @@ fn platform_snapshot() -> Result<SavedState> {
         proxy_server: key.get_value("ProxyServer").ok(),
         proxy_override: key.get_value("ProxyOverride").ok(),
         mac_services: Vec::new(),
+        win_proxy_flags: read_connection_flags(),
         applied_at: None,
     })
 }
@@ -243,13 +251,126 @@ fn platform_snapshot() -> Result<SavedState> {
 const INTERNET_SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
 #[cfg(windows)]
+const INTERNET_CONNECTIONS: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Internet Settings\Connections";
+
+/// WinINet's authoritative proxy mode lives in the per-connection settings
+/// blob, not in the legacy `AutoConfigURL`/`ProxyEnable` values. Reading the
+/// blob lets a restore put back the exact mode the user had (including
+/// auto-detect), instead of guessing from the legacy values.
+#[cfg(windows)]
+fn read_connection_flags() -> Option<u32> {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    use winreg::RegKey;
+
+    let key = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(INTERNET_CONNECTIONS, KEY_READ)
+        .ok()?;
+    let blob = key.get_raw_value("DefaultConnectionSettings").ok()?;
+    let flags = blob.bytes.get(8..12)?;
+    Some(u32::from_le_bytes(flags.try_into().ok()?))
+}
+
+/// Write WinINet's per-connection proxy configuration.
+///
+/// This is the state WinINet enforces: on a settings-changed notification it
+/// refreshes the legacy registry values from the blob. Writing only the legacy
+/// values is therefore not enough — when the blob still says "direct", the
+/// notification deletes the freshly written `AutoConfigURL` again. Updating
+/// the blob first keeps the two views consistent, so both survive.
+#[cfg(windows)]
+fn apply_per_connection(
+    flags: u32,
+    pac_url: Option<&str>,
+    proxy_server: Option<&str>,
+    proxy_bypass: Option<&str>,
+) -> Result<()> {
+    use windows_sys::Win32::Networking::WinInet::{
+        InternetSetOptionW, INTERNET_OPTION_PER_CONNECTION_OPTION,
+        INTERNET_PER_CONN_AUTOCONFIG_URL, INTERNET_PER_CONN_FLAGS, INTERNET_PER_CONN_OPTIONW,
+        INTERNET_PER_CONN_OPTIONW_0, INTERNET_PER_CONN_OPTION_LISTW,
+        INTERNET_PER_CONN_PROXY_BYPASS, INTERNET_PER_CONN_PROXY_SERVER,
+    };
+
+    // The API reads these buffers synchronously; keep them alive until it
+    // returns.
+    let mut pac: Option<Vec<u16>> = pac_url.map(|url| url.encode_utf16().chain([0]).collect());
+    let mut server: Option<Vec<u16>> = proxy_server.map(|s| s.encode_utf16().chain([0]).collect());
+    let mut bypass: Option<Vec<u16>> = proxy_bypass.map(|s| s.encode_utf16().chain([0]).collect());
+
+    let string_option = |option: u32, value: *mut u16| INTERNET_PER_CONN_OPTIONW {
+        dwOption: option,
+        Value: INTERNET_PER_CONN_OPTIONW_0 { pszValue: value },
+    };
+
+    let mut options: Vec<INTERNET_PER_CONN_OPTIONW> = Vec::with_capacity(4);
+    options.push(INTERNET_PER_CONN_OPTIONW {
+        dwOption: INTERNET_PER_CONN_FLAGS,
+        Value: INTERNET_PER_CONN_OPTIONW_0 { dwValue: flags },
+    });
+    if let Some(server) = server.as_mut() {
+        options.push(string_option(
+            INTERNET_PER_CONN_PROXY_SERVER,
+            server.as_mut_ptr(),
+        ));
+    }
+    if let Some(bypass) = bypass.as_mut() {
+        options.push(string_option(
+            INTERNET_PER_CONN_PROXY_BYPASS,
+            bypass.as_mut_ptr(),
+        ));
+    }
+    if let Some(pac) = pac.as_mut() {
+        options.push(string_option(
+            INTERNET_PER_CONN_AUTOCONFIG_URL,
+            pac.as_mut_ptr(),
+        ));
+    }
+
+    let mut list = INTERNET_PER_CONN_OPTION_LISTW {
+        dwSize: std::mem::size_of::<INTERNET_PER_CONN_OPTION_LISTW>() as u32,
+        // NULL selects the LAN connection, which the legacy values describe.
+        pszConnection: std::ptr::null_mut(),
+        dwOptionCount: options.len() as u32,
+        dwOptionError: 0,
+        pOptions: options.as_mut_ptr(),
+    };
+    let pointer: *const std::ffi::c_void = std::ptr::from_mut(&mut list).cast();
+    let ok = unsafe {
+        InternetSetOptionW(
+            std::ptr::null(),
+            INTERNET_OPTION_PER_CONNECTION_OPTION,
+            pointer,
+            list.dwSize,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("setting per-connection proxy options");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn platform_apply_pac(_state_path: &Path, pac_url: &str) -> Result<()> {
+    use windows_sys::Win32::Networking::WinInet::{PROXY_TYPE_AUTO_PROXY_URL, PROXY_TYPE_DIRECT};
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
     use winreg::RegKey;
+
+    apply_per_connection(
+        PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL,
+        Some(pac_url),
+        None,
+        None,
+    )
+    .context("applying the PAC through WinINet")?;
 
     let key = RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey_with_flags(INTERNET_SETTINGS, KEY_READ | KEY_WRITE)
         .context("opening Internet Settings registry key")?;
+    // Mirror the legacy values for readers that do not go through WinINet,
+    // including this crate's health probe. The blob now carries the same PAC,
+    // so the notification cannot undo them.
     key.set_value("AutoConfigURL", &pac_url)
         .context("setting AutoConfigURL")?;
     // PAC takes precedence; disable the fixed proxy so a stale old value cannot win.
@@ -261,14 +382,23 @@ fn platform_apply_pac(_state_path: &Path, pac_url: &str) -> Result<()> {
 
 #[cfg(windows)]
 fn platform_apply_http(_state_path: &Path, proxy: SocketAddr) -> Result<()> {
+    use windows_sys::Win32::Networking::WinInet::{PROXY_TYPE_DIRECT, PROXY_TYPE_PROXY};
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
     use winreg::RegKey;
+
+    let server = format!("http={proxy};https={proxy}", proxy = proxy);
+    apply_per_connection(
+        PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY,
+        None,
+        Some(&server),
+        Some("<local>"),
+    )
+    .context("applying the HTTP proxy through WinINet")?;
 
     let key = RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey_with_flags(INTERNET_SETTINGS, KEY_READ | KEY_WRITE)
         .context("opening Internet Settings registry key")?;
     let _ = key.delete_value("AutoConfigURL");
-    let server = format!("http={proxy};https={proxy}", proxy = proxy);
     key.set_value("ProxyServer", &server)
         .context("setting ProxyServer")?;
     key.set_value("ProxyOverride", &"<local>")
@@ -296,23 +426,106 @@ fn platform_pac_health(expected_url: &str) -> bool {
 
 #[cfg(windows)]
 fn platform_pac_disable() {
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
+    use windows_sys::Win32::Networking::WinInet::{
+        PROXY_TYPE_AUTO_PROXY_URL, PROXY_TYPE_DIRECT, PROXY_TYPE_PROXY,
+    };
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
     use winreg::RegKey;
-    if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags(INTERNET_SETTINGS, KEY_WRITE)
-    {
-        let _ = key.delete_value("AutoConfigURL");
-        // WinINet keeps the previous PAC in memory until it is told the
-        // settings changed; without this the browser would keep dialing the
-        // dead PAC port after a takeover was rolled back.
-        notify_proxy_changed();
+
+    let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(INTERNET_SETTINGS, KEY_READ | KEY_WRITE)
+    else {
+        return;
+    };
+    // Only this instance's PAC is ours to clear: a user-configured fixed proxy
+    // stays enabled.
+    let enabled: u32 = key.get_value("ProxyEnable").unwrap_or(0);
+    let server: Option<String> = key.get_value("ProxyServer").ok();
+    let bypass: Option<String> = key.get_value("ProxyOverride").ok();
+    let present_server = server.as_deref().filter(|server| !server.is_empty());
+    let manual = enabled == 1 && present_server.is_some();
+    // Clear only the PAC bit; keep auto-detect and any manual proxy the user
+    // configured for themselves.
+    let mut flags = read_connection_flags().unwrap_or(PROXY_TYPE_DIRECT);
+    flags &= !PROXY_TYPE_AUTO_PROXY_URL;
+    if manual {
+        flags |= PROXY_TYPE_PROXY;
+    } else {
+        flags &= !PROXY_TYPE_PROXY;
     }
+    if flags == 0 {
+        flags = PROXY_TYPE_DIRECT;
+    }
+    if let Err(error) = apply_per_connection(
+        flags,
+        None,
+        if manual { present_server } else { None },
+        if manual { bypass.as_deref() } else { None },
+    ) {
+        tracing::warn!(error = %error, "failed to clear the per-connection PAC setting");
+    }
+    let _ = key.delete_value("AutoConfigURL");
+    // WinINet keeps the previous PAC in memory until it is told the settings
+    // changed; without this the browser would keep dialing the dead PAC port
+    // after a takeover was rolled back.
+    notify_proxy_changed();
+}
+
+/// Reconcile the captured per-connection flags with the values that are
+/// actually being restored: never keep a mode bit whose value is missing, and
+/// never pass a value without its mode bit (that inconsistency is what makes
+/// WinINet drop the PAC on the next reload). Unrelated bits, such as
+/// auto-detect, are preserved.
+#[cfg(windows)]
+fn restore_flags(saved: Option<u32>, has_pac: bool, has_manual: bool) -> u32 {
+    use windows_sys::Win32::Networking::WinInet::{
+        PROXY_TYPE_AUTO_PROXY_URL, PROXY_TYPE_DIRECT, PROXY_TYPE_PROXY,
+    };
+
+    let mut flags = saved.unwrap_or(PROXY_TYPE_DIRECT);
+    if has_pac {
+        flags |= PROXY_TYPE_AUTO_PROXY_URL;
+    } else {
+        flags &= !PROXY_TYPE_AUTO_PROXY_URL;
+    }
+    if has_manual {
+        flags |= PROXY_TYPE_PROXY;
+    } else {
+        flags &= !PROXY_TYPE_PROXY;
+    }
+    if flags == 0 {
+        flags = PROXY_TYPE_DIRECT;
+    }
+    flags
 }
 
 #[cfg(windows)]
 fn platform_restore(state: &SavedState) -> Result<()> {
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
     use winreg::RegKey;
+
+    let auto = state
+        .auto_config_url
+        .as_deref()
+        .filter(|url| !url.is_empty());
+    let manual_server = state
+        .proxy_enable
+        .filter(|enabled| *enabled == 1)
+        .and(state.proxy_server.as_deref())
+        .filter(|server| !server.is_empty());
+    let bypass = manual_server.and(state.proxy_override.as_deref());
+
+    // Restore the per-connection state first: it is what WinINet enforces on
+    // the next settings reload. Restoring only the legacy values below would
+    // be reverted by that reload.
+    let flags = restore_flags(
+        state.win_proxy_flags,
+        auto.is_some(),
+        manual_server.is_some(),
+    );
+    if let Err(error) = apply_per_connection(flags, auto, manual_server, bypass) {
+        tracing::warn!(error = %error, "failed to restore per-connection proxy settings");
+    }
 
     let key = RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey_with_flags(INTERNET_SETTINGS, KEY_READ | KEY_WRITE)
@@ -619,6 +832,47 @@ mod tests {
     fn snapshot_has_platform() {
         let state = platform_snapshot().unwrap();
         assert_eq!(state.platform, "windows");
+    }
+
+    #[test]
+    fn restore_flags_match_the_values_being_restored() {
+        use windows_sys::Win32::Networking::WinInet::{
+            PROXY_TYPE_AUTO_DETECT, PROXY_TYPE_AUTO_PROXY_URL, PROXY_TYPE_DIRECT, PROXY_TYPE_PROXY,
+        };
+
+        // A captured "direct" mode gains the PAC bit when a PAC is restored.
+        assert_eq!(
+            restore_flags(Some(PROXY_TYPE_DIRECT), true, false),
+            PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL
+        );
+        // A captured PAC is dropped when the snapshot has no PAC URL.
+        assert_eq!(
+            restore_flags(
+                Some(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL),
+                false,
+                false
+            ),
+            PROXY_TYPE_DIRECT
+        );
+        // Manual proxy and PAC can coexist.
+        assert_eq!(
+            restore_flags(
+                Some(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL),
+                true,
+                true
+            ),
+            PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL | PROXY_TYPE_PROXY
+        );
+        // Without a captured blob, the flags are derived from the values.
+        assert_eq!(
+            restore_flags(None, false, true),
+            PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY
+        );
+        // Unrelated bits such as auto-detect survive the reconciliation.
+        assert_eq!(
+            restore_flags(Some(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_DETECT), false, false),
+            PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_DETECT
+        );
     }
 }
 
