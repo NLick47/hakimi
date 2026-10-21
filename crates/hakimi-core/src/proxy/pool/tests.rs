@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::cache::{CacheManager, LastGoodEntry};
+use crate::ca::CertificateAuthority;
 use crate::catalog::CatalogManager;
 use crate::config::{ConfigManager, GroupConfig};
 use crate::decision::DecisionEngine;
@@ -14,6 +15,24 @@ use crate::resolver::{DohResolution, EchOutcome, IpResolver, Resolver};
 use crate::status::StatusStore;
 use crate::strategy::{IpSource, Strategy};
 use crate::util::now;
+
+/// A remote catalog with one working address.
+struct StubRemote;
+
+#[async_trait::async_trait]
+impl crate::catalog::RemoteIpProvider for StubRemote {
+    fn remote_ips(&self, _domain: &str) -> Option<Vec<std::net::IpAddr>> {
+        Some(vec!["127.0.0.1".parse().unwrap()])
+    }
+
+    fn remote_sni(&self, _group_id: &str) -> Option<String> {
+        None
+    }
+
+    fn has_ip_catalog(&self) -> bool {
+        true
+    }
+}
 
 struct SlowResolver {
     delay: std::time::Duration,
@@ -224,7 +243,8 @@ async fn cached_candidate_is_not_blocked_by_slow_doh_expansion() {
             };
             tokio::spawn(async move {
                 let mut buffer = [0u8; 4096];
-                let _ = socket.read(&mut buffer).await;
+                let read = socket.read(&mut buffer).await;
+                eprintln!("[live] read={read:?}");
                 let _ = socket
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
@@ -253,5 +273,114 @@ async fn cached_candidate_is_not_blocked_by_slow_doh_expansion() {
     assert!(
         elapsed < Duration::from_millis(600),
         "the cached candidate was blocked by DoH expansion: {elapsed:?}"
+    );
+}
+
+/// Concurrent cold connections for one domain share a single route
+/// discovery.  Without the single flight every request would race the
+/// candidates on its own and dial the dead one again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_cold_connections_share_one_discovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = crate::paths::Paths::new(dir.path());
+    paths.ensure().unwrap();
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    // The proxy has to trust the local CA for the working candidate.
+    let roots = dir.path().join("extra-root.pem");
+    std::fs::write(&roots, ca.ca_pem()).unwrap();
+    std::env::set_var("HAKIMI_EXTRA_ROOT_CA", &roots);
+
+    // The working candidate: a TLS server on 127.0.0.1.
+    let live_tls = ca.server_config("upstream.test").unwrap();
+    let live = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = live.local_addr().unwrap().port();
+    let acceptor = tokio_rustls::TlsAcceptor::from(live_tls);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = live.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let service = hyper::service::service_fn(|_req: hyper::Request<hyper::body::Incoming>| async {
+                    Ok::<_, std::convert::Infallible>(
+                        hyper::Response::new(http_body_util::Full::new(Bytes::from_static(b"ok"))),
+                    )
+                });
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), service)
+                .await;
+            });
+        }
+    });
+
+    // The dead candidate: the same port on the other loopback address, but a
+    // plain TCP server, so the TLS handshake fails right away.
+    let dead = TcpListener::bind(("::1", port)).await.unwrap();
+    let dead_accepts = Arc::new(AtomicUsize::new(0));
+    let counter = dead_accepts.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = dead.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            drop(socket);
+        }
+    });
+
+    let (engine, config) = engine_for(dir.path());
+    // The last known route points at the address that never answers, so the
+    // race has to try it before the working candidate.
+    engine.cache.put_last_good(LastGoodEntry {
+        domain: "upstream.test".into(),
+        ip: "::1".parse().unwrap(),
+        strategy: Strategy::Direct,
+        source: IpSource::Cache,
+        network_id: "test".into(),
+        saved_at: now(),
+        catalog_version: 0,
+    });
+    // The remote catalog offers the working address.
+    let engine = DecisionEngine::new(
+        engine.config.clone(),
+        engine.cache.clone(),
+        Arc::new(StubRemote),
+        engine.resolver.clone(),
+        engine.prober.clone(),
+        engine.status.clone(),
+    );
+    let tls = TlsContext::new().unwrap();
+    let pool = Arc::new(UpstreamPool::new(engine, tls, &config.snapshot()));
+    let uri = format!("https://upstream.test:{port}/");
+
+    // Ten requests at once, all to the same cold domain.
+    let mut tasks = Vec::new();
+    for _ in 0..10 {
+        let pool = pool.clone();
+        let uri = uri.clone();
+        tasks.push(tokio::spawn(async move {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(&uri)
+                .body(Either::Right(Full::new(Bytes::new())))
+                .unwrap();
+            pool.send(request, false)
+                .await
+                .map(|response| response.status())
+                .map_err(|error| error)
+        }));
+    }
+    for (index, task) in tasks.into_iter().enumerate() {
+        let outcome = task.await.unwrap();
+        assert!(outcome.is_ok(), "request {index} failed: {outcome:?}");
+        assert_eq!(outcome.unwrap(), http::StatusCode::OK);
+    }
+    assert_eq!(
+        dead_accepts.load(Ordering::SeqCst),
+        1,
+        "the dead candidate must be dialled once, not once per request"
     );
 }
