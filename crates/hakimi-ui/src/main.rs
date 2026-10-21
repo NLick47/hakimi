@@ -784,6 +784,9 @@ fn wire_window(app: &AppWindow, ctx: &UiContext) {
                     app.set_editor_id(SharedString::from(group.id.clone()));
                     app.set_editor_name(SharedString::from(group.name.clone()));
                     app.set_editor_domains(SharedString::from(group.domains.join("\n")));
+                    app.set_editor_homepage(SharedString::from(
+                        group.homepage.clone().unwrap_or_default(),
+                    ));
                     app.set_editor_strategy(editor_strategy_index(group.strategy));
                     app.set_editor_sni(SharedString::from(group.sni.clone().unwrap_or_default()));
                     app.set_editor_deletable(!builtins.contains(&group.id));
@@ -793,6 +796,7 @@ fn wire_window(app: &AppWindow, ctx: &UiContext) {
                     app.set_editor_id(SharedString::new());
                     app.set_editor_name(SharedString::new());
                     app.set_editor_domains(SharedString::new());
+                    app.set_editor_homepage(SharedString::new());
                     app.set_editor_strategy(0);
                     app.set_editor_sni(SharedString::new());
                     app.set_editor_deletable(false);
@@ -1248,6 +1252,7 @@ struct SiteDraft {
     is_new: bool,
     name: String,
     domains: String,
+    homepage: String,
     strategy: Strategy,
     sni: String,
 }
@@ -1304,6 +1309,19 @@ fn build_group(config: &AppConfig, draft: &SiteDraft) -> Result<GroupConfig> {
     } else {
         draft.name.trim().to_string()
     };
+    let homepage = match draft.homepage.trim() {
+        "" => None,
+        raw => {
+            let candidate = if raw.contains("://") {
+                raw.to_string()
+            } else {
+                format!("https://{raw}")
+            };
+            hakimi_core::config::validate_catalog_url(&candidate, "访问地址")
+                .with_context(|| "访问地址格式不正确")?;
+            Some(candidate)
+        }
+    };
     let sni = draft.sni.trim().to_ascii_lowercase();
     if !sni.is_empty() {
         hakimi_core::domain::normalize_hostname(&sni).context("SNI 主机格式不正确")?;
@@ -1322,6 +1340,7 @@ fn build_group(config: &AppConfig, draft: &SiteDraft) -> Result<GroupConfig> {
     };
     group.name = name;
     group.domains = domains;
+    group.homepage = homepage;
     group.strategy = draft.strategy;
     // An empty preset is meaningful for fake SNI: it means "send no SNI".
     group.sni = if draft.strategy == Strategy::FakeSni || !sni.is_empty() {
@@ -1344,6 +1363,7 @@ fn save_site(runtime: &HakimiRuntime, app: &AppWindow) -> Result<()> {
         is_new: app.get_editor_is_new(),
         name: app.get_editor_name().to_string(),
         domains: app.get_editor_domains().to_string(),
+        homepage: app.get_editor_homepage().to_string(),
         strategy: strategy_from_index(app.get_editor_strategy()),
         sni: app.get_editor_sni().to_string(),
     };
@@ -1517,6 +1537,7 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
             app.set_editor_is_new(true);
             app.set_editor_strategy(3);
             app.set_editor_sni(SharedString::from(""));
+            app.set_editor_homepage(SharedString::new());
             app.set_editor_open(true);
         }
         Ok(_) => {
@@ -1528,6 +1549,7 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
             ));
             app.set_editor_strategy(3);
             app.set_editor_sni(SharedString::from(""));
+            app.set_editor_homepage(SharedString::from("https://www.pixiv.net/"));
             app.set_editor_deletable(false);
             app.set_editor_open(true);
         }
@@ -1981,6 +2003,7 @@ mod tests {
             is_new: true,
             name: String::new(),
             domains: domains.into(),
+            homepage: String::new(),
             strategy,
             sni: sni.into(),
         }
@@ -2110,9 +2133,34 @@ mod tests {
             is_new,
             name: String::new(),
             domains: domains.into(),
+            homepage: String::new(),
             strategy,
             sni: sni.into(),
         }
+    }
+
+    #[test]
+    fn new_site_homepage_is_normalized_and_optional() {
+        let config = AppConfig::default();
+        let mut site = draft("www.example.com", Strategy::Auto, "");
+
+        // Blank means "use the first exact domain" at render time.
+        assert_eq!(build_group(&config, &site).unwrap().homepage, None);
+
+        site.homepage = "example.com".into();
+        assert_eq!(
+            build_group(&config, &site).unwrap().homepage.as_deref(),
+            Some("https://example.com")
+        );
+
+        site.homepage = "https://www.example.com/path".into();
+        assert_eq!(
+            build_group(&config, &site).unwrap().homepage.as_deref(),
+            Some("https://www.example.com/path")
+        );
+
+        site.homepage = "file:///etc/passwd".into();
+        assert!(build_group(&config, &site).is_err());
     }
 
     #[test]

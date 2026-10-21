@@ -615,6 +615,7 @@ export component AppWindow inherits Window {
     in-out property <string> editor-id;
     in-out property <string> editor-name;
     in-out property <string> editor-domains;
+    in-out property <string> editor-homepage;
     in-out property <int> editor-strategy: 0;
     in-out property <string> editor-sni;
     in property <string> editor-error;
@@ -1776,6 +1777,19 @@ export component AppWindow inherits Window {
                         wrap: word-wrap;
                         font-size: 12px;
                         placeholder-text: "每行一个，可粘贴网址，例如 www.example.com";
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 5px;
+                    Text {
+                        text: "访问地址（可选）";
+                        font-size: 11px;
+                        color: #6B7480;
+                    }
+                    LineEdit {
+                        text <=> root.editor-homepage;
+                        placeholder-text: "例如 https://www.example.com/，留空使用第一个域名";
                     }
                 }
 
