@@ -216,9 +216,15 @@ impl CacheManager {
             Ok(json) => {
                 if let Err(error) = atomic_write(&self.path, json.as_bytes()) {
                     tracing::warn!(error = %error, "failed to persist cache");
+                    // Keep the flag: the next tick retries the write instead of
+                    // dropping the change on the floor.
+                    self.dirty.store(true, Ordering::SeqCst);
                 }
             }
-            Err(error) => tracing::warn!(error = %error, "failed to encode cache"),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to encode cache");
+                self.dirty.store(true, Ordering::SeqCst);
+            }
         }
         true
     }
@@ -672,6 +678,23 @@ mod tests {
         let scores = cache.ip_scores();
         assert_eq!(scores[0].2.successes, 3);
         assert_eq!(scores[0].2.ewma_ms, 90.0);
+    }
+
+    /// A write that fails must stay scheduled: the change may not be lost
+    /// because the disk was busy for a moment.
+    #[test]
+    fn a_failed_write_is_retried_on_the_next_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let cache = CacheManager::load(&path).unwrap();
+        // A directory in place of the state file makes every write fail.
+        std::fs::create_dir_all(&path).unwrap();
+        cache.mark_skip_once(["example.com"]);
+        assert!(cache.flush_if_dirty(), "the first flush attempts the write");
+        assert!(
+            cache.flush_if_dirty(),
+            "a failed write has to stay scheduled for the next flush"
+        );
     }
 
     #[tokio::test]
