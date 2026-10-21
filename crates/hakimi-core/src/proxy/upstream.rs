@@ -53,7 +53,7 @@ pub(crate) async fn handle_forward(
     let host_uri = upstream_uri.clone();
     let host: &str = target_host(normalized_host.as_deref(), host_uri.as_ref());
 
-    let upgrade_requested = is_upgrade(&req);
+    let upgrade_requested = is_upgrade(req.headers());
     let mut req = req;
     let client_upgrade = if upgrade_requested {
         Some(upgrade::on(&mut req))
@@ -118,7 +118,14 @@ struct Target {
 fn target_host<'a>(normalized_host: Option<&'a str>, upstream_uri: Option<&'a Uri>) -> &'a str {
     match normalized_host {
         Some(host) => host,
-        None => upstream_uri.and_then(|uri| uri.host()).unwrap_or(""),
+        None => {
+            let host = upstream_uri.and_then(|uri| uri.host()).unwrap_or("");
+            // An IPv6 literal keeps its brackets in the authority.
+            match host.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+                Some(inner) => inner,
+                None => host,
+            }
+        }
     }
 }
 
@@ -147,6 +154,13 @@ impl MitmTarget {
 fn target_of<B>(req: &Request<B>) -> Result<Target> {
     let uri = req.uri();
     if let (Some(scheme), Some(host)) = (uri.scheme_str(), uri.host()) {
+        // The brackets of an IPv6 literal belong to the authority, not to the
+        // host.  Keeping them would make the host look like a domain name and
+        // the request would bypass every group.
+        let host = match host.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+            Some(inner) => inner,
+            None => host,
+        };
         let https = match scheme {
             "https" => true,
             "http" => false,
@@ -253,7 +267,7 @@ pub(crate) async fn handle_mitm_request(
             )
         }
     };
-    let upgrade_requested = is_upgrade(&req);
+    let upgrade_requested = is_upgrade(req.headers());
     let mut req = req;
     let client_upgrade = if upgrade_requested {
         Some(upgrade::on(&mut req))
@@ -362,19 +376,17 @@ fn same_host(candidate: &str, expected: &str) -> bool {
     candidate.eq_ignore_ascii_case(expected)
 }
 
-fn is_upgrade(req: &Request<Incoming>) -> bool {
-    req.headers().contains_key(header::UPGRADE)
-        && req
-            .headers()
+fn is_upgrade(headers: &HeaderMap) -> bool {
+    headers.contains_key(header::UPGRADE)
+        && headers
             .get(header::CONNECTION)
             .and_then(|value| value.to_str().ok())
-            // Same substring test as the old lowercase+contains, without
-            // allocating a String for every WebSocket request.
+            // Compare the comma separated tokens instead of searching for a
+            // substring: `Connection: x-upgrade` is not an upgrade request.
             .map(|value| {
                 value
-                    .as_bytes()
-                    .windows(7)
-                    .any(|window| window.eq_ignore_ascii_case(b"upgrade"))
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
             })
             .unwrap_or(true)
 }
@@ -666,11 +678,11 @@ fn attempt_row(attempt: &AttemptRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        authority, build_upstream_uri, host_header_name, same_host, target_host, target_of,
-        MitmTarget, Target,
+        authority, build_upstream_uri, host_header_name, is_upgrade, same_host, target_host,
+        target_of, MitmTarget, Target,
     };
-    use http::{Request, Uri};
     use http::uri::PathAndQuery;
+    use http::{HeaderMap, Request, Uri};
 
     fn host_of(target: &Target) -> &str {
         target_host(
@@ -703,9 +715,34 @@ mod tests {
         assert_eq!(target.authority.as_str(), "example.com:8443");
     }
 
+    fn headers(upgrade: bool, connection: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if upgrade {
+            headers.insert("upgrade", "websocket".parse().unwrap());
+        }
+        if let Some(connection) = connection {
+            headers.insert("connection", connection.parse().unwrap());
+        }
+        headers
+    }
+
     #[test]
-    fn authority_brackets_ipv6_literals() {
-        assert_eq!(authority("2001:db8::1", 443, true), "[2001:db8::1]");
+    fn upgrade_detection_needs_the_exact_token() {
+        assert!(is_upgrade(&headers(true, Some("Upgrade"))));
+        assert!(is_upgrade(&headers(true, Some("upgrade"))));
+        assert!(is_upgrade(&headers(true, Some("keep-alive, Upgrade"))));
+        assert!(is_upgrade(&headers(true, Some("UPGRADE"))));
+        // A missing Connection header still means "upgrade".
+        assert!(is_upgrade(&headers(true, None)));
+        // Not the upgrade token.
+        assert!(!is_upgrade(&headers(true, Some("x-upgrade"))));
+        assert!(!is_upgrade(&headers(true, Some("keep-alive"))));
+        // No Upgrade header at all.
+        assert!(!is_upgrade(&headers(false, Some("Upgrade"))));
+    }
+
+    #[test]
+    fn authority_brackets_ipv6_literals() {        assert_eq!(authority("2001:db8::1", 443, true), "[2001:db8::1]");
         assert_eq!(authority("2001:db8::1", 8443, true), "[2001:db8::1]:8443");
         assert_eq!(authority("example.com", 443, true), "example.com");
         assert_eq!(authority("example.com", 8443, true), "example.com:8443");
@@ -771,6 +808,70 @@ mod tests {
             target.upstream_uri.is_none(),
             "an explicit default port is rebuilt to the previous authority"
         );
+    }
+
+    #[test]
+    fn absolute_form_edge_cases() {
+        // Userinfo must not be forwarded: the request is rebuilt without it.
+        let req = Request::builder()
+            .uri("http://user:pass@example.com/path")
+            .body(())
+            .unwrap();
+        let target = target_of(&req).unwrap();
+        assert!(target.upstream_uri.is_none(), "userinfo forces a rebuild");
+        assert_eq!(host_of(&target), "example.com");
+
+        // An IPv6 literal is a host, not a domain name: the brackets belong
+        // to the authority.
+        let req = Request::builder()
+            .uri("http://[2001:db8::1]/path")
+            .body(())
+            .unwrap();
+        let target = target_of(&req).unwrap();
+        assert_eq!(host_of(&target), "2001:db8::1");
+
+        // A URL without a path still has one.  The reusable form keeps it in
+        // the URI, the rebuilt form in `path_and_query`.
+        let req = Request::builder().uri("http://example.com").body(()).unwrap();
+        let target = target_of(&req).unwrap();
+        assert_eq!(host_of(&target), "example.com");
+        let path = target
+            .upstream_uri
+            .as_ref()
+            .map(|uri| uri.path().to_string())
+            .or_else(|| {
+                target
+                    .path_and_query
+                    .as_ref()
+                    .map(|value| value.as_str().to_string())
+            });
+        assert_eq!(path.as_deref(), Some("/"));
+
+        // A query without a path is impossible, but an empty path is.
+        let req = Request::builder()
+            .uri("http://example.com?a=1")
+            .body(())
+            .unwrap();
+        let target = target_of(&req).unwrap();
+        let path = target
+            .upstream_uri
+            .as_ref()
+            .map(|uri| uri.path_and_query().map(|value| value.as_str().to_string()))
+            .flatten()
+            .or_else(|| {
+                target
+                    .path_and_query
+                    .as_ref()
+                    .map(|value| value.as_str().to_string())
+            });
+        // The URI keeps its empty path, the query is what matters.
+        assert_eq!(path.as_deref(), Some("?a=1"));
+    }
+
+    #[test]
+    fn origin_form_without_host_header_is_rejected() {
+        let req = Request::builder().uri("/path").body(()).unwrap();
+        assert!(target_of(&req).is_err());
     }
 
     #[test]

@@ -352,6 +352,101 @@ mod tests {
         assert!(DomainPattern::parse("bad*pattern.com").is_err());
     }
 
+    /// The behaviour of `normalize_hostname` before the borrowing fast path
+    /// existed.  The fast path must not change any decision, only the
+    /// allocation behaviour.
+    fn reference_normalize(input: &str) -> Result<String> {
+        let mut host = input.trim().to_ascii_lowercase();
+        if host.ends_with('.') {
+            host.pop();
+        }
+        if host.is_empty() {
+            bail!("empty host name");
+        }
+        if host.contains(':') {
+            bail!("`{input}` is not a domain name");
+        }
+        let ascii = if host.is_ascii() {
+            host
+        } else {
+            idna::domain_to_ascii(&host)
+                .map_err(|err| anyhow::anyhow!("invalid internationalized domain `{input}`: {err:?}"))?
+        };
+        if ascii.len() > 253 {
+            bail!("domain name is longer than 253 characters");
+        }
+        for label in ascii.split('.') {
+            if label.is_empty() {
+                bail!("domain name contains an empty label");
+            }
+            if label.len() > 63 {
+                bail!("domain label is longer than 63 characters");
+            }
+            if label.starts_with('-') || label.ends_with('-') {
+                bail!("domain label `{label}` starts or ends with a hyphen");
+            }
+            if !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                bail!("domain label `{label}` contains unsupported characters");
+            }
+        }
+        Ok(ascii)
+    }
+
+    #[test]
+    fn cow_normalization_matches_the_previous_behaviour() {
+        let long_label = "a".repeat(64);
+        let long_host = std::iter::repeat("a".repeat(63) + ".")
+            .take(4)
+            .collect::<String>()
+            + "com";
+        let cases = [
+            "",
+            " ",
+            ".",
+            "..",
+            "a.",
+            "a..b",
+            "A.COM",
+            "a.com.",
+            " a.com. ",
+            "example.com",
+            "xn--bcher-kva.example",
+            "bücher.example",
+            "2001:db8::1",
+            "host:443",
+            "a.com/path",
+            "a.com:80",
+            "1.2.3.4",
+            "0.0.0.0",
+            "under_score.com",
+            "-lead.com",
+            "trail-.com",
+            "a b.com",
+            "a.com\n",
+            "\ta.com",
+            long_label.as_str(),
+            long_host.as_str(),
+        ];
+        for input in cases {
+            let expected = reference_normalize(input);
+            let actual = normalize_hostname_cow(input);
+            match (&expected, &actual) {
+                (Ok(expected), Ok(actual)) => assert_eq!(
+                    expected.as_str(),
+                    actual.as_ref(),
+                    "different result for {input:?}"
+                ),
+                (Err(_), Err(_)) => {}
+                (expected, actual) => panic!(
+                    "different outcome for {input:?}: old={expected:?} new={actual:?}"
+                ),
+            }
+        }
+    }
+
     #[test]
     fn cow_normalization_borrows_canonical_hosts_only() {
         assert!(matches!(
