@@ -99,6 +99,16 @@ pub struct IpScoreEntry {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One IP quality sample to persist.
+#[derive(Debug, Clone, Copy)]
+pub struct IpScoreUpdate<'a> {
+    pub domain: &'a str,
+    pub ip: IpAddr,
+    pub ewma_ms: f64,
+    pub successes: u32,
+    pub failures: u32,
+}
+
 /// How many (domain, ip) quality entries to keep at most. The active set of a
 /// heavy user stays well below this.
 const MAX_IP_SCORES: usize = 1024;
@@ -312,37 +322,77 @@ impl CacheManager {
             .collect()
     }
 
+    /// Persist one connection outcome: the remembered route and the IP quality
+    /// sample. One write lock covers both.
+    pub fn record_outcome(
+        &self,
+        last_good: Option<LastGoodEntry>,
+        score: Option<IpScoreUpdate<'_>>,
+    ) {
+        let mut data = self.data.write();
+        let timestamp = now();
+        let mut changed = false;
+        if let Some(entry) = last_good {
+            let fresh = data.last_good.get(&entry.domain).is_some_and(|existing| {
+                existing.ip == entry.ip
+                    && existing.strategy == entry.strategy
+                    && existing.source == entry.source
+                    && timestamp.signed_duration_since(existing.saved_at) < Duration::seconds(60)
+            });
+            if !fresh {
+                data.last_good.insert(entry.domain.clone(), entry);
+                if data.last_good.len() > MAX_LAST_GOOD {
+                    self.prune_last_good(&mut data);
+                }
+                changed = true;
+            }
+        }
+        if let Some(score) = score {
+            let key = format!("{}|{}", score.domain, score.ip);
+            data.ip_scores.insert(
+                key,
+                IpScoreEntry {
+                    ewma_ms: score.ewma_ms,
+                    successes: score.successes,
+                    failures: score.failures,
+                    updated_at: timestamp,
+                },
+            );
+            // Prune lazily: a full scan on every write (record_ip runs on every
+            // connection outcome) is wasted work; the map is bounded and the
+            // periodic flush already drops aged entries via `expire`.
+            if data.ip_scores.len() > MAX_IP_SCORES {
+                let mut by_age: Vec<(String, DateTime<Utc>)> = data
+                    .ip_scores
+                    .iter()
+                    .map(|(key, entry)| (key.clone(), entry.updated_at))
+                    .collect();
+                by_age.sort_by_key(|(_, at)| *at);
+                let overflow = data.ip_scores.len() - IP_SCORE_PRUNE_TO;
+                for (key, _) in by_age.into_iter().take(overflow) {
+                    data.ip_scores.remove(&key);
+                }
+            }
+            changed = true;
+        }
+        if changed {
+            self.mark_dirty(&data);
+        }
+    }
+
     /// Upsert one quality entry. Keeps the map bounded: entries past the widest
     /// freshness window are dropped, then the oldest beyond the cap.
     pub fn put_ip_score(&self, domain: &str, ip: IpAddr, ewma_ms: f64, successes: u32, failures: u32) {
-        let mut data = self.data.write();
-        let now = now();
-        let key = format!("{domain}|{ip}");
-        data.ip_scores.insert(
-            key,
-            IpScoreEntry {
+        self.record_outcome(
+            None,
+            Some(IpScoreUpdate {
+                domain,
+                ip,
                 ewma_ms,
                 successes,
                 failures,
-                updated_at: now,
-            },
+            }),
         );
-        // Prune lazily: a full scan on every write (record_ip runs on every
-        // connection outcome) is wasted work; the map is bounded and the
-        // periodic flush already drops aged entries via `expire`.
-        if data.ip_scores.len() > MAX_IP_SCORES {
-            let mut by_age: Vec<(String, DateTime<Utc>)> = data
-                .ip_scores
-                .iter()
-                .map(|(key, entry)| (key.clone(), entry.updated_at))
-                .collect();
-            by_age.sort_by_key(|(_, at)| *at);
-            let overflow = data.ip_scores.len() - IP_SCORE_PRUNE_TO;
-            for (key, _) in by_age.into_iter().take(overflow) {
-                data.ip_scores.remove(&key);
-            }
-        }
-        self.mark_dirty(&data);
     }
 
     /// Drop remembered routes that no freshness setting can use anymore, and cap
@@ -392,24 +442,7 @@ impl CacheManager {
     }
 
     pub fn put_last_good(&self, entry: LastGoodEntry) {
-        let mut data = self.data.write();
-        let timestamp = now();
-        if let Some(existing) = data.last_good.get(&entry.domain) {
-            if existing.ip == entry.ip
-                && existing.strategy == entry.strategy
-                && existing.source == entry.source
-                && timestamp.signed_duration_since(existing.saved_at) < Duration::seconds(60)
-            {
-                return;
-            }
-        }
-        data.last_good.insert(entry.domain.clone(), entry);
-        // A read-time age check already ignores stale routes; only pay for the
-        // full scan/sort when the map actually needs bounding.
-        if data.last_good.len() > MAX_LAST_GOOD {
-            self.prune_last_good(&mut data);
-        }
-        self.mark_dirty(&data);
+        self.record_outcome(Some(entry), None);
     }
 
     pub fn remove_last_good(&self, domain: &str) {

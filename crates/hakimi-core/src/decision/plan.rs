@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -115,16 +114,4 @@ pub(super) fn mode_for_strategy(strategy: Strategy) -> TlsMode {
         Strategy::FakeSni => TlsMode::FakeSni,
         Strategy::Auto => TlsMode::Direct,
     }
-}
-
-pub(super) fn plan_key(domain: &str, port: u16, tls: bool) -> String {
-    let domain = domain.trim().trim_end_matches('.');
-    // The proxy passes already-normalized domains on the hot path; only
-    // allocate a lowercase copy when the caller actually preserved case.
-    let domain = if domain.bytes().any(|byte| byte.is_ascii_uppercase()) {
-        Cow::Owned(domain.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(domain)
-    };
-    format!("{domain}|{port}|{tls}")
 }

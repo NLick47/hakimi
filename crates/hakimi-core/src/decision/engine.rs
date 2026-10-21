@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::cache::{CacheManager, LastGoodEntry};
+use crate::cache::{CacheManager, IpScoreUpdate, LastGoodEntry};
 use crate::catalog::RemoteIpProvider;
 use crate::config::{AppConfig, ConfigManager, GroupConfig};
 use crate::domain::normalize_hostname;
@@ -15,7 +15,7 @@ use crate::strategy::{CacheStatus, FailureReason, IpSource, TlsMode};
 use crate::util::{network_id, now};
 
 use super::cursor::{Route, RouteCursor};
-use super::plan::{plan_key, ConnectPlan, DecisionOutcome, Prober};
+use super::plan::{ConnectPlan, DecisionOutcome, Prober};
 use super::score::{IpScore, IP_SCORE_CAP, IP_SCORE_PRUNE_TO};
 use super::types::{Candidate, DohExpansion};
 
@@ -28,7 +28,10 @@ pub struct DecisionEngine {
     pub status: Arc<StatusStore>,
     /// Last successful route per authority. New pooled connections start here, so a
     /// connection failure is the only event that triggers re-resolution.
-    pub(super) plan_cache: parking_lot::Mutex<HashMap<String, (Instant, Arc<ConnectPlan>)>>,
+    /// Read on every new connection, written on every success. Keyed by
+    /// domain first so a lookup needs no formatted key.
+    pub(super) plan_cache:
+        parking_lot::RwLock<HashMap<String, HashMap<(u16, bool), (Instant, Arc<ConnectPlan>)>>>,
     /// Per (domain, IP) observations. Candidates are ordered by score, so a host picks the
     /// address that has actually been fast on this network instead of a static list.
     pub(super) ip_scores: parking_lot::RwLock<HashMap<String, HashMap<IpAddr, IpScore>>>,
@@ -72,7 +75,7 @@ impl DecisionEngine {
             resolver,
             prober,
             status,
-            plan_cache: parking_lot::Mutex::new(HashMap::new()),
+            plan_cache: parking_lot::RwLock::new(HashMap::new()),
             ip_scores: parking_lot::RwLock::new(seeded_scores),
             ip_score_count: AtomicUsize::new(ip_score_count),
         })
@@ -253,17 +256,18 @@ impl DecisionEngine {
     /// Last successful plan for a new connection. Established pooled connections never
     /// consult this, so it only affects cold connections and raw CONNECT tunnels.
     pub fn cached_plan(&self, domain: &str, port: u16, tls: bool) -> Option<Arc<ConnectPlan>> {
-        let key = plan_key(domain, port, tls);
         let (config, matcher) = self.config.snapshot_and_matcher();
         let ttl = Duration::from_secs(config.advanced.plan_cache_secs);
-        let mut cache = self.plan_cache.lock();
-        let (at, plan) = cache.get(&key)?;
-        if at.elapsed() >= ttl {
-            cache.remove(&key);
+        let (at, plan) = {
+            let cache = self.plan_cache.read();
+            let (at, plan) = cache.get(domain)?.get(&(port, tls))?;
+            (at.elapsed(), plan.clone())
+        };
+        if at >= ttl {
+            self.forget_plan(domain, port, tls);
             return None;
         }
-        let plan = plan.clone();
-        drop(cache);
+        let plan = plan;
 
         // A catalog update marks affected domains skipOnce: do not reuse the old route
         // before the new remote IPs have been attempted.
@@ -308,7 +312,15 @@ impl DecisionEngine {
     }
 
     pub fn forget_plan(&self, domain: &str, port: u16, tls: bool) {
-        self.plan_cache.lock().remove(&plan_key(domain, port, tls));
+        let mut cache = self.plan_cache.write();
+        let mut empty = false;
+        if let Some(inner) = cache.get_mut(domain) {
+            inner.remove(&(port, tls));
+            empty = inner.is_empty();
+        }
+        if empty {
+            cache.remove(domain);
+        }
     }
 
     /// Drop every remembered route. A network change invalidates the in-memory
@@ -317,7 +329,7 @@ impl DecisionEngine {
     /// hedge it against fresh candidates instead of blocking on it through the
     /// single-route fast path.
     pub fn forget_all_plans(&self) {
-        self.plan_cache.lock().clear();
+        self.plan_cache.write().clear();
     }
 
     pub(super) fn score_ip(&self, domain: &str, ip: IpAddr) -> f64 {
@@ -336,6 +348,22 @@ impl DecisionEngine {
         latency_ms: Option<u64>,
         failed: bool,
     ) -> bool {
+        let (degraded, score) = self.record_ip_in_memory(domain, ip, latency_ms, failed);
+        // Persist both outcomes: a restart must keep knowing that this IP was
+        // fast — or blocked — on this network. The cache batches disk writes.
+        self.cache.record_outcome(None, score);
+        degraded
+    }
+
+    /// Update the in-memory quality table and hand the sample back so the
+    /// caller can persist it together with the rest of the outcome.
+    pub(super) fn record_ip_in_memory<'a>(
+        &self,
+        domain: &'a str,
+        ip: IpAddr,
+        latency_ms: Option<u64>,
+        failed: bool,
+    ) -> (bool, Option<IpScoreUpdate<'a>>) {
         let (snapshot, degraded) = {
             let mut scores = self.ip_scores.write();
             let (is_new, snapshot, degraded) = {
@@ -414,38 +442,67 @@ impl DecisionEngine {
             }
             (snapshot, degraded)
         };
-        // Persist both outcomes: a restart must keep knowing that this IP was
-        // fast — or blocked — on this network. The cache batches disk writes.
-        self.cache
-            .put_ip_score(domain, ip, snapshot.0, snapshot.1, snapshot.2);
-        degraded
+        let score = IpScoreUpdate {
+            domain,
+            ip,
+            ewma_ms: snapshot.0,
+            successes: snapshot.1,
+            failures: snapshot.2,
+        };
+        (degraded, Some(score))
     }
 
     /// Store a plan that is already shared. The plan cache keeps the same
     /// allocation, so a successful connection no longer deep-copies the
     /// domain, group and SNI strings.
     pub(super) fn remember_plan_arc(&self, plan: Arc<ConnectPlan>) {
-        let key = plan_key(&plan.domain, plan.port, plan.tls);
-        let mut cache = self.plan_cache.lock();
-        if cache.len() >= PLAN_CACHE_MAX {
+        let mut cache = self.plan_cache.write();
+        let total: usize = cache.values().map(|inner| inner.len()).sum();
+        if total >= PLAN_CACHE_MAX {
             let ttl = Duration::from_secs(self.config.snapshot().advanced.plan_cache_secs);
-            cache.retain(|_, (at, _)| at.elapsed() < ttl);
+            for inner in cache.values_mut() {
+                inner.retain(|_, (at, _)| at.elapsed() < ttl);
+            }
+            cache.retain(|_, inner| !inner.is_empty());
             // A crawler can push more than the cap of *fresh* plans in the TTL
             // window; keep the newest instead of scanning the full map on every
             // subsequent success.
-            if cache.len() >= PLAN_CACHE_MAX {
-                let mut ages: Vec<(String, Instant)> = cache
-                    .iter()
-                    .map(|(key, (at, _))| (key.clone(), *at))
-                    .collect();
-                ages.sort_by_key(|(_, at)| *at);
-                let excess = cache.len() - PLAN_CACHE_PRUNE_TO;
-                for (key, _) in ages.into_iter().take(excess) {
-                    cache.remove(&key);
+            let total: usize = cache.values().map(|inner| inner.len()).sum();
+            if total >= PLAN_CACHE_MAX {
+                let mut ages: Vec<(String, u16, bool, Instant)> = Vec::new();
+                for (domain, inner) in cache.iter() {
+                    for ((port, tls), (at, _)) in inner.iter() {
+                        ages.push((domain.clone(), *port, *tls, *at));
+                    }
+                }
+                ages.sort_by_key(|(_, _, _, at)| *at);
+                let excess = total - PLAN_CACHE_PRUNE_TO;
+                for (domain, port, tls, _) in ages.into_iter().take(excess) {
+                    let mut empty = false;
+                    if let Some(inner) = cache.get_mut(&domain) {
+                        inner.remove(&(port, tls));
+                        empty = inner.is_empty();
+                    }
+                    if empty {
+                        cache.remove(&domain);
+                    }
                 }
             }
         }
-        cache.insert(key, (Instant::now(), plan));
+        let domain = plan.domain.clone();
+        let port = plan.port;
+        let tls = plan.tls;
+        let entry = (Instant::now(), plan);
+        match cache.get_mut(&domain) {
+            Some(inner) => {
+                inner.insert((port, tls), entry);
+            }
+            None => {
+                let mut inner = HashMap::new();
+                inner.insert((port, tls), entry);
+                cache.insert(domain, inner);
+            }
+        }
     }
 
     /// TCP-probe IPs that accumulated failures and forgive the ones that answer
@@ -525,15 +582,6 @@ impl DecisionEngine {
         doh: &DohExpansion,
         config: &AppConfig,
     ) -> Arc<DomainDiagnostics> {
-        self.cache.put_last_good(LastGoodEntry {
-            domain: plan.domain.clone(),
-            ip: plan.ip,
-            strategy: plan.mode.cache_strategy(),
-            source: plan.source,
-            network_id: network_id(),
-            saved_at: now(),
-            catalog_version: config.catalog_version,
-        });
         let cache_status = match plan.source {
             IpSource::Cache => CacheStatus::Fresh,
             IpSource::DohCache => CacheStatus::Stale,
@@ -579,7 +627,21 @@ impl DecisionEngine {
             attempts,
             suggestions: Vec::new(),
         });
-        let degraded = self.record_ip(&plan.domain, plan.ip, Some(latency_ms), false);
+        let (degraded, score) =
+            self.record_ip_in_memory(&plan.domain, plan.ip, Some(latency_ms), false);
+        // One cache write for the route and the quality sample.
+        self.cache.record_outcome(
+            Some(LastGoodEntry {
+                domain: plan.domain.clone(),
+                ip: plan.ip,
+                strategy: plan.mode.cache_strategy(),
+                source: plan.source,
+                network_id: network_id(),
+                saved_at: now(),
+                catalog_version: config.catalog_version,
+            }),
+            score,
+        );
         self.remember_plan_arc(plan.clone());
         if degraded {
             // The proven route suddenly got slow: drop the cached plan so the next
@@ -589,9 +651,7 @@ impl DecisionEngine {
                 latency_ms,
                 "route degraded; re-racing routes on the next connection"
             );
-            self.plan_cache
-                .lock()
-                .remove(&plan_key(&plan.domain, plan.port, plan.tls));
+            self.forget_plan(&plan.domain, plan.port, plan.tls);
         }
         self.status.record_arc(diagnostics.clone());
         tracing::info!(

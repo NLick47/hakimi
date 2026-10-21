@@ -61,6 +61,12 @@ pub(super) fn build_leaf_config(
         .with_single_cert(chain, key)
         .context("installing local leaf certificate")?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // TLS 1.3 session tickets: without a ticketer rustls only does stateful
+    // TLS 1.2 session ids, so a repeat CONNECT repeats the local handshake.
+    // One ticketer per leaf, so a ticket never crosses hosts.
+    if let Ok(ticketer) = rustls::crypto::aws_lc_rs::Ticketer::new() {
+        config.ticketer = ticketer;
+    }
     Ok(Arc::new(config))
 }
 

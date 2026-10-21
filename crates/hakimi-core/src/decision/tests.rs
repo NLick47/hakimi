@@ -18,7 +18,6 @@ use crate::util::{network_id, now};
 use anyhow::Result;
 
 use super::engine::PLAN_CACHE_MAX;
-use super::plan::plan_key;
 use super::*;
 
 #[derive(Default)]
@@ -446,14 +445,13 @@ fn plan_cache_stays_bounded_when_every_entry_is_fresh() {
         plan.domain = format!("h{i}.example.com");
         h.engine.remember_plan_arc(Arc::new(plan));
     }
-    let cache = h.engine.plan_cache.lock();
-    assert!(cache.len() <= PLAN_CACHE_MAX);
+    let cache = h.engine.plan_cache.read();
+    let total: usize = cache.values().map(|inner| inner.len()).sum();
+    assert!(total <= PLAN_CACHE_MAX);
     assert!(
-        cache.contains_key(&plan_key(
-            &format!("h{}.example.com", PLAN_CACHE_MAX + 99),
-            443,
-            true
-        )),
+        cache
+            .get(&format!("h{}.example.com", PLAN_CACHE_MAX + 99))
+            .is_some_and(|inner| inner.contains_key(&(443, true))),
         "the newest plan must survive the prune"
     );
 }

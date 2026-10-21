@@ -41,6 +41,9 @@ fn leaf_config_covers_real_domain() {
     // Cached leaf is reused.
     let config2 = ca.server_config("github.com").unwrap();
     assert!(Arc::ptr_eq(&config, &config2));
+    // A ticketer is required for TLS 1.3 session tickets, without them a
+    // repeat CONNECT repeats the full local handshake.
+    assert!(config.ticketer.enabled());
 }
 
 #[test]

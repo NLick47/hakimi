@@ -4,6 +4,7 @@
 //! material and platform trust-store commands live in submodules so each can be
 //! tested and audited on its own.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,6 +71,8 @@ pub struct CertificateAuthority {
     // Trust status costs a `security find-certificate` subprocess on macOS;
     // it only changes when the user (de)installs, so cache it briefly.
     status_cache: Mutex<Option<(Instant, CaStatus)>>,
+    /// Mirror of the cached snapshot's `installed` flag.
+    installed_flag: AtomicBool,
     // A subprocess must never run under `status_cache` (that would block every
     // CONNECT and UI probe behind Keychain). Concurrent callers reuse the last
     // snapshot instead of piling up more `security` processes; operations that
@@ -102,6 +105,7 @@ impl CertificateAuthority {
             material: RwLock::new(Arc::new(material)),
             leaves: RwLock::new(HashMap::new()),
             status_cache: Mutex::new(None),
+            installed_flag: AtomicBool::new(false),
             probe_lock: Mutex::new(()),
             busy: AtomicBool::new(false),
         }))
@@ -125,8 +129,14 @@ impl CertificateAuthority {
 
     /// Build (or reuse) a rustls server config with a locally signed leaf certificate.
     pub fn server_config(&self, domain: &str) -> Result<Arc<ServerConfig>> {
-        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-        if let Some(entry) = self.leaves.read().get(&domain).cloned() {
+        // The CONNECT path already passes a normalized host.
+        let domain = domain.trim_end_matches('.');
+        let key = if domain.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            Cow::Owned(domain.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(domain)
+        };
+        if let Some(entry) = self.leaves.read().get(key.as_ref()).cloned() {
             if OffsetDateTime::now_utc() - entry.created_at < TimeDuration::hours(LEAF_ROTATE_HOURS)
             {
                 return Ok(entry.config.clone());
@@ -137,10 +147,10 @@ impl CertificateAuthority {
         // `regenerate` could swap the CA and clear the cache between those two
         // steps, leaving a leaf signed by the retired CA in the fresh cache.
         let material = self.material.read();
-        let config = build_leaf_config(&domain, &material, self.provider.clone())?;
+        let config = build_leaf_config(&key, &material, self.provider.clone())?;
         let mut leaves = self.leaves.write();
         leaves.insert(
-            domain,
+            key.into_owned(),
             Arc::new(LeafEntry {
                 config: config.clone(),
                 created_at: OffsetDateTime::now_utc(),
@@ -156,12 +166,29 @@ impl CertificateAuthority {
     /// read in place without cloning every fingerprint/path string; stale or
     /// missing snapshots fall back to the full probe in [`Self::status`].
     pub fn installed(&self) -> bool {
+        // Trust state changes only when the user (de)installs the CA.
+        if self.installed_flag.load(Ordering::Relaxed) {
+            return true;
+        }
         if let Some((at, status)) = self.status_cache.lock().as_ref() {
             if at.elapsed() < CA_STATUS_TTL {
                 return status.installed;
             }
         }
         self.status().installed
+    }
+
+    /// Store (or drop) the cached trust snapshot.
+    fn store_status(&self, status: Option<CaStatus>) {
+        let mut cache = self.status_cache.lock();
+        match &status {
+            Some(status) => self
+                .installed_flag
+                .store(status.installed, Ordering::Relaxed),
+            // An invalidated snapshot means "unknown".
+            None => self.installed_flag.store(false, Ordering::Relaxed),
+        }
+        *cache = status.map(|status| (Instant::now(), status));
     }
 
     pub fn status(&self) -> CaStatus {
@@ -271,7 +298,7 @@ impl CertificateAuthority {
             error,
             note: trust_note(),
         };
-        *self.status_cache.lock() = Some((Instant::now(), status.clone()));
+        self.store_status(Some(status.clone()));
         status
     }
 
@@ -302,7 +329,7 @@ impl CertificateAuthority {
 
     /// Install the CA into the current user's trust store.
     pub fn install(&self) -> Result<CaStatus> {
-        *self.status_cache.lock() = None;
+        self.store_status(None);
         let was_installed = self.status_now().installed;
         self.install_with_rollback(was_installed)
     }
@@ -332,7 +359,7 @@ impl CertificateAuthority {
         // The pre-operation cache is stale now; the next status re-reads the
         // store. A failed or cancelled install must never be reported through
         // a leftover "installed" entry.
-        *self.status_cache.lock() = None;
+        self.store_status(None);
         match &result {
             Ok(()) => tracing::info!(fingerprint, "ca install command succeeded"),
             Err(error) => {
@@ -360,7 +387,7 @@ impl CertificateAuthority {
                     "nothing to roll back"
                 ),
             }
-            *self.status_cache.lock() = None;
+            self.store_status(None);
             status = self.status_now();
         }
         tracing::info!(
@@ -378,7 +405,7 @@ impl CertificateAuthority {
         let sha1 = self.material.read().fingerprint_sha1.clone();
         let fingerprint = short_fingerprint(&sha1);
         tracing::info!(fingerprint, "ca uninstall starting");
-        *self.status_cache.lock() = None;
+        self.store_status(None);
         // Fill the cache with the pre-operation state for mid-flight queries.
         let _ = self.status_now();
         let result = {
@@ -386,7 +413,7 @@ impl CertificateAuthority {
             // Explicit removal should drop the trust settings as well.
             uninstall_by_sha1(&sha1, true)
         };
-        *self.status_cache.lock() = None;
+        self.store_status(None);
         match &result {
             Ok(()) => tracing::info!(fingerprint, "ca uninstall command succeeded"),
             Err(error) => {
@@ -407,7 +434,7 @@ impl CertificateAuthority {
     pub fn repair(&self) -> Result<CaStatus> {
         let sha1 = self.material.read().fingerprint_sha1.clone();
         tracing::info!(fingerprint = short_fingerprint(&sha1), "ca repair starting");
-        *self.status_cache.lock() = None;
+        self.store_status(None);
         // A repair that gets cancelled should end where it started: if the CA
         // was trusted before, the re-imported copy may stay trusted.
         let was_installed = self.status_now().installed;
@@ -442,7 +469,7 @@ impl CertificateAuthority {
         self.leaves.write().clear();
         // The cached trust snapshot describes the old certificate; the new one
         // has not been imported anywhere yet.
-        *self.status_cache.lock() = None;
+        self.store_status(None);
         Ok(self.status_now())
     }
 }
