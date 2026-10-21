@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use hakimi_core::instance::{InstanceLock, InstanceLockError};
@@ -22,23 +22,6 @@ mod ui_state;
 pub(crate) fn data_dir() -> Option<PathBuf> {
     std::env::var_os("HAKIMI_DATA_DIR").map(PathBuf::from)
 }
-
-/// Releases the resident pages of a hidden window. The private commit stays,
-/// but the working set drops to what the background proxy still touches.
-/// Windows has an in-process call for this; the other platforms do not, so the
-/// hidden app keeps its working set there.
-#[cfg(windows)]
-fn trim_working_set() {
-    use windows_sys::Win32::System::ProcessStatus::EmptyWorkingSet;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    // SAFETY: the pseudo-handle always refers to this process.
-    unsafe {
-        let _ = EmptyWorkingSet(GetCurrentProcess());
-    }
-}
-
-#[cfg(not(windows))]
-fn trim_working_set() {}
 
 /// The window is a fixed light (Acrylic/Fluent) surface, so keep the macOS title bar
 /// in the same appearance even when the system is in dark mode.
@@ -669,6 +652,24 @@ fn apply_ui_update(
             settings,
         });
     });
+}
+
+/// Drops the rows and snapshots only the hidden window owns. The proxy's
+/// memory is deliberately left alone: forcing the process working set out
+/// would page out its hot code and connection state, hurt live traffic, and
+/// still not reduce committed memory. These UI structures really are
+/// disposable and are rebuilt from the runtime on the next visible tick.
+fn release_ui_caches(app: &AppWindow) {
+    SITES_MODEL.with(|cell| {
+        if let Some(model) = cell.borrow_mut().take() {
+            model.set_vec(Vec::new());
+        }
+    });
+    app.set_sites(ModelRc::new(VecModel::default()));
+    PREV_STATE.with(|slot| *slot.borrow_mut() = None);
+    REFRESH_CACHE.with(|slot| *slot.borrow_mut() = None);
+    CONFIG_CACHE.with(|slot| *slot.borrow_mut() = None);
+    ASSETS.with(|assets| assets.borrow_mut().clear());
 }
 
 pub(crate) fn load_assets() {
@@ -1340,14 +1341,28 @@ fn main() -> Result<()> {
     app.set_cfg_data_dir(SharedString::from(runtime.paths().root().display().to_string()));
     app.set_cfg_version(SharedString::from(env!("CARGO_PKG_VERSION")));
 
+    let expanded: Rc<std::cell::RefCell<HashSet<String>>> =
+        Rc::new(std::cell::RefCell::new(HashSet::new()));
+    if let Ok(id) = std::env::var("HAKIMI_UI_EXPAND") {
+        expanded.borrow_mut().insert(id);
+    }
+
     // System tray: keeps the app alive with the window closed, and mirrors the
     // window actions. The tray must be created on the main thread.
     let tray = TrayRoot::new()?;
     tray.on_show_main({
         let weak = app.as_weak();
+        let runtime = runtime.clone();
+        let expanded = expanded.clone();
+        let sweep = sweep.clone();
         move || {
             if let Some(app) = weak.upgrade() {
+                // The rows and icons were released while the window was
+                // hidden; reload and rebuild them before revealing it so the
+                // first frame is complete.
+                load_assets();
                 reveal_window(&app);
+                refresh(&app, &runtime, &expanded.borrow(), &sweep);
             }
         }
     });
@@ -1373,12 +1388,6 @@ fn main() -> Result<()> {
         let _ = slint::quit_event_loop();
     });
     TRAY.with(|slot| *slot.borrow_mut() = Some(tray));
-
-    let expanded: Rc<std::cell::RefCell<HashSet<String>>> =
-        Rc::new(std::cell::RefCell::new(HashSet::new()));
-    if let Ok(id) = std::env::var("HAKIMI_UI_EXPAND") {
-        expanded.borrow_mut().insert(id);
-    }
 
     // -- callbacks: direct calls, applied in the same frame --
     {
@@ -1720,16 +1729,17 @@ fn main() -> Result<()> {
     }
 
     // Periodic refresh picks up background activity (probe results, EWMA
-    // latency). A window parked in the tray has nothing to repaint, so the
-    // same tick releases its working set instead (immediately on hide, then
-    // every 30 s). The proxy and the environment probe keep running.
+    // latency). A window parked in the tray has nothing to repaint: skip the
+    // refresh and, on the hide transition, release the UI-owned rows/caches.
+    // The proxy keeps its memory and keeps serving; forcing the process
+    // working set out would only cause page faults and latency spikes.
     let timer = slint::Timer::default();
     {
         let runtime = runtime.clone();
         let expanded = expanded.clone();
         let weak = app.as_weak();
         let sweep = sweep.clone();
-        let last_trim: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
+        let was_visible = Rc::new(Cell::new(true));
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(1000),
@@ -1738,18 +1748,15 @@ fn main() -> Result<()> {
                     return;
                 };
                 if !app.window().is_visible() {
-                    let due = last_trim
-                        .get()
-                        .map(|at| at.elapsed() >= Duration::from_secs(30))
-                        .unwrap_or(true);
-                    if due {
-                        trim_working_set();
-                        last_trim.set(Some(Instant::now()));
+                    if was_visible.replace(false) {
+                        release_ui_caches(&app);
                     }
                     return;
                 }
-                // Shown again: the next hidden tick re-arms the trim.
-                last_trim.set(None);
+                if !was_visible.replace(true) {
+                    // Shown again: rebuild what release_ui_caches dropped.
+                    load_assets();
+                }
                 refresh(&app, &runtime, &expanded.borrow(), &sweep);
             },
         );
