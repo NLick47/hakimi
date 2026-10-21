@@ -857,7 +857,14 @@ impl Resolver {
             builder = builder.resolve(host, SocketAddr::new(ip, port));
         }
         let client = builder.build().context("building DoH client")?;
-        self.clients.write().insert(key, client.clone());
+        let mut clients = self.clients.write();
+        // A client keeps a connection pool, so old ones must not pile up.  The
+        // key changes when the endpoint or the timeout changes, and a dropped
+        // client is simply rebuilt on the next query.
+        if clients.len() > 16 {
+            clients.clear();
+        }
+        clients.insert(key, client.clone());
         Ok(client)
     }
 

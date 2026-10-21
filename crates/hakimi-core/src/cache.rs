@@ -124,6 +124,22 @@ const MAX_LAST_GOOD: usize = 512;
 /// the remembered-route map on every new host.
 const LAST_GOOD_PRUNE_TO: usize = MAX_LAST_GOOD * 3 / 4;
 const MAX_LAST_GOOD_AGE_DAYS: i64 = 30;
+/// Resolved addresses, one A and one AAAA entry per domain.  These maps grow
+/// with every visited domain, so without a cap the cache and the JSON written
+/// from it would grow without bound: 5000 domains already meant 2.4 MB and an
+/// 83 ms flush.  The cache is a hint, an evicted answer is looked up again.
+const MAX_DOH_ANSWERS: usize = 1024;
+const DOH_PRUNE_TO: usize = MAX_DOH_ANSWERS * 3 / 4;
+/// ECH configurations.  One per domain, and only for the groups that use ECH.
+const MAX_ECH_CONFIGS: usize = 256;
+const ECH_PRUNE_TO: usize = MAX_ECH_CONFIGS * 3 / 4;
+/// Remembered fake SNI names, one per group, domain and network.
+const MAX_FAKE_SNI: usize = 256;
+const SNI_PRUNE_TO: usize = MAX_FAKE_SNI * 3 / 4;
+/// Domains waiting for a re-plan after a catalog update.  A huge catalog
+/// update can name thousands of domains; the flags are consumed by the next
+/// connection to each domain.
+const MAX_SKIP_ONCE: usize = 4096;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -208,6 +224,12 @@ impl CacheManager {
         if !self.dirty.swap(false, Ordering::SeqCst) {
             return false;
         }
+        // Expire under the write lock, then encode under the read lock: the
+        // encoding must not block the lookups of the request path.
+        {
+            let mut data = self.data.write();
+            Self::expire(&mut data, now());
+        }
         let json = {
             let data = self.data.read();
             serde_json::to_string(&*data)
@@ -257,6 +279,30 @@ impl CacheManager {
         data.sni.retain(|_, sni| {
             now.signed_duration_since(sni.saved_at) <= Duration::days(MAX_SNI_AGE_DAYS)
         });
+    }
+
+    /// Drop the oldest entries until the map is back under its cap.
+    ///
+    /// The maps that grow with the number of visited domains need this: the
+    /// cache is a hint, so an evicted entry only costs one more lookup.
+    fn prune_by_age<V>(
+        map: &mut HashMap<String, V>,
+        max: usize,
+        to: usize,
+        at: impl Fn(&V) -> DateTime<Utc>,
+    ) {
+        if map.len() <= max {
+            return;
+        }
+        let mut by_age: Vec<(String, DateTime<Utc>)> = map
+            .iter()
+            .map(|(key, value)| (key.clone(), at(value)))
+            .collect();
+        by_age.sort_by_key(|(_, at)| *at);
+        let overflow = map.len() - to;
+        for (key, _) in by_age.into_iter().take(overflow) {
+            map.remove(&key);
+        }
     }
 
     // ---- last-good -------------------------------------------------------
@@ -466,6 +512,12 @@ impl CacheManager {
                 changed = true;
             }
         }
+        // A huge catalog update can name more domains than the flags are
+        // worth; the set is a hint that the old route should be re-planned.
+        if data.skip_once.len() > MAX_SKIP_ONCE {
+            data.skip_once.clear();
+            changed = true;
+        }
         if changed {
             self.mark_dirty(&data);
         }
@@ -505,6 +557,9 @@ impl CacheManager {
         let mut data = self.data.write();
         data.doh
             .insert(doh_key(&answer.domain, answer.qtype), answer);
+        Self::prune_by_age(&mut data.doh, MAX_DOH_ANSWERS, DOH_PRUNE_TO, |answer| {
+            answer.fetched_at
+        });
         self.mark_dirty(&data);
     }
 
@@ -525,6 +580,9 @@ impl CacheManager {
     pub fn put_ech(&self, entry: CachedEch) {
         let mut data = self.data.write();
         data.ech.insert(entry.domain.clone(), entry);
+        Self::prune_by_age(&mut data.ech, MAX_ECH_CONFIGS, ECH_PRUNE_TO, |entry| {
+            entry.fetched_at
+        });
         self.mark_dirty(&data);
     }
 
@@ -553,6 +611,7 @@ impl CacheManager {
             }
         }
         data.sni.insert(key, entry);
+        Self::prune_by_age(&mut data.sni, MAX_FAKE_SNI, SNI_PRUNE_TO, |entry| entry.saved_at);
         self.mark_dirty(&data);
     }
 
@@ -678,6 +737,51 @@ mod tests {
         let scores = cache.ip_scores();
         assert_eq!(scores[0].2.successes, 3);
         assert_eq!(scores[0].2.ewma_ms, 90.0);
+    }
+
+    /// The maps that grow with the number of visited domains need a cap:
+    /// 5000 resolved domains meant 2.4 MB of cache and an 83 ms flush.
+    #[test]
+    fn the_growing_maps_stay_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheManager::load(dir.path().join("state.json")).unwrap();
+        for index in 0..5000u32 {
+            let domain = format!("host{index}.example.com");
+            cache.put_doh_answer(CachedAnswer {
+                domain: domain.clone(),
+                qtype: 1,
+                ips: vec!["93.184.216.34".parse().unwrap()],
+                hints: Vec::new(),
+                ech_config: None,
+                ttl_secs: 300,
+                fetched_at: now(),
+            });
+            cache.put_ech(CachedEch {
+                domain: domain.clone(),
+                ech_config: "config".into(),
+                ttl_secs: 300,
+                fetched_at: now(),
+            });
+            cache.put_sni(CachedSni {
+                group: "g".into(),
+                domain,
+                network_id: "net".into(),
+                sni: None,
+                saved_at: now(),
+            });
+        }
+        cache.mark_skip_once((0..5000u32).map(|index| format!("host{index}.example.com")));
+        cache.flush_if_dirty();
+        let size = std::fs::metadata(cache.path()).map(|meta| meta.len()).unwrap_or(0);
+        assert!(
+            size < 900_000,
+            "the cache file must stay small, got {size} bytes"
+        );
+        // The newest entries survive, the oldest are dropped.
+        assert!(cache.doh_answer("host4999.example.com", 1).is_some());
+        assert!(cache.doh_answer("host0.example.com", 1).is_none());
+        assert!(cache.ech("host4999.example.com", false).is_some());
+        assert!(cache.sni("g", "host4999.example.com", "net").is_some());
     }
 
     /// A write that fails must stay scheduled: the change may not be lost
