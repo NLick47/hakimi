@@ -790,7 +790,7 @@ impl HakimiRuntime {
                     _ = receiver.changed() => break,
                     _ = tokio::time::sleep(Duration::from_secs(10)) => {}
                 }
-                let next = crate::util::network_id();
+                let next = crate::util::refresh_network_id();
                 if next != current {
                     tracing::info!(from = %current, to = %next, "network changed");
                     current = next.clone();

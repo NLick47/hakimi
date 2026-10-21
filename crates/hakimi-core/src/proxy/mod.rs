@@ -45,6 +45,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// with far fewer read/write syscalls than tokio's 8 KiB default while keeping
 /// per-connection memory reasonable.
 pub(crate) const COPY_BUFFER_SIZE: usize = 64 * 1024;
+/// Addresses raced in parallel while a direct tunnel hunts for a reachable path.
+const RAW_RACE_SIZE: usize = 8;
+const RAW_RACE_STAGGER: Duration = Duration::from_millis(150);
 
 /// Shared proxy state. Runtime installs a callback used by `/hakimi/status` so the CLI and the
 /// desktop shell can read the same JSON the UI uses.
@@ -279,7 +282,7 @@ async fn handle_connect(
     let Some(group_id) = group_id else {
         return tunnel_to_host(req, &host, port).await;
     };
-    let Some(group) = config.group(&group_id).cloned() else {
+    let Some(group) = config.group(&group_id) else {
         return tunnel_to_host(req, &host, port).await;
     };
     if !group.enabled || ctx.status.paused() {
@@ -436,9 +439,6 @@ async fn race_tcp_plans(
     cursor: &mut RouteCursor,
     timeout: Duration,
 ) -> Option<(ConnectPlan, TcpStream, u64)> {
-    const RAW_RACE_SIZE: usize = 8;
-    const RAW_RACE_STAGGER: Duration = Duration::from_millis(150);
-
     type RaceResult = Result<(ConnectPlan, TcpStream, u64), (ConnectPlan, FailureReason, String)>;
     enum Event {
         Plan(Option<ConnectPlan>),
@@ -535,32 +535,125 @@ async fn connect_tcp_upstream(
     }
 }
 
+/// Race the addresses `host` resolves to with a Happy-Eyeballs-style staggered start.
+/// `TcpStream::connect((host, port))` walks the addresses one at a time, so a black-holed
+/// IPv6 route can stall a direct tunnel for the whole connect timeout before IPv4 is tried.
+/// Returns `(timed_out, detail)` so the caller can distinguish 504 from 502.
+pub(super) async fn connect_host_staggered(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<TcpStream, (bool, String)> {
+    let started = tokio::time::Instant::now();
+    // The system resolver runs in tokio's blocking pool; a stuck lookup must not
+    // outlive the caller's connect deadline.
+    let resolved = match tokio::time::timeout(timeout, tokio::net::lookup_host((host, port))).await
+    {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(error)) => {
+            return Err((false, format!("resolving {host}:{port} failed: {error}")));
+        }
+        Err(_) => {
+            return Err((true, format!("resolving {host}:{port} timed out")));
+        }
+    };
+    let mut addresses: Vec<SocketAddr> = Vec::new();
+    for address in resolved {
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    if addresses.is_empty() {
+        return Err((false, format!("no address found for {host}")));
+    }
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err((true, format!("resolving {host}:{port} timed out")));
+    }
+    race_tcp_addresses(addresses, remaining).await
+}
+
+/// Connect the first address that answers, in rolling staggered batches. Every attempt
+/// shares one overall deadline, so a batch of black-holed candidates cannot extend the
+/// caller's timeout.
+async fn race_tcp_addresses(
+    addresses: Vec<SocketAddr>,
+    timeout: Duration,
+) -> Result<TcpStream, (bool, String)> {
+    type ConnectResult = Result<TcpStream, (bool, String)>;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut index = 0usize;
+    let mut timed_out = false;
+    let mut last_error = String::from("no address available");
+
+    while index < addresses.len() {
+        let end = (index + RAW_RACE_SIZE).min(addresses.len());
+        let mut pending: FuturesUnordered<Pin<Box<dyn Future<Output = ConnectResult> + Send>>> =
+            FuturesUnordered::new();
+        for (offset, address) in addresses[index..end].iter().copied().enumerate() {
+            pending.push(Box::pin(async move {
+                // Give the preferred address a head start; the rest follow together
+                // after one stagger instead of a linear ramp.
+                if offset > 0 {
+                    tokio::time::sleep(RAW_RACE_STAGGER).await;
+                }
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err((true, format!("connecting to {address} timed out")));
+                }
+                match tokio::time::timeout(remaining, TcpStream::connect(address)).await {
+                    Ok(Ok(stream)) => {
+                        // Same socket tuning as every other upstream path: Nagle adds
+                        // latency to interactive tunnels (SSH/WebSocket), and keepalive
+                        // lets a dead peer release the tunnel instead of hanging it.
+                        let _ = stream.set_nodelay(true);
+                        crate::util::apply_tcp_keepalive(&stream);
+                        Ok(stream)
+                    }
+                    Ok(Err(error)) => {
+                        Err((false, format!("connecting to {address} failed: {error}")))
+                    }
+                    Err(_) => Err((true, format!("connecting to {address} timed out"))),
+                }
+            }));
+        }
+        while let Some(result) = pending.next().await {
+            match result {
+                Ok(stream) => return Ok(stream),
+                Err((hit_timeout, detail)) => {
+                    timed_out |= hit_timeout;
+                    last_error = detail;
+                }
+            }
+        }
+        index = end;
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    Err((timed_out, last_error))
+}
+
 async fn tunnel_to_host(req: &mut Request<Incoming>, host: &str, port: u16) -> Response<ProxyBody> {
-    let upstream =
-        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
-            Ok(Ok(stream)) => {
-                // Same socket tuning as every other upstream path: Nagle adds
-                // latency to interactive tunnels (SSH/WebSocket), and keepalive
-                // lets a dead peer release the tunnel instead of hanging it.
-                let _ = stream.set_nodelay(true);
-                crate::util::apply_tcp_keepalive(&stream);
-                stream
-            }
-            Ok(Err(error)) => {
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "Upstream connection failed",
-                    &format!("{host}:{port}: {error}"),
-                );
-            }
-            Err(_) => {
-                return error_response(
+    let upstream = match connect_host_staggered(host, port, CONNECT_TIMEOUT).await {
+        Ok(stream) => stream,
+        Err((timed_out, detail)) => {
+            return if timed_out {
+                error_response(
                     StatusCode::GATEWAY_TIMEOUT,
                     "Upstream connection timed out",
-                    &format!("{host}:{port}"),
-                );
-            }
-        };
+                    &detail,
+                )
+            } else {
+                error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "Upstream connection failed",
+                    &detail,
+                )
+            };
+        }
+    };
     tunnel_connect(req, upstream)
 }
 
@@ -912,6 +1005,56 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "candidate timeout was not honored: {elapsed:?}"
+        );
+    }
+
+    /// Bypass tunnels used to call `TcpStream::connect((host, port))`, which walks
+    /// resolved addresses serially: a black-holed first address stalled the whole
+    /// tunnel even when another address was reachable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tunnel_address_race_beats_a_blackholed_first_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable = listener.local_addr().unwrap();
+
+        // Serial baseline: the black-holed address consumes the whole first timeout.
+        let serial_started = Instant::now();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(1), TcpStream::connect("192.0.2.1:443")).await;
+        let serial_elapsed = serial_started.elapsed();
+
+        let started = Instant::now();
+        let stream = race_tcp_addresses(
+            vec!["192.0.2.1:443".parse().unwrap(), reachable],
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("the reachable address must win");
+        let elapsed = started.elapsed();
+        drop(stream);
+        println!("serial first-address wait {serial_elapsed:?}; staggered race {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "the reachable address was blocked behind the black-holed one: {elapsed:?}"
+        );
+    }
+
+    /// All addresses black-holed: the shared deadline still bounds the attempt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tunnel_address_race_honors_the_deadline() {
+        let started = Instant::now();
+        let result = race_tcp_addresses(
+            vec![
+                "192.0.2.1:443".parse().unwrap(),
+                "198.51.100.1:443".parse().unwrap(),
+            ],
+            Duration::from_millis(400),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "TEST-NET addresses must not connect");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the overall deadline was not honored: {elapsed:?}"
         );
     }
 }

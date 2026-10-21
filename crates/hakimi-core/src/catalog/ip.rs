@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{
     validate_group_id, AppConfig, MAX_DOMAINS_PER_GROUP, MAX_GROUPS, MAX_TOTAL_DOMAINS,
 };
-use crate::domain::{lookup_domain_map, normalize_hostname, DomainMatcher, DomainPattern};
+use crate::domain::{normalize_hostname, DomainMatcher, DomainPattern};
 use crate::util::is_public_ip;
 
 pub const IP_CATALOG_SCHEMA: u32 = 1;
@@ -37,11 +37,27 @@ pub struct IpCatalog {
     pub sni: HashMap<String, String>,
     pub warnings: Vec<String>,
     matcher: DomainMatcher,
+    /// `(suffix, key)` for every `*.` entry, longest suffix first. Looking up a
+    /// host must not walk thousands of unrelated exact keys on every cold
+    /// connection.
+    wildcards: Vec<(String, String)>,
 }
 
 impl IpCatalog {
     pub fn lookup_ips(&self, domain: &str) -> Option<(&String, &Vec<IpAddr>)> {
-        lookup_domain_map(&self.ips, domain)
+        let host = normalize_hostname(domain).ok()?;
+        if let Some((key, ips)) = self.ips.get_key_value(&host) {
+            return Some((key, ips));
+        }
+        for (suffix, key) in &self.wildcards {
+            if host.len() > suffix.len()
+                && host.ends_with(suffix)
+                && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+            {
+                return self.ips.get_key_value(key);
+            }
+        }
+        None
     }
 
     pub fn match_group(&self, host: &str) -> Option<&str> {
@@ -224,6 +240,21 @@ pub fn validate(raw: IpCatalogRaw, config: &AppConfig) -> Result<IpCatalog> {
             .map(move |domain| (id.clone(), domain.clone()))
     }))?;
 
+    let mut wildcards: Vec<(String, String)> = ips
+        .keys()
+        .filter_map(|key| {
+            key.strip_prefix("*.")
+                .map(|suffix| (suffix.to_string(), key.clone()))
+        })
+        .collect();
+    wildcards.sort_by(|a, b| {
+        b.0.split('.')
+            .count()
+            .cmp(&a.0.split('.').count())
+            .then_with(|| b.0.len().cmp(&a.0.len()))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
     Ok(IpCatalog {
         schema_version: raw.v,
         groups,
@@ -231,6 +262,7 @@ pub fn validate(raw: IpCatalogRaw, config: &AppConfig) -> Result<IpCatalog> {
         sni,
         warnings,
         matcher,
+        wildcards,
     })
 }
 
@@ -383,6 +415,36 @@ mod tests {
                 .join(",")
         );
         assert!(validate(raw(&too_many), &AppConfig::default()).is_err());
+    }
+
+    #[test]
+    fn indexed_lookup_matches_the_linear_reference() {
+        let catalog = validate(
+            raw(r#"{
+                    "v": 1,
+                    "groups": {"g": ["example.com", "*.example.com"]},
+                    "ips": {
+                        "example.com": ["8.8.8.8"],
+                        "api.example.com": ["8.8.4.4"],
+                        "*.example.com": ["1.1.1.1"],
+                        "*.cdn.example.com": ["9.9.9.9"]
+                    }
+                }"#),
+            &AppConfig::default(),
+        )
+        .unwrap();
+        for host in [
+            "example.com",
+            "api.example.com",
+            "www.example.com",
+            "a.cdn.example.com",
+            "other.example.net",
+        ] {
+            let expected =
+                crate::domain::lookup_domain_map(&catalog.ips, host).map(|(key, _)| key.clone());
+            let actual = catalog.lookup_ips(host).map(|(key, _)| key.clone());
+            assert_eq!(actual, expected, "lookup for {host}");
+        }
     }
 
     #[test]

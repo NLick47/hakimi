@@ -648,7 +648,12 @@ impl IpScore {
 const PLAN_CACHE_MAX: usize = 2048;
 /// How many (domain, ip) quality entries to keep in memory. The active set of a
 /// heavy user stays well below this; growth past it evicts the worst-ranked.
-const IP_SCORE_CAP: usize = 128;
+/// A page loading assets from dozens of hosts already produces several hundred
+/// entries, so a smaller cap made every connection sort the whole map.
+const IP_SCORE_CAP: usize = 1024;
+/// Evict down to this many entries so the next few hundred observations do not
+/// each pay for a full rank-and-sort pass.
+const IP_SCORE_PRUNE_TO: usize = IP_SCORE_CAP * 3 / 4;
 
 impl DecisionEngine {
     pub fn new(
@@ -921,7 +926,6 @@ impl DecisionEngine {
             };
         }
         let snapshot = (entry.ewma_ms, entry.successes, entry.failures);
-        drop(entry);
         // Bounded map: when full, drop the least valuable entries — the ones
         // with the worst measured quality — instead of wiping everything. A
         // flood of dead IPs must never erase knowledge of a proven route.
@@ -936,7 +940,7 @@ impl DecisionEngine {
                 })
                 .collect();
             ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            for ((domain, ip), _) in ranked.into_iter().take(total - IP_SCORE_CAP) {
+            for ((domain, ip), _) in ranked.into_iter().take(total - IP_SCORE_PRUNE_TO) {
                 if let Some(by_ip) = scores.get_mut(&domain) {
                     by_ip.remove(&ip);
                     if by_ip.is_empty() {

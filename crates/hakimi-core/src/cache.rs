@@ -102,11 +102,17 @@ pub struct IpScoreEntry {
 /// How many (domain, ip) quality entries to keep at most. The active set of a
 /// heavy user stays well below this.
 const MAX_IP_SCORES: usize = 1024;
+/// Evict in bulk down to this size when the cap is crossed. Pruning back to
+/// exactly the cap would make every subsequent insert sort the whole map.
+const IP_SCORE_PRUNE_TO: usize = MAX_IP_SCORES * 3 / 4;
 /// Entries older than the widest freshness window can never be used again.
 const MAX_IP_SCORE_AGE_DAYS: i64 = 30;
 /// Same cap and age window for remembered routes; the pre-warm loop takes the
 /// newest 20, and 30 days is the widest freshness setting any config can use.
 const MAX_LAST_GOOD: usize = 512;
+/// Leave headroom after a prune so a page's asset burst does not rank-and-sort
+/// the remembered-route map on every new host.
+const LAST_GOOD_PRUNE_TO: usize = MAX_LAST_GOOD * 3 / 4;
 const MAX_LAST_GOOD_AGE_DAYS: i64 = 30;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -299,7 +305,7 @@ impl CacheManager {
                 .map(|(key, entry)| (key.clone(), entry.updated_at))
                 .collect();
             by_age.sort_by_key(|(_, at)| *at);
-            let overflow = data.ip_scores.len() - MAX_IP_SCORES;
+            let overflow = data.ip_scores.len() - IP_SCORE_PRUNE_TO;
             for (key, _) in by_age.into_iter().take(overflow) {
                 data.ip_scores.remove(&key);
             }
@@ -329,7 +335,7 @@ impl CacheManager {
                 .map(|(domain, entry)| (domain.clone(), entry.saved_at))
                 .collect();
             by_age.sort_by_key(|(_, at)| *at);
-            let overflow = data.last_good.len() - MAX_LAST_GOOD;
+            let overflow = data.last_good.len() - LAST_GOOD_PRUNE_TO;
             for (domain, _) in by_age.into_iter().take(overflow) {
                 data.last_good.remove(&domain);
             }
@@ -339,10 +345,14 @@ impl CacheManager {
     /// Domains with a remembered route, most recently used first. The desktop app
     /// re-warms these after a restart so an active host does not pay a cold dial.
     pub fn last_good_hosts(&self) -> Vec<String> {
+        let now = now();
         let data = self.data.read();
         let mut hosts: Vec<(chrono::DateTime<chrono::Utc>, String)> = data
             .last_good
             .iter()
+            .filter(|(_, entry)| {
+                now.signed_duration_since(entry.saved_at) <= Duration::days(MAX_LAST_GOOD_AGE_DAYS)
+            })
             .map(|(domain, entry)| (entry.saved_at, domain.clone()))
             .collect();
         hosts.sort_by(|a, b| b.0.cmp(&a.0));
@@ -362,7 +372,11 @@ impl CacheManager {
             }
         }
         data.last_good.insert(entry.domain.clone(), entry);
-        self.prune_last_good(&mut data);
+        // A read-time age check already ignores stale routes; only pay for the
+        // full scan/sort when the map actually needs bounding.
+        if data.last_good.len() > MAX_LAST_GOOD {
+            self.prune_last_good(&mut data);
+        }
         self.mark_dirty(&data);
     }
 

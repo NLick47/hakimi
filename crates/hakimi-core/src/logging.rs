@@ -13,28 +13,6 @@ use crate::util::{atomic_write_json, now, redact_ip, redact_url};
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const DIAGNOSTIC_LOG_LINES: usize = 300;
 
-#[derive(Clone)]
-struct LogFile {
-    path: PathBuf,
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogFile {
-    type Writer = std::fs::File;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .unwrap_or_else(|_| {
-                OpenOptions::new()
-                    .write(true)
-                    .open(if cfg!(windows) { "NUL" } else { "/dev/null" })
-                    .expect("null device")
-            })
-    }
-}
-
 /// Initialize local-only logging. Logs never leave the machine; catalog/DoH URLs are redacted
 /// before they are written by callers.
 pub fn init(paths: &Paths, level: &str) -> Result<()> {
@@ -46,11 +24,25 @@ pub fn init(paths: &Paths, level: &str) -> Result<()> {
             let _ = std::fs::rename(&log_path, rotated);
         }
     }
+    // Keep the append-only handle open for the lifetime of the subscriber. Opening and
+    // closing the file for every event costs a pair of metadata syscalls, which is
+    // noticeable during a page-load burst of connection logs. O_APPEND keeps lines from
+    // concurrent processes intact.
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap_or_else(|_| {
+            OpenOptions::new()
+                .write(true)
+                .open(if cfg!(windows) { "NUL" } else { "/dev/null" })
+                .expect("null device")
+        });
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(level.to_ascii_lowercase()));
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(LogFile { path: log_path })
+        .with_writer(std::sync::Mutex::new(file))
         .with_ansi(false)
         .with_target(true);
     let _ = subscriber.try_init();

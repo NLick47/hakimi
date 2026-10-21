@@ -513,13 +513,12 @@ impl RouteConnector {
     async fn connect_plain(&self, host: &str, port: u16) -> Result<PooledIo> {
         match self.engine.route(host, port, false) {
             Route::Bypass(_) => {
-                let stream =
-                    tokio::time::timeout(SYSTEM_CONNECT_TIMEOUT, TcpStream::connect((host, port)))
-                        .await
-                        .map_err(|_| anyhow!("TCP connect to {host}:{port} timed out"))?
-                        .with_context(|| format!("TCP connect to {host}:{port} failed"))?;
-                let _ = stream.set_nodelay(true);
-                crate::util::apply_tcp_keepalive(&stream);
+                // Same Happy-Eyeballs treatment as CONNECT tunnels: a black-holed
+                // AAAA answer must not hide a working IPv4 origin behind a full
+                // per-address timeout.
+                let stream = super::connect_host_staggered(host, port, SYSTEM_CONNECT_TIMEOUT)
+                    .await
+                    .map_err(|(_, detail)| anyhow!(detail))?;
                 Ok(PooledIo {
                     io: Transport::Tcp(stream),
                     h2: false,
@@ -769,11 +768,15 @@ impl RouteConnector {
         port: u16,
         force_http1: bool,
     ) -> Result<PooledIo> {
-        let addresses: Vec<std::net::IpAddr> = tokio::net::lookup_host((host, port))
-            .await
-            .with_context(|| format!("resolving {host}:{port}"))?
-            .map(|address| address.ip())
-            .collect();
+        let addresses: Vec<std::net::IpAddr> = tokio::time::timeout(
+            SYSTEM_CONNECT_TIMEOUT,
+            tokio::net::lookup_host((host, port)),
+        )
+        .await
+        .map_err(|_| anyhow!("resolving {host}:{port} timed out"))?
+        .with_context(|| format!("resolving {host}:{port}"))?
+        .map(|address| address.ip())
+        .collect();
         // Staggered race across resolved addresses (Happy-Eyeballs style): a black-holed
         // IPv6 route no longer delays the IPv4 fallback by a full timeout.
         let mut index = 0;

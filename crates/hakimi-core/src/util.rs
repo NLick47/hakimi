@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -186,7 +187,11 @@ pub fn is_public_ipv6(ip: Ipv6Addr) -> bool {
 /// The design only needs "did the network change" semantics. We use the local address chosen
 /// for an outbound route; it changes with most Wi-Fi/Ethernet switches. Tests can pin a value
 /// with `HAKIMI_NETWORK_ID`.
-pub fn network_id() -> String {
+///
+/// This probes the OS and is deliberately not used on hot paths: binding a UDP socket and
+/// asking the routing table costs tens of microseconds on macOS. Use [`network_id`] instead
+/// and let the runtime monitor call this periodically to detect network changes.
+pub fn probe_network_id() -> String {
     if let Ok(value) = std::env::var("HAKIMI_NETWORK_ID") {
         if !value.trim().is_empty() {
             return value;
@@ -200,6 +205,26 @@ pub fn network_id() -> String {
         Ok(SocketAddr::V6(addr)) => format!("ip6:{}", addr.ip()),
         Err(_) => "unknown".to_string(),
     }
+}
+
+/// Cached network id. Route planning and connection bookkeeping run this for every cold
+/// connection, so it must not perform the UDP/route-table probe each time. The runtime's
+/// network-change detector refreshes the cache with [`refresh_network_id`].
+pub fn network_id() -> String {
+    network_id_cache().read().as_ref().to_string()
+}
+
+/// Re-probe the OS, publish the result to the cached accessor, and return it.
+/// Called by the network-change monitor.
+pub fn refresh_network_id() -> String {
+    let value = probe_network_id();
+    *network_id_cache().write() = Arc::from(value.as_str());
+    value
+}
+
+fn network_id_cache() -> &'static parking_lot::RwLock<Arc<str>> {
+    static CACHE: std::sync::OnceLock<parking_lot::RwLock<Arc<str>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::RwLock::new(Arc::from(probe_network_id().as_str())))
 }
 
 pub fn redact_url(input: &str) -> String {
@@ -343,6 +368,14 @@ mod tests {
             decode_key_material(&base64::engine::general_purpose::STANDARD.encode(raw)).unwrap(),
             raw
         );
+    }
+
+    #[test]
+    fn refreshed_network_id_is_published_to_the_cached_accessor() {
+        let refreshed = refresh_network_id();
+        assert_eq!(network_id(), refreshed);
+        // Repeated hot-path reads are cheap and stable until the next refresh.
+        assert_eq!(network_id(), refreshed);
     }
 
     #[test]

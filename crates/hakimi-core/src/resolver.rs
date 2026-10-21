@@ -542,31 +542,38 @@ impl Resolver {
     /// Health check used at startup, after network changes, and manually. It always performs a
     /// real query (never the cache) and updates [`DohHealth`] for the UI.
     pub async fn health_check(&self) -> Vec<DohHealth> {
+        // The endpoints are independent; probing them in parallel turns the
+        // worst case from the sum of their timeouts into the slowest one. This
+        // runs on network changes before the warm-up sweep, so it is directly
+        // visible as recovery latency.
         let endpoints = self.effective_endpoints();
-        let mut out = Vec::with_capacity(endpoints.len());
-        for endpoint in endpoints {
+        let checks = endpoints.iter().map(|endpoint| async move {
             let started = Instant::now();
-            let result = self.query_endpoint(&endpoint, "example.com", TYPE_A).await;
-            let latency_ms = started.elapsed().as_millis() as u64;
+            let result = self.query_endpoint(endpoint, "example.com", TYPE_A).await;
             let health = DohHealth {
                 name: endpoint.name.clone(),
                 url: endpoint.url.clone(),
                 source: endpoint.source,
                 healthy: result.is_ok(),
-                latency_ms: Some(latency_ms),
+                latency_ms: Some(started.elapsed().as_millis() as u64),
                 last_error: result.as_ref().err().map(|error| format!("{error:#}")),
                 checked_at: now(),
             };
-            if let Err(error) = &result {
+            (health, result.is_err())
+        });
+        let results = futures_util::future::join_all(checks).await;
+        let mut out = Vec::with_capacity(results.len());
+        for (health, failed) in results {
+            if failed {
                 tracing::warn!(
-                    endpoint = %redact_url(&endpoint.url),
-                    error = %error,
+                    endpoint = %redact_url(&health.url),
+                    error = %health.last_error.as_deref().unwrap_or(""),
                     "DoH health check failed"
                 );
             }
             self.health
                 .write()
-                .insert(endpoint.url.clone(), health.clone());
+                .insert(health.url.clone(), health.clone());
             out.push(health);
         }
         out
