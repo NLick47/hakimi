@@ -45,6 +45,17 @@ pub(super) const PLAN_CACHE_MAX: usize = 2048;
 /// on every success.
 pub(super) const PLAN_CACHE_PRUNE_TO: usize = PLAN_CACHE_MAX * 3 / 4;
 
+/// The key a plan is stored under.  Hot-path callers already pass a
+/// normalized host, so the common case borrows.
+fn plan_cache_domain(domain: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = domain.trim().trim_end_matches('.');
+    if trimmed.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(trimmed.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    }
+}
+
 impl DecisionEngine {
     pub fn new(
         config: Arc<ConfigManager>,
@@ -258,9 +269,12 @@ impl DecisionEngine {
     pub fn cached_plan(&self, domain: &str, port: u16, tls: bool) -> Option<Arc<ConnectPlan>> {
         let (config, matcher) = self.config.snapshot_and_matcher();
         let ttl = Duration::from_secs(config.advanced.plan_cache_secs);
+        // The key must be spelled the same way the plan was stored, so a
+        // caller that passes a raw host still finds its entry.
+        let key = plan_cache_domain(domain);
         let (at, plan) = {
             let cache = self.plan_cache.read();
-            let (at, plan) = cache.get(domain)?.get(&(port, tls))?;
+            let (at, plan) = cache.get(key.as_ref())?.get(&(port, tls))?;
             (at.elapsed(), plan.clone())
         };
         if at >= ttl {
@@ -312,14 +326,15 @@ impl DecisionEngine {
     }
 
     pub fn forget_plan(&self, domain: &str, port: u16, tls: bool) {
+        let key = plan_cache_domain(domain);
         let mut cache = self.plan_cache.write();
         let mut empty = false;
-        if let Some(inner) = cache.get_mut(domain) {
+        if let Some(inner) = cache.get_mut(key.as_ref()) {
             inner.remove(&(port, tls));
             empty = inner.is_empty();
         }
         if empty {
-            cache.remove(domain);
+            cache.remove(key.as_ref());
         }
     }
 
@@ -489,7 +504,7 @@ impl DecisionEngine {
                 }
             }
         }
-        let domain = plan.domain.clone();
+        let domain = plan_cache_domain(&plan.domain).into_owned();
         let port = plan.port;
         let tls = plan.tls;
         let entry = (Instant::now(), plan);

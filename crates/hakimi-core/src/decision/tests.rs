@@ -470,6 +470,43 @@ fn network_change_drops_remembered_plans() {
 }
 
 #[test]
+fn plan_cache_finds_entries_under_any_spelling_of_the_domain() {
+    let h = harness(&["example.com"], Strategy::Direct);
+    h.engine.remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
+    for spelling in ["example.com", "EXAMPLE.com", "example.com.", " example.com. "] {
+        assert!(
+            h.engine.cached_plan(spelling, 443, true).is_some(),
+            "`{spelling}` must find the stored plan"
+        );
+    }
+    // Forgetting has to use the same spelling rules.
+    h.engine.forget_plan("EXAMPLE.com.", 443, true);
+    assert!(h.engine.cached_plan("example.com", 443, true).is_none());
+}
+
+#[test]
+fn plan_cache_separates_ports_and_tls_flags() {
+    let h = harness(&["example.com"], Strategy::Direct);
+    let mut plain = test_plan(TlsMode::Direct, None);
+    plain.port = 80;
+    plain.tls = false;
+    h.engine.remember_plan_arc(Arc::new(plain));
+    h.engine.remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
+
+    assert!(h.engine.cached_plan("example.com", 443, true).is_some());
+    assert!(h.engine.cached_plan("example.com", 80, false).is_some());
+    assert!(h.engine.cached_plan("example.com", 80, true).is_none());
+    assert!(h.engine.cached_plan("example.com", 443, false).is_none());
+
+    h.engine.forget_plan("example.com", 443, true);
+    assert!(h.engine.cached_plan("example.com", 443, true).is_none());
+    assert!(
+        h.engine.cached_plan("example.com", 80, false).is_some(),
+        "forgetting one port must not drop the other"
+    );
+}
+
+#[test]
 fn cached_fake_sni_plan_follows_the_configured_sni() {
     let h = harness(&["example.com"], Strategy::FakeSni);
     h.engine
