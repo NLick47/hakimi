@@ -1,10 +1,14 @@
 use std::collections::VecDeque;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde_json::json;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::LogFormat;
@@ -14,6 +18,10 @@ use crate::util::{atomic_write_json, now, redact_ip, redact_url};
 const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_LOG_BACKUPS: usize = 5;
 const DIAGNOSTIC_LOG_LINES: usize = 300;
+/// Bounded queue between request workers and the log writer. A page-load burst
+/// can produce thousands of events; keeping the queue finite means a stalled
+/// disk can never turn logging into unbounded memory growth.
+const LOG_QUEUE_CAPACITY: usize = 8192;
 
 /// Initialize local-only logging. Logs never leave the machine; catalog/DoH URLs are redacted
 /// before they are written by callers.
@@ -25,23 +33,46 @@ pub fn init(paths: &Paths, level: &str, format: LogFormat) -> Result<()> {
             rotate_logs(&log_path);
         }
     }
-    // Keep the append-only handle open for the lifetime of the subscriber. Opening and
-    // closing the file for every event costs a pair of metadata syscalls, which is
-    // noticeable during a page-load burst of connection logs. O_APPEND keeps lines from
-    // concurrent processes intact.
-    let file = OpenOptions::new()
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(level.to_ascii_lowercase()));
+    let file = open_log_file(&log_path);
+    match spawn_log_writer(file, log_path.clone()) {
+        Ok(sink) => install(NonBlockingMakeWriter::new(sink), filter, format),
+        Err(error) => {
+            // Thread creation is the only fallible part; if it fails, keep the
+            // previous synchronous behavior rather than losing logging entirely.
+            eprintln!(
+                "hakimi: could not start asynchronous log writer ({error}); using synchronous writes"
+            );
+            install(
+                std::sync::Mutex::new(open_log_file(&log_path)),
+                filter,
+                format,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Append-only file handle. O_APPEND keeps lines from concurrent processes
+/// intact; opening once avoids a metadata syscall per event.
+fn open_log_file(path: &Path) -> File {
+    OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)
+        .open(path)
         .unwrap_or_else(|_| {
             OpenOptions::new()
                 .write(true)
                 .open(if cfg!(windows) { "NUL" } else { "/dev/null" })
                 .expect("null device")
-        });
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level.to_ascii_lowercase()));
-    let writer = std::sync::Mutex::new(file);
+        })
+}
+
+fn install<W>(writer: W, filter: EnvFilter, format: LogFormat)
+where
+    W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+{
     match format {
         LogFormat::Text => {
             let subscriber = tracing_subscriber::fmt()
@@ -66,7 +97,103 @@ pub fn init(paths: &Paths, level: &str, format: LogFormat) -> Result<()> {
             let _ = subscriber.try_init();
         }
     }
-    Ok(())
+}
+
+#[derive(Clone)]
+struct LogSink {
+    tx: SyncSender<Vec<u8>>,
+    dropped: Arc<AtomicU64>,
+}
+
+/// Writer factory for one tracing event. Formatting happens on the caller's
+/// thread (tracing requires that), but the completed line is handed to a
+/// bounded channel and written by one dedicated thread. No file lock or disk
+/// syscall runs on a Tokio worker.
+#[derive(Clone)]
+struct NonBlockingMakeWriter {
+    sink: LogSink,
+}
+
+impl NonBlockingMakeWriter {
+    fn new(sink: LogSink) -> Self {
+        Self { sink }
+    }
+}
+
+impl<'a> MakeWriter<'a> for NonBlockingMakeWriter {
+    type Writer = NonBlockingWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        NonBlockingWriter {
+            sink: self.sink.clone(),
+            buffer: Vec::with_capacity(256),
+        }
+    }
+}
+
+struct NonBlockingWriter {
+    sink: LogSink,
+    buffer: Vec<u8>,
+}
+
+impl Write for NonBlockingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for NonBlockingWriter {
+    fn drop(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        // try_send keeps a slow/stalled disk from applying backpressure to
+        // request handling. If the queue is full, this event is dropped and
+        // counted rather than blocking the proxy.
+        if self
+            .sink
+            .tx
+            .try_send(std::mem::take(&mut self.buffer))
+            .is_err()
+        {
+            self.sink.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn spawn_log_writer(mut file: File, path: PathBuf) -> io::Result<LogSink> {
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(LOG_QUEUE_CAPACITY);
+    let sink = LogSink {
+        tx,
+        dropped: Arc::new(AtomicU64::new(0)),
+    };
+    std::thread::Builder::new()
+        .name("hakimi-log".to_string())
+        .spawn(move || {
+            let mut written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+            for bytes in rx {
+                if file.write_all(&bytes).is_err() {
+                    break;
+                }
+                written = written.saturating_add(bytes.len() as u64);
+                // Rotate while the process runs, not only at the next launch:
+                // per-connection INFO lines can fill the cap during one session.
+                if written > MAX_LOG_BYTES {
+                    let _ = file.flush();
+                    drop(file);
+                    rotate_logs(&path);
+                    file = open_log_file(&path);
+                    written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+                }
+            }
+            let _ = file.flush();
+        })?;
+    Ok(sink)
 }
 
 /// Rotate to `hakimi.1.log` ... `hakimi.5.log`. Text logs are cheap to keep,
@@ -199,6 +326,42 @@ pub fn redact_log_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[test]
+    fn nonblocking_writer_buffers_one_event_until_drop() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let sink = LogSink {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
+        let make = NonBlockingMakeWriter::new(sink);
+        {
+            let mut writer = make.make_writer();
+            writer.write_all(b"hello").unwrap();
+            writer.write_all(b" world\n").unwrap();
+            assert!(rx.try_recv().is_err(), "must not write while formatting");
+        }
+        assert_eq!(rx.recv().unwrap(), b"hello world\n");
+    }
+
+    #[test]
+    fn full_log_queue_drops_instead_of_blocking() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let sink = LogSink {
+            tx: tx.clone(),
+            dropped: dropped.clone(),
+        };
+        tx.send(b"first\n".to_vec()).unwrap();
+        let make = NonBlockingMakeWriter::new(sink);
+        {
+            let mut writer = make.make_writer();
+            writer.write_all(b"second\n").unwrap();
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(rx.recv().unwrap(), b"first\n");
+    }
 
     #[test]
     fn tail_reads_last_lines() {
