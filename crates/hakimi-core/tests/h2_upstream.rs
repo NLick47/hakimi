@@ -14,7 +14,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -77,13 +76,13 @@ async fn spawn_h2_origin(tls: Arc<rustls::ServerConfig>) -> (SocketAddr, Arc<Ori
                             state.h2_requests.fetch_add(1, Ordering::Relaxed);
                         }
                         state.versions.lock().unwrap().push(req.version());
-                        let body = req
-                            .uri()
-                            .path()
+                        let path = req.uri().path().to_string();
+                        let received = req.into_body().collect().await.map(|b| b.to_bytes().len()).unwrap_or(0);
+                        let body = path
                             .strip_prefix("/bytes/")
                             .and_then(|count| count.parse::<usize>().ok())
                             .map(|count| Bytes::from(vec![7u8; count]))
-                            .unwrap_or_else(|| Bytes::from_static(b"origin-ok"));
+                            .unwrap_or_else(|| Bytes::from(format!("origin-ok len={received}").into_bytes()));
                         Ok::<_, Infallible>(hyper::Response::new(Full::new(body)))
                     }
                 });
@@ -264,6 +263,72 @@ async fn setup_with(http1_hosts: Vec<String>) -> (
     (proxy_addr, origin_addr, state, handle, dir, ca_dir)
 }
 
+
+/// Open a CONNECT tunnel to the proxy and speak HTTP/2 inside it, trusting
+/// the local CA.  The connection task runs in the background.
+async fn tunnel_h2(
+    proxy: SocketAddr,
+    port: u16,
+    ca_pem: &std::path::Path,
+) -> hyper::client::conn::http2::SendRequest<http_body_util::Full<Bytes>> {
+    // CONNECT through the proxy.
+    let mut stream = TcpStream::connect(proxy).await.unwrap();
+    stream
+        .write_all(
+            format!("CONNECT origin.test:{port} HTTP/1.1\r\nHost: origin.test:{port}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut head = Vec::new();
+    let mut buffer = [0u8; 1024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = stream.read(&mut buffer).await.unwrap();
+        assert!(read > 0, "the proxy must answer the CONNECT");
+        head.extend_from_slice(&buffer[..read]);
+    }
+    assert!(
+        String::from_utf8_lossy(&head).starts_with("HTTP/1.1 200"),
+        "the CONNECT must be accepted: {}",
+        String::from_utf8_lossy(&head)
+    );
+
+    // TLS with the local CA as the only root, offering h2.
+    let mut roots_store = rustls::RootCertStore::empty();
+    for certificate in rustls_pki_types::pem::PemObject::pem_file_iter(ca_pem)
+        .unwrap()
+        .flatten()
+    {
+        roots_store.add(certificate).unwrap();
+    }
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut client_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots_store)
+        .with_no_client_auth();
+    client_config.alpn_protocols = vec![b"h2".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let tls = connector
+        .connect(rustls_pki_types::ServerName::try_from("origin.test").unwrap(), stream)
+        .await
+        .unwrap();
+    assert_eq!(
+        tls.get_ref().1.alpn_protocol(),
+        Some(&b"h2"[..]),
+        "the proxy must offer h2 on the MITM tunnel"
+    );
+
+    let (sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    sender
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_upstream_connection_uses_http2() {
     let (proxy_addr, origin_addr, state, _handle, _dir, _ca_dir) = setup_with(Vec::new()).await;
@@ -275,7 +340,7 @@ async fn the_upstream_connection_uses_http2() {
         "the request must succeed: {}",
         String::from_utf8_lossy(&body)
     );
-    assert_eq!(body, b"origin-ok");
+    assert_eq!(body, b"origin-ok len=0");
     assert_eq!(
         state.h2_requests.load(Ordering::Relaxed),
         1,
@@ -294,7 +359,7 @@ async fn sequential_requests_share_one_http2_connection() {
     for _ in 0..3 {
         let (status, body) = request(proxy_addr, origin_addr.port(), "/").await;
         assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
-        assert_eq!(body, b"origin-ok");
+        assert_eq!(body, b"origin-ok len=0");
     }
     assert_eq!(
         state.connections.load(Ordering::Relaxed),
@@ -331,76 +396,16 @@ async fn a_browser_can_use_http2_through_the_mitm_tunnel() {
     // The MITM path needs a trusted local CA; a harness cannot install one.
     std::env::set_var("HAKIMI_ASSUME_CA_INSTALLED", "1");
 
-    // CONNECT through the proxy.
-    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
-    stream
-        .write_all(
-            format!(
-                "CONNECT origin.test:{} HTTP/1.1\r\nHost: origin.test:{}\r\n\r\n",
-                origin_addr.port(),
-                origin_addr.port()
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-    let mut head = Vec::new();
-    let mut buffer = [0u8; 1024];
-    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-        let read = stream.read(&mut buffer).await.unwrap();
-        assert!(read > 0, "the proxy must answer the CONNECT");
-        head.extend_from_slice(&buffer[..read]);
-    }
-    assert!(
-        String::from_utf8_lossy(&head).starts_with("HTTP/1.1 200"),
-        "the CONNECT must be accepted: {}",
-        String::from_utf8_lossy(&head)
-    );
-
-    // TLS with the local CA as the only root, offering h2.
-    let mut roots_store = rustls::RootCertStore::empty();
-    let ca_path = ca_dir.path().join("ca").join("ca.pem");
-    for certificate in rustls_pki_types::pem::PemObject::pem_file_iter(&ca_path)
-        .unwrap()
-        .flatten()
-    {
-        roots_store.add(certificate).unwrap();
-    }
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let mut client_config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots_store)
-        .with_no_client_auth();
-    client_config.alpn_protocols = vec![b"h2".to_vec()];
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-    let tls = connector
-        .connect(
-            rustls_pki_types::ServerName::try_from("origin.test").unwrap(),
-            stream,
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        tls.get_ref().1.alpn_protocol(),
-        Some(&b"h2"[..]),
-        "the proxy must offer h2 on the MITM tunnel"
-    );
+    let ca_pem = ca_dir.path().join("ca").join("ca.pem");
+    let mut sender = tunnel_h2(proxy_addr, origin_addr.port(), &ca_pem).await;
 
     // One request over h2 inside the tunnel.
-    let (mut sender, connection) =
-        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
-            .await
-            .unwrap();
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
     let response = sender
         .send_request(
             hyper::Request::builder()
                 .uri("https://origin.test/")
                 .header("host", "origin.test")
-                .body(http_body_util::Empty::<Bytes>::new())
+                .body(http_body_util::Full::new(Bytes::new()))
                 .unwrap(),
         )
         .await
@@ -408,7 +413,7 @@ async fn a_browser_can_use_http2_through_the_mitm_tunnel() {
     assert_eq!(response.version(), http::Version::HTTP_2);
     assert_eq!(response.status(), 200);
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(body.as_ref(), b"origin-ok");
+    assert_eq!(body.as_ref(), b"origin-ok len=0");
     assert_eq!(
         state.h2_requests.load(Ordering::Relaxed),
         1,
@@ -425,7 +430,7 @@ async fn an_image_host_is_forced_to_http1() {
 
     let (status, body) = request(proxy_addr, origin_addr.port(), "/").await;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
-    assert_eq!(body, b"origin-ok");
+    assert_eq!(body, b"origin-ok len=0");
     let alpn = state.alpn.lock().unwrap().clone();
     assert_eq!(
         alpn,
@@ -442,8 +447,71 @@ async fn a_normal_host_keeps_http2() {
 
     let (status, body) = request(proxy_addr, origin_addr.port(), "/").await;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
-    assert_eq!(body, b"origin-ok");
+    assert_eq!(body, b"origin-ok len=0");
     let alpn = state.alpn.lock().unwrap().clone();
     assert_eq!(alpn, vec![b"h2".to_vec()]);
+    assert_eq!(state.h2_requests.load(Ordering::Relaxed), 1);
+}
+
+/// A tunnel belongs to one host: a request for another host on the same
+/// tunnel must be refused, not forwarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_for_another_host_on_the_tunnel_is_refused() {
+    let (proxy_addr, origin_addr, state, _handle, _dir, _ca_dir) = setup_with(Vec::new()).await;
+    std::env::set_var("HAKIMI_ASSUME_CA_INSTALLED", "1");
+
+    let ca_pem = _ca_dir.path().join("ca").join("ca.pem");
+    let mut sender = tunnel_h2(proxy_addr, origin_addr.port(), &ca_pem).await;
+    let response = sender
+        .send_request(
+            hyper::Request::builder()
+                .method("GET")
+                .uri("https://evil.test/")
+                .header("host", "evil.test")
+                .body(http_body_util::Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        400,
+        "a foreign host on the tunnel must be refused"
+    );
+    assert_eq!(
+        state.h2_requests.load(Ordering::Relaxed),
+        0,
+        "the request must not reach the origin"
+    );
+}
+
+/// A request body has to survive the tunnel unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_body_survives_the_tunnel() {
+    let (proxy_addr, origin_addr, state, _handle, _dir, _ca_dir) = setup_with(Vec::new()).await;
+    std::env::set_var("HAKIMI_ASSUME_CA_INSTALLED", "1");
+
+    let ca_pem = _ca_dir.path().join("ca").join("ca.pem");
+    let mut sender = tunnel_h2(proxy_addr, origin_addr.port(), &ca_pem).await;
+    let payload = Bytes::from(vec![9u8; 4096]);
+    let response = sender
+        .send_request(
+            hyper::Request::builder()
+                .method("POST")
+                .uri("https://origin.test/")
+                .header("host", "origin.test")
+                .body(http_body_util::Full::new(payload.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    // The origin reports the length of the body it received.
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        format!("origin-ok len={}", payload.len()),
+        "the body must arrive unchanged"
+    );
     assert_eq!(state.h2_requests.load(Ordering::Relaxed), 1);
 }
