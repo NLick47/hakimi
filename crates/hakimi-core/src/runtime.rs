@@ -680,7 +680,9 @@ impl HakimiRuntime {
     }
 
     pub fn export_diagnostics(&self) -> Result<PathBuf> {
-        let mut status = self.status_json();
+        // The status carries the DoH endpoint URLs; they can hold a token in
+        // their path, so the bundle gets the same redaction as the config.
+        let mut status = logging::redact_config_value(self.status_json());
         status["config"] = logging::redact_config_value(self.config_json());
         logging::export_diagnostics(&self.paths, status)
     }

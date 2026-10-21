@@ -171,7 +171,14 @@ async fn main() -> Result<()> {
             runtime.stop().await?;
         }
         Command::Status { json } => {
-            if let Some(value) = try_live_status(&runtime).await {
+            // An explicit data directory names one instance: a running proxy
+            // on the same port may well be a different one.
+            let live = if cli.data_dir.is_none() {
+                try_live_status(&runtime).await
+            } else {
+                None
+            };
+            if let Some(value) = live {
                 print_status(&value, json)?;
             } else {
                 print_status(&runtime.status_json(), json)?;
@@ -346,11 +353,14 @@ async fn try_live_status(runtime: &HakimiRuntime) -> Option<Value> {
         .no_proxy()
         .build()
         .ok()?;
-    tokio::time::timeout(Duration::from_millis(800), async {
+    let value: Value = tokio::time::timeout(Duration::from_millis(800), async {
         client.get(url).send().await.ok()?.json().await.ok()
     })
     .await
-    .ok()?
+    .ok()??;
+    // Something else may listen on the proxy port. Only a hakimi answer is a
+    // status; anything else falls back to this runtime's own snapshot.
+    (value["app"].as_str() == Some("hakimi")).then_some(value)
 }
 
 fn print_status(value: &Value, json: bool) -> Result<()> {
@@ -378,10 +388,18 @@ fn print_status(value: &Value, json: bool) -> Result<()> {
     );
     if let Some(groups) = value["groups"].as_array() {
         for group in groups {
+            let state = group["state"].as_str().unwrap_or("?");
+            // Nothing has been tested yet: nothing is being checked either.
+            let state = if state == "checking" && group["testedDomains"].as_u64().unwrap_or(0) == 0
+            {
+                "untested"
+            } else {
+                state
+            };
             println!(
                 "{:<10} {:<10} {:<20} tested={} failed={}",
                 group["id"].as_str().unwrap_or("?"),
-                group["state"].as_str().unwrap_or("?"),
+                state,
                 group["name"].as_str().unwrap_or(""),
                 group["testedDomains"].as_u64().unwrap_or(0),
                 group["failedDomains"].as_u64().unwrap_or(0),
