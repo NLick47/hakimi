@@ -186,6 +186,34 @@ fn mode_name(mode: ProxyMode) -> &'static str {
     }
 }
 
+/// The proxy address the system reports, in the same shape as the address
+/// the proxy announces.
+///
+/// macOS prints a web proxy as two lines ("Server:" and "Port:").  Dropping
+/// the port makes the comparison with the announced address fail, so the
+/// proxy would look unapplied even while it routes the traffic.
+fn parse_current_proxy(text: &str, mode: Option<ProxyMode>) -> Option<String> {
+    let value = |key: &str| {
+        text.lines().find_map(|line| {
+            let (name, value) = line.trim_start().split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case(key)
+                .then(|| value.trim().to_string())
+        })
+    };
+    let server = || {
+        let server = value("Server")?;
+        Some(match value("Port") {
+            Some(port) => format!("{server}:{port}"),
+            None => server,
+        })
+    };
+    match mode {
+        Some(ProxyMode::Http) => server(),
+        _ => value("URL").or_else(server),
+    }
+}
+
 #[derive(Debug)]
 struct CurrentProxy {
     supported: bool,
@@ -537,15 +565,7 @@ fn platform_current(mode: Option<ProxyMode>) -> Result<CurrentProxy> {
         _ => vec!["-getautoproxyurl", service.as_str()],
     };
     let text = run_networksetup_with_timeout(&args, NETWORKSETUP_TIMEOUT_SECS)?;
-    let current = text
-        .lines()
-        .find(|line| line.trim_start().starts_with("URL:"))
-        .map(|line| line.trim_start_matches("URL:").trim().to_string())
-        .or_else(|| {
-            text.lines()
-                .find(|line| line.trim_start().starts_with("Server:"))
-                .map(|line| line.trim_start_matches("Server:").trim().to_string())
-        });
+    let current = parse_current_proxy(&text, mode);
     Ok(CurrentProxy {
         supported: true,
         current,
@@ -619,5 +639,44 @@ mod process_timeout_tests {
             "timeout not enforced: waited {elapsed:?} for a hung child"
         );
         assert!(result.is_err(), "a killed child must surface as an error");
+    }
+}
+
+#[cfg(test)]
+mod current_proxy_tests {
+    use super::*;
+
+    /// macOS reports a web proxy as two lines. The address has to keep the
+    /// port, otherwise the proxy looks unapplied even while it is routing.
+    #[test]
+    fn the_web_proxy_address_keeps_its_port() {
+        let text = "Enabled: Yes\nServer: 127.0.0.1\nPort: 8443\nAuthenticated Proxy Enabled: 0\n";
+        let current = parse_current_proxy(text, Some(ProxyMode::Http)).unwrap();
+        assert_eq!(current, "127.0.0.1:8443");
+        // The comparison the status does must now succeed.
+        assert!(current.contains("127.0.0.1:8443"));
+    }
+
+    #[test]
+    fn the_pac_url_is_read_as_a_whole() {
+        let text = "URL: http://127.0.0.1:8443/proxy.pac\nEnabled: Yes\n";
+        let current = parse_current_proxy(text, Some(ProxyMode::Pac)).unwrap();
+        assert_eq!(current, "http://127.0.0.1:8443/proxy.pac");
+        assert!(current.contains("http://127.0.0.1:8443/proxy.pac"));
+    }
+
+    /// Without a mode the URL wins, and the web proxy is the fallback.
+    #[test]
+    fn the_fallback_reads_the_web_proxy() {
+        let text = "Enabled: Yes\nServer: 127.0.0.1\nPort: 8443\n";
+        assert_eq!(
+            parse_current_proxy(text, None),
+            Some("127.0.0.1:8443".to_string())
+        );
+        let text = "URL: http://127.0.0.1:8443/proxy.pac\nEnabled: Yes\n";
+        assert_eq!(
+            parse_current_proxy(text, None),
+            Some("http://127.0.0.1:8443/proxy.pac".to_string())
+        );
     }
 }
