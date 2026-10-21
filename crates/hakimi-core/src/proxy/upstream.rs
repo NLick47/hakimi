@@ -9,7 +9,7 @@ use hyper::upgrade::{self, OnUpgrade};
 use hyper_util::rt::TokioIo;
 
 use super::pool::{UpstreamBody, UpstreamResponseBody};
-use super::{escape_html, full_body, ProxyBody, ProxyContext};
+use super::{escape_html, full_body, ProxyBody, ProxyContext, COPY_BUFFER_SIZE};
 use crate::domain::{is_ip_literal, normalize_hostname};
 use crate::status::{AttemptRecord, DomainDiagnostics, State};
 use crate::strategy::FailureReason;
@@ -266,8 +266,13 @@ async fn forward_with_pool(
                     (Ok(client), Ok(server)) => {
                         let mut client = TokioIo::new(client);
                         let mut server = TokioIo::new(server);
-                        if let Err(error) =
-                            tokio::io::copy_bidirectional(&mut client, &mut server).await
+                        if let Err(error) = tokio::io::copy_bidirectional_with_sizes(
+                            &mut client,
+                            &mut server,
+                            COPY_BUFFER_SIZE,
+                            COPY_BUFFER_SIZE,
+                        )
+                        .await
                         {
                             tracing::debug!(error = %error, "websocket tunnel closed");
                         }

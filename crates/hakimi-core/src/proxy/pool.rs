@@ -19,7 +19,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _, Result};
 use bytes::Bytes;
@@ -623,61 +623,74 @@ impl RouteConnector {
         }
     }
 
-    /// Race candidate batches until one connects. Only the single-flight leader runs this;
-    /// every other caller for the same domain waits for and reuses the winning plan.
+    /// Race candidate plans as they become available. Only the single-flight leader
+    /// runs this; every other caller for the same domain waits for and reuses the
+    /// winning plan.
+    ///
+    /// Plans are streamed into the race instead of being buffered first: the first
+    /// usable candidate starts connecting immediately, while the next plan is being
+    /// generated. This matters because plan generation can await an ECH HTTPS-RR
+    /// query or a DoH expansion; buffering would delay a perfectly good cached or
+    /// catalog route behind those network round trips.
     async fn race_plans(
         &self,
         mut cursor: RouteCursor,
         force_http1: bool,
     ) -> std::result::Result<(ConnectPlan, PooledIo), String> {
+        type RaceResult =
+            Result<(ConnectPlan, PooledIo, u64), (ConnectPlan, FailureReason, String)>;
+        enum Event {
+            Plan(Option<ConnectPlan>),
+            Result(RaceResult),
+        }
+
+        let mut pending: FuturesUnordered<
+            Pin<Box<dyn Future<Output = RaceResult> + Send>>,
+        > = FuturesUnordered::new();
+        let mut exhausted = false;
+        // Plans generated together form one initial hedge wave. Plans that arrive
+        // after a failed handshake start immediately instead of sleeping again.
+        let mut first_start: Option<Instant> = None;
+
         loop {
-            // Pull a batch of plans and race them. The first plan (the learned-best
-            // route) gets a short head start; every other route fires together, so a
-            // batch of failing candidates costs one timeout in parallel instead of
-            // RACE_SIZE timeouts serially. A dead route no longer makes every
-            // following candidate wait out its full timeout.
-            let mut plans: Vec<ConnectPlan> = Vec::new();
-            for _ in 0..RACE_SIZE {
-                match cursor.next_plan().await {
-                    Some(plan) => plans.push(plan),
-                    None => break,
+            let event = if !exhausted && pending.len() < RACE_SIZE {
+                tokio::select! {
+                    plan = cursor.next_plan() => Event::Plan(plan),
+                    Some(result) = pending.next(), if !pending.is_empty() => Event::Result(result),
                 }
-            }
-            if plans.is_empty() {
-                let detail = cursor
-                    .outcome()
-                    .and_then(|outcome| outcome.diagnostics.detail.clone())
-                    .or_else(|| {
-                        cursor
-                            .outcome()
-                            .map(|outcome| format!("{:?}", outcome.diagnostics.state))
-                    })
-                    .unwrap_or_else(|| "no route candidate succeeded".into());
-                return Err(detail);
-            }
+            } else if !pending.is_empty() {
+                Event::Result(pending.next().await.expect("pending is not empty"))
+            } else {
+                return Err(discovery_failure_detail(&cursor));
+            };
 
-            type RaceResult = Result<(ConnectPlan, PooledIo, u64), (ConnectPlan, FailureReason, String)>;
-            let mut pending = FuturesUnordered::<
-                Pin<Box<dyn Future<Output = RaceResult> + Send>>,
-            >::new();
-            for (index, plan) in plans.into_iter().enumerate() {
-                let this = self.clone();
-                pending.push(Box::pin(async move {
-                    // The priority route starts immediately; the rest share one short
-                    // head-start delay so the race still prefers it when close.
-                    if index > 0 {
-                        tokio::time::sleep(RACE_STAGGER).await;
-                    }
-                    let started = std::time::Instant::now();
-                    match this.connect_plan(&plan, force_http1).await {
-                        Ok(io) => Ok((plan, io, started.elapsed().as_millis() as u64)),
-                        Err((reason, detail)) => Err((plan, reason, detail)),
-                    }
-                }));
-            }
-
-            while let Some(result) = pending.next().await {
-                match result {
+            match event {
+                Event::Plan(Some(plan)) => {
+                    let delay = match first_start {
+                        None => {
+                            first_start = Some(Instant::now());
+                            None
+                        }
+                        Some(start) => {
+                            let deadline = start + RACE_STAGGER;
+                            let now = Instant::now();
+                            (now < deadline).then(|| deadline - now)
+                        }
+                    };
+                    let this = self.clone();
+                    pending.push(Box::pin(async move {
+                        if let Some(delay) = delay {
+                            tokio::time::sleep(delay).await;
+                        }
+                        let started = Instant::now();
+                        match this.connect_plan(&plan, force_http1).await {
+                            Ok(io) => Ok((plan, io, started.elapsed().as_millis() as u64)),
+                            Err((reason, detail)) => Err((plan, reason, detail)),
+                        }
+                    }));
+                }
+                Event::Plan(None) => exhausted = true,
+                Event::Result(result) => match result {
                     Ok((plan, io, latency)) => {
                         cursor.note_success(&plan, latency);
                         // Dropping `pending` cancels the losing handshakes mid-flight.
@@ -687,9 +700,8 @@ impl RouteConnector {
                         self.engine.forget_plan(&plan.domain, plan.port, plan.tls);
                         cursor.note_failure(&plan, reason, detail);
                     }
-                }
+                },
             }
-            // The whole batch failed; the loop pulls the next batch from the cursor.
         }
     }
 
@@ -827,6 +839,18 @@ impl RouteConnector {
     }
 }
 
+fn discovery_failure_detail(cursor: &RouteCursor) -> String {
+    cursor
+        .outcome()
+        .and_then(|outcome| outcome.diagnostics.detail.clone())
+        .or_else(|| {
+            cursor
+                .outcome()
+                .map(|outcome| format!("{:?}", outcome.diagnostics.state))
+        })
+        .unwrap_or_else(|| "no route candidate succeeded".into())
+}
+
 struct PooledIo {
     io: Transport,
     h2: bool,
@@ -901,12 +925,40 @@ mod tests {
     use crate::config::{ConfigManager, GroupConfig};
     use crate::decision::DecisionEngine;
     use crate::paths::Paths;
-    use crate::resolver::Resolver;
+    use crate::resolver::{DohResolution, EchOutcome, IpResolver, Resolver};
     use crate::status::StatusStore;
     use crate::strategy::{IpSource, Strategy};
     use crate::util::now;
 
+    struct SlowResolver {
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl IpResolver for SlowResolver {
+        async fn doh_ips(&self, _domain: &str) -> anyhow::Result<DohResolution> {
+            tokio::time::sleep(self.delay).await;
+            Err(anyhow::anyhow!("slow resolver intentionally failed"))
+        }
+
+        async fn doh_ech_config(
+            &self,
+            _domain: &str,
+            _allow_shared: bool,
+        ) -> anyhow::Result<EchOutcome> {
+            tokio::time::sleep(self.delay).await;
+            Err(anyhow::anyhow!("slow resolver intentionally failed"))
+        }
+    }
+
     fn engine_for(dir: &std::path::Path) -> (Arc<DecisionEngine>, Arc<ConfigManager>) {
+        engine_for_with_resolver(dir, None)
+    }
+
+    fn engine_for_with_resolver(
+        dir: &std::path::Path,
+        slow: Option<std::time::Duration>,
+    ) -> (Arc<DecisionEngine>, Arc<ConfigManager>) {
         let paths = Paths::new(dir);
         paths.ensure().unwrap();
         let config = Arc::new(ConfigManager::load_or_create(&paths).unwrap());
@@ -938,7 +990,10 @@ mod tests {
         });
         let catalogs = CatalogManager::load(&paths, config.clone(), cache.clone()).unwrap();
         let status = Arc::new(StatusStore::new());
-        let resolver = Resolver::new(cache.clone(), config.clone(), catalogs.clone());
+        let resolver: Arc<dyn IpResolver> = match slow {
+            Some(delay) => Arc::new(SlowResolver { delay }),
+            None => Resolver::new(cache.clone(), config.clone(), catalogs.clone()),
+        };
         let tls = TlsContext::new().unwrap();
         let engine = DecisionEngine::new(config.clone(), cache, catalogs, resolver, tls, status);
         (engine, config)
@@ -1064,5 +1119,53 @@ mod tests {
         let stats = pool.stats_json();
         assert_eq!(stats["connectionsOpened"], 1);
         assert_eq!(stats["responsesH1"], 3);
+    }
+
+    /// Regression probe for cold-connection latency: a single cached candidate is
+    /// available, but `race_plans` pre-buffers plans and `next_plan` waits for DoH
+    /// expansion before the race can start. The first connection should not wait
+    /// for DoH when a usable cached route is already known.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cached_candidate_is_not_blocked_by_slow_doh_expansion() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, config) =
+            engine_for_with_resolver(dir.path(), Some(Duration::from_millis(1500)));
+        let tls = TlsContext::new().unwrap();
+        let pool = UpstreamPool::new(engine, tls, &config.snapshot());
+        let uri = format!("http://upstream.test:{port}/");
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(Either::Right(Full::new(Bytes::new())))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let response = pool.send(request, false).await.unwrap();
+        let elapsed = started.elapsed();
+        println!("cached candidate response took {elapsed:?} with a 1.5s DoH delay");
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "the cached candidate was blocked by DoH expansion: {elapsed:?}"
+        );
     }
 }

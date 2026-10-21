@@ -4,12 +4,15 @@ mod upstream;
 pub use pool::UpstreamPool;
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use http::{header, Method, Request, Response, StatusCode};
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Empty, Full};
 use hyper::body::Incoming;
@@ -26,18 +29,22 @@ use crate::ca::CertificateAuthority;
 use crate::cache::CacheManager;
 use crate::catalog::CatalogManager;
 use crate::config::ConfigManager;
-use crate::decision::{ConnectPlan, DecisionEngine, Route};
+use crate::decision::{ConnectPlan, DecisionEngine, Route, RouteCursor};
 use crate::domain::is_ip_literal;
 use crate::ip_tester::TlsContext;
 use crate::resolver::Resolver;
 use crate::status::StatusStore;
-use crate::strategy::{Strategy, TlsMode};
+use crate::strategy::{FailureReason, Strategy, TlsMode};
 use crate::util::parse_authority;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-direction buffer for upgraded/TCP tunnels. 64 KiB moves large responses
+/// with far fewer read/write syscalls than tokio's 8 KiB default while keeping
+/// per-connection memory reasonable.
+pub(crate) const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Shared proxy state. Runtime installs a callback used by `/hakimi/status` so the CLI and the
 /// desktop shell can read the same JSON the UI uses.
@@ -281,11 +288,13 @@ async fn handle_connect(
 
     // Fast path: a previously successful direct route turns CONNECT into a raw TCP tunnel,
     // with no probe, no local certificate and no extra TLS handshake.
+    let candidate_timeout =
+        Duration::from_millis(config.advanced.ip_timeout_ms.clamp(500, 10_000));
     let mut stale_plan = None;
     if let Some(plan) = ctx.engine.cached_plan(&host, port, true) {
         if plan.mode == TlsMode::Direct {
             let started = std::time::Instant::now();
-            match connect_tcp_upstream(plan.ip, plan.port).await {
+            match connect_tcp_upstream(plan.ip, plan.port, candidate_timeout).await {
                 Ok(stream) => {
                     let latency = started.elapsed().as_millis() as u64;
                     ctx.engine.note_tunnel_success(&plan, latency);
@@ -393,35 +402,112 @@ async fn tunnel_direct_group(
     if let Some(plan) = failed_plan {
         cursor.skip_plan(plan);
     }
-    loop {
-        let Some(plan) = cursor.next_plan().await else {
+    let timeout = Duration::from_millis(
+        ctx.config
+            .snapshot()
+            .advanced
+            .ip_timeout_ms
+            .clamp(500, 10_000),
+    );
+    match race_tcp_plans(&mut cursor, timeout).await {
+        Some((plan, stream, latency)) => {
+            let _ = cursor.note_success(&plan, latency);
+            tunnel_connect(req, stream)
+        }
+        None => {
             let diagnostics = cursor.outcome().map(|outcome| outcome.diagnostics.clone());
-            return match diagnostics {
+            match diagnostics {
                 Some(diagnostics) => upstream::diagnostics_error_page(host, &diagnostics, ctx),
                 None => error_response(
                     StatusCode::BAD_GATEWAY,
                     "Upstream connection failed",
                     &format!("no candidate route succeeded for {host}:{port}"),
                 ),
-            };
-        };
-        if plan.mode != TlsMode::Direct {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "Direct routing failed",
-                &format!(
-                    "the direct strategy was exhausted for {host}:{port}; install the local CA trust                      anchor to enable ECH/fake-SNI through the MITM proxy"
-                ),
-            );
-        }
-        let started = std::time::Instant::now();
-        match connect_tcp_upstream(plan.ip, plan.port).await {
-            Ok(stream) => {
-                let latency = started.elapsed().as_millis() as u64;
-                let _ = cursor.note_success(&plan, latency);
-                return tunnel_connect(req, stream);
             }
-            Err((reason, detail)) => cursor.note_failure(&plan, reason, detail),
+        }
+    }
+}
+
+/// Connect a raw tunnel with Happy-Eyeballs-style hedging: direct candidates are
+/// raced in a rolling window instead of being tried one at a time. Non-direct
+/// plans are skipped (the caller's browser performs the real TLS handshake, so a
+/// direct candidate is the only usable one here).
+async fn race_tcp_plans(
+    cursor: &mut RouteCursor,
+    timeout: Duration,
+) -> Option<(ConnectPlan, TcpStream, u64)> {
+    const RAW_RACE_SIZE: usize = 8;
+    const RAW_RACE_STAGGER: Duration = Duration::from_millis(150);
+
+    type RaceResult = Result<(ConnectPlan, TcpStream, u64), (ConnectPlan, FailureReason, String)>;
+    enum Event {
+        Plan(Option<ConnectPlan>),
+        Result(RaceResult),
+    }
+
+    let mut pending: FuturesUnordered<Pin<Box<dyn Future<Output = RaceResult> + Send>>> =
+        FuturesUnordered::new();
+    let mut exhausted = false;
+    let mut first_start: Option<Instant> = None;
+
+    loop {
+        let event = if !exhausted && pending.len() < RAW_RACE_SIZE {
+            tokio::select! {
+                plan = cursor.next_plan() => Event::Plan(plan),
+                Some(result) = pending.next(), if !pending.is_empty() => Event::Result(result),
+            }
+        } else if !pending.is_empty() {
+            Event::Result(pending.next().await.expect("pending is not empty"))
+        } else {
+            return None;
+        };
+
+        match event {
+            Event::Plan(Some(plan)) => {
+                if plan.mode != TlsMode::Direct {
+                    continue;
+                }
+                let delay = match first_start {
+                    None => {
+                        first_start = Some(Instant::now());
+                        None
+                    }
+                    Some(start) => {
+                        let deadline = start + RAW_RACE_STAGGER;
+                        let now = Instant::now();
+                        (now < deadline).then(|| deadline - now)
+                    }
+                };
+                pending.push(Box::pin(async move {
+                    if let Some(delay) = delay {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let address = SocketAddr::new(plan.ip, plan.port);
+                    let started = Instant::now();
+                    match tokio::time::timeout(timeout, TcpStream::connect(address)).await {
+                        Ok(Ok(stream)) => {
+                            let _ = stream.set_nodelay(true);
+                            crate::util::apply_tcp_keepalive(&stream);
+                            Ok((plan, stream, started.elapsed().as_millis() as u64))
+                        }
+                        Ok(Err(error)) => Err((
+                            plan,
+                            FailureReason::TcpRefused,
+                            format!("connecting to {address} failed: {error}"),
+                        )),
+                        Err(_) => Err((
+                            plan,
+                            FailureReason::TcpTimeout,
+                            format!("connecting to {address} timed out"),
+                        )),
+                    }
+                }));
+            }
+            Event::Plan(None) => exhausted = true,
+            Event::Result(result) => match result {
+                Ok(success) => return Some(success),
+                Err((plan, reason, detail)) => cursor.note_failure(&plan, reason, detail),
+            },
         }
     }
 }
@@ -429,20 +515,21 @@ async fn tunnel_direct_group(
 async fn connect_tcp_upstream(
     ip: std::net::IpAddr,
     port: u16,
-) -> Result<TcpStream, (crate::strategy::FailureReason, String)> {
+    timeout: Duration,
+) -> Result<TcpStream, (FailureReason, String)> {
     let address = SocketAddr::new(ip, port);
-    match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await {
+    match tokio::time::timeout(timeout, TcpStream::connect(address)).await {
         Ok(Ok(stream)) => {
             let _ = stream.set_nodelay(true);
             crate::util::apply_tcp_keepalive(&stream);
             Ok(stream)
         }
         Ok(Err(error)) => Err((
-            crate::strategy::FailureReason::TcpRefused,
+            FailureReason::TcpRefused,
             format!("connecting to {address} failed: {error}"),
         )),
         Err(_) => Err((
-            crate::strategy::FailureReason::TcpTimeout,
+            FailureReason::TcpTimeout,
             format!("connecting to {address} timed out"),
         )),
     }
@@ -483,8 +570,13 @@ fn tunnel_connect(req: &mut Request<Incoming>, mut upstream: TcpStream) -> Respo
         match on_upgrade.await {
             Ok(upgraded) => {
                 let mut upgraded = TokioIo::new(upgraded);
-                if let Err(error) =
-                    tokio::io::copy_bidirectional(&mut upgraded, &mut upstream).await
+                if let Err(error) = tokio::io::copy_bidirectional_with_sizes(
+                    &mut upgraded,
+                    &mut upstream,
+                    COPY_BUFFER_SIZE,
+                    COPY_BUFFER_SIZE,
+                )
+                .await
                 {
                     tracing::debug!(error = %error, "tunnel closed");
                 }
@@ -593,8 +685,232 @@ pub(crate) fn escape_html(value: &str) -> String {
 mod tests {
     use super::*;
 
+    use std::net::IpAddr;
+
+    use crate::cache::{CacheManager, LastGoodEntry};
+    use crate::catalog::RemoteIpProvider;
+    use crate::config::GroupConfig;
+    use crate::paths::Paths;
+    use crate::resolver::{DohResolution, EchOutcome, IpResolver};
+    use crate::strategy::IpSource;
+    use crate::util::now;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Loopback throughput microbenchmark for the proxy's bidirectional copy
+    /// buffer size. Ignored by default because it moves a large payload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "loopback throughput benchmark"]
+    async fn copy_buffer_size_throughput() {
+        async fn run(buffer: usize, total: usize) -> Duration {
+            let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin_addr = origin.local_addr().unwrap();
+            let origin_task = tokio::spawn(async move {
+                let (mut socket, _) = origin.accept().await.unwrap();
+                let _ = socket.set_nodelay(true);
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut read = 0usize;
+                while read < total {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    read += n;
+                }
+                socket.write_all(b"ok").await.unwrap();
+            });
+
+            let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let relay_addr = relay.local_addr().unwrap();
+            let relay_task = tokio::spawn(async move {
+                let (mut client, _) = relay.accept().await.unwrap();
+                let _ = client.set_nodelay(true);
+                let mut upstream = TcpStream::connect(origin_addr).await.unwrap();
+                let _ = upstream.set_nodelay(true);
+                let _ = tokio::io::copy_bidirectional_with_sizes(
+                    &mut client,
+                    &mut upstream,
+                    buffer,
+                    buffer,
+                )
+                .await;
+            });
+
+            let mut client = TcpStream::connect(relay_addr).await.unwrap();
+            let _ = client.set_nodelay(true);
+            let chunk = vec![0u8; 64 * 1024];
+            let started = Instant::now();
+            let mut sent = 0usize;
+            while sent < total {
+                let n = (total - sent).min(chunk.len());
+                client.write_all(&chunk[..n]).await.unwrap();
+                sent += n;
+            }
+            client.shutdown().await.unwrap();
+            let mut response = [0u8; 2];
+            client.read_exact(&mut response).await.unwrap();
+            let elapsed = started.elapsed();
+            origin_task.await.unwrap();
+            relay_task.await.unwrap();
+            elapsed
+        }
+
+        const TOTAL: usize = 128 * 1024 * 1024;
+        for buffer in [8 * 1024usize, 64 * 1024] {
+            let mut samples = Vec::new();
+            for _ in 0..3 {
+                let elapsed = run(buffer, TOTAL).await;
+                let mbps = (TOTAL as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
+                println!("buffer={}KiB elapsed={elapsed:?} throughput={mbps:.1} MiB/s", buffer / 1024);
+                samples.push(elapsed);
+            }
+            samples.sort();
+            println!("buffer={}KiB median={:?}", buffer / 1024, samples[1]);
+        }
+    }
+
     #[test]
     fn html_escape() {
         assert_eq!(escape_html("<a&b>"), "&lt;a&amp;b&gt;");
+    }
+
+    struct FakeRemote {
+        ips: Vec<IpAddr>,
+    }
+
+    impl RemoteIpProvider for FakeRemote {
+        fn remote_ips(&self, _domain: &str) -> Option<(String, Vec<IpAddr>)> {
+            Some(("upstream.test".into(), self.ips.clone()))
+        }
+
+        fn remote_sni(&self, _group_id: &str) -> Option<String> {
+            None
+        }
+
+        fn has_ip_catalog(&self) -> bool {
+            true
+        }
+    }
+
+    struct FakeResolver;
+
+    #[async_trait::async_trait]
+    impl IpResolver for FakeResolver {
+        async fn doh_ips(&self, _domain: &str) -> anyhow::Result<DohResolution> {
+            Err(anyhow::anyhow!("no doh in this test"))
+        }
+
+        async fn doh_ech_config(
+            &self,
+            _domain: &str,
+            _allow_shared: bool,
+        ) -> anyhow::Result<EchOutcome> {
+            Err(anyhow::anyhow!("no ech in this test"))
+        }
+    }
+
+    fn engine_for_direct_test(
+        dir: &std::path::Path,
+        cached_ip: IpAddr,
+        remote_ips: Vec<IpAddr>,
+    ) -> Arc<DecisionEngine> {
+        let paths = Paths::new(dir);
+        paths.ensure().unwrap();
+        let config = Arc::new(ConfigManager::load_or_create(&paths).unwrap());
+        config
+            .upsert_group(GroupConfig {
+                id: "test".into(),
+                name: "Test".into(),
+                domains: vec!["upstream.test".into()],
+                strategy: Strategy::Direct,
+                enabled: true,
+                sni: None,
+                experimental: false,
+                ech_shared: false,
+            })
+            .unwrap();
+        let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
+        cache.put_last_good(LastGoodEntry {
+            domain: "upstream.test".into(),
+            ip: cached_ip,
+            strategy: Strategy::Direct,
+            source: IpSource::Cache,
+            network_id: "test".into(),
+            saved_at: now(),
+            catalog_version: 0,
+        });
+        let tls = TlsContext::new().unwrap();
+        let status = Arc::new(StatusStore::new());
+        DecisionEngine::new(
+            config,
+            cache,
+            Arc::new(FakeRemote { ips: remote_ips }),
+            Arc::new(FakeResolver),
+            tls,
+            status,
+        )
+    }
+
+    /// The raw CONNECT path must not wait ten seconds for a black-holed first
+    /// candidate when another candidate is reachable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_tunnel_races_past_a_blackholed_candidate() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Keep the listener alive for the duration of the test; the winning
+        // connect only needs the kernel handshake, not an accept.
+        let _listener = listener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_for_direct_test(
+            dir.path(),
+            "192.0.2.1".parse().unwrap(),
+            vec!["127.0.0.1".parse().unwrap()],
+        );
+        let mut cursor = match engine.route("upstream.test", port, true) {
+            Route::Group(cursor) => cursor,
+            _ => panic!("expected a group route"),
+        };
+
+        // Baseline: the previous implementation tried candidates one at a time.
+        let serial_started = Instant::now();
+        let _ = connect_tcp_upstream(
+            "192.0.2.1".parse().unwrap(),
+            443,
+            Duration::from_secs(1),
+        )
+        .await;
+        let _ = connect_tcp_upstream("127.0.0.1".parse().unwrap(), port, Duration::from_secs(1))
+            .await;
+        let serial_elapsed = serial_started.elapsed();
+
+        let started = Instant::now();
+        let result = race_tcp_plans(&mut cursor, Duration::from_secs(1)).await;
+        let elapsed = started.elapsed();
+        println!("serial fallback took {serial_elapsed:?}; raw candidate race finished in {elapsed:?}");
+        let (plan, _stream, _) = result.expect("the reachable candidate must win");
+        assert_eq!(plan.ip.to_string(), "127.0.0.1");
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "serial fallback would wait for the black-holed candidate; elapsed={elapsed:?}"
+        );
+    }
+
+    /// Before the fix this helper used the 10 s system connect timeout even for
+    /// accelerated candidates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_candidate_uses_the_configured_timeout() {
+        let started = Instant::now();
+        let result = connect_tcp_upstream(
+            "192.0.2.1".parse().unwrap(),
+            443,
+            Duration::from_millis(300),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "the TEST-NET candidate must not connect");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "candidate timeout was not honored: {elapsed:?}"
+        );
     }
 }

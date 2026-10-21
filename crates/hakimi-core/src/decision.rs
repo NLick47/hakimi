@@ -355,6 +355,10 @@ impl RouteCursor {
                     Some(candidate) => {
                         self.current = Some(candidate);
                         self.mode_index = 0;
+                        // The SNI list is swept per candidate. Without this reset the
+                        // second IP starts at the end of the list and never gets a
+                        // fake-SNI attempt at all.
+                        self.sni_index = 0;
                     }
                     None => {
                         self.finish_failure();
@@ -365,7 +369,6 @@ impl RouteCursor {
             let mode = self.modes[self.mode_index];
 
             if mode == TlsMode::Ech && !self.ech_checked {
-                self.ech_checked = true;
                 match self
                     .engine
                     .resolver
@@ -388,6 +391,10 @@ impl RouteCursor {
                         self.ech_error = Some(format!("{error:#}"));
                     }
                 }
+                // Mark the attempt only after the await: if the race that
+                // requested this plan is cancelled mid-query, the next plan
+                // request retries instead of silently dropping the ECH route.
+                self.ech_checked = true;
                 if self.ech_config.is_none() {
                     if self.group.strategy == Strategy::Ech {
                         self.last_reason = Some(FailureReason::EchUnavailable);
@@ -412,8 +419,11 @@ impl RouteCursor {
 
             if mode == TlsMode::FakeSni {
                 if self.sni_index >= self.sni_candidates.len() {
-                    // Every fake-SNI host was tried: drop the route for every round.
-                    self.modes.retain(|m| *m != TlsMode::FakeSni);
+                    // The SNI list is exhausted for this candidate, but another
+                    // candidate may still work with the same hosts. Move past the
+                    // fake-SNI route for this round; the mode stays in the list so
+                    // the next candidate sweeps the full SNI list again.
+                    self.mode_index += 1;
                     continue;
                 }
                 // Stay on this mode until the whole SNI list has been paired with
@@ -479,11 +489,13 @@ impl RouteCursor {
                 && self.candidates.len() < self.max
                 && self.candidate_index >= EARLY_DOH_AFTER.min(self.candidates.len())
             {
-                self.doh_loaded = true;
                 let engine = self.engine.clone();
                 let expansion = engine
                     .expand_doh(&self.domain, &mut self.candidates, &mut self.seen, self.max)
                     .await;
+                // Set the flag only after the await: a cancelled race must not
+                // permanently skip the DoH expansion for this route cursor.
+                self.doh_loaded = true;
                 merge_expansion(&mut self.doh, expansion);
                 if self.candidate_index < self.candidates.len() {
                     continue;
@@ -1667,6 +1679,38 @@ mod tests {
             .engine
             .sni_candidates(&config, &group, "example.com", "net");
         assert!(candidates.iter().any(|candidate| candidate.is_some()));
+    }
+
+    /// The fake-SNI sweep is candidate-major: every candidate IP must get the
+    /// full SNI list. Previously `sni_index` was never reset when the cursor
+    /// advanced to the next candidate, so only the first IP was ever tried.
+    #[tokio::test]
+    async fn fake_sni_sweep_restarts_for_each_candidate() {
+        let harness = harness(&["example.com"], Strategy::FakeSni);
+        *harness.remote.catalog.lock() = true;
+        let first: IpAddr = "203.0.113.10".parse().unwrap();
+        let second: IpAddr = "203.0.113.11".parse().unwrap();
+        *harness.remote.ips.lock() = Some(vec![first, second]);
+
+        let mut cursor = match harness.engine.route("example.com", 443, true) {
+            Route::Group(cursor) => cursor,
+            _ => panic!("expected a group route"),
+        };
+        let mut plans = Vec::new();
+        while let Some(plan) = cursor.next_plan().await {
+            plans.push(plan);
+        }
+
+        let first_plans = plans.iter().filter(|plan| plan.ip == first).count();
+        let second_plans = plans.iter().filter(|plan| plan.ip == second).count();
+        assert!(
+            first_plans > 0,
+            "the first candidate must get the SNI sweep: {plans:?}"
+        );
+        assert_eq!(
+            first_plans, second_plans,
+            "both candidate IPs must be paired with the same SNI list, got {plans:?}"
+        );
     }
 
     #[tokio::test]

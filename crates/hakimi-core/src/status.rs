@@ -176,6 +176,7 @@ impl StatusStore {
 
     pub fn record(&self, diagnostics: DomainDiagnostics) {
         let mut map = self.domains.write();
+        let mut unchanged_checking = false;
         if let Some(existing) = map.get(&diagnostics.domain) {
             // Never let a slower, older probe overwrite a newer result.
             if existing.last_check > diagnostics.last_check
@@ -184,6 +185,10 @@ impl StatusStore {
             {
                 return;
             }
+            // Re-marking an already-checking domain is the common cold-connect
+            // path. It changes no visible state, so do not wake every UI poller.
+            unchanged_checking =
+                existing.state == State::Checking && diagnostics.state == State::Checking;
             // A state flip is the single most useful troubleshooting signal:
             // it tells whether a site just broke or just recovered, and when.
             // `Checking` is a transient marker, not a real transition — logging
@@ -205,8 +210,11 @@ impl StatusStore {
         map.insert(diagnostics.domain.clone(), diagnostics);
         // The record is in the map now: publish the change to pollers. Doing
         // it after the write (and after the early return above) means a
-        // revision bump always corresponds to a visible change.
-        self.revision.fetch_add(1, Ordering::SeqCst);
+        // revision bump always corresponds to a visible change. Re-marking an
+        // already-checking domain is not a visible change.
+        if !unchanged_checking {
+            self.revision.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     pub fn mark_checking(
@@ -340,6 +348,30 @@ mod tests {
             attempts: Vec::new(),
             suggestions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn repeated_checking_does_not_bump_revision() {
+        let store = StatusStore::new();
+        store.record(report("example.com", State::Normal));
+        store.mark_checking(
+            Some("github".into()),
+            "example.com",
+            Some(Strategy::Auto),
+            1,
+        );
+        let revision = store.revision();
+        store.mark_checking(
+            Some("github".into()),
+            "example.com",
+            Some(Strategy::Auto),
+            1,
+        );
+        assert_eq!(
+            store.revision(),
+            revision,
+            "a cold connect that is already marked Checking must not force a UI snapshot rebuild"
+        );
     }
 
     #[test]
