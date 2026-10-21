@@ -29,11 +29,8 @@ struct FakeRemote {
 }
 
 impl RemoteIpProvider for FakeRemote {
-    fn remote_ips(&self, _domain: &str) -> Option<(String, Vec<IpAddr>)> {
-        self.ips
-            .lock()
-            .clone()
-            .map(|ips| ("example.com".to_string(), ips))
+    fn remote_ips(&self, _domain: &str) -> Option<Vec<IpAddr>> {
+        self.ips.lock().clone()
     }
     fn remote_sni(&self, _group_id: &str) -> Option<String> {
         self.sni.lock().clone()

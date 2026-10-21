@@ -110,7 +110,10 @@ pub struct CatalogManager {
 
 /// Read-only catalog surface used by the decision engine. It can be mocked in tests.
 pub trait RemoteIpProvider: Send + Sync {
-    fn remote_ips(&self, domain: &str) -> Option<(String, Vec<std::net::IpAddr>)>;
+    /// Candidate IPs for a domain. The catalog pattern is not part of the
+    /// result: the route cursor only needs the addresses, so the pattern
+    /// string is not copied for every new connection.
+    fn remote_ips(&self, domain: &str) -> Option<Vec<std::net::IpAddr>>;
     fn remote_sni(&self, group_id: &str) -> Option<String>;
     fn has_ip_catalog(&self) -> bool;
 
@@ -122,13 +125,13 @@ pub trait RemoteIpProvider: Send + Sync {
     fn remote_ips_with_catalog(
         &self,
         domain: &str,
-    ) -> (Option<(String, Vec<std::net::IpAddr>)>, bool) {
+    ) -> (Option<Vec<std::net::IpAddr>>, bool) {
         (self.remote_ips(domain), self.has_ip_catalog())
     }
 }
 
 impl RemoteIpProvider for CatalogManager {
-    fn remote_ips(&self, domain: &str) -> Option<(String, Vec<std::net::IpAddr>)> {
+    fn remote_ips(&self, domain: &str) -> Option<Vec<std::net::IpAddr>> {
         CatalogManager::remote_ips(self, domain)
     }
 
@@ -143,7 +146,7 @@ impl RemoteIpProvider for CatalogManager {
     fn remote_ips_with_catalog(
         &self,
         domain: &str,
-    ) -> (Option<(String, Vec<std::net::IpAddr>)>, bool) {
+    ) -> (Option<Vec<std::net::IpAddr>>, bool) {
         CatalogManager::remote_ips_with_catalog(self, domain)
     }
 }
@@ -217,12 +220,12 @@ impl CatalogManager {
         self.ip_catalog.read().is_some()
     }
 
-    pub fn remote_ips(&self, domain: &str) -> Option<(String, Vec<std::net::IpAddr>)> {
+    pub fn remote_ips(&self, domain: &str) -> Option<Vec<std::net::IpAddr>> {
         self.ip_catalog
             .read()
             .as_ref()
             .and_then(|catalog| catalog.lookup_ips_normalized(domain))
-            .map(|(pattern, ips)| (pattern.clone(), ips.clone()))
+            .map(|(_, ips)| ips.clone())
     }
 
     /// One read-lock acquisition for the domain's IPs and the catalog flag.
@@ -230,13 +233,13 @@ impl CatalogManager {
     pub fn remote_ips_with_catalog(
         &self,
         domain: &str,
-    ) -> (Option<(String, Vec<std::net::IpAddr>)>, bool) {
+    ) -> (Option<Vec<std::net::IpAddr>>, bool) {
         let catalog = self.ip_catalog.read();
         let available = catalog.is_some();
         let ips = catalog
             .as_ref()
             .and_then(|catalog| catalog.lookup_ips_normalized(domain))
-            .map(|(pattern, ips)| (pattern.clone(), ips.clone()));
+            .map(|(_, ips)| ips.clone());
         (ips, available)
     }
 

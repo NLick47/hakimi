@@ -104,8 +104,8 @@ struct FakeRemote {
 }
 
 impl RemoteIpProvider for FakeRemote {
-    fn remote_ips(&self, _domain: &str) -> Option<(String, Vec<IpAddr>)> {
-        Some(("upstream.test".into(), self.ips.clone()))
+    fn remote_ips(&self, _domain: &str) -> Option<Vec<IpAddr>> {
+        Some(self.ips.clone())
     }
 
     fn remote_sni(&self, _group_id: &str) -> Option<String> {

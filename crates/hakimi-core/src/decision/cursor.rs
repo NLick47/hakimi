@@ -47,7 +47,6 @@ pub struct RouteCursor {
     config: Arc<AppConfig>,
     max: usize,
     candidates: Vec<Candidate>,
-    seen: HashSet<IpAddr>,
     candidate_index: usize,
     doh_loaded: bool,
     doh: DohExpansion,
@@ -91,14 +90,18 @@ impl RouteCursor {
         let (remote, remote_available) = engine.remote.remote_ips_with_catalog(&domain);
 
         let mut candidates: Vec<Candidate> = Vec::new();
-        let mut seen = HashSet::new();
-        let add_remote = |candidates: &mut Vec<Candidate>, seen: &mut HashSet<IpAddr>| {
-            if let Some((_, ips)) = &remote {
+        // The candidate list is capped at eight entries, so a linear scan is
+        // cheaper than allocating a hash set for every new connection.
+        let contains_ip = |candidates: &[Candidate], ip: IpAddr| {
+            candidates.iter().any(|candidate| candidate.ip == ip)
+        };
+        let add_remote = |candidates: &mut Vec<Candidate>| {
+            if let Some(ips) = &remote {
                 for ip in ips {
                     if candidates.len() >= max {
                         break;
                     }
-                    if seen.insert(*ip) {
+                    if !contains_ip(candidates, *ip) {
                         candidates.push(Candidate {
                             ip: *ip,
                             source: IpSource::Remote,
@@ -107,9 +110,9 @@ impl RouteCursor {
                 }
             }
         };
-        let add_cache = |candidates: &mut Vec<Candidate>, seen: &mut HashSet<IpAddr>| {
+        let add_cache = |candidates: &mut Vec<Candidate>| {
             if let Some((ip, _)) = last_good {
-                if candidates.len() < max && seen.insert(ip) {
+                if candidates.len() < max && !contains_ip(candidates, ip) {
                     candidates.push(Candidate {
                         ip,
                         source: IpSource::Cache,
@@ -120,11 +123,11 @@ impl RouteCursor {
         // 8.1 / 8.2: after a catalog update the new remote IPs are attempted before the
         // last-good cache; otherwise the cache is tried first.
         if skip_once {
-            add_remote(&mut candidates, &mut seen);
-            add_cache(&mut candidates, &mut seen);
+            add_remote(&mut candidates);
+            add_cache(&mut candidates);
         } else {
-            add_cache(&mut candidates, &mut seen);
-            add_remote(&mut candidates, &mut seen);
+            add_cache(&mut candidates);
+            add_remote(&mut candidates);
         }
 
         // Order by measured quality on this network: proven fast IPs lead, failures sink.
@@ -180,7 +183,6 @@ impl RouteCursor {
             config,
             max,
             candidates,
-            seen,
             candidate_index: 0,
             doh_loaded: false,
             doh: DohExpansion::default(),
@@ -422,7 +424,7 @@ impl RouteCursor {
             {
                 let engine = self.engine.clone();
                 let expansion = engine
-                    .expand_doh(&self.domain, &mut self.candidates, &mut self.seen, self.max)
+                    .expand_doh(&self.domain, &mut self.candidates, self.max)
                     .await;
                 // Set the flag only after the await: a cancelled race must not
                 // permanently skip the DoH expansion for this route cursor.

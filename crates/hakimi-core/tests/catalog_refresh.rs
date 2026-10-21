@@ -55,8 +55,7 @@ async fn refresh_ip_catalog_with_etag_and_skip_once() {
     assert_eq!(first.version, 1);
     assert!(first.affected_domains.contains(&"example.com".to_string()));
     assert!(cache.has_skip_once("example.com"));
-    let (pattern, ips) = catalogs.remote_ips("example.com").unwrap();
-    assert_eq!(pattern, "example.com");
+    let ips = catalogs.remote_ips("example.com").unwrap();
     assert_eq!(ips.len(), 2);
     assert_eq!(
         catalogs.remote_sni("test").as_deref(),
@@ -116,7 +115,7 @@ async fn validation_failure_falls_back_to_mirror() {
         "{report:?}"
     );
     assert_eq!(
-        catalogs.remote_ips("example.com").unwrap().1[0].to_string(),
+        catalogs.remote_ips("example.com").unwrap()[0].to_string(),
         "9.9.9.9"
     );
     server.await.unwrap();

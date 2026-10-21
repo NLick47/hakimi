@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -675,7 +675,6 @@ impl DecisionEngine {
         &self,
         domain: &str,
         candidates: &mut Vec<Candidate>,
-        seen: &mut HashSet<IpAddr>,
         max: usize,
     ) -> DohExpansion {
         let started = std::time::Instant::now();
@@ -698,7 +697,9 @@ impl DecisionEngine {
                     if candidates.len() >= max {
                         break;
                     }
-                    if seen.insert(ip) {
+                    // The candidate list is capped at eight entries, so a
+                    // linear scan replaces the per-cursor hash set.
+                    if !candidates.iter().any(|candidate| candidate.ip == ip) {
                         candidates.push(Candidate {
                             ip,
                             source: candidate_source,
