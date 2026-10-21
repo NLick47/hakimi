@@ -153,7 +153,6 @@ pub struct CacheManager {
     path: PathBuf,
     data: RwLock<CacheData>,
     dirty: AtomicBool,
-    auto_flush: AtomicBool,
 }
 
 impl CacheManager {
@@ -180,7 +179,6 @@ impl CacheManager {
             path,
             data: RwLock::new(data),
             dirty: AtomicBool::new(false),
-            auto_flush: AtomicBool::new(false),
         })
     }
 
@@ -193,21 +191,14 @@ impl CacheManager {
         atomic_write_json(&self.path, &*data)
     }
 
-    fn persist_locked(&self, data: &CacheData) {
-        if let Err(error) = atomic_write_json(&self.path, data) {
-            tracing::warn!(error = %error, "failed to persist cache");
-        }
-    }
-
-    /// Record a cache mutation. With the background flusher running this only flips a flag,
-    /// so request handling never waits on disk; otherwise it keeps the eager write.
-    fn mark_dirty(&self, data: &CacheData) {
-        if self.auto_flush.load(Ordering::SeqCst) {
-            self.dirty.store(true, Ordering::SeqCst);
-        } else {
-            self.persist_locked(data);
-            self.dirty.store(false, Ordering::SeqCst);
-        }
+    /// Record a cache mutation.
+    ///
+    /// The cache holds hints (remembered routes, measured quality), so the
+    /// write is always deferred: the request path only flips a flag, the
+    /// background flusher writes the file, and the runtime flushes once more
+    /// when it shuts down.  Nothing in the request path waits on the disk.
+    fn mark_dirty(&self, _data: &CacheData) {
+        self.dirty.store(true, Ordering::SeqCst);
     }
 
     /// Write once if anything changed since the last flush. The JSON is encoded
@@ -236,10 +227,9 @@ impl CacheManager {
     /// fine while the fsyncs move off the request path entirely.
     pub fn start_auto_flush(self: &Arc<Self>, interval: StdDuration) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            tracing::debug!("no tokio runtime available; cache writes stay synchronous");
+            tracing::debug!("no tokio runtime available; the cache is written on shutdown");
             return;
         };
-        self.auto_flush.store(true, Ordering::SeqCst);
         let manager = self.clone();
         handle.spawn(async move {
             loop {
@@ -770,7 +760,7 @@ mod tests {
             let cache = CacheManager::load(&path).unwrap();
             cache.put_ip_score("example.com", "203.0.113.10".parse().unwrap(), 120.0, 3, 1);
             cache.put_ip_score("example.com", "203.0.113.11".parse().unwrap(), 90.0, 5, 0);
-            cache.save().unwrap();
+            cache.flush_if_dirty();
         }
         let reloaded = CacheManager::load(&path).unwrap();
         let mut scores = reloaded.ip_scores();
@@ -840,6 +830,8 @@ mod tests {
                 sni: Some("www.baidu.com".into()),
                 saved_at: now(),
             });
+            // Writes are deferred; flush them like the runtime does on exit.
+            cache.flush_if_dirty();
         }
         let cache = CacheManager::load(&path).unwrap();
         assert!(cache.has_skip_once("example.com"));
@@ -848,4 +840,49 @@ mod tests {
             Some("www.baidu.com")
         );
     }
+
+/// The two writes a successful connection does to the cache.
+#[tokio::test]
+#[ignore = "micro benchmark"]
+async fn bench_cache_writes() {
+    let (_dir, cache) = manager();
+    let cache = Arc::new(cache);
+    // The runtime writes the cache in the background; without the flusher
+    // every write would serialize and fsync the whole file.
+    cache.start_auto_flush(std::time::Duration::from_secs(5));
+    let ip: IpAddr = "203.0.113.7".parse().unwrap();
+    crate::bench::measure("cache.record_outcome", 20_000, || {
+        cache.record_outcome(
+            Some(sample_entry("example.com", "203.0.113.7")),
+            Some(IpScoreUpdate {
+                domain: "example.com",
+                ip,
+                ewma_ms: 100.0,
+                successes: 1,
+                failures: 0,
+            }),
+        );
+    });
+}
+
+/// The same writes without a background flusher, which is how the one-shot
+/// commands run.  The write must still not touch the disk.
+#[test]
+#[ignore = "micro benchmark"]
+fn bench_cache_writes_without_flusher() {
+    let (_dir, cache) = manager();
+    let ip: IpAddr = "203.0.113.7".parse().unwrap();
+    crate::bench::measure("cache.write (no flusher)", 20_000, || {
+        cache.record_outcome(
+            Some(sample_entry("example.com", "203.0.113.7")),
+            Some(IpScoreUpdate {
+                domain: "example.com",
+                ip,
+                ewma_ms: 100.0,
+                successes: 1,
+                failures: 0,
+            }),
+        );
+    });
+}
 }

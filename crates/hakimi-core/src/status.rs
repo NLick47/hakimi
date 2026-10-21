@@ -574,4 +574,17 @@ mod tests {
             "the bulk prune should leave headroom below the cap"
         );
     }
+
+/// The snapshot the UI polls: a clone of every domain record plus the counts.
+#[test]
+#[ignore = "micro benchmark"]
+fn bench_status_snapshot() {
+    let store = StatusStore::new();
+    for index in 0..256 {
+        store.record(report(&format!("host{index}.example.com"), State::Normal));
+    }
+    crate::bench::measure("status.snapshot", 2_000, || {
+        let _ = store.domains_snapshot_with_counts();
+    });
+}
 }

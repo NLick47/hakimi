@@ -862,6 +862,37 @@ mod tests {
     }
 
     #[test]
+    fn odd_absolute_uris_do_not_panic() {
+        for uri in [
+            "http://",
+            "http://[",
+            "http://[::1",
+            "http://host:",
+            "http://host:0",
+            "http://host:99999",
+            "http://host:65536",
+            "http://user@host",
+            "http://host/%",
+            "http://host/%zz",
+            "http://host/a%2",
+            "http://host/#frag",
+            "http://host?a=%",
+            "https://[::1]:8443/x",
+            "http://[::1]:99999/x",
+            "http://xn--bcher-kva.example/x",
+            "http://HOST.example/x",
+            "http://.example/x",
+            "http://example../x",
+        ] {
+            let Ok(req) = Request::builder().uri(uri).body(()) else {
+                continue;
+            };
+            // A malformed URI must be rejected, never panic.
+            let _ = target_of(&req);
+        }
+    }
+
+    #[test]
     fn origin_form_without_host_header_is_rejected() {
         let req = Request::builder().uri("/path").body(()).unwrap();
         assert!(target_of(&req).is_err());

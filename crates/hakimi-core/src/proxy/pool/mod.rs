@@ -417,7 +417,7 @@ impl UpstreamPool {
                     version = ?request_version,
                     host = debug_host.unwrap_or(""),
                     path = %debug_path,
-                    error = %error,
+                    error = %format!("{error:#}"),
                     "upstream request failed"
                 );
                 Err(format!("{error:?}"))

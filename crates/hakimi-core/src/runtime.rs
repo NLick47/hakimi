@@ -154,6 +154,14 @@ pub struct HakimiRuntime {
     started_at: DateTime<Utc>,
 }
 
+impl Drop for HakimiRuntime {
+    /// The cache holds hints, and every write is deferred.  One-shot commands
+    /// never start the background flusher, so the last flush happens here.
+    fn drop(&mut self) {
+        self.cache.flush_if_dirty();
+    }
+}
+
 /// Keeps [`HakimiRuntime::proxy_syncs_in_flight`] raised for its lifetime,
 /// including on panic or when moved into a worker thread.
 struct ProxySyncGuard(Arc<AtomicUsize>);
@@ -334,8 +342,9 @@ impl HakimiRuntime {
         if self.started.load(Ordering::SeqCst) {
             return Ok(());
         }
-        // Cache writes are hints, not state: once the proxy runs, fsyncs leave the request
-        // path and the flusher picks them up. One-shot CLI commands keep eager writes.
+        // Cache writes are hints, not state: the fsyncs stay off the request
+        // path and the flusher picks them up.  One-shot commands flush when
+        // the runtime is dropped.
         self.cache
             .clone()
             .start_auto_flush(std::time::Duration::from_secs(5));

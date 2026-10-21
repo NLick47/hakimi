@@ -31,6 +31,8 @@ pub mod proxy;
 pub mod resolver;
 pub mod runtime;
 pub mod status;
+#[cfg(test)]
+mod bench;
 pub mod strategy;
 pub mod system_proxy;
 pub mod hooks;

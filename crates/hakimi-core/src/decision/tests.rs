@@ -517,6 +517,32 @@ fn plan_cache_finds_entries_under_any_spelling_of_the_domain() {
 }
 
 #[test]
+fn an_expired_plan_is_dropped() {
+    let h = harness(&["example.com"], Strategy::Direct);
+    h.engine.remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
+    assert!(h.engine.cached_plan("example.com", 443, true).is_some());
+
+    // Age the entry past the TTL (the default is ten minutes).
+    {
+        let mut cache = h.engine.plan_cache.write();
+        let inner = cache.get_mut("example.com").expect("the domain is cached");
+        let entry = inner.get_mut(&(443, true)).expect("the plan is cached");
+        entry.0 = std::time::Instant::now() - Duration::from_secs(3600);
+    }
+    assert!(
+        h.engine.cached_plan("example.com", 443, true).is_none(),
+        "an expired plan must not be used"
+    );
+    let cache = h.engine.plan_cache.read();
+    assert!(
+        !cache
+            .get("example.com")
+            .is_some_and(|inner| inner.contains_key(&(443, true))),
+        "an expired plan must be removed"
+    );
+}
+
+#[test]
 fn plan_cache_separates_ports_and_tls_flags() {
     let h = harness(&["example.com"], Strategy::Direct);
     let mut plain = test_plan(TlsMode::Direct, None);
@@ -745,4 +771,28 @@ async fn failure_returns_reasons_and_attempts() {
         outcome.diagnostics.attempts[0].error,
         Some(FailureReason::TlsReset)
     );
+}
+
+/// The routing path of a new connection: match the group, read the route
+/// hints and build the candidate list.
+#[test]
+#[ignore = "micro benchmark"]
+fn bench_route_decision() {
+    let h = harness(&["example.com"], Strategy::Direct);
+    *h.remote.catalog.lock() = true;
+    *h.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+    crate::bench::measure("decision.route", 20_000, || {
+        let _ = h.engine.route("example.com", 443, true);
+    });
+}
+
+/// The plan cache lookup of a new connection.
+#[test]
+#[ignore = "micro benchmark"]
+fn bench_plan_cache_lookup() {
+    let h = harness(&["example.com"], Strategy::Direct);
+    h.engine.remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
+    crate::bench::measure("decision.cached_plan", 100_000, || {
+        let _ = h.engine.cached_plan("example.com", 443, true);
+    });
 }
