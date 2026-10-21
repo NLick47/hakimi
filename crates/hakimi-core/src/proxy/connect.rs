@@ -40,9 +40,9 @@ struct TunnelInfo {
 }
 
 impl TunnelInfo {
-    fn new(host: &str, port: u16, mode: &'static str) -> Self {
+    fn new(host: impl Into<String>, port: u16, mode: &'static str) -> Self {
         Self {
-            host: host.to_owned(),
+            host: host.into(),
             port,
             mode,
         }
@@ -96,13 +96,15 @@ pub(super) async fn handle_connect(
         matcher.match_normalized(&host)
     };
     let Some(group_id) = group_id else {
-        return tunnel_to_host(req, &host, port).await;
+        // These branches are terminal, so move the host into the tunnel info
+        // instead of cloning it once more.
+        return tunnel_to_host(req, host, port).await;
     };
     let Some(group) = config.group(group_id) else {
-        return tunnel_to_host(req, &host, port).await;
+        return tunnel_to_host(req, host, port).await;
     };
     if !group.enabled || ctx.status.paused() {
-        return tunnel_to_host(req, &host, port).await;
+        return tunnel_to_host(req, host, port).await;
     }
 
     // Fast path: a previously successful direct route turns CONNECT into a raw TCP tunnel,
@@ -119,7 +121,8 @@ pub(super) async fn handle_connect(
                     return tunnel_connect(
                         req,
                         stream,
-                        TunnelInfo::new(&host, port, "cached-direct"),
+                        // No later path in this branch needs the string.
+                        TunnelInfo::new(host, port, "cached-direct"),
                     );
                 }
                 Err((reason, detail)) => {
@@ -141,7 +144,7 @@ pub(super) async fn handle_connect(
     // Auto groups on the raw path: a direct origin still works, while an ECH/fake-SNI
     // origin would only produce a browser certificate error anyway.
     if group.strategy == Strategy::Direct || !ctx.ca.installed() {
-        return tunnel_direct_group(req, &ctx, &host, port, stale_plan.as_deref()).await;
+        return tunnel_direct_group(req, &ctx, host, port, stale_plan.as_deref()).await;
     }
 
     // ECH / fake SNI / Auto without a direct route: terminate browser TLS locally and let
@@ -220,14 +223,14 @@ pub(super) async fn handle_connect(
 async fn tunnel_direct_group(
     req: &mut Request<Incoming>,
     ctx: &Arc<ProxyContext>,
-    host: &str,
+    host: String,
     port: u16,
     failed_plan: Option<&ConnectPlan>,
 ) -> Response<ProxyBody> {
-    let mut cursor = match ctx.engine.route_normalized(host, port, true) {
+    let mut cursor = match ctx.engine.route_normalized(&host, port, true) {
         Route::Bypass(_) => return tunnel_to_host(req, host, port).await,
         Route::Blocked(outcome) => {
-            return upstream::diagnostics_error_page(host, &outcome.diagnostics, ctx)
+            return upstream::diagnostics_error_page(&host, &outcome.diagnostics, ctx)
         }
         Route::Group(cursor) => cursor,
     };
@@ -254,7 +257,7 @@ async fn tunnel_direct_group(
         None => {
             let diagnostics = cursor.outcome().map(|outcome| outcome.diagnostics.clone());
             match diagnostics {
-                Some(diagnostics) => upstream::diagnostics_error_page(host, &diagnostics, ctx),
+                Some(diagnostics) => upstream::diagnostics_error_page(&host, &diagnostics, ctx),
                 None => error_response(
                     StatusCode::BAD_GATEWAY,
                     "Upstream connection failed",
@@ -469,8 +472,8 @@ pub(super) async fn race_tcp_addresses(
     Err((timed_out, last_error))
 }
 
-async fn tunnel_to_host(req: &mut Request<Incoming>, host: &str, port: u16) -> Response<ProxyBody> {
-    let upstream = match connect_host_staggered(host, port, CONNECT_TIMEOUT).await {
+async fn tunnel_to_host(req: &mut Request<Incoming>, host: String, port: u16) -> Response<ProxyBody> {
+    let upstream = match connect_host_staggered(&host, port, CONNECT_TIMEOUT).await {
         Ok(stream) => stream,
         Err((timed_out, detail)) => {
             return if timed_out {

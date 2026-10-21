@@ -80,10 +80,13 @@ impl RouteCursor {
     ) -> Self {
         let group = &config.groups[group_index];
         let max = config.advanced.max_candidates_per_domain;
-        let skip_once = engine.cache.take_skip_once(&domain);
-        let last_good = engine
-            .cache
-            .last_good_route(&domain, config.advanced.last_good_days);
+        let (skip_hint, last_good) =
+            engine
+                .cache
+                .route_hints(&domain, config.advanced.last_good_days);
+        // The common case is an empty set. Only take the write lock (and
+        // re-check) when the read-only hint saw a marker.
+        let skip_once = skip_hint && engine.cache.take_skip_once(&domain);
         let remote = engine.remote.remote_ips(&domain);
         let remote_available = engine.remote.has_ip_catalog();
 

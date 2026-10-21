@@ -275,6 +275,24 @@ impl CacheManager {
             .then_some((entry.ip, entry.strategy))
     }
 
+    /// One read-lock acquisition for the two pieces of route state a new cursor
+    /// needs. `skip_once` is only consumed by the caller when it is present, so
+    /// the common empty-set path never takes the write lock.
+    pub fn route_hints(
+        &self,
+        domain: &str,
+        max_age_days: i64,
+    ) -> (bool, Option<(IpAddr, Strategy)>) {
+        let now = now();
+        let data = self.data.read();
+        let skip_once = data.skip_once.contains(domain);
+        let last_good = data.last_good.get(domain).and_then(|entry| {
+            (now.signed_duration_since(entry.saved_at) <= Duration::days(max_age_days))
+                .then_some((entry.ip, entry.strategy))
+        });
+        (skip_once, last_good)
+    }
+
     /// Persisted quality entries, for seeding the decision engine on startup.
     /// Entries beyond the widest freshness window are dropped on the way in.
     pub fn ip_scores(&self) -> Vec<(String, IpAddr, IpScoreEntry)> {
@@ -592,6 +610,17 @@ mod tests {
         assert!(cache.take_skip_once("github.com"));
         assert!(!cache.take_skip_once("github.com"));
         assert!(cache.has_skip_once("api.github.com"));
+    }
+
+    #[test]
+    fn route_hints_do_not_consume_the_skip_marker() {
+        let (_dir, cache) = manager();
+        cache.mark_skip_once(["github.com"]);
+        let (skip, last_good) = cache.route_hints("github.com", 7);
+        assert!(skip);
+        assert!(last_good.is_none());
+        assert!(cache.has_skip_once("github.com"));
+        assert!(cache.take_skip_once("github.com"));
     }
 
     #[test]

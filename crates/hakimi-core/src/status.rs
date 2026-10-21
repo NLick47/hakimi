@@ -328,6 +328,7 @@ impl StatusStore {
 
     pub fn groups_snapshot(&self, config: &AppConfig) -> Vec<GroupStatus> {
         let domains = self.domains.read();
+        let paused = self.paused();
         config
             .groups
             .iter()
@@ -358,7 +359,7 @@ impl StatusStore {
 
                 let state = if !group.enabled {
                     State::Disabled
-                } else if self.paused() {
+                } else if paused {
                     State::Paused
                 } else if matches!(primary_state, Some(State::Failed)) {
                     State::Failed

@@ -100,11 +100,15 @@ impl ProxyContext {
     }
 
     pub fn pac_script(&self) -> String {
-        crate::pac::generate(
-            &self.config.snapshot(),
-            self.proxy_addr(),
-            self.status.paused(),
-        )
+        // Use one config snapshot for both the rules and the fallback address;
+        // `proxy_addr()` would otherwise take the config lock a second time.
+        let config = self.config.snapshot();
+        let addr = self
+            .proxy_addr
+            .get()
+            .copied()
+            .unwrap_or_else(|| SocketAddr::new(config.proxy.bind, config.proxy.port));
+        crate::pac::generate(&config, addr, self.status.paused())
     }
 
     pub fn pac_url(&self) -> String {
