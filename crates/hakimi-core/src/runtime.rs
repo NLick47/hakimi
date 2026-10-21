@@ -146,6 +146,9 @@ pub struct HakimiRuntime {
     /// into a false "someone else took over". A counter, not a flag, so
     /// overlapping applies cannot end the window early.
     proxy_syncs_in_flight: Arc<AtomicUsize>,
+    /// Bounds concurrent diagnostic probes so one sweep does not open dozens
+    /// of TLS connections at once.
+    probe_gate: Arc<Semaphore>,
     started_at: DateTime<Utc>,
 }
 
@@ -232,6 +235,7 @@ impl HakimiRuntime {
             tasks: Mutex::new(Vec::new()),
             started: AtomicBool::new(false),
             proxy_syncs_in_flight: Arc::new(AtomicUsize::new(0)),
+            probe_gate: Arc::new(Semaphore::new(8)),
             started_at,
         });
         // A previous crash may have left the OS proxy pointing at us.
@@ -277,6 +281,12 @@ impl HakimiRuntime {
     /// [`Self::config_json`] instead of re-serializing every tick.
     pub fn config_revision(&self) -> u64 {
         self.config.revision()
+    }
+
+    /// Bumped whenever the domain/pause state rendered by the desktop UI
+    /// changes, so an idle poller can skip rebuilding the snapshot.
+    pub fn status_revision(&self) -> u64 {
+        self.status.revision()
     }
 
     pub fn status_json(&self) -> serde_json::Value {
@@ -663,35 +673,47 @@ impl HakimiRuntime {
     /// shared concurrency limit. Resolves when the whole sweep is done, so a
     /// manual 测速 is one atomic operation instead of N futures the caller
     /// has to count.
-    pub async fn probe_sweep(&self) {
-        let started = std::time::Instant::now();
+    pub async fn probe_sweep(self: &Arc<Self>) {
         let config = self.config.snapshot();
-        let semaphore = Arc::new(Semaphore::new(8));
         let mut seen = HashSet::new();
-        let mut tasks = Vec::new();
+        let mut hosts = Vec::new();
         for group in config.enabled_groups() {
             for host in group.exact_domains() {
-                if !seen.insert(host.to_string()) {
-                    continue;
+                if seen.insert(host.to_string()) {
+                    hosts.push(host.to_string());
                 }
-                let permit = semaphore.clone();
-                let engine = self.engine.clone();
-                let host = host.to_string();
-                tasks.push(tokio::spawn(async move {
-                    let _permit = permit.acquire_owned().await;
-                    let _ = engine.decide_https(&host).await;
-                }));
             }
         }
-        let total = tasks.len();
-        tracing::info!(domains = total, "manual probe sweep started");
+        self.probe_hosts(hosts, "all").await;
+    }
+
+    /// Probe a set of hosts through the shared gate. Each task checks out one
+    /// permit for the duration of its probe, so a sweep never opens dozens of
+    /// TLS connections at once.
+    async fn probe_hosts(self: &Arc<Self>, hosts: Vec<String>, scope: &str) {
+        let started = std::time::Instant::now();
+        let total = hosts.len();
+        if total == 0 {
+            return;
+        }
+        let mut tasks = Vec::new();
+        for host in hosts {
+            let gate = self.probe_gate.clone();
+            let engine = self.engine.clone();
+            tasks.push(tokio::spawn(async move {
+                let _permit = gate.acquire_owned().await;
+                let _ = engine.decide_https(&host).await;
+            }));
+        }
+        tracing::info!(scope = scope, domains = total, "probe sweep started");
         for task in tasks {
             let _ = task.await;
         }
         tracing::info!(
+            scope = scope,
             domains = total,
             elapsed_ms = started.elapsed().as_millis() as u64,
-            "manual probe sweep finished"
+            "probe sweep finished"
         );
     }
 

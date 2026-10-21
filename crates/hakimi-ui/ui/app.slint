@@ -629,7 +629,7 @@ export component AppWindow inherits Window {
     callback reapply-proxy();
     callback toggle-group(string, bool);
     callback select-all(bool);
-    callback probe-all();
+    callback probe-selected();
     callback open-site(string);
     callback toggle-open(string);
     callback settings-action(int);
@@ -897,9 +897,9 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                     }
                     Rectangle { horizontal-stretch: 1; }
-                    TextButton { label: "测速"; min-width: 44px; clicked => { root.probe-all(); } }
+                    TextButton { label: "检测选中"; min-width: 60px; clicked => { root.probe-selected(); } }
                     TextButton { label: "全选"; min-width: 44px; clicked => { root.select-all(true); } }
-                    TextButton { label: "清除"; min-width: 44px; clicked => { root.select-all(false); } }
+                    TextButton { label: "取消全选"; min-width: 64px; clicked => { root.select-all(false); } }
                 }
 
                 ScrollView {
@@ -1043,7 +1043,7 @@ export component AppWindow inherits Window {
                                             height: site.open ? site.domains.length * 26px + 1px : 0px;
                                             clip: true;
                                             background: #FAFBFC;
-                                            animate height { duration: 200ms; easing: ease-out; }
+                                            animate height { duration: 120ms; easing: ease-out; }
 
                                             VerticalLayout {
                                                 spacing: 0px;
@@ -1864,7 +1864,7 @@ export component TrayRoot inherits SystemTrayIcon {
     in property <bool> running: false;
     callback show-main();
     callback toggle-master();
-    callback probe-all();
+    callback probe-selected();
     callback quit();
     clicked => { root.show-main(); }
     Menu {
@@ -1878,8 +1878,8 @@ export component TrayRoot inherits SystemTrayIcon {
             activated => { root.toggle-master(); }
         }
         MenuItem {
-            title: "测速";
-            activated => { root.probe-all(); }
+            title: "检测选中";
+            activated => { root.probe-selected(); }
         }
         MenuSeparator {}
         MenuItem {

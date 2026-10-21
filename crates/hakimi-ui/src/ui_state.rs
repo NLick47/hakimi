@@ -167,6 +167,22 @@ impl AppModel {
         self.effects_apply_if_needed()
     }
 
+    /// Stop acceleration outright. Used when the selection becomes empty:
+    /// there is nothing left to accelerate, so the switch must not keep
+    /// claiming to run. Unlike [`Self::toggle`] this never turns acceleration
+    /// on and is idempotent.
+    pub fn stop(&mut self) -> Effects {
+        let was_active = self.accel != AccelState::Stopped;
+        self.takeover = false;
+        self.unhealthy_streak = 0;
+        self.accel = AccelState::Stopped;
+        if was_active {
+            Effects::stopped()
+        } else {
+            Effects::default()
+        }
+    }
+
     /// Periodic environment probe. A pending resume completes itself the
     /// moment the environment passes.
     pub fn env_changed(&mut self, env: EnvState) -> Effects {
@@ -445,8 +461,8 @@ mod tests {
     }
 
     #[test]
-    fn starting_phase_holds_instead_of_claiming_paused() {
-        let mut sites = vec![sample_site("mp", "1 个域名 · 已暂停")];
+    fn starting_phase_holds_instead_of_a_stale_result() {
+        let mut sites = vec![sample_site("mp", "1 个域名 · 待检测")];
         apply_settle(&mut sites, SettlePhase::Starting);
         assert_eq!(sites[0].summary, "1 个域名 · 启动中");
 
@@ -623,6 +639,19 @@ mod tests {
     }
 
     #[test]
+    fn clearing_the_selection_stops_acceleration() {
+        let mut model = AppModel::default();
+        model.startup(env(true));
+
+        let effects = model.stop();
+        assert_eq!(model.accel(), AccelState::Stopped);
+        assert!(effects.pause && !effects.resume);
+
+        // Clearing an empty selection is a no-op.
+        assert_eq!(model.stop(), Effects::default());
+    }
+
+    #[test]
     fn takeover_retry_reapplies_the_proxy() {
         let mut model = AppModel::default();
         model.startup(env(true));
@@ -703,7 +732,7 @@ const SETTLE_MILLIS: u128 = 3000;
 #[derive(Clone, Copy, PartialEq)]
 pub enum SettlePhase {
     /// The user asked to run but the runtime has not finished starting: hold
-    /// 启动中 instead of misreporting 已暂停.
+    /// 启动中 instead of misreporting a stale 待检测/失败 state.
     Starting,
     /// A manual sweep is running: hold 测速中 for every active site.
     Sweeping,
@@ -735,8 +764,8 @@ fn settle_display(
     raw_hex: &'static str,
     stable: bool,
 ) -> (String, &'static str) {
-    // Disabled / paused are not probing states: always display them directly.
-    if raw.ends_with("未选择") || raw.ends_with("已暂停") {
+    // Disabled sites are not probing states: always display them directly.
+    if raw.ends_with("未选择") {
         entry.shown = raw.into();
         entry.shown_hex = raw_hex;
         entry.pending = None;
@@ -787,7 +816,7 @@ pub fn apply_settle(sites: &mut [crate::SiteData], phase: SettlePhase) {
                     }
                 }
                 SettlePhase::Sweeping => {
-                    if site.summary.ends_with("未选择") || site.summary.ends_with("已暂停") {
+                    if site.summary.ends_with("未选择") {
                         (site.summary.clone(), site.summary_hex)
                     } else {
                         let prefix = site.summary.split(" · ").next().unwrap_or(&site.summary);

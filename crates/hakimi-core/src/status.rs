@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
@@ -128,6 +128,9 @@ pub struct StatusCounts {
 pub struct StatusStore {
     domains: RwLock<HashMap<String, DomainDiagnostics>>,
     paused: AtomicBool,
+    /// Bumped whenever a domain record or the pause flag changes. Pollers
+    /// compare it to skip rebuilding a snapshot that cannot have changed.
+    revision: AtomicU64,
     started_at: DateTime<Utc>,
 }
 
@@ -142,6 +145,7 @@ impl StatusStore {
         Self {
             domains: RwLock::new(HashMap::new()),
             paused: AtomicBool::new(false),
+            revision: AtomicU64::new(0),
             started_at: now(),
         }
     }
@@ -150,8 +154,16 @@ impl StatusStore {
         self.started_at
     }
 
+    /// Monotonic change counter for the state exposed by [`Self::domains_snapshot`]
+    /// and [`Self::paused`].
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::SeqCst)
+    }
+
     pub fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::SeqCst);
+        if self.paused.swap(paused, Ordering::SeqCst) != paused {
+            self.revision.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     pub fn paused(&self) -> bool {
@@ -191,6 +203,10 @@ impl StatusStore {
             }
         }
         map.insert(diagnostics.domain.clone(), diagnostics);
+        // The record is in the map now: publish the change to pollers. Doing
+        // it after the write (and after the early return above) means a
+        // revision bump always corresponds to a visible change.
+        self.revision.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn mark_checking(
@@ -377,5 +393,22 @@ mod tests {
             .find(|g| g.id == "github")
             .unwrap();
         assert_eq!(github.state, State::Paused);
+    }
+
+    #[test]
+    fn revision_moves_only_when_the_published_state_changes() {
+        let store = StatusStore::new();
+        let start = store.revision();
+
+        store.set_paused(true);
+        let paused = store.revision();
+        assert!(paused > start, "a pause flip must publish");
+
+        // Setting the same value again is not a change.
+        store.set_paused(true);
+        assert_eq!(store.revision(), paused);
+
+        store.record(report("github.com", State::Normal));
+        assert!(store.revision() > paused, "a domain record must publish");
     }
 }

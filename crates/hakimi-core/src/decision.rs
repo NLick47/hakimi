@@ -684,7 +684,10 @@ impl DecisionEngine {
     /// are TLS-only).
     pub async fn decide(self: &Arc<Self>, domain: &str, port: u16, tls: bool) -> DecisionOutcome {
         let timeout = Duration::from_millis(self.config.snapshot().advanced.ip_timeout_ms);
-        match self.route(domain, port, tls) {
+        // A diagnostic probe is an observation, not routing: it must keep
+        // working while acceleration is paused. The paused check belongs to
+        // `route` (the proxy hot path), not to the probe path.
+        match self.route_inner(domain, port, tls, true) {
             Route::Bypass(outcome) | Route::Blocked(outcome) => outcome,
             Route::Group(mut cursor) => loop {
                 let Some(plan) = cursor.next_plan().await else {
@@ -725,6 +728,19 @@ impl DecisionEngine {
     /// validates the certificate exactly like [`Self::decide`], but costs only one
     /// handshake instead of a probe plus the actual connection.
     pub fn route(self: &Arc<Self>, domain: &str, port: u16, tls: bool) -> Route {
+        self.route_inner(domain, port, tls, false)
+    }
+
+    /// Routing variant used by diagnostic probes. `probing` skips the paused
+    /// gate: pausing controls whether traffic is intercepted, not whether a
+    /// manual health check may run.
+    fn route_inner(
+        self: &Arc<Self>,
+        domain: &str,
+        port: u16,
+        tls: bool,
+        probing: bool,
+    ) -> Route {
         let config = self.config.snapshot();
         let normalized = match normalize_hostname(domain) {
             Ok(domain) => domain,
@@ -782,7 +798,7 @@ impl DecisionEngine {
                 "group is disabled; traffic is not intercepted",
             ));
         }
-        if self.status.paused() {
+        if !probing && self.status.paused() {
             return Route::Bypass(self.state_only(
                 &group,
                 &normalized,
@@ -874,6 +890,11 @@ impl DecisionEngine {
             degraded = false;
         } else {
             entry.successes += 1;
+            // Pay down the failure history with each real success. Without
+            // this an IP that ever failed stays in `reprobe_failed_ips`
+            // forever, so the same addresses get re-probed every minute for
+            // the whole session even after they recovered.
+            entry.failures = entry.failures.saturating_sub(1);
             let sample = latency_ms.unwrap_or(500) as f64;
             // A sample far worse than the established average means the proven route
             // degraded (network flap, congestion). Signal the caller to re-race.
@@ -1491,11 +1512,38 @@ mod tests {
         h.engine.record_ip("example.com", dead, None, true);
         let before_dead = h.engine.score_ip("example.com", dead);
         let restored = h.engine.reprobe_failed_ips(16).await;
-        assert_eq!(restored, 1, "only the working ip is restored this round");
+        assert_eq!(
+            restored, 0,
+            "the recovered ip has left the re-probe set; the dead one still fails"
+        );
         assert_eq!(
             h.engine.score_ip("example.com", dead),
             before_dead,
             "a dead ip must not be forgiven"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_reprobe_pays_down_the_failure_history() {
+        let h = harness(&["example.com"], Strategy::Auto);
+        let ip: IpAddr = "203.0.113.40".parse().unwrap();
+        h.engine.record_ip("example.com", ip, None, true);
+        h.prober.working.lock().insert(ip);
+
+        assert_eq!(h.engine.reprobe_failed_ips(16).await, 1);
+        let failures = h
+            .engine
+            .ip_scores
+            .read()
+            .get("example.com")
+            .and_then(|by_ip| by_ip.get(&ip))
+            .map(|score| score.failures)
+            .unwrap();
+        assert_eq!(failures, 0, "a success must forgive the failure history");
+        assert_eq!(
+            h.engine.reprobe_failed_ips(16).await,
+            0,
+            "a recovered ip must leave the re-probe set instead of being probed every minute"
         );
     }
 
@@ -1637,6 +1685,26 @@ mod tests {
         assert_eq!(plan.mode, TlsMode::Direct);
         assert_eq!(outcome.diagnostics.ip_source, Some(IpSource::Remote));
         assert!(harness.resolver.answers.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_manual_probe_runs_while_routing_is_paused() {
+        let harness = harness(&["example.com"], Strategy::Auto);
+        *harness.remote.catalog.lock() = true;
+        *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+        harness.prober.working.lock().insert("1.1.1.1".parse().unwrap());
+        harness.engine.status.set_paused(true);
+
+        // Routing still bypasses while paused...
+        assert!(matches!(
+            harness.engine.route("example.com", 443, true),
+            Route::Bypass(_)
+        ));
+
+        // ...but a diagnostic probe is an observation and must run.
+        let outcome = harness.engine.decide_https("example.com").await;
+        assert_eq!(outcome.diagnostics.state, State::Direct);
+        assert_eq!(outcome.diagnostics.ip, Some("1.1.1.1".parse().unwrap()));
     }
 
     #[tokio::test]

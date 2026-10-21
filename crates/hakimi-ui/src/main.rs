@@ -1,10 +1,11 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use hakimi_core::instance::{InstanceLock, InstanceLockError};
@@ -21,6 +22,23 @@ mod ui_state;
 pub(crate) fn data_dir() -> Option<PathBuf> {
     std::env::var_os("HAKIMI_DATA_DIR").map(PathBuf::from)
 }
+
+/// Releases the resident pages of a hidden window. The private commit stays,
+/// but the working set drops to what the background proxy still touches.
+/// Windows has an in-process call for this; the other platforms do not, so the
+/// hidden app keeps its working set there.
+#[cfg(windows)]
+fn trim_working_set() {
+    use windows_sys::Win32::System::ProcessStatus::EmptyWorkingSet;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: the pseudo-handle always refers to this process.
+    unsafe {
+        let _ = EmptyWorkingSet(GetCurrentProcess());
+    }
+}
+
+#[cfg(not(windows))]
+fn trim_working_set() {}
 
 /// The window is a fixed light (Acrylic/Fluent) surface, so keep the macOS title bar
 /// in the same appearance even when the system is in dark mode.
@@ -202,13 +220,9 @@ fn domain_status(
     state: &str,
     latency_ms: Option<u64>,
     group_enabled: bool,
-    master_running: bool,
 ) -> (String, &'static str, String) {
     if !group_enabled {
         return ("未选择".into(), IDLE_COLOR, "—".into());
-    }
-    if !master_running {
-        return ("已暂停".into(), IDLE_COLOR, "—".into());
     }
     match state {
         "failed" => ("超时".into(), BAD_COLOR, "—".into()),
@@ -223,14 +237,13 @@ fn domain_status(
     }
 }
 
-pub(crate) fn build_snapshot(
+/// Builds the raw per-site rows from the status/config JSON. Summaries here
+/// are the live values, before the settle/hysteresis pass.
+pub(crate) fn build_sites(
     status: &Value,
     config: &Value,
     expanded: &HashSet<String>,
-    master_running: bool,
-    starting: bool,
-    settle: Option<SettlePhase>,
-) -> (Vec<SiteData>, String) {
+) -> (Vec<SiteData>, usize) {
     let mut diagnostics: HashMap<String, &Value> = HashMap::new();
     if let Some(domains) = status.get("domains").and_then(Value::as_array) {
         for record in domains {
@@ -256,8 +269,6 @@ pub(crate) fn build_snapshot(
             if enabled {
                 selected += 1;
             }
-            // A paused runtime shows the same "off" state as a disabled group.
-            let active = enabled && master_running;
 
             let domains_config: Vec<String> = group
                 .get("domains")
@@ -280,20 +291,25 @@ pub(crate) fn build_snapshot(
             for host in &domains_config {
                 let (word, word_hex, latency) = match diagnostics.get(host) {
                     Some(record) if enabled => {
-                        tested += 1;
                         let state = text(record, "state");
-                        let latency_ms = record.get("latencyMs").and_then(Value::as_u64);
-                        if active {
+                        if state == "paused" || state == "disabled" {
+                            // A routing bypass is not a health result.
+                            domain_status("", None, enabled)
+                        } else {
+                            tested += 1;
+                            let latency_ms = record.get("latencyMs").and_then(Value::as_u64);
+                            // Health is an observation, not a function of the
+                            // global switch: a paused app still knows its sites.
                             match state.as_str() {
                                 "failed" => bad += 1,
                                 "checking" => checking += 1,
                                 "normal" if latency_ms.map(|ms| ms > 150).unwrap_or(false) => slow += 1,
                                 _ => {}
                             }
+                            domain_status(&state, latency_ms, enabled)
                         }
-                        domain_status(&state, latency_ms, enabled, active)
                     }
-                    _ => domain_status("", None, enabled, active),
+                    _ => domain_status("", None, enabled),
                 };
                 rows.push(DomainData {
                     host: host.clone(),
@@ -306,8 +322,6 @@ pub(crate) fn build_snapshot(
             let count = domains_config.len();
             let (summary, summary_hex) = if !enabled {
                 (format!("{count} 个域名 · 未选择"), IDLE_COLOR)
-            } else if !master_running {
-                (format!("{count} 个域名 · 已暂停"), IDLE_COLOR)
             } else if bad > 0 {
                 let text = match (bad == count, slow) {
                     (true, _) => format!("{count} 个域名 · 全部超时"),
@@ -325,7 +339,7 @@ pub(crate) fn build_snapshot(
             } else if checking > 0 {
                 (format!("{count} 个域名 · 检测中"), IDLE_COLOR)
             } else if tested == 0 {
-                (format!("{count} 个域名 · 未检测"), IDLE_COLOR)
+                (format!("{count} 个域名 · 待检测"), IDLE_COLOR)
             } else {
                 (format!("{count} 个域名 · 全部正常"), OK_COLOR)
             };
@@ -371,6 +385,19 @@ pub(crate) fn build_snapshot(
         site.last = index + 1 == total;
     }
 
+    (sites, selected)
+}
+
+/// Applies the display hysteresis and derives the subtitle. Takes the raw rows
+/// by value so an unchanged refresh tick can clone the cached rows and reuse
+/// the expensive part (the status snapshot) without re-reading it.
+pub(crate) fn finish_snapshot(
+    mut sites: Vec<SiteData>,
+    selected: usize,
+    master_running: bool,
+    starting: bool,
+    settle: Option<SettlePhase>,
+) -> (Vec<SiteData>, String) {
     // Probing makes the raw summaries flap between 超时/较慢 while the engine
     // hunts for a working IP. With hysteresis a summary is only shown once it
     // has been stable for a moment; before that a fresh site holds on 测速中.
@@ -382,21 +409,59 @@ pub(crate) fn build_snapshot(
         .filter(|site| site.enabled && site.summary.contains("超时"))
         .count();
 
+    let all_untested = sites
+        .iter()
+        .filter(|site| site.enabled)
+        .all(|site| site.domains.iter().all(|domain| domain.status == "—"));
     let subtitle = if selected == 0 {
         "未选择站点，勾选后即可加速".to_string()
+    } else if matches!(settle, Some(SettlePhase::Sweeping)) {
+        let total: usize = sites
+            .iter()
+            .filter(|site| site.enabled)
+            .map(|site| site.domains.len())
+            .sum();
+        let pending = sites
+            .iter()
+            .filter(|site| site.enabled)
+            .flat_map(|site| &site.domains)
+            .filter(|domain| domain.status == "检测中")
+            .count();
+        if pending == 0 {
+            format!("正在检测 {total} 个域名 · 结果会自动更新")
+        } else {
+            format!("正在检测 {pending}/{total} 个域名 · 结果会自动更新")
+        }
+    } else if all_untested {
+        // Selection never starts a test: point at the explicit action instead
+        // of leaving "待检测" unexplained.
+        format!("已选择 {selected} 个站点 · 点击检测选中获取健康状态")
     } else if failed_sites > 0 {
-        if master_running {
+        if starting || master_running {
             format!("正在加速 {selected} 个站点 · {failed_sites} 个异常")
         } else {
-            format!("已选择 {selected} 个站点 · {failed_sites} 个异常")
+            format!("已选择 {selected} 个站点 · {failed_sites} 个异常 · 加速已暂停")
         }
     } else if starting || master_running {
         format!("正在加速 {selected} 个站点")
     } else {
-        format!("已选择 {selected} 个站点")
+        format!("已选择 {selected} 个站点 · 加速已暂停")
     };
 
     (sites, subtitle)
+}
+
+/// Convenience wrapper used by tests and the offscreen `--shot` renderer.
+pub(crate) fn build_snapshot(
+    status: &Value,
+    config: &Value,
+    expanded: &HashSet<String>,
+    master_running: bool,
+    starting: bool,
+    settle: Option<SettlePhase>,
+) -> (Vec<SiteData>, String) {
+    let (sites, selected) = build_sites(status, config, expanded);
+    finish_snapshot(sites, selected, master_running, starting, settle)
 }
 
 /// How long a summary must stay unchanged before it replaces the displayed one.
@@ -1031,54 +1096,157 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
 }
 
 thread_local! {
-    static CONFIG_CACHE: std::cell::RefCell<Option<(u64, Value)>> =
+    // Shared handles, not clones: the config JSON can be large and the refresh
+    // path only borrows it.
+    static CONFIG_CACHE: std::cell::RefCell<Option<(u64, Rc<Value>)>> =
+        const { std::cell::RefCell::new(None) };
+    // The last built (unsettled) site snapshot. While neither the status nor
+    // the config has changed, the refresh tick reuses it instead of
+    // re-serializing the whole status every second.
+    static REFRESH_CACHE: std::cell::RefCell<Option<RefreshCache>> =
         const { std::cell::RefCell::new(None) };
     // The acceleration state machine lives on the UI thread.
     static MODEL: std::cell::RefCell<ui_state::AppModel> =
         std::cell::RefCell::new(ui_state::AppModel::default());
 }
 
-/// Re-reads the world and applies it to the window. Runs on the UI thread;
-/// the diff in apply_ui_update makes a no-op refresh nearly free.
+/// The last raw (unsettled) snapshot, keyed by everything that can change it.
+/// A refresh tick that hits this reuses the rows and skips `status_json`; a
+/// config-only change (enabling/disabling a site) reuses the cached status
+/// JSON and rebuilds just the rows.
+struct RefreshCache {
+    status_revision: u64,
+    config_revision: u64,
+    expanded: HashSet<String>,
+    status: Rc<Value>,
+    raw_sites: Vec<SiteData>,
+    selected: usize,
+    ca: (bool, bool, bool),
+    settings: SettingsValues,
+}
+
+/// Re-reads the world and applies it to the window. Runs on the UI thread on a
+/// one-second timer; `apply_ui_update` diffs, and this cache keeps an idle tick
+/// from rebuilding a snapshot that cannot have changed.
 fn refresh(
     app: &AppWindow,
     runtime: &Arc<HakimiRuntime>,
     expanded: &HashSet<String>,
     sweep: &SweepState,
 ) {
-    let status = runtime.status_json();
-    let revision = runtime.config_revision();
-    let config = cached_config(revision, || runtime.config_json());
+    let status_revision = runtime.status_revision();
+    let config_revision = runtime.config_revision();
     let running = runtime.is_started() && !runtime.status().paused();
     // Running intent without a started runtime means "still starting": the
-    // summaries must not claim 已暂停 while the proxy is coming up.
+    // summaries must not claim a stale 待检测/健康 state while the proxy is
+    // coming up.
     let starting = MODEL.with(|m| m.borrow().accel()) == ui_state::AccelState::Running && !running;
     let phase = if starting {
         SettlePhase::Starting
     } else {
         sweep.phase()
     };
-    let (sites, subtitle) =
-        build_snapshot(&status, &config, expanded, running, starting, Some(phase));
-    let ca = &status["ca"];
-    let ca_state = (
-        ca.get("present").and_then(Value::as_bool).unwrap_or(false),
-        ca.get("supported").and_then(Value::as_bool).unwrap_or(false),
-        ca.get("installed").and_then(Value::as_bool).unwrap_or(false),
-    );
-    let settings = settings_values(&config);
+
+    // The status snapshot is the expensive part. A config-only change (a site
+    // toggle) keeps the same status revision, so the cached JSON is reused and
+    // only the display rows are rebuilt.
+    let cached_status = REFRESH_CACHE.with(|cell| {
+        let slot = cell.borrow();
+        slot.as_ref()
+            .filter(|cache| cache.status_revision == status_revision)
+            .map(|cache| cache.status.clone())
+    });
+
+    let cached = REFRESH_CACHE.with(|cell| {
+        let slot = cell.borrow();
+        slot.as_ref().and_then(|cache| {
+            (cache.status_revision == status_revision
+                && cache.config_revision == config_revision
+                && &cache.expanded == expanded)
+                .then(|| {
+                    (
+                        cache.raw_sites.clone(),
+                        cache.selected,
+                        cache.ca,
+                        cache.settings.clone(),
+                    )
+                })
+        })
+    });
+
+    // Expanding or collapsing a site only flips its `open` flag. Patch the
+    // cached rows instead of walking every group and domain again.
+    let expanded_only = REFRESH_CACHE.with(|cell| {
+        let slot = cell.borrow();
+        slot.as_ref().and_then(|cache| {
+            (cache.status_revision == status_revision
+                && cache.config_revision == config_revision
+                && cache.expanded != *expanded)
+                .then(|| {
+                    let mut sites = cache.raw_sites.clone();
+                    for site in &mut sites {
+                        site.open = expanded.contains(&site.id);
+                    }
+                    (sites, cache.selected, cache.ca, cache.settings.clone())
+                })
+        })
+    });
+
+    let (raw_sites, selected, ca_state, settings) = if let Some(hit) = expanded_only {
+        REFRESH_CACHE.with(|cell| {
+            if let Some(cache) = cell.borrow_mut().as_mut() {
+                cache.expanded = expanded.clone();
+                cache.raw_sites = hit.0.clone();
+            }
+        });
+        hit
+    } else {
+        match cached {
+            // Nothing the window renders has changed: reuse the rows and let
+            // finish_snapshot's settle pass decide whether a pending summary
+            // has been stable long enough to commit.
+            Some(hit) => hit,
+            None => {
+                let status = cached_status.unwrap_or_else(|| Rc::new(runtime.status_json()));
+                let config = cached_config(config_revision, || runtime.config_json());
+                let (raw_sites, selected) = build_sites(&status, &config, expanded);
+                let ca = &status["ca"];
+                let ca_state = (
+                    ca.get("present").and_then(Value::as_bool).unwrap_or(false),
+                    ca.get("supported").and_then(Value::as_bool).unwrap_or(false),
+                    ca.get("installed").and_then(Value::as_bool).unwrap_or(false),
+                );
+                let settings = settings_values(&config);
+                REFRESH_CACHE.with(|cell| {
+                    *cell.borrow_mut() = Some(RefreshCache {
+                        status_revision,
+                        config_revision,
+                        expanded: expanded.clone(),
+                        status: status.clone(),
+                        raw_sites: raw_sites.clone(),
+                        selected,
+                        ca: ca_state,
+                        settings: settings.clone(),
+                    });
+                });
+                (raw_sites, selected, ca_state, settings)
+            }
+        }
+    };
+
+    let (sites, subtitle) = finish_snapshot(raw_sites, selected, running, starting, Some(phase));
     apply_ui_update(app, sites, subtitle, running, ca_state, settings);
     // Environment state comes from the probe thread; the window already
     // mirrors the model, so there is nothing else to do here.
 }
 
-fn cached_config(revision: u64, fetch: impl FnOnce() -> Value) -> Value {
+fn cached_config(revision: u64, fetch: impl FnOnce() -> Value) -> Rc<Value> {
     CONFIG_CACHE.with(|cell| {
         let mut slot = cell.borrow_mut();
         match slot.as_ref() {
             Some((cached_revision, config)) if *cached_revision == revision => config.clone(),
             _ => {
-                let config = fetch();
+                let config = Rc::new(fetch());
                 *slot = Some((revision, config.clone()));
                 config
             }
@@ -1191,11 +1359,11 @@ fn main() -> Result<()> {
             }
         }
     });
-    tray.on_probe_all({
+    tray.on_probe_selected({
         let weak = app.as_weak();
         move || {
             if let Some(app) = weak.upgrade() {
-                app.invoke_probe_all();
+                app.invoke_probe_selected();
             }
         }
     });
@@ -1231,6 +1399,13 @@ fn main() -> Result<()> {
         let weak = app.as_weak();
         let sweep = sweep.clone();
         app.on_toggle_master(move || {
+            // Turning acceleration on with nothing selected would claim to run
+            // an empty set. Leave the switch off; the subtitle explains why.
+            let turning_on =
+                MODEL.with(|m| m.borrow().accel() != ui_state::AccelState::Running);
+            if turning_on && !runtime.config().snapshot().groups.iter().any(|g| g.enabled) {
+                return;
+            }
             // Use the last known environment (fresh within a second of the
             // probe stream) so the click never waits on a subprocess.
             let effects = MODEL.with(|m| {
@@ -1250,6 +1425,8 @@ fn main() -> Result<()> {
         let weak = app.as_weak();
         let sweep = sweep.clone();
         app.on_toggle_group(move |id, enabled| {
+            // Selection only changes the acceleration set. Probing is an
+            // explicit action ("检测选中"), never a side effect of a checkbox.
             let _ = runtime.set_group_enabled(id.as_str(), enabled);
             if let Some(app) = weak.upgrade() {
                 refresh(&app, &runtime, &expanded.borrow(), &sweep);
@@ -1262,13 +1439,20 @@ fn main() -> Result<()> {
         let weak = app.as_weak();
         let sweep = sweep.clone();
         app.on_select_all(move |enabled| {
+            // Select-all only changes the set; it never starts a test.
             let _ = runtime.config().mutate(|config| {
                 for group in &mut config.groups {
                     group.enabled = enabled;
                 }
                 Ok(())
             });
+            if !enabled {
+                // Nothing is selected: stop claiming acceleration.
+                let effects = MODEL.with(|m| m.borrow_mut().stop());
+                ui_state::execute(&effects, &runtime);
+            }
             if let Some(app) = weak.upgrade() {
+                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
                 refresh(&app, &runtime, &expanded.borrow(), &sweep);
             }
         });
@@ -1293,17 +1477,23 @@ fn main() -> Result<()> {
     {
         let runtime = runtime.clone();
         let spawner = spawner.clone();
+        let expanded = expanded.clone();
+        let weak = app.as_weak();
         let sweep = sweep.clone();
-        app.on_probe_all(move || {
+        app.on_probe_selected(move || {
             // One atomic sweep on the runtime: the UI only flips the phase and
             // awaits completion, no per-domain bookkeeping here.
             sweep.running.store(true, Ordering::SeqCst);
+            if let Some(app) = weak.upgrade() {
+                // Flip the rows to 检测中 now; the sweep runs off-thread.
+                refresh(&app, &runtime, &expanded.borrow(), &sweep);
+            }
             let runtime = runtime.clone();
-            let sweep = sweep.clone();
+            let done = sweep.clone();
             spawner.spawn(async move {
                 runtime.probe_sweep().await;
-                sweep.running.store(false, Ordering::SeqCst);
-                sweep.commit_once.store(true, Ordering::SeqCst);
+                done.running.store(false, Ordering::SeqCst);
+                done.commit_once.store(true, Ordering::SeqCst);
             });
         });
     }
@@ -1529,20 +1719,38 @@ fn main() -> Result<()> {
         });
     }
 
-    // Periodic refresh picks up background activity (probe results, EWMA latency).
+    // Periodic refresh picks up background activity (probe results, EWMA
+    // latency). A window parked in the tray has nothing to repaint, so the
+    // same tick releases its working set instead (immediately on hide, then
+    // every 30 s). The proxy and the environment probe keep running.
     let timer = slint::Timer::default();
     {
         let runtime = runtime.clone();
         let expanded = expanded.clone();
         let weak = app.as_weak();
         let sweep = sweep.clone();
+        let last_trim: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(1000),
             move || {
-                if let Some(app) = weak.upgrade() {
-                    refresh(&app, &runtime, &expanded.borrow(), &sweep);
+                let Some(app) = weak.upgrade() else {
+                    return;
+                };
+                if !app.window().is_visible() {
+                    let due = last_trim
+                        .get()
+                        .map(|at| at.elapsed() >= Duration::from_secs(30))
+                        .unwrap_or(true);
+                    if due {
+                        trim_working_set();
+                        last_trim.set(Some(Instant::now()));
+                    }
+                    return;
                 }
+                // Shown again: the next hidden tick re-arms the trim.
+                last_trim.set(None);
+                refresh(&app, &runtime, &expanded.borrow(), &sweep);
             },
         );
     }
@@ -1874,7 +2082,7 @@ mod tests {
     }
 
     #[test]
-    fn paused_snapshot_reports_paused_instead_of_timing_out() {
+    fn paused_snapshot_still_reports_health() {
         let config = serde_json::json!({
             "groups": [
                 { "id": "ok", "name": "OK", "enabled": true, "domains": ["a.example"] }
@@ -1884,9 +2092,49 @@ mod tests {
             { "domain": "a.example", "state": "failed" }
         ]});
         let (sites, subtitle) = build_snapshot(&status, &config, &HashSet::new(), false, false, None);
-        assert_eq!(sites[0].summary, "1 个域名 · 已暂停");
-        assert_eq!(sites[0].summary_hex, IDLE_COLOR);
-        assert_eq!(subtitle, "已选择 1 个站点", "paused runs must not claim activity");
+        assert_eq!(
+            sites[0].summary, "1 个域名 · 全部超时",
+            "pause is a routing state, not a health result"
+        );
+        assert_eq!(sites[0].summary_hex, BAD_COLOR);
+        assert_eq!(subtitle, "已选择 1 个站点 · 1 个异常 · 加速已暂停");
+    }
+
+    #[test]
+    fn selected_but_untested_sites_point_to_the_explicit_action() {
+        let config = serde_json::json!({
+            "groups": [
+                { "id": "ok", "name": "OK", "enabled": true, "domains": ["a.example"] }
+            ]
+        });
+        let status = serde_json::json!({ "domains": [] });
+        let (sites, subtitle) = build_snapshot(&status, &config, &HashSet::new(), true, false, None);
+        assert_eq!(sites[0].summary, "1 个域名 · 待检测");
+        assert_eq!(
+            subtitle,
+            "已选择 1 个站点 · 点击检测选中获取健康状态",
+            "selection must not imply a test; the subtitle names the explicit action"
+        );
+    }
+
+    #[test]
+    fn a_sweep_is_visible_while_paused() {
+        let config = serde_json::json!({
+            "groups": [
+                { "id": "ok", "name": "OK", "enabled": true, "domains": ["a.example"] }
+            ]
+        });
+        let status = serde_json::json!({ "domains": [] });
+        let (sites, subtitle) = build_snapshot(
+            &status,
+            &config,
+            &HashSet::new(),
+            false,
+            false,
+            Some(SettlePhase::Sweeping),
+        );
+        assert_eq!(sites[0].summary, "1 个域名 · 测速中");
+        assert_eq!(subtitle, "正在检测 1 个域名 · 结果会自动更新");
     }
 
     #[test]
