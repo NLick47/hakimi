@@ -23,6 +23,14 @@ const DIAGNOSTIC_LOG_LINES: usize = 300;
 /// disk can never turn logging into unbounded memory growth.
 const LOG_QUEUE_CAPACITY: usize = 8192;
 
+/// Events that were dropped because the writer could not keep up.
+static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+/// How many log events were dropped because the queue was full.
+pub fn dropped_events() -> u64 {
+    DROPPED_EVENTS.load(Ordering::Relaxed)
+}
+
 /// Initialize local-only logging. Logs never leave the machine; catalog/DoH URLs are redacted
 /// before they are written by callers.
 pub fn init(paths: &Paths, level: &str, format: LogFormat) -> Result<()> {
@@ -162,6 +170,7 @@ impl Drop for NonBlockingWriter {
             .is_err()
         {
             self.sink.dropped.fetch_add(1, Ordering::Relaxed);
+            DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -343,6 +352,26 @@ mod tests {
             assert!(rx.try_recv().is_err(), "must not write while formatting");
         }
         assert_eq!(rx.recv().unwrap(), b"hello world\n");
+    }
+
+    #[test]
+    fn dropped_events_are_counted() {
+        let before = dropped_events();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let sink = LogSink {
+            tx: tx.clone(),
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
+        tx.send(b"first\n".to_vec()).unwrap();
+        let make = NonBlockingMakeWriter::new(sink);
+        {
+            let mut writer = make.make_writer();
+            writer.write_all(b"second\n").unwrap();
+        }
+        // Another test may drop an event at the same time, so only the
+        // direction of the change is pinned here.
+        assert!(dropped_events() > before);
+        assert_eq!(rx.recv().unwrap(), b"first\n");
     }
 
     #[test]

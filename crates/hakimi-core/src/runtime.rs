@@ -114,6 +114,7 @@ impl StatusProvider {
             "dohHealth": self.resolver.health_snapshot(),
             "upstream": self.upstream.stats_json(),
             "cache": cache,
+            "logDropped": crate::logging::dropped_events(),
             "counts": counts,
             "groups": groups,
             "domains": domains,
