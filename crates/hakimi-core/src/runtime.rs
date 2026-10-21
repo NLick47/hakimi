@@ -177,7 +177,11 @@ impl HakimiRuntime {
         };
         paths.ensure()?;
         let config = Arc::new(ConfigManager::load_or_create(&paths)?);
-        logging::init(&paths, &config.snapshot().log.level)?;
+        logging::init(
+            &paths,
+            &config.snapshot().log.level,
+            config.snapshot().log.format,
+        )?;
         let cache = Arc::new(CacheManager::load(paths.state_file())?);
         let catalogs = CatalogManager::load(&paths, config.clone(), cache.clone())?;
         let ca = CertificateAuthority::load_or_create(&paths)?;
@@ -394,7 +398,11 @@ impl HakimiRuntime {
         self.spawn_background_tasks(shutdown_tx);
         self.started.store(true, Ordering::SeqCst);
         tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
             data_dir = %self.paths.root().display(),
+            network_id = %self.status_provider.current_network.read(),
+            catalog_version = self.config.snapshot().catalog_version,
+            log_format = ?self.config.snapshot().log.format,
             "hakimi runtime started"
         );
         Ok(())

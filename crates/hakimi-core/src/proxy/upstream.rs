@@ -265,6 +265,10 @@ async fn forward_with_pool(
     parts.uri = absolute
         .parse()
         .map_err(|error| format!("building upstream URI for {host}:{port} failed: {error}"))?;
+    // Keep a cheap `Uri` handle for the response body's error logger. Cloning the
+    // parsed URI shares its `Bytes`; allocating a fresh host String per response is
+    // not necessary on this hot path.
+    let response_uri = parts.uri.clone();
     parts.version = http::Version::HTTP_11;
     let upstream_request = Request::from_parts(parts, Either::Left(body) as UpstreamBody);
 
@@ -303,21 +307,25 @@ async fn forward_with_pool(
         }
     }
 
-    Ok(into_proxy_response(response, host))
+    Ok(into_proxy_response(response, response_uri))
 }
 
 fn into_proxy_response(
     mut response: Response<UpstreamResponseBody>,
-    host: &str,
+    uri: http::Uri,
 ) -> Response<ProxyBody> {
     let upgrade = response.status() == StatusCode::SWITCHING_PROTOCOLS;
     let status = response.status();
     sanitize_response_headers(response.headers_mut(), upgrade);
     let (parts, body) = response.into_parts();
-    let host = host.to_string();
     let body = body
         .map_err(move |error| -> super::BoxError {
-            tracing::warn!(host = %host, status = status.as_u16(), error = %error, "upstream response body failed");
+            tracing::warn!(
+                host = uri.host().unwrap_or(""),
+                status = status.as_u16(),
+                error = %error,
+                "upstream response body failed"
+            );
             Box::new(error)
         })
         .boxed_unsync();
@@ -361,14 +369,14 @@ fn sanitize_response_headers(headers: &mut HeaderMap, upgrade: bool) {
     headers.remove("proxy-connection");
 }
 
-fn authority(host: &str, port: u16, https: bool) -> String {
+fn authority(host: &str, port: u16, https: bool) -> Cow<'_, str> {
     let default = if https { 443 } else { 80 };
     if port == default {
-        host.to_string()
+        Cow::Borrowed(host)
     } else if host.contains(':') {
-        format!("[{host}]:{port}")
+        Cow::Owned(format!("[{host}]:{port}"))
     } else {
-        format!("{host}:{port}")
+        Cow::Owned(format!("{host}:{port}"))
     }
 }
 

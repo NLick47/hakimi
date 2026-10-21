@@ -49,6 +49,9 @@ impl IpCatalog {
         if let Some((key, ips)) = self.ips.get_key_value(&host) {
             return Some((key, ips));
         }
+        if self.wildcards.is_empty() {
+            return None;
+        }
         for (index, byte) in host.bytes().enumerate() {
             if byte == b'.' {
                 if let Some(key) = self.wildcards.get(&host[index + 1..]) {

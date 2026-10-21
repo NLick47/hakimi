@@ -29,14 +29,35 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RAW_RACE_SIZE: usize = 8;
 const RAW_RACE_STAGGER: Duration = Duration::from_millis(150);
 
+/// Context attached to a raw CONNECT tunnel. Raw tunnels bypass the pooled HTTP
+/// client, so without this summary a stalled TLS handshake leaves no request-level
+/// trace in the logs.
+struct TunnelInfo {
+    host: String,
+    port: u16,
+    mode: &'static str,
+}
+
+impl TunnelInfo {
+    fn new(host: &str, port: u16, mode: &'static str) -> Self {
+        Self {
+            host: host.to_owned(),
+            port,
+            mode,
+        }
+    }
+}
+
 pub(super) async fn handle_connect(
     req: &mut Request<Incoming>,
     ctx: Arc<ProxyContext>,
 ) -> Response<ProxyBody> {
+    // Borrow the authority instead of copying it: CONNECT is the entry point for
+    // every new browser connection, and `parse_authority` owns the result anyway.
     let authority = match req.uri().authority() {
-        Some(authority) => authority.to_string(),
+        Some(authority) => authority.as_str(),
         None => match req.uri().path().strip_prefix("//") {
-            Some(value) => value.to_string(),
+            Some(value) => value,
             None => {
                 return error_response(
                     StatusCode::BAD_REQUEST,
@@ -46,7 +67,7 @@ pub(super) async fn handle_connect(
             }
         },
     };
-    let Some((host, port)) = parse_authority(&authority, 443) else {
+    let Some((host, port)) = parse_authority(authority, 443) else {
         return error_response(
             StatusCode::BAD_REQUEST,
             "Invalid CONNECT target",
@@ -55,7 +76,8 @@ pub(super) async fn handle_connect(
     };
     // Normalize once here: the raw tunnel, plan cache and the MITM Host check
     // must all agree on one spelling (trailing root dot, IDNA, case).
-    let host = if is_ip_literal(&host) {
+    let is_ip = is_ip_literal(&host);
+    let host = if is_ip {
         host
     } else {
         normalize_hostname(&host).unwrap_or(host)
@@ -63,7 +85,7 @@ pub(super) async fn handle_connect(
 
     let config = ctx.config.snapshot();
     let matcher = ctx.config.matcher();
-    let group_id = if is_ip_literal(&host) {
+    let group_id = if is_ip {
         None
     } else {
         matcher.match_normalized(&host).map(ToOwned::to_owned)
@@ -89,7 +111,11 @@ pub(super) async fn handle_connect(
                 Ok(stream) => {
                     let latency = started.elapsed().as_millis() as u64;
                     ctx.engine.note_tunnel_success(&plan, latency);
-                    return tunnel_connect(req, stream);
+                    return tunnel_connect(
+                        req,
+                        stream,
+                        TunnelInfo::new(&host, port, "cached-direct"),
+                    );
                 }
                 Err((reason, detail)) => {
                     tracing::debug!(
@@ -208,7 +234,7 @@ async fn tunnel_direct_group(
     match race_tcp_plans(&mut cursor, timeout).await {
         Some((plan, stream, latency)) => {
             let _ = cursor.note_success(&plan, latency);
-            tunnel_connect(req, stream)
+            tunnel_connect(req, stream, TunnelInfo::new(host, port, "raw-direct"))
         }
         None => {
             let diagnostics = cursor.outcome().map(|outcome| outcome.diagnostics.clone());
@@ -447,16 +473,22 @@ async fn tunnel_to_host(req: &mut Request<Incoming>, host: &str, port: u16) -> R
             };
         }
     };
-    tunnel_connect(req, upstream)
+    tunnel_connect(req, upstream, TunnelInfo::new(host, port, "bypass"))
 }
 
-fn tunnel_connect(req: &mut Request<Incoming>, mut upstream: TcpStream) -> Response<ProxyBody> {
+fn tunnel_connect(
+    req: &mut Request<Incoming>,
+    mut upstream: TcpStream,
+    info: TunnelInfo,
+) -> Response<ProxyBody> {
     let on_upgrade = upgrade::on(req);
     tokio::spawn(async move {
+        let started = Instant::now();
         match on_upgrade.await {
             Ok(upgraded) => {
+                let upstream_addr = upstream.peer_addr().ok();
                 let mut upgraded = TokioIo::new(upgraded);
-                if let Err(error) = tokio::io::copy_bidirectional_with_sizes(
+                match tokio::io::copy_bidirectional_with_sizes(
                     &mut upgraded,
                     &mut upstream,
                     COPY_BUFFER_SIZE,
@@ -464,10 +496,58 @@ fn tunnel_connect(req: &mut Request<Incoming>, mut upstream: TcpStream) -> Respo
                 )
                 .await
                 {
-                    tracing::debug!(error = %error, "tunnel closed");
+                    Ok((to_upstream, from_upstream)) => {
+                        let elapsed_ms = started.elapsed().as_millis() as u64;
+                        // A long-lived WebSocket/SSH tunnel is not a stall. The
+                        // actionable case is a client that sent bytes but the
+                        // upstream never answered (the raw TLS handshake hung).
+                        let stalled = from_upstream == 0 && to_upstream > 0 && elapsed_ms >= 500;
+                        if stalled {
+                            tracing::warn!(
+                                host = %info.host,
+                                port = info.port,
+                                mode = info.mode,
+                                upstream = ?upstream_addr,
+                                bytes_to_upstream = to_upstream,
+                                bytes_from_upstream = from_upstream,
+                                elapsed_ms,
+                                "raw tunnel finished without upstream data"
+                            );
+                        } else {
+                            tracing::debug!(
+                                host = %info.host,
+                                port = info.port,
+                                mode = info.mode,
+                                upstream = ?upstream_addr,
+                                bytes_to_upstream = to_upstream,
+                                bytes_from_upstream = from_upstream,
+                                elapsed_ms,
+                                "raw tunnel finished"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let elapsed_ms = started.elapsed().as_millis() as u64;
+                        let upstream_addr = upstream.peer_addr().ok();
+                        tracing::debug!(
+                            host = %info.host,
+                            port = info.port,
+                            mode = info.mode,
+                            upstream = ?upstream_addr,
+                            elapsed_ms,
+                            error = %error,
+                            "raw tunnel failed"
+                        );
+                    }
                 }
             }
-            Err(error) => tracing::debug!(error = %error, "CONNECT upgrade failed"),
+            Err(error) => tracing::debug!(
+                host = %info.host,
+                port = info.port,
+                mode = info.mode,
+                error = %error,
+                "CONNECT upgrade failed"
+            ),
         }
     });
     empty_response(StatusCode::OK)

@@ -213,16 +213,26 @@ impl Default for AdvancedConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LogConfig {
     pub level: String,
+    pub format: LogFormat,
 }
 
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
             level: "info".to_string(),
+            format: LogFormat::Text,
         }
     }
 }

@@ -74,8 +74,8 @@ impl DomainPattern {
 /// Normalize a DNS host name to lowercase ASCII (IDNA) without a trailing dot.
 pub fn normalize_hostname(input: &str) -> Result<String> {
     let mut host = input.trim().to_ascii_lowercase();
-    if let Some(stripped) = host.strip_suffix('.') {
-        host = stripped.to_string();
+    if host.ends_with('.') {
+        host.pop();
     }
     if host.is_empty() {
         bail!("empty host name");
@@ -201,6 +201,9 @@ impl DomainMatcher {
     /// visits the longest suffix first and costs O(labels) map lookups instead of
     /// an O(number of wildcards) scan per request.
     fn wildcard_match(&self, host: &str) -> Option<&str> {
+        if self.wildcards.is_empty() {
+            return None;
+        }
         for (index, byte) in host.bytes().enumerate() {
             if byte == b'.' {
                 if let Some(group) = self.wildcards.get(&host[index + 1..]) {

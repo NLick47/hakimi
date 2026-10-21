@@ -48,6 +48,12 @@ use crate::strategy::{FailureReason, TlsMode};
 /// browser body directly; warm-up requests use an empty `Full` body.
 pub(crate) type UpstreamBody = Either<Incoming, Full<Bytes>>;
 
+/// After a response takes this long, the authority is considered unhealthy for a
+/// short period. New requests then use a fresh, unpooled connection so a single
+/// half-dead HTTP/2 connection cannot delay a whole page load again.
+const SLOW_ROUTE_MARK_MS: u64 = 5_000;
+const SLOW_ROUTE_TTL: Duration = Duration::from_secs(60);
+
 /// Browser response bodies stay streaming; the pool only owns the upstream connection.
 pub(crate) type UpstreamResponse = Response<UpstreamResponseBody>;
 
@@ -131,6 +137,7 @@ pub(crate) struct UpstreamStats {
     responses_h2: AtomicU64,
     responses_h1: AtomicU64,
     request_errors: AtomicU64,
+    slow_responses: AtomicU64,
     warm_success: AtomicU64,
     warm_failures: AtomicU64,
 }
@@ -146,6 +153,7 @@ impl UpstreamStats {
             "responsesH2": self.responses_h2.load(Ordering::Relaxed),
             "responsesH1": self.responses_h1.load(Ordering::Relaxed),
             "requestErrors": self.request_errors.load(Ordering::Relaxed),
+            "slowResponses": self.slow_responses.load(Ordering::Relaxed),
             "warmSuccess": self.warm_success.load(Ordering::Relaxed),
             "warmFailures": self.warm_failures.load(Ordering::Relaxed),
         })
@@ -155,6 +163,9 @@ impl UpstreamStats {
 pub struct UpstreamPool {
     auto: Client<RouteConnector, UpstreamBody>,
     upgrade: Client<RouteConnector, UpstreamBody>,
+    recovery: Client<RouteConnector, UpstreamBody>,
+    engine: Arc<DecisionEngine>,
+    slow_hosts: Mutex<HashMap<String, Instant>>,
     http1_hosts: Arc<DomainMatcher>,
     http1_limit: usize,
     http1_slots: Mutex<HashMap<String, Arc<Semaphore>>>,
@@ -165,6 +176,36 @@ pub struct UpstreamPool {
 /// share a single probe instead of each racing its own candidate batch.
 struct Discovery {
     inflight: Mutex<HashMap<String, Arc<Inflight>>>,
+}
+
+fn build_client(
+    config: &AppConfig,
+    connector: RouteConnector,
+    max_idle: usize,
+) -> Client<RouteConnector, UpstreamBody> {
+    let idle = Duration::from_secs(config.advanced.upstream_idle_secs.max(10));
+    let mut builder = Client::builder(TokioExecutor::new());
+    builder
+        .pool_timer(TokioTimer::new())
+        .pool_idle_timeout(idle)
+        .pool_max_idle_per_host(max_idle)
+        .timer(TokioTimer::new())
+        .http2_adaptive_window(true)
+        // Larger than the 64 KiB h2 defaults: a 1 MB image over a 50 ms
+        // link would otherwise need ~16 window updates before reaching
+        // line rate. Adaptive window still grows beyond these.
+        .http2_initial_stream_window_size(1024 * 1024)
+        .http2_initial_connection_window_size(4 * 1024 * 1024)
+        // A half-open HTTP/2 connection used to stay in the pool for up to
+        // 30s (next ping) + 10s (ping timeout). That matches the 38-39s
+        // stalls seen on cached 304 revalidations: the request was checked
+        // out before the dead connection was detected. Keep idle
+        // connections probed often enough that they are evicted before the
+        // next page load, without turning this into a busy loop.
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .http2_keep_alive_timeout(Duration::from_secs(5))
+        .http2_keep_alive_while_idle(true);
+    builder.build(connector)
 }
 
 #[derive(Default)]
@@ -201,24 +242,7 @@ impl Drop for DiscoveryGuard<'_> {
 impl UpstreamPool {
     pub fn new(engine: Arc<DecisionEngine>, tls: Arc<TlsContext>, config: &AppConfig) -> Arc<Self> {
         let stats = Arc::new(UpstreamStats::default());
-        let idle = Duration::from_secs(config.advanced.upstream_idle_secs.max(10));
         let max_idle = config.advanced.upstream_max_idle_per_host.max(1);
-
-        let mut builder = Client::builder(TokioExecutor::new());
-        builder
-            .pool_timer(TokioTimer::new())
-            .pool_idle_timeout(idle)
-            .pool_max_idle_per_host(max_idle)
-            .timer(TokioTimer::new())
-            .http2_adaptive_window(true)
-            // Larger than the 64 KiB h2 defaults: a 1 MB image over a 50 ms
-            // link would otherwise need ~16 window updates before reaching
-            // line rate. Adaptive window still grows beyond these.
-            .http2_initial_stream_window_size(1024 * 1024)
-            .http2_initial_connection_window_size(4 * 1024 * 1024)
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .http2_keep_alive_timeout(Duration::from_secs(10))
-            .http2_keep_alive_while_idle(true);
 
         let http1_hosts = DomainMatcher::from_patterns(
             config
@@ -249,8 +273,14 @@ impl UpstreamPool {
             stats: stats.clone(),
         };
         Arc::new(Self {
-            auto: builder.build(auto_connector),
-            upgrade: builder.build(upgrade_connector),
+            auto: build_client(config, auto_connector.clone(), max_idle),
+            upgrade: build_client(config, upgrade_connector, max_idle),
+            // No idle connections: after a slow response, use this client to
+            // guarantee that the next request starts on a fresh connection
+            // instead of reusing the stalled one.
+            recovery: build_client(config, auto_connector, 0),
+            engine,
+            slow_hosts: Mutex::new(HashMap::new()),
             http1_hosts,
             http1_limit: config.advanced.http1_max_concurrent.max(1),
             http1_slots: Mutex::new(HashMap::new()),
@@ -265,30 +295,41 @@ impl UpstreamPool {
         request: Request<UpstreamBody>,
         upgrade: bool,
     ) -> std::result::Result<UpstreamResponse, String> {
-        self.stats.requests.fetch_add(1, Ordering::Relaxed);
-        let host = request.uri().host().map(ToOwned::to_owned);
-        let permit = if !upgrade {
-            // Forwarded URIs are built from an already-normalized host, so the
-            // per-request image-host check does not need to normalize again.
-            match host
-                .as_deref()
-                .filter(|host| self.http1_hosts.match_normalized(host).is_some())
-            {
-                Some(host) => {
-                    let semaphore = self.host_slots(host);
-                    match semaphore.acquire_owned().await {
-                        Ok(permit) => Some(permit),
-                        Err(_) => return Err("image connection limiter is closed".into()),
-                    }
-                }
-                None => None,
+        let request_id = self.stats.requests.fetch_add(1, Ordering::Relaxed) + 1;
+        // `http::Uri` clones its components as cheap `Bytes` handles. Keeping one
+        // around lets the logging paths borrow host/path after the request is moved,
+        // instead of allocating a new String for every forwarded request.
+        let uri = request.uri().clone();
+        let method = request.method().clone();
+        let request_version = request.version();
+        let scheme = uri.scheme_str().unwrap_or("");
+        let host = uri.host();
+        // Forwarded URIs are built from an already-normalized host, so the
+        // per-request image-host check does not need to normalize again.
+        let is_http1_host =
+            host.is_some_and(|host| self.http1_hosts.match_normalized(host).is_some());
+        let permit = if !upgrade && is_http1_host {
+            let host = host.expect("is_http1_host requires a host");
+            let semaphore = self.host_slots(host);
+            match semaphore.acquire_owned().await {
+                Ok(permit) => Some(permit),
+                Err(_) => return Err("image connection limiter is closed".into()),
             }
         } else {
             None
         };
-        let client = if upgrade { &self.upgrade } else { &self.auto };
+        let tls = uri.scheme_str() != Some("http");
+        let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+        let recovery = !upgrade && host.is_some_and(|host| self.is_slow(host));
+        let client = if upgrade {
+            &self.upgrade
+        } else if recovery {
+            &self.recovery
+        } else {
+            &self.auto
+        };
         let debug_host = host;
-        let debug_path = request.uri().path().to_string();
+        let debug_path = uri.path();
         let started = std::time::Instant::now();
         match client.request(request).await {
             Ok(response) => {
@@ -301,7 +342,25 @@ impl UpstreamPool {
                 // optimization: they point at candidates that deserve a re-race.
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 if elapsed_ms > 2000 {
+                    self.stats.slow_responses.fetch_add(1, Ordering::Relaxed);
+                }
+                if elapsed_ms > SLOW_ROUTE_MARK_MS {
+                    if let Some(host) = debug_host {
+                        // The established connection may be half-dead (packet
+                        // loss, a stale h2 stream, or a path change). Do not
+                        // pin the next request to it or to the same cached
+                        // route; use a fresh connection and let the route
+                        // cursor re-race candidates.
+                        self.mark_slow(host);
+                        self.engine.forget_plan(host, port, tls);
+                    }
+                }
+                if elapsed_ms > 2000 {
                     tracing::warn!(
+                        request_id,
+                        method = %method,
+                        scheme,
+                        version = ?request_version,
                         host = ?debug_host,
                         path = %debug_path,
                         status = response.status().as_u16(),
@@ -310,6 +369,10 @@ impl UpstreamPool {
                     );
                 } else {
                     tracing::debug!(
+                        request_id,
+                        method = %method,
+                        scheme,
+                        version = ?request_version,
                         host = ?debug_host,
                         path = %debug_path,
                         status = response.status().as_u16(),
@@ -317,17 +380,15 @@ impl UpstreamPool {
                         "upstream response"
                     );
                 }
-                if response.status().is_client_error() || response.status().is_server_error() {
-                    if let Some(host) = debug_host.as_deref() {
-                        if self.http1_hosts.match_normalized(host).is_some() {
-                            tracing::warn!(
-                                host,
-                                path = %debug_path,
-                                status = response.status().as_u16(),
-                                "image upstream returned an HTTP error"
-                            );
-                        }
-                    }
+                if (response.status().is_client_error() || response.status().is_server_error())
+                    && is_http1_host
+                {
+                    tracing::warn!(
+                        host = debug_host.unwrap_or(""),
+                        path = %debug_path,
+                        status = response.status().as_u16(),
+                        "image upstream returned an HTTP error"
+                    );
                 }
                 let (parts, body) = response.into_parts();
                 let body = match permit {
@@ -341,8 +402,16 @@ impl UpstreamPool {
             }
             Err(error) => {
                 self.stats.request_errors.fetch_add(1, Ordering::Relaxed);
+                if let Some(host) = debug_host {
+                    self.mark_slow(host);
+                    self.engine.forget_plan(host, port, tls);
+                }
                 tracing::warn!(
-                    host = debug_host.as_deref().unwrap_or(""),
+                    request_id,
+                    method = %method,
+                    scheme,
+                    version = ?request_version,
+                    host = debug_host.unwrap_or(""),
                     path = %debug_path,
                     error = %error,
                     "upstream request failed"
@@ -350,6 +419,30 @@ impl UpstreamPool {
                 Err(format!("{error:?}"))
             }
         }
+    }
+
+    fn is_slow(&self, host: &str) -> bool {
+        let mut hosts = self.slow_hosts.lock();
+        match hosts.get(host).copied() {
+            Some(at) if at.elapsed() < SLOW_ROUTE_TTL => true,
+            Some(_) => {
+                hosts.remove(host);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn mark_slow(&self, host: &str) {
+        let now = Instant::now();
+        let mut hosts = self.slow_hosts.lock();
+        if hosts.len() >= 256 {
+            hosts.retain(|_, at| now.duration_since(*at) < SLOW_ROUTE_TTL);
+            if hosts.len() >= 256 {
+                hosts.clear();
+            }
+        }
+        hosts.insert(host.to_owned(), now);
     }
 
     fn host_slots(&self, host: &str) -> Arc<Semaphore> {

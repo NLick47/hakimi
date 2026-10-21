@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -7,21 +7,22 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
+use crate::config::LogFormat;
 use crate::paths::Paths;
 use crate::util::{atomic_write_json, now, redact_ip, redact_url};
 
-const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_LOG_BACKUPS: usize = 5;
 const DIAGNOSTIC_LOG_LINES: usize = 300;
 
 /// Initialize local-only logging. Logs never leave the machine; catalog/DoH URLs are redacted
 /// before they are written by callers.
-pub fn init(paths: &Paths, level: &str) -> Result<()> {
+pub fn init(paths: &Paths, level: &str, format: LogFormat) -> Result<()> {
     paths.ensure()?;
     let log_path = paths.log_file();
-    if let Ok(metadata) = std::fs::metadata(&log_path) {
+    if let Ok(metadata) = fs::metadata(&log_path) {
         if metadata.len() > MAX_LOG_BYTES {
-            let rotated = paths.logs_dir().join("hakimi.1.log");
-            let _ = std::fs::rename(&log_path, rotated);
+            rotate_logs(&log_path);
         }
     }
     // Keep the append-only handle open for the lifetime of the subscriber. Opening and
@@ -40,13 +41,50 @@ pub fn init(paths: &Paths, level: &str) -> Result<()> {
         });
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(level.to_ascii_lowercase()));
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::sync::Mutex::new(file))
-        .with_ansi(false)
-        .with_target(true);
-    let _ = subscriber.try_init();
+    let writer = std::sync::Mutex::new(file);
+    match format {
+        LogFormat::Text => {
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_target(true);
+            let _ = subscriber.try_init();
+        }
+        LogFormat::Json => {
+            // JSONL is append-only and self-describing, which makes it suitable
+            // for local analysis (jq/SQLite/ClickHouse) without a text parser.
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_target(true)
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(false);
+            let _ = subscriber.try_init();
+        }
+    }
     Ok(())
+}
+
+/// Rotate to `hakimi.1.log` ... `hakimi.5.log`. Text logs are cheap to keep,
+/// but JSON/debug logs grow quickly; a single 5 MB backup loses the history
+/// needed to compare a regression with the previous day.
+fn rotate_logs(log_path: &Path) {
+    let Some(dir) = log_path.parent() else {
+        return;
+    };
+    let _ = fs::remove_file(dir.join(format!("hakimi.{MAX_LOG_BACKUPS}.log")));
+    for index in (1..MAX_LOG_BACKUPS).rev() {
+        let from = dir.join(format!("hakimi.{index}.log"));
+        let to = dir.join(format!("hakimi.{}.log", index + 1));
+        if from.exists() {
+            let _ = fs::rename(from, to);
+        }
+    }
+    let _ = fs::rename(log_path, dir.join("hakimi.1.log"));
 }
 
 pub fn log_file_tail(path: &Path, max_lines: usize) -> Vec<String> {
