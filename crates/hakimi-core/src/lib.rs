@@ -33,6 +33,7 @@ pub mod runtime;
 pub mod status;
 pub mod strategy;
 pub mod system_proxy;
+pub mod hooks;
 pub mod util;
 
 pub use config::{AppConfig, GroupConfig};

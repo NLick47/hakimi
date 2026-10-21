@@ -197,7 +197,8 @@ pub fn validate(raw: IpCatalogRaw, config: &AppConfig) -> Result<IpCatalog> {
                 .trim()
                 .parse()
                 .with_context(|| format!("IP catalog entry `{raw_domain}` contains `{raw_ip}`"))?;
-            if !is_public_ip(ip) {
+            // A harness points the catalog at its own loopback origins.
+            if !is_public_ip(ip) && !crate::hooks::allow_private_catalog_ips() {
                 warnings.push(format!(
                     "IP catalog entry `{raw_domain}` contains non-public IP `{ip}`; ignored"
                 ));
@@ -446,6 +447,22 @@ mod tests {
             let actual = catalog.lookup_ips(host).map(|(key, _)| key.clone());
             assert_eq!(actual, expected, "lookup for {host}");
         }
+    }
+
+    #[test]
+    fn wildcard_catalog_entry_serves_a_subdomain() {
+        let catalog = validate(
+            raw(r#"{
+                    "v": 1,
+                    "groups": {"g": ["*.mitm.test"]},
+                    "ips": {"*.mitm.test": ["1.1.1.1"]}
+                }"#),
+            &AppConfig::default(),
+        )
+        .unwrap();
+        let found = catalog.lookup_ips("a.mitm.test");
+        assert!(found.is_some(), "the wildcard entry must serve the subdomain");
+        assert_eq!(found.unwrap().1.len(), 1);
     }
 
     #[test]

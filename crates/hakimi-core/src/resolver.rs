@@ -841,6 +841,12 @@ impl Resolver {
             // DoH must bypass the OS proxy: otherwise it could recurse into our own listener.
             .no_proxy()
             .user_agent(format!("hakimi/{}", env!("CARGO_PKG_VERSION")));
+        // Test hook: extra roots for a local harness (off by default).
+        for root in crate::hooks::extra_roots() {
+            if let Ok(certificate) = reqwest::Certificate::from_der(root.as_ref()) {
+                builder = builder.add_root_certificate(certificate);
+            }
+        }
         if let Some(ip) = endpoint.bootstrap_ip {
             let parsed = url::Url::parse(&endpoint.url)
                 .with_context(|| format!("invalid DoH URL {}", redact_url(&endpoint.url)))?;

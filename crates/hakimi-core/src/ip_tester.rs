@@ -38,6 +38,8 @@ impl TlsContext {
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // Test hook: extra roots for a local harness (off by default).
+        roots.add_parsable_certificates(crate::hooks::extra_roots());
         Ok(Arc::new(Self {
             provider,
             roots: Arc::new(roots),

@@ -166,6 +166,10 @@ impl CertificateAuthority {
     /// read in place without cloning every fingerprint/path string; stale or
     /// missing snapshots fall back to the full probe in [`Self::status`].
     pub fn installed(&self) -> bool {
+        // Test hook: a harness cannot install a CA without a user prompt.
+        if crate::hooks::assume_ca_installed() {
+            return true;
+        }
         // Trust state changes only when the user (de)installs the CA.
         if self.installed_flag.load(Ordering::Relaxed) {
             return true;
