@@ -15,7 +15,7 @@ use super::{escape_html, full_body, ProxyBody, ProxyContext, COPY_BUFFER_SIZE};
 use crate::domain::{is_ip_literal, normalize_hostname, normalize_hostname_cow};
 use crate::status::{AttemptRecord, DomainDiagnostics, State};
 use crate::strategy::FailureReason;
-use crate::util::parse_authority;
+use crate::util::{host_header_name, parse_authority};
 
 pub(crate) const ERROR_STYLE: &str = r#"<style>
 :root{color-scheme:light dark}body{margin:0;background:#0f1115;color:#e7e9ee;font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -347,18 +347,6 @@ fn request_host_matches(req: &Request<Incoming>, expected: &str) -> bool {
         .and_then(|value| value.to_str().ok())
         .map(host_header_name)
         .is_some_and(|host| same_host(host, expected))
-}
-
-/// Host portion of a `Host` header, borrowing the original string.
-fn host_header_name(value: &str) -> &str {
-    let value = value.trim();
-    if let Some(rest) = value.strip_prefix('[') {
-        return rest.split_once(']').map_or(rest, |(host, _)| host);
-    }
-    match value.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
-        _ => value,
-    }
 }
 
 /// Host equality without allocating on the hot path. Browsers may preserve a

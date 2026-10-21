@@ -35,7 +35,7 @@ use crate::decision::DecisionEngine;
 use crate::ip_tester::TlsContext;
 use crate::resolver::Resolver;
 use crate::status::StatusStore;
-use crate::util::parse_authority;
+use crate::util::host_header_name;
 
 use self::connect::handle_connect;
 
@@ -236,15 +236,17 @@ fn is_local_request(req: &Request<Incoming>, ctx: &ProxyContext) -> bool {
     let host: &str = match borrowed {
         Some(host) => host,
         None => {
+            // Borrow the host: this runs on every request of a MITM tunnel,
+            // and the name is only compared, never kept.
             let Some(parsed) = req
                 .headers()
                 .get(header::HOST)
                 .and_then(|value| value.to_str().ok())
-                .and_then(|value| parse_authority(value, 80))
+                .map(host_header_name)
             else {
                 return false;
             };
-            owned = parsed.0;
+            owned = parsed;
             &owned
         }
     };

@@ -254,6 +254,21 @@ pub fn redact_ip(ip: IpAddr) -> String {
     }
 }
 
+/// Host portion of an authority or a `Host` header, borrowed from the input.
+///
+/// Unlike [`parse_authority`] it allocates nothing, which matters on the
+/// request path where the host is only compared, never stored.
+pub fn host_header_name(value: &str) -> &str {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('[') {
+        return rest.split_once(']').map_or(rest, |(host, _)| host);
+    }
+    match value.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => value,
+    }
+}
+
 pub fn parse_authority(authority: &str, default_port: u16) -> Option<(String, u16)> {
     let authority = authority.trim();
     if authority.is_empty() {
