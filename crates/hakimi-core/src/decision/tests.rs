@@ -437,6 +437,38 @@ fn test_plan(mode: TlsMode, sni: Option<&str>) -> ConnectPlan {
     }
 }
 
+#[tokio::test]
+async fn duplicate_addresses_from_catalog_and_doh_are_merged() {
+    let h = harness(&["example.com"], Strategy::Direct);
+    *h.remote.catalog.lock() = true;
+    *h.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+    h.resolver.answers.lock().push_back(Ok(DohResolution {
+        // The first address is already known from the catalog.
+        ips: vec!["1.1.1.1".parse().unwrap(), "2.2.2.2".parse().unwrap()],
+        hints: Vec::new(),
+        source: DohSource::Primary,
+        endpoint: "primary".into(),
+        stale: false,
+        ttl: 60,
+        fallback_used: false,
+    }));
+    let mut cursor = match h.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let mut seen: Vec<IpAddr> = Vec::new();
+    while let Some(plan) = cursor.next_plan().await {
+        seen.push(plan.ip);
+    }
+    let first: IpAddr = "1.1.1.1".parse().unwrap();
+    assert_eq!(
+        seen.iter().filter(|ip| **ip == first).count(),
+        1,
+        "an address known from both sources must be tried once: {seen:?}"
+    );
+    assert!(seen.contains(&"2.2.2.2".parse().unwrap()));
+}
+
 #[test]
 fn plan_cache_stays_bounded_when_every_entry_is_fresh() {
     let h = harness(&["example.com"], Strategy::Direct);

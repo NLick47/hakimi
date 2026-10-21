@@ -636,8 +636,86 @@ mod tests {
     }
 
     #[test]
-    fn skip_once_is_consumed() {
+    fn record_outcome_writes_both_parts_and_keeps_the_freshness_rule() {
         let (_dir, cache) = manager();
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        let entry = sample_entry("example.com", "203.0.113.5");
+        let saved_at = entry.saved_at;
+
+        cache.record_outcome(
+            Some(entry),
+            Some(IpScoreUpdate {
+                domain: "example.com",
+                ip,
+                ewma_ms: 120.0,
+                successes: 2,
+                failures: 0,
+            }),
+        );
+        // Both parts are in the cache.
+        let stored = cache.last_good("example.com", 7).unwrap();
+        assert_eq!(stored.ip, ip);
+        assert_eq!(stored.saved_at, saved_at);
+        let scores = cache.ip_scores();
+        assert_eq!(scores.len(), 1);
+        assert_eq!(scores[0].2.successes, 2);
+
+        // The same route within 60 seconds keeps the original timestamp, but
+        // the quality sample is still updated.
+        let mut again = sample_entry("example.com", "203.0.113.5");
+        again.saved_at = now();
+        cache.record_outcome(
+            Some(again),
+            Some(IpScoreUpdate {
+                domain: "example.com",
+                ip,
+                ewma_ms: 90.0,
+                successes: 3,
+                failures: 0,
+            }),
+        );
+        let stored = cache.last_good("example.com", 7).unwrap();
+        assert_eq!(
+            stored.saved_at, saved_at,
+            "a fresh repeat must not restart the freshness window"
+        );
+        let scores = cache.ip_scores();
+        assert_eq!(scores[0].2.successes, 3);
+        assert_eq!(scores[0].2.ewma_ms, 90.0);
+    }
+
+    #[tokio::test]
+    async fn record_outcome_without_changes_does_not_schedule_a_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            std::sync::Arc::new(CacheManager::load(dir.path().join("state.json")).unwrap());
+        // The background flusher has to be running, otherwise every write is
+        // persisted eagerly and the dirty flag never shows up.
+        cache.start_auto_flush(StdDuration::from_secs(3600));
+        let ip: IpAddr = "203.0.113.6".parse().unwrap();
+        let entry = sample_entry("example.com", "203.0.113.6");
+        cache.record_outcome(
+            Some(entry.clone()),
+            Some(IpScoreUpdate {
+                domain: "example.com",
+                ip,
+                ewma_ms: 100.0,
+                successes: 1,
+                failures: 0,
+            }),
+        );
+        assert!(cache.flush_if_dirty(), "the first outcome is a change");
+
+        // The same route within the freshness window changes nothing.
+        cache.record_outcome(Some(entry), None);
+        assert!(
+            !cache.flush_if_dirty(),
+            "an unchanged route must not schedule a write"
+        );
+    }
+
+    #[test]
+    fn skip_once_is_consumed() {        let (_dir, cache) = manager();
         cache.mark_skip_once(["github.com", "api.github.com"]);
         assert!(cache.has_skip_once("github.com"));
         assert!(cache.take_skip_once("github.com"));

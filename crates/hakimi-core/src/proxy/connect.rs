@@ -49,6 +49,16 @@ impl TunnelInfo {
     }
 }
 
+/// Whether a cached direct plan may be turned into a raw TCP tunnel.
+///
+/// Only groups that never use MITM may do this.  A group that can use ECH or
+/// fake SNI has to terminate the browser's TLS locally, and the browser must
+/// not see a different certificate on the next connection to the same host:
+/// the first CONNECT was intercepted, the next one has to be too.
+pub(super) fn may_tunnel_directly(group_strategy: Strategy, plan_mode: TlsMode) -> bool {
+    group_strategy == Strategy::Direct && plan_mode == TlsMode::Direct
+}
+
 pub(super) async fn handle_connect(
     req: &mut Request<Incoming>,
     ctx: Arc<ProxyContext>,
@@ -109,10 +119,15 @@ pub(super) async fn handle_connect(
 
     // Fast path: a previously successful direct route turns CONNECT into a raw TCP tunnel,
     // with no probe, no local certificate and no extra TLS handshake.
+    //
+    // Only groups that never use MITM may take it.  A group that can use ECH or
+    // fake SNI has to terminate the browser's TLS locally, and the browser
+    // must not see a different certificate on the next connection to the same
+    // host: the first CONNECT was intercepted, the next one must be too.
     let candidate_timeout = Duration::from_millis(config.advanced.ip_timeout_ms.clamp(500, 10_000));
     let mut stale_plan = None;
     if let Some(plan) = ctx.engine.cached_plan(&host, port, true) {
-        if plan.mode == TlsMode::Direct {
+        if may_tunnel_directly(group.strategy, plan.mode) {
             let started = std::time::Instant::now();
             match connect_tcp_upstream(plan.ip, plan.port, candidate_timeout).await {
                 Ok(stream) => {

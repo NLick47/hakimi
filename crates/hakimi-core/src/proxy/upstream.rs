@@ -119,12 +119,8 @@ fn target_host<'a>(normalized_host: Option<&'a str>, upstream_uri: Option<&'a Ur
     match normalized_host {
         Some(host) => host,
         None => {
-            let host = upstream_uri.and_then(|uri| uri.host()).unwrap_or("");
             // An IPv6 literal keeps its brackets in the authority.
-            match host.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
-                Some(inner) => inner,
-                None => host,
-            }
+            crate::domain::bare_host(upstream_uri.and_then(|uri| uri.host()).unwrap_or(""))
         }
     }
 }
@@ -157,10 +153,7 @@ fn target_of<B>(req: &Request<B>) -> Result<Target> {
         // The brackets of an IPv6 literal belong to the authority, not to the
         // host.  Keeping them would make the host look like a domain name and
         // the request would bypass every group.
-        let host = match host.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
-            Some(inner) => inner,
-            None => host,
-        };
+        let host = crate::domain::bare_host(host);
         let https = match scheme {
             "https" => true,
             "http" => false,

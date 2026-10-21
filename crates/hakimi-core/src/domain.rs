@@ -167,6 +167,17 @@ pub fn is_ip_literal(host: &str) -> bool {
     host.parse::<std::net::IpAddr>().is_ok()
 }
 
+/// The host of an authority without the brackets of an IPv6 literal.
+///
+/// The brackets belong to the authority, not to the host: keeping them makes
+/// the host look like a name, so it matches no group and cannot be resolved.
+pub fn bare_host(host: &str) -> &str {
+    match host.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+        Some(inner) => inner,
+        None => host,
+    }
+}
+
 /// Maps hosts to group ids with the documented precedence:
 /// exact match first, then the longest wildcard suffix.
 #[derive(Clone, Debug, Default)]
@@ -341,6 +352,16 @@ mod tests {
         .unwrap();
         assert_eq!(matcher.match_host("a.cdn.example.com"), Some("narrow"));
         assert_eq!(matcher.match_host("a.example.com"), Some("broad"));
+    }
+
+    #[test]
+    fn ipv6_literals_lose_their_brackets() {
+        assert_eq!(bare_host("[2001:db8::1]"), "2001:db8::1");
+        assert_eq!(bare_host("[::1]"), "::1");
+        assert_eq!(bare_host("example.com"), "example.com");
+        assert_eq!(bare_host("1.2.3.4"), "1.2.3.4");
+        // A missing closing bracket is not an IPv6 literal.
+        assert_eq!(bare_host("[2001:db8::1"), "[2001:db8::1");
     }
 
     #[test]

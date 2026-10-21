@@ -571,6 +571,10 @@ impl RouteConnector {
         let host = uri
             .host()
             .ok_or_else(|| anyhow!("upstream URI has no host"))?;
+        // The brackets of an IPv6 literal belong to the authority, not to the
+        // host.  Routing and the direct fallback need the bare address,
+        // otherwise the literal is treated as a name and never resolves.
+        let host = crate::domain::bare_host(host);
         // Forwarded URIs normally carry an already-normalized host. Warm-up
         // callers can still pass a raw config entry (uppercase, trailing dot,
         // or IDN), so normalize only those edge cases before the hot-path

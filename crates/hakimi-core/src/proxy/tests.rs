@@ -16,7 +16,9 @@ use crate::status::StatusStore;
 use crate::strategy::{IpSource, Strategy, TlsMode};
 use crate::util::now;
 
-use super::connect::{connect_tcp_upstream, race_tcp_addresses, race_tcp_plans};
+use super::connect::{
+    connect_tcp_upstream, may_tunnel_directly, race_tcp_addresses, race_tcp_plans,
+};
 use super::*;
 
 /// Loopback throughput microbenchmark for the proxy's bidirectional copy
@@ -356,4 +358,17 @@ async fn tunnel_address_race_honors_the_deadline() {
         elapsed < Duration::from_secs(2),
         "the overall deadline was not honored: {elapsed:?}"
     );
+}
+
+/// A group that can use ECH or fake SNI has to keep intercepting the browser's
+/// TLS.  Otherwise the second CONNECT to a host would present the origin's
+/// certificate instead of the local one.
+#[test]
+fn only_direct_groups_may_use_the_cached_direct_tunnel() {
+    assert!(may_tunnel_directly(Strategy::Direct, TlsMode::Direct));
+    assert!(!may_tunnel_directly(Strategy::Auto, TlsMode::Direct));
+    assert!(!may_tunnel_directly(Strategy::Ech, TlsMode::Direct));
+    assert!(!may_tunnel_directly(Strategy::FakeSni, TlsMode::Direct));
+    assert!(!may_tunnel_directly(Strategy::Direct, TlsMode::FakeSni));
+    assert!(!may_tunnel_directly(Strategy::Direct, TlsMode::Ech));
 }

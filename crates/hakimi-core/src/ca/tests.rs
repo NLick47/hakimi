@@ -166,3 +166,67 @@ fn pem_roundtrip() {
     let pem = ca.ca_pem();
     assert_eq!(pem_to_der(&pem).unwrap(), der);
 }
+
+/// A repeat CONNECT must be able to resume the local TLS session.  Without a
+/// ticketer rustls only supports stateful TLS 1.2 session ids, so a browser
+/// would run a full local handshake for every connection.
+#[test]
+fn the_local_server_resumes_sessions() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    use rustls::{
+        ClientConfig, ClientConnection, HandshakeKind, RootCertStore, ServerConnection, StreamOwned,
+    };
+    use rustls_pki_types::pem::PemObject;
+
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    let server_config = ca.server_config("example.test").unwrap();
+
+    let mut roots = RootCertStore::empty();
+    let certificate = rustls_pki_types::CertificateDer::from_pem_file(ca.ca_path()).unwrap();
+    roots.add(certificate).unwrap();
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let client_config = Arc::new(
+        ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let connection = ServerConnection::new(server_config.clone()).unwrap();
+            let mut tls = StreamOwned::new(connection, stream);
+            let mut buffer = [0u8; 1];
+            tls.read_exact(&mut buffer).unwrap();
+            tls.write_all(&buffer).unwrap();
+            tls.flush().unwrap();
+        }
+    });
+
+    let mut resumed = false;
+    for attempt in 0..2 {
+        let stream = TcpStream::connect(address).unwrap();
+        let name = rustls::pki_types::ServerName::try_from("example.test").unwrap();
+        let connection = ClientConnection::new(client_config.clone(), name).unwrap();
+        let mut tls = StreamOwned::new(connection, stream);
+        // The ticket arrives after the handshake; reading lets the client
+        // store it for the next connection.
+        tls.write_all(b"x").unwrap();
+        tls.flush().unwrap();
+        let mut buffer = [0u8; 1];
+        tls.read_exact(&mut buffer).unwrap();
+        if attempt == 1 {
+            resumed = tls.conn.handshake_kind() == Some(HandshakeKind::Resumed);
+        }
+    }
+    server.join().unwrap();
+    assert!(resumed, "the second local handshake must resume the session");
+}
