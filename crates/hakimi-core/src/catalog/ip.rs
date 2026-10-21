@@ -37,10 +37,10 @@ pub struct IpCatalog {
     pub sni: HashMap<String, String>,
     pub warnings: Vec<String>,
     matcher: DomainMatcher,
-    /// `(suffix, key)` for every `*.` entry, longest suffix first. Looking up a
-    /// host must not walk thousands of unrelated exact keys on every cold
-    /// connection.
-    wildcards: Vec<(String, String)>,
+    /// `suffix -> full wildcard key` for every `*.` entry. Matching walks the
+    /// host's label boundaries, so a cold connection does not scan unrelated
+    /// wildcard entries.
+    wildcards: HashMap<String, String>,
 }
 
 impl IpCatalog {
@@ -49,12 +49,11 @@ impl IpCatalog {
         if let Some((key, ips)) = self.ips.get_key_value(&host) {
             return Some((key, ips));
         }
-        for (suffix, key) in &self.wildcards {
-            if host.len() > suffix.len()
-                && host.ends_with(suffix)
-                && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
-            {
-                return self.ips.get_key_value(key);
+        for (index, byte) in host.bytes().enumerate() {
+            if byte == b'.' {
+                if let Some(key) = self.wildcards.get(&host[index + 1..]) {
+                    return self.ips.get_key_value(key);
+                }
             }
         }
         None
@@ -240,20 +239,13 @@ pub fn validate(raw: IpCatalogRaw, config: &AppConfig) -> Result<IpCatalog> {
             .map(move |domain| (id.clone(), domain.clone()))
     }))?;
 
-    let mut wildcards: Vec<(String, String)> = ips
+    let wildcards: HashMap<String, String> = ips
         .keys()
         .filter_map(|key| {
             key.strip_prefix("*.")
                 .map(|suffix| (suffix.to_string(), key.clone()))
         })
         .collect();
-    wildcards.sort_by(|a, b| {
-        b.0.split('.')
-            .count()
-            .cmp(&a.0.split('.').count())
-            .then_with(|| b.0.len().cmp(&a.0.len()))
-            .then_with(|| a.0.cmp(&b.0))
-    });
 
     Ok(IpCatalog {
         schema_version: raw.v,

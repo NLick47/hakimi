@@ -125,17 +125,21 @@ impl RouteCursor {
 
         // Order by measured quality on this network: proven fast IPs lead, failures sink.
         // Unknown addresses keep the catalog order, so a fresh start is still deterministic.
-        let rank = |candidate: &Candidate| -> f64 {
-            if skip_once && candidate.source == IpSource::Remote {
-                return 0.0;
-            }
-            engine.score_ip(&domain, candidate.ip)
-        };
-        candidates.sort_by(|a, b| {
-            rank(a)
-                .partial_cmp(&rank(b))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // Score each candidate once instead of taking the score lock on every comparison.
+        let mut ranked: Vec<(f64, Candidate)> = candidates
+            .into_iter()
+            .map(|candidate| {
+                let score = if skip_once && candidate.source == IpSource::Remote {
+                    0.0
+                } else {
+                    engine.score_ip(&domain, candidate.ip)
+                };
+                (score, candidate)
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let candidates: Vec<Candidate> =
+            ranked.into_iter().map(|(_, candidate)| candidate).collect();
 
         let mut modes = if tls {
             group.strategy.attempts().to_vec()

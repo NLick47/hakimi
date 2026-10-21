@@ -145,7 +145,7 @@ pub fn is_ip_literal(host: &str) -> bool {
 #[derive(Clone, Debug, Default)]
 pub struct DomainMatcher {
     exact: HashMap<String, String>,
-    wildcards: Vec<(String, String)>,
+    wildcards: HashMap<String, String>,
 }
 
 impl DomainMatcher {
@@ -155,7 +155,7 @@ impl DomainMatcher {
         S: AsRef<str>,
     {
         let mut exact = HashMap::new();
-        let mut wildcards = Vec::new();
+        let mut wildcards = HashMap::new();
         for (group_id, pattern) in entries {
             let group_id = group_id.as_ref().to_string();
             if group_id.is_empty() {
@@ -163,20 +163,15 @@ impl DomainMatcher {
             }
             let pattern = DomainPattern::parse(pattern.as_ref())?;
             if pattern.wildcard {
-                wildcards.push((pattern.pattern[2..].to_string(), group_id));
+                // `or_insert` keeps the first declaration for a shared wildcard, matching
+                // exact-match precedence.
+                wildcards
+                    .entry(pattern.pattern[2..].to_string())
+                    .or_insert(group_id);
             } else {
                 exact.entry(pattern.pattern).or_insert(group_id);
             }
         }
-        // Stable sort: equal suffixes keep configuration order, so the first group that
-        // declared a shared wildcard wins (matching exact-match "first declaration" rules).
-        wildcards.sort_by(|a, b| {
-            b.0.split('.')
-                .count()
-                .cmp(&a.0.split('.').count())
-                .then_with(|| b.0.len().cmp(&a.0.len()))
-                .then_with(|| a.0.cmp(&b.0))
-        });
         Ok(Self { exact, wildcards })
     }
 
@@ -199,12 +194,18 @@ impl DomainMatcher {
         if let Some(group) = self.exact.get(host) {
             return Some(group);
         }
-        for (suffix, group) in &self.wildcards {
-            if host.len() > suffix.len()
-                && host.ends_with(suffix)
-                && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
-            {
-                return Some(group);
+        self.wildcard_match(host)
+    }
+
+    /// Longest wildcard suffix wins. Scanning label boundaries from left to right
+    /// visits the longest suffix first and costs O(labels) map lookups instead of
+    /// an O(number of wildcards) scan per request.
+    fn wildcard_match(&self, host: &str) -> Option<&str> {
+        for (index, byte) in host.bytes().enumerate() {
+            if byte == b'.' {
+                if let Some(group) = self.wildcards.get(&host[index + 1..]) {
+                    return Some(group.as_str());
+                }
             }
         }
         None
@@ -231,12 +232,7 @@ impl DomainMatcher {
             return self.match_normalized(&pattern.pattern).is_some();
         }
         let suffix = &pattern.pattern[2..];
-        self.wildcards.iter().any(|(group_suffix, _)| {
-            suffix == group_suffix
-                || (suffix.len() > group_suffix.len()
-                    && suffix.ends_with(group_suffix)
-                    && suffix.as_bytes()[suffix.len() - group_suffix.len() - 1] == b'.')
-        })
+        self.wildcards.contains_key(suffix) || self.wildcard_match(suffix).is_some()
     }
 }
 

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,9 @@ pub struct DecisionEngine {
     /// Per (domain, IP) observations. Candidates are ordered by score, so a host picks the
     /// address that has actually been fast on this network instead of a static list.
     pub(super) ip_scores: parking_lot::RwLock<HashMap<String, HashMap<IpAddr, IpScore>>>,
+    /// Number of entries in `ip_scores`, maintained under its write lock. Avoids a
+    /// full-map sum on every connection outcome.
+    ip_score_count: AtomicUsize,
 }
 
 pub(super) const PLAN_CACHE_MAX: usize = 2048;
@@ -59,6 +63,7 @@ impl DecisionEngine {
                 },
             );
         }
+        let ip_score_count = seeded_scores.values().map(|by_ip| by_ip.len()).sum();
         Arc::new(Self {
             config,
             cache,
@@ -68,6 +73,7 @@ impl DecisionEngine {
             status,
             plan_cache: parking_lot::Mutex::new(HashMap::new()),
             ip_scores: parking_lot::RwLock::new(seeded_scores),
+            ip_score_count: AtomicUsize::new(ip_score_count),
         })
     }
 
@@ -144,7 +150,7 @@ impl DecisionEngine {
                     &config,
                     FailureReason::ConfigInvalid,
                     format!("invalid domain: {error}"),
-                ))
+                ));
             }
         };
         let matcher = self.config.matcher();
@@ -303,65 +309,79 @@ impl DecisionEngine {
         latency_ms: Option<u64>,
         failed: bool,
     ) -> bool {
-        let mut scores = self.ip_scores.write();
-        let entry = scores
-            .entry(domain.to_string())
-            .or_default()
-            .entry(ip)
-            .or_default();
-        let degraded;
-        if failed {
-            entry.failures += 1;
-            entry.ewma_ms = if entry.ewma_ms == 0.0 {
-                10_000.0
-            } else {
-                entry.ewma_ms * 0.7 + 10_000.0 * 0.3
+        let (snapshot, degraded) = {
+            let mut scores = self.ip_scores.write();
+            let (is_new, snapshot, degraded) = {
+                let by_ip = scores.entry(domain.to_string()).or_default();
+                let is_new = !by_ip.contains_key(&ip);
+                let entry = by_ip.entry(ip).or_default();
+                let degraded;
+                if failed {
+                    entry.failures += 1;
+                    entry.ewma_ms = if entry.ewma_ms == 0.0 {
+                        10_000.0
+                    } else {
+                        entry.ewma_ms * 0.7 + 10_000.0 * 0.3
+                    };
+                    degraded = false;
+                } else {
+                    entry.successes += 1;
+                    // Pay down the failure history with each real success. Without
+                    // this an IP that ever failed stays in `reprobe_failed_ips`
+                    // forever, so the same addresses get re-probed every minute for
+                    // the whole session even after they recovered.
+                    entry.failures = entry.failures.saturating_sub(1);
+                    let sample = latency_ms.unwrap_or(500) as f64;
+                    // A sample far worse than the established average means the proven route
+                    // degraded (network flap, congestion). Signal the caller to re-race.
+                    degraded = entry.successes > 2
+                        && sample > 800.0
+                        && entry.ewma_ms > 0.0
+                        && sample > entry.ewma_ms * 2.5;
+                    entry.ewma_ms = if entry.successes == 1 {
+                        sample
+                    } else {
+                        entry.ewma_ms * 0.7 + sample * 0.3
+                    };
+                }
+                (
+                    is_new,
+                    (entry.ewma_ms, entry.successes, entry.failures),
+                    degraded,
+                )
             };
-            degraded = false;
-        } else {
-            entry.successes += 1;
-            // Pay down the failure history with each real success. Without
-            // this an IP that ever failed stays in `reprobe_failed_ips`
-            // forever, so the same addresses get re-probed every minute for
-            // the whole session even after they recovered.
-            entry.failures = entry.failures.saturating_sub(1);
-            let sample = latency_ms.unwrap_or(500) as f64;
-            // A sample far worse than the established average means the proven route
-            // degraded (network flap, congestion). Signal the caller to re-race.
-            degraded = entry.successes > 2
-                && sample > 800.0
-                && entry.ewma_ms > 0.0
-                && sample > entry.ewma_ms * 2.5;
-            entry.ewma_ms = if entry.successes == 1 {
-                sample
-            } else {
-                entry.ewma_ms * 0.7 + sample * 0.3
-            };
-        }
-        let snapshot = (entry.ewma_ms, entry.successes, entry.failures);
-        // Bounded map: when full, drop the least valuable entries — the ones
-        // with the worst measured quality — instead of wiping everything. A
-        // flood of dead IPs must never erase knowledge of a proven route.
-        let total: usize = scores.values().map(|by_ip| by_ip.len()).sum();
-        if total > IP_SCORE_CAP {
-            let mut ranked: Vec<((String, IpAddr), f64)> = scores
-                .iter()
-                .flat_map(|(domain, by_ip)| {
-                    by_ip
-                        .iter()
-                        .map(|(ip, score)| ((domain.clone(), *ip), score.rank()))
-                })
-                .collect();
-            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            for ((domain, ip), _) in ranked.into_iter().take(total - IP_SCORE_PRUNE_TO) {
-                if let Some(by_ip) = scores.get_mut(&domain) {
-                    by_ip.remove(&ip);
-                    if by_ip.is_empty() {
-                        scores.remove(&domain);
+            if is_new {
+                self.ip_score_count.fetch_add(1, Ordering::Relaxed);
+            }
+            // Bounded map: when full, drop the least valuable entries — the ones
+            // with the worst measured quality — instead of wiping everything. A
+            // flood of dead IPs must never erase knowledge of a proven route.
+            let total = self.ip_score_count.load(Ordering::Relaxed);
+            if total > IP_SCORE_CAP {
+                let mut ranked: Vec<((String, IpAddr), f64)> = scores
+                    .iter()
+                    .flat_map(|(domain, by_ip)| {
+                        by_ip
+                            .iter()
+                            .map(|(ip, score)| ((domain.clone(), *ip), score.rank()))
+                    })
+                    .collect();
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let mut removed = 0usize;
+                for ((domain, ip), _) in ranked.into_iter().take(total - IP_SCORE_PRUNE_TO) {
+                    if let Some(by_ip) = scores.get_mut(&domain) {
+                        if by_ip.remove(&ip).is_some() {
+                            removed += 1;
+                        }
+                        if by_ip.is_empty() {
+                            scores.remove(&domain);
+                        }
                     }
                 }
+                self.ip_score_count.fetch_sub(removed, Ordering::Relaxed);
             }
-        }
+            (snapshot, degraded)
+        };
         // Persist both outcomes: a restart must keep knowing that this IP was
         // fast — or blocked — on this network. The cache batches disk writes.
         self.cache
