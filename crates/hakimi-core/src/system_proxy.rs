@@ -1,15 +1,13 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
-#[cfg(target_os = "macos")]
-use anyhow::bail;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ProxyMode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use crate::util::{atomic_write_json, now, read_json};
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,6 +40,15 @@ struct SavedState {
     applied_at: Option<DateTime<Utc>>,
 }
 
+/// How long a PAC health result may be reused. Reading the registry is cheap
+/// on Windows, so it is answered fresh on every call; macOS spawns `scutil`,
+/// so it gets a short window. Any mutation of the OS proxy invalidates the
+/// entry first, so this process never contradicts its own writes.
+#[cfg(windows)]
+const PAC_HEALTH_TTL: Duration = Duration::ZERO;
+#[cfg(not(windows))]
+const PAC_HEALTH_TTL: Duration = Duration::from_secs(2);
+
 /// Applies/restores the OS proxy setting. The original state is persisted before the first
 /// change, so a crash still allows the next start to restore it.
 pub struct SystemProxyManager {
@@ -49,6 +56,11 @@ pub struct SystemProxyManager {
     // `networksetup` subprocess queries are expensive on macOS; the status only
     // changes when this manager (or the user) touches the proxy, so cache it.
     status_cache: Mutex<Option<(Instant, Option<ProxyMode>, Option<String>, SystemProxyStatus)>>,
+    // The health probe has the same platform asymmetry: a registry read on
+    // Windows, a subprocess on macOS. Keyed by the expected URL and
+    // invalidated by every mutation, so a fresh apply is never judged by a
+    // pre-apply observation.
+    health_cache: Mutex<Option<(Instant, String, bool)>>,
 }
 
 impl SystemProxyManager {
@@ -56,20 +68,21 @@ impl SystemProxyManager {
         Self {
             state_path: state_path.into(),
             status_cache: Mutex::new(None),
+            health_cache: Mutex::new(None),
         }
     }
 
     pub fn apply_pac(&self, pac_url: &str) -> Result<SystemProxyStatus> {
         self.save_original()?;
         platform_apply_pac(&self.state_path, pac_url)?;
-        *self.status_cache.lock() = None;
+        self.invalidate_caches();
         self.status(Some(ProxyMode::Pac), Some(pac_url.to_string()))
     }
 
     pub fn apply_http(&self, proxy: SocketAddr) -> Result<SystemProxyStatus> {
         self.save_original()?;
         platform_apply_http(&self.state_path, proxy)?;
-        *self.status_cache.lock() = None;
+        self.invalidate_caches();
         self.status(Some(ProxyMode::Http), Some(proxy.to_string()))
     }
 
@@ -80,7 +93,7 @@ impl SystemProxyManager {
         let state: SavedState = read_json(&self.state_path).unwrap_or_default();
         platform_restore(&state)?;
         std::fs::remove_file(&self.state_path).ok();
-        *self.status_cache.lock() = None;
+        self.invalidate_caches();
         Ok(true)
     }
 
@@ -120,7 +133,17 @@ impl SystemProxyManager {
     /// True when at least one network service has the expected PAC URL *and* the
     /// enabled flag set — the URL alone does not route traffic.
     pub fn pac_health(&self, expected_url: &str) -> bool {
-        platform_pac_health(expected_url)
+        {
+            let cache = self.health_cache.lock();
+            if let Some((at, url, healthy)) = cache.as_ref() {
+                if url == expected_url && at.elapsed() < PAC_HEALTH_TTL {
+                    return *healthy;
+                }
+            }
+        }
+        let healthy = platform_pac_health(expected_url);
+        *self.health_cache.lock() = Some((Instant::now(), expected_url.to_string(), healthy));
+        healthy
     }
 
     /// Switch every network service's automatic proxy off. Used when a stale
@@ -128,10 +151,16 @@ impl SystemProxyManager {
     /// directly while the environment is being fixed.
     pub fn pac_disable(&self) {
         platform_pac_disable();
+        self.invalidate_caches();
     }
 
     pub fn saved_state_exists(&self) -> bool {
         self.state_path.exists()
+    }
+
+    fn invalidate_caches(&self) {
+        *self.status_cache.lock() = None;
+        *self.health_cache.lock() = None;
     }
 
     fn save_original(&self) -> Result<()> {
@@ -245,6 +274,10 @@ fn platform_pac_disable() {
         .open_subkey_with_flags(INTERNET_SETTINGS, KEY_WRITE)
     {
         let _ = key.delete_value("AutoConfigURL");
+        // WinINet keeps the previous PAC in memory until it is told the
+        // settings changed; without this the browser would keep dialing the
+        // dead PAC port after a takeover was rolled back.
+        notify_proxy_changed();
     }
 }
 

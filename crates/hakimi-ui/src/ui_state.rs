@@ -136,13 +136,14 @@ impl AppModel {
     /// The master switch. Turning acceleration ON with a broken environment
     /// does not accelerate: it parks in [`AccelState::AwaitingEnvironment`].
     pub fn toggle(&mut self, env: EnvState) -> Effects {
-        let mut env = env;
-        if self.takeover {
-            // Turning acceleration on after a takeover is explicit user
-            // intent: re-assert our PAC even though the check says unhealthy.
+        // Turning acceleration on after a takeover is explicit user intent:
+        // put our PAC back. This must be an effect, not a doctored health
+        // value — the health observation is what declared the takeover, and
+        // faking it healthy is what made the retry skip the apply entirely.
+        let reassert = self.takeover;
+        if reassert {
             self.takeover = false;
             self.unhealthy_streak = 0;
-            env.proxy_ok = true;
         }
         self.env = env;
         self.accel = match self.accel {
@@ -155,6 +156,14 @@ impl AppModel {
                 }
             }
         };
+        if self.accel == AccelState::Running {
+            // A fresh Running state gets a full strike window; the apply it
+            // schedules may not be visible to the very next probe.
+            self.unhealthy_streak = 0;
+            if reassert {
+                return self.effects_with(Effects::running);
+            }
+        }
         self.effects_apply_if_needed()
     }
 
@@ -162,12 +171,18 @@ impl AppModel {
     /// moment the environment passes.
     pub fn env_changed(&mut self, env: EnvState) -> Effects {
         let mut env = env;
-        // One flaky health check must not flip the whole acceleration: a
-        // single unhealthy probe is absorbed, two in a row are real.
-        if !env.proxy_ok && self.env.proxy_ok {
-            self.unhealthy_streak += 1;
-            if self.unhealthy_streak < 2 {
-                env.proxy_ok = true;
+        // Health is only judged while running: a stopped app has no PAC claim
+        // to defend. Two *consecutive* unhealthy probes are real, wherever the
+        // streak started — a single flaky probe (or one that raced the apply
+        // we just scheduled) is absorbed.
+        if self.accel == AccelState::Running {
+            if env.proxy_ok {
+                self.unhealthy_streak = 0;
+            } else {
+                self.unhealthy_streak += 1;
+                if self.unhealthy_streak < 2 {
+                    env.proxy_ok = true;
+                }
             }
         } else {
             self.unhealthy_streak = 0;
@@ -177,12 +192,16 @@ impl AppModel {
             // The system proxy was taken over by other software (or cleared
             // externally). Pause and yield: fighting for the setting would be
             // a proxy war with whatever the user chose to run instead.
+            tracing::warn!(
+                "system proxy changed externally while running; pausing acceleration"
+            );
             self.takeover = true;
             self.accel = AccelState::Stopped;
             return Effects::stopped();
         }
         if self.accel == AccelState::AwaitingEnvironment && self.env.allows_acceleration() {
             self.accel = AccelState::Running;
+            self.unhealthy_streak = 0;
             return self.effects_apply_if_needed();
         }
         Effects::default()
@@ -292,7 +311,8 @@ pub fn execute_startup(effects: &Effects, runtime: &HakimiRuntime) -> StartMode 
 }
 
 /// Execute the effects of a transition. The only place that drives the runtime
-/// from state.
+/// from state. The runtime owns OS-proxy work (and the "write in flight" state
+/// that keeps a racing health probe from reporting a takeover).
 pub fn execute(effects: &Effects, runtime: &Arc<HakimiRuntime>) {
     if effects.resume {
         runtime.resume();
@@ -301,18 +321,10 @@ pub fn execute(effects: &Effects, runtime: &Arc<HakimiRuntime>) {
         runtime.pause();
     }
     if effects.apply_proxy {
-        let runtime = runtime.clone();
-        std::thread::spawn(move || {
-            if let Err(error) = runtime.apply_system_proxy() {
-                eprintln!("hakimi-ui: applying the system proxy failed: {error:#}");
-            }
-        });
+        runtime.apply_system_proxy_async();
     }
     if effects.disable_proxy {
-        let runtime = runtime.clone();
-        std::thread::spawn(move || {
-            runtime.disable_system_proxy();
-        });
+        runtime.disable_system_proxy_async();
     }
 }
 
@@ -337,29 +349,17 @@ pub fn sync_window(model: &AppModel, app: &AppWindow) {
 
 // -- environment probing ------------------------------------------------------
 
-thread_local! {
-    static TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static PROXY_CACHE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-}
-
-/// Probe the environment. Spawns subprocesses (`security`, `networksetup`),
-/// so it must run OFF the UI thread — callers post the result back through the
-/// event loop. The proxy health is probed every 10th call and cached in
-/// between.
+/// Probe the environment. Spawns subprocesses (the CA status, and `scutil` on
+/// macOS), so it must run OFF the UI thread — callers post the result back
+/// through the event loop. Proxy health is owned by the runtime: it caches
+/// the platform probe and reports optimistic health while it is changing the
+/// setting itself, so there is deliberately no second cache here.
 pub fn probe_env(runtime: &HakimiRuntime) -> EnvState {
     let ca = runtime.ca().status();
-    let tick = TICK.with(|t| {
-        let value = t.get() + 1;
-        t.set(value);
-        value
-    });
-    if tick == 1 || tick % 60 == 0 {
-        PROXY_CACHE.with(|t| t.set(runtime.system_proxy_healthy()));
-    }
     EnvState {
         ca_ok: ca.installed,
         ca_error: ca.error.unwrap_or_default(),
-        proxy_ok: PROXY_CACHE.with(|t| t.get()),
+        proxy_ok: runtime.system_proxy_healthy(),
     }
 }
 
@@ -475,8 +475,6 @@ mod tests {
         apply_settle(&mut sites, SettlePhase::Tracking);
         assert_eq!(sites[0].summary, "1 个域名 · 全部较慢");
     }
-
-    use super::*;
 
     fn env(healthy: bool) -> EnvState {
         EnvState {
@@ -622,6 +620,67 @@ mod tests {
         model.startup(env(true));
         model.toggle(env(false)); // → Stopped
         assert_eq!(model.accel(), AccelState::Stopped);
+    }
+
+    #[test]
+    fn takeover_retry_reapplies_the_proxy() {
+        let mut model = AppModel::default();
+        model.startup(env(true));
+
+        let unhealthy = EnvState {
+            ca_ok: true,
+            ca_error: String::new(),
+            proxy_ok: false,
+        };
+        model.env_changed(unhealthy.clone());
+        let effects = model.env_changed(unhealthy.clone());
+        assert!(effects.pause, "two unhealthy probes must pause acceleration");
+        assert!(model.takeover());
+        assert_eq!(model.accel(), AccelState::Stopped);
+
+        // Turning acceleration back on is explicit user intent to put our PAC
+        // back; it must apply, not just resume and wait to be taken over again.
+        let effects = model.toggle(unhealthy);
+        assert_eq!(model.accel(), AccelState::Running);
+        assert!(!model.takeover());
+        assert!(effects.resume);
+        assert!(
+            effects.apply_proxy,
+            "a takeover retry must re-apply the PAC instead of trusting the probe that declared the takeover"
+        );
+    }
+
+    #[test]
+    fn entering_running_gets_a_full_strike_window() {
+        // The CA is fixed while the proxy is known unhealthy: the auto-resume
+        // schedules an apply, and the first subsequent false probe may still
+        // race that write. It must not count as a takeover yet.
+        let mut model = AppModel::default();
+        let broken_ca = EnvState {
+            ca_ok: false,
+            ca_error: "not trusted".into(),
+            proxy_ok: false,
+        };
+        model.startup(broken_ca.clone()); // Stopped: CA is the gate
+        model.toggle(broken_ca); // AwaitingEnvironment
+
+        let fixed_ca = EnvState {
+            ca_ok: true,
+            ca_error: String::new(),
+            proxy_ok: false,
+        };
+        let effects = model.env_changed(fixed_ca.clone());
+        assert_eq!(model.accel(), AccelState::Running);
+        assert!(effects.apply_proxy, "entering Running must reconcile the PAC");
+
+        let effects = model.env_changed(fixed_ca.clone());
+        assert_eq!(effects, Effects::default(), "the first false probe is absorbed");
+        assert_eq!(model.accel(), AccelState::Running);
+        assert!(!model.takeover());
+
+        let effects = model.env_changed(fixed_ca);
+        assert!(effects.pause);
+        assert!(model.takeover(), "the second consecutive false probe is real");
     }
 }
 

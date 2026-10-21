@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -140,7 +140,30 @@ pub struct HakimiRuntime {
     shutdown: RwLock<Option<watch::Sender<bool>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     started: AtomicBool,
+    /// Number of OS-proxy writes currently in flight. The write is not
+    /// visible to a probe until it completes, so health checks are optimistic
+    /// while this is non-zero: judging the old value would turn our own apply
+    /// into a false "someone else took over". A counter, not a flag, so
+    /// overlapping applies cannot end the window early.
+    proxy_syncs_in_flight: Arc<AtomicUsize>,
     started_at: DateTime<Utc>,
+}
+
+/// Keeps [`HakimiRuntime::proxy_syncs_in_flight`] raised for its lifetime,
+/// including on panic or when moved into a worker thread.
+struct ProxySyncGuard(Arc<AtomicUsize>);
+
+impl ProxySyncGuard {
+    fn begin(flag: &Arc<AtomicUsize>) -> Self {
+        flag.fetch_add(1, Ordering::SeqCst);
+        Self(flag.clone())
+    }
+}
+
+impl Drop for ProxySyncGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl HakimiRuntime {
@@ -208,6 +231,7 @@ impl HakimiRuntime {
             shutdown: RwLock::new(None),
             tasks: Mutex::new(Vec::new()),
             started: AtomicBool::new(false),
+            proxy_syncs_in_flight: Arc::new(AtomicUsize::new(0)),
             started_at,
         });
         // A previous crash may have left the OS proxy pointing at us.
@@ -338,7 +362,7 @@ impl HakimiRuntime {
             tracing::info!("started without applying the system proxy");
             self.disable_system_proxy();
         } else if config.proxy.takeover {
-            if let Err(error) = self.apply_system_proxy_inner() {
+            if let Err(error) = self.apply_system_proxy() {
                 // A silent failure here leaves the user "accelerating" without a proxy
                 // and with no way to notice; surface it in the status instead.
                 tracing::error!(error = %error, "failed to apply the system proxy");
@@ -384,7 +408,7 @@ impl HakimiRuntime {
             let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
         }
         // Always restore: a previous process may have crashed while the OS proxy pointed at us.
-        if let Err(error) = self.system_proxy.restore() {
+        if let Err(error) = self.restore_system_proxy() {
             tracing::warn!(error = %error, "failed to restore the system proxy");
         }
         // Final flush so the last few seconds of routes survive the shutdown.
@@ -395,6 +419,11 @@ impl HakimiRuntime {
 
     /// Environment check for the acceleration toggle: the PAC must actually be
     /// enabled on a network service, not merely present as a URL.
+    ///
+    /// While an apply/disable is in flight the answer is optimistically
+    /// healthy. The OS does not reflect the new value until the write
+    /// completes, and an observation made in that window says nothing about
+    /// whether another program took over.
     pub fn system_proxy_healthy(&self) -> bool {
         let config = self.config.snapshot();
         if config.proxy.mode == ProxyMode::Off || !config.proxy.takeover {
@@ -403,12 +432,20 @@ impl HakimiRuntime {
         let Some(url) = self.pac_url() else {
             return true;
         };
+        if self.proxy_syncs_in_flight.load(Ordering::SeqCst) > 0 {
+            return true;
+        }
         self.system_proxy.pac_health(&url)
     }
 
     /// Disable a PAC takeover that points at this instance. Only this
     /// instance's own PAC is touched; a user-configured proxy is left alone.
     pub fn disable_system_proxy(&self) {
+        let _sync = ProxySyncGuard::begin(&self.proxy_syncs_in_flight);
+        self.disable_system_proxy_inner();
+    }
+
+    fn disable_system_proxy_inner(&self) {
         let Some(url) = self.pac_url() else {
             return;
         };
@@ -419,12 +456,39 @@ impl HakimiRuntime {
     }
 
     pub fn apply_system_proxy(&self) -> Result<SystemProxyStatus> {
+        let _sync = ProxySyncGuard::begin(&self.proxy_syncs_in_flight);
         self.apply_system_proxy_inner()
+    }
+
+    /// Apply the OS proxy on a worker thread. The guard is created before the
+    /// thread starts and moved into it, so the window covers the spawn as well
+    /// as the write itself.
+    pub fn apply_system_proxy_async(self: &Arc<Self>) {
+        let sync = ProxySyncGuard::begin(&self.proxy_syncs_in_flight);
+        let runtime = self.clone();
+        std::thread::spawn(move || {
+            let _sync = sync;
+            if let Err(error) = runtime.apply_system_proxy_inner() {
+                tracing::error!(error = %error, "failed to apply the system proxy");
+            }
+        });
+    }
+
+    /// Disable the PAC takeover on a worker thread, with the same in-flight
+    /// guarantee as [`Self::apply_system_proxy_async`].
+    pub fn disable_system_proxy_async(self: &Arc<Self>) {
+        let sync = ProxySyncGuard::begin(&self.proxy_syncs_in_flight);
+        let runtime = self.clone();
+        std::thread::spawn(move || {
+            let _sync = sync;
+            runtime.disable_system_proxy_inner();
+        });
     }
 
     /// Restore OS proxy settings saved by a previous `serve` (also usable from a separate
     /// process after the proxy was terminated).
     pub fn restore_system_proxy(&self) -> Result<bool> {
+        let _sync = ProxySyncGuard::begin(&self.proxy_syncs_in_flight);
         self.system_proxy.restore()
     }
 
