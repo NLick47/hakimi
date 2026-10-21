@@ -563,10 +563,18 @@ impl RouteConnector {
         let host = uri
             .host()
             .ok_or_else(|| anyhow!("upstream URI has no host"))?;
-        // Forwarded URIs normally carry an already-lowercase host; only pay
-        // for a new string when the caller preserved uppercase.
-        let host = if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            Cow::Owned(host.to_ascii_lowercase())
+        // Forwarded URIs normally carry an already-normalized host. Warm-up
+        // callers can still pass a raw config entry (uppercase, trailing dot,
+        // or IDN), so normalize only those edge cases before the hot-path
+        // `route_normalized` call, which assumes a canonical host.
+        let host = if host.bytes().any(|byte| byte.is_ascii_uppercase())
+            || host.ends_with('.')
+            || !host.is_ascii()
+        {
+            Cow::Owned(
+                crate::domain::normalize_hostname(host)
+                    .unwrap_or_else(|_| host.to_ascii_lowercase()),
+            )
         } else {
             Cow::Borrowed(host)
         };
@@ -599,7 +607,7 @@ impl RouteConnector {
     }
 
     async fn connect_tls(&self, host: &str, port: u16, force_http1: bool) -> Result<PooledIo> {
-        match self.engine.route(host, port, true) {
+        match self.engine.route_normalized(host, port, true) {
             Route::Bypass(_) => self.connect_direct_system(host, port, force_http1).await,
             Route::Blocked(outcome) => Err(anyhow!(
                 "{}",
@@ -613,7 +621,7 @@ impl RouteConnector {
     }
 
     async fn connect_plain(&self, host: &str, port: u16) -> Result<PooledIo> {
-        match self.engine.route(host, port, false) {
+        match self.engine.route_normalized(host, port, false) {
             Route::Bypass(_) => {
                 // Same Happy-Eyeballs treatment as CONNECT tunnels: a black-holed
                 // AAAA answer must not hide a working IPv4 origin behind a full

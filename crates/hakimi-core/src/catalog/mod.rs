@@ -202,7 +202,7 @@ impl CatalogManager {
         self.ip_catalog
             .read()
             .as_ref()
-            .and_then(|catalog| catalog.lookup_ips(domain))
+            .and_then(|catalog| catalog.lookup_ips_normalized(domain))
             .map(|(pattern, ips)| (pattern.clone(), ips.clone()))
     }
 

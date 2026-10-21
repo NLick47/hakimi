@@ -50,8 +50,7 @@ impl StatusProvider {
         let ca = self.ca.status();
         let catalogs = self.catalogs.status();
         let groups = self.status.groups_snapshot(&config);
-        let domains = self.status.domains_snapshot();
-        let counts = self.status.counts();
+        let (domains, counts) = self.status.domains_snapshot_with_counts();
         let cache = self.cache.stats();
         let listen = *self.proxy_listen.read();
         let pac_url = listen.map(|addr| format!("http://{addr}/proxy.pac"));

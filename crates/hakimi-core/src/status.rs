@@ -177,7 +177,7 @@ impl StatusStore {
     pub fn record(&self, diagnostics: DomainDiagnostics) {
         let mut map = self.domains.write();
         let mut unchanged_checking = false;
-        if let Some(existing) = map.get(&diagnostics.domain) {
+        if let Some(existing) = map.get_mut(&diagnostics.domain) {
             // Never let a slower, older probe overwrite a newer result.
             if existing.last_check > diagnostics.last_check
                 && existing.state != State::Checking
@@ -206,8 +206,12 @@ impl StatusStore {
                     "domain state changed"
                 );
             }
+            // Reuse the existing key: the common path is an update of a known
+            // domain, so there is no reason to clone its name for the map.
+            *existing = diagnostics;
+        } else {
+            map.insert(diagnostics.domain.clone(), diagnostics);
         }
-        map.insert(diagnostics.domain.clone(), diagnostics);
         // The record is in the map now: publish the change to pollers. Doing
         // it after the write (and after the early return above) means a
         // revision bump always corresponds to a visible change. Re-marking an
@@ -219,13 +223,29 @@ impl StatusStore {
 
     pub fn mark_checking(
         &self,
-        group: Option<String>,
+        group: Option<&str>,
         domain: &str,
         strategy: Option<Strategy>,
         catalog_version: u64,
     ) {
+        // A connection that succeeds and is followed immediately by another
+        // connection (image hosts with HTTP/1.1, or a page's asset burst)
+        // would otherwise flip Normal -> Checking -> Normal for every dial,
+        // allocating a diagnostics record and waking every UI poller twice.
+        // Keep a fresh real result visible instead of a transient marker.
+        {
+            let now = now();
+            let domains = self.domains.read();
+            if let Some(existing) = domains.get(domain) {
+                if matches!(existing.state, State::Normal | State::Direct)
+                    && now.signed_duration_since(existing.last_check) < chrono::Duration::seconds(1)
+                {
+                    return;
+                }
+            }
+        }
         self.record(DomainDiagnostics::checking(
-            group,
+            group.map(str::to_owned),
             domain,
             strategy,
             catalog_version,
@@ -236,6 +256,32 @@ impl StatusStore {
         let mut values: Vec<DomainDiagnostics> = self.domains.read().values().cloned().collect();
         values.sort_by(|a, b| a.domain.cmp(&b.domain));
         values
+    }
+
+    /// One pass for the two values the status JSON always needs together.
+    /// Avoids a second read lock and a second full scan of the domain map.
+    pub fn domains_snapshot_with_counts(&self) -> (Vec<DomainDiagnostics>, StatusCounts) {
+        let map = self.domains.read();
+        let mut counts = StatusCounts {
+            normal: 0,
+            direct: 0,
+            failed: 0,
+            checking: 0,
+            total: map.len(),
+        };
+        let mut values = Vec::with_capacity(map.len());
+        for entry in map.values() {
+            match entry.state {
+                State::Normal => counts.normal += 1,
+                State::Direct => counts.direct += 1,
+                State::Failed => counts.failed += 1,
+                State::Checking => counts.checking += 1,
+                _ => {}
+            }
+            values.push(entry.clone());
+        }
+        values.sort_by(|a, b| a.domain.cmp(&b.domain));
+        (values, counts)
     }
 
     pub fn counts(&self) -> StatusCounts {
@@ -355,14 +401,14 @@ mod tests {
         let store = StatusStore::new();
         store.record(report("example.com", State::Normal));
         store.mark_checking(
-            Some("github".into()),
+            Some("github"),
             "example.com",
             Some(Strategy::Auto),
             1,
         );
         let revision = store.revision();
         store.mark_checking(
-            Some("github".into()),
+            Some("github"),
             "example.com",
             Some(Strategy::Auto),
             1,
@@ -372,6 +418,32 @@ mod tests {
             revision,
             "a cold connect that is already marked Checking must not force a UI snapshot rebuild"
         );
+    }
+
+    #[test]
+    fn fresh_success_absorbs_the_next_checking_marker() {
+        let store = StatusStore::new();
+        store.record(report("example.com", State::Normal));
+
+        store.mark_checking(
+            Some("github"),
+            "example.com",
+            Some(Strategy::Auto),
+            1,
+        );
+        assert_eq!(store.get("example.com").unwrap().state, State::Normal);
+
+        // A stale result is re-marked so the UI still shows progress.
+        let mut stale = report("stale.example", State::Normal);
+        stale.last_check = now() - chrono::Duration::seconds(2);
+        store.record(stale);
+        store.mark_checking(
+            Some("github"),
+            "stale.example",
+            Some(Strategy::Auto),
+            1,
+        );
+        assert_eq!(store.get("stale.example").unwrap().state, State::Checking);
     }
 
     #[test]

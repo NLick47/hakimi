@@ -234,7 +234,11 @@ impl CacheManager {
         handle.spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                manager.flush_if_dirty();
+                // Serializing the cache and fsyncing it are blocking operations.
+                // Keep them off the async workers so a slow disk cannot stall
+                // proxy request handling.
+                let manager = manager.clone();
+                let _ = tokio::task::spawn_blocking(move || manager.flush_if_dirty()).await;
             }
         });
     }
@@ -259,6 +263,16 @@ impl CacheManager {
         } else {
             None
         }
+    }
+
+    /// Route-relevant fields of a remembered entry. The decision cursor only
+    /// needs the IP and strategy; avoid cloning the domain/network strings.
+    pub fn last_good_route(&self, domain: &str, max_age_days: i64) -> Option<(IpAddr, Strategy)> {
+        let now = now();
+        let data = self.data.read();
+        let entry = data.last_good.get(domain)?;
+        (now.signed_duration_since(entry.saved_at) <= Duration::days(max_age_days))
+            .then_some((entry.ip, entry.strategy))
     }
 
     /// Persisted quality entries, for seeding the decision engine on startup.

@@ -46,7 +46,13 @@ pub struct IpCatalog {
 impl IpCatalog {
     pub fn lookup_ips(&self, domain: &str) -> Option<(&String, &Vec<IpAddr>)> {
         let host = normalize_hostname(domain).ok()?;
-        if let Some((key, ips)) = self.ips.get_key_value(&host) {
+        self.lookup_ips_normalized(&host)
+    }
+
+    /// Lookup for callers that already normalized the host (the route cursor
+    /// does this once per connection).
+    pub fn lookup_ips_normalized(&self, host: &str) -> Option<(&String, &Vec<IpAddr>)> {
+        if let Some((key, ips)) = self.ips.get_key_value(host) {
             return Some((key, ips));
         }
         if self.wildcards.is_empty() {

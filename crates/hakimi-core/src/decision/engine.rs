@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,7 +28,7 @@ pub struct DecisionEngine {
     pub status: Arc<StatusStore>,
     /// Last successful route per authority. New pooled connections start here, so a
     /// connection failure is the only event that triggers re-resolution.
-    pub(super) plan_cache: parking_lot::Mutex<HashMap<String, (Instant, ConnectPlan)>>,
+    pub(super) plan_cache: parking_lot::Mutex<HashMap<String, (Instant, Arc<ConnectPlan>)>>,
     /// Per (domain, IP) observations. Candidates are ordered by score, so a host picks the
     /// address that has actually been fast on this network instead of a static list.
     pub(super) ip_scores: parking_lot::RwLock<HashMap<String, HashMap<IpAddr, IpScore>>>,
@@ -136,14 +137,24 @@ impl DecisionEngine {
         self.route_inner(domain, port, tls, false)
     }
 
+    /// Hot-path variant for callers that already normalized `domain` (the proxy
+    /// does this once per CONNECT / upstream authority). Skipping the second
+    /// normalize removes a String allocation and two label-validation passes
+    /// from every new upstream connection.
+    ///
+    /// `domain` must already be lowercase ASCII without a trailing root dot.
+    pub(crate) fn route_normalized(self: &Arc<Self>, domain: &str, port: u16, tls: bool) -> Route {
+        self.route_with_config(Cow::Borrowed(domain), port, tls, false)
+    }
+
     /// Routing variant used by diagnostic probes. `probing` skips the paused
     /// gate: pausing controls whether traffic is intercepted, not whether a
     /// manual health check may run.
     fn route_inner(self: &Arc<Self>, domain: &str, port: u16, tls: bool, probing: bool) -> Route {
-        let config = self.config.snapshot();
         let normalized = match normalize_hostname(domain) {
             Ok(domain) => domain,
             Err(error) => {
+                let config = self.config.snapshot();
                 return Route::Blocked(self.config_failure(
                     None,
                     domain,
@@ -153,13 +164,23 @@ impl DecisionEngine {
                 ));
             }
         };
-        let matcher = self.config.matcher();
-        let Some(group_id) = matcher.match_normalized(&normalized).map(ToOwned::to_owned) else {
+        self.route_with_config(Cow::Owned(normalized), port, tls, probing)
+    }
+
+    fn route_with_config(
+        self: &Arc<Self>,
+        normalized: Cow<'_, str>,
+        port: u16,
+        tls: bool,
+        probing: bool,
+    ) -> Route {
+        let (config, matcher) = self.config.snapshot_and_matcher();
+        let Some(group_id) = matcher.match_normalized(&normalized) else {
             return Route::Bypass(DecisionOutcome {
                 plan: None,
                 diagnostics: DomainDiagnostics {
                     group: None,
-                    domain: normalized,
+                    domain: normalized.into_owned(),
                     state: State::Direct,
                     strategy: None,
                     configured_strategy: None,
@@ -179,9 +200,9 @@ impl DecisionEngine {
                 },
             });
         };
-        let Some(group) = config.group(&group_id).cloned() else {
+        let Some(group) = config.group(group_id) else {
             return Route::Blocked(self.config_failure(
-                Some(group_id),
+                Some(group_id.to_string()),
                 &normalized,
                 &config,
                 FailureReason::ConfigInvalid,
@@ -190,7 +211,7 @@ impl DecisionEngine {
         };
         if !group.enabled {
             return Route::Bypass(self.state_only(
-                &group,
+                group,
                 &normalized,
                 &config,
                 State::Disabled,
@@ -199,7 +220,7 @@ impl DecisionEngine {
         }
         if !probing && self.status.paused() {
             return Route::Bypass(self.state_only(
-                &group,
+                group,
                 &normalized,
                 &config,
                 State::Paused,
@@ -207,26 +228,33 @@ impl DecisionEngine {
             ));
         }
         self.status.mark_checking(
-            Some(group.id.clone()),
+            Some(group.id.as_str()),
             &normalized,
             Some(group.strategy),
             config.catalog_version,
         );
+        // The cursor keeps an index into this immutable config snapshot, so a
+        // new connection does not clone the whole group (and all its domains).
+        let group_index = config
+            .groups
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, group))
+            .expect("matched group must come from the config snapshot");
         Route::Group(Box::new(RouteCursor::new(
             self.clone(),
-            normalized,
+            normalized.into_owned(),
             port,
             tls,
-            group,
+            group_index,
             config,
         )))
     }
 
     /// Last successful plan for a new connection. Established pooled connections never
     /// consult this, so it only affects cold connections and raw CONNECT tunnels.
-    pub fn cached_plan(&self, domain: &str, port: u16, tls: bool) -> Option<ConnectPlan> {
+    pub fn cached_plan(&self, domain: &str, port: u16, tls: bool) -> Option<Arc<ConnectPlan>> {
         let key = plan_key(domain, port, tls);
-        let config = self.config.snapshot();
+        let (config, matcher) = self.config.snapshot_and_matcher();
         let ttl = Duration::from_secs(config.advanced.plan_cache_secs);
         let mut cache = self.plan_cache.lock();
         let (at, plan) = cache.get(&key)?;
@@ -242,14 +270,13 @@ impl DecisionEngine {
         if self.cache.has_skip_once(&plan.domain) {
             return None;
         }
-        let matcher = self.config.matcher();
-        let group_id = matcher.match_normalized(&plan.domain)?.to_string();
+        let group_id = matcher.match_normalized(&plan.domain)?;
         // The domain may have been moved to another group; its old route (and
         // especially its old fake SNI) must not leak into the new group.
         if plan.group_id != group_id {
             return None;
         }
-        let group = config.group(&group_id)?;
+        let group = config.group(group_id)?;
         if !group.enabled || self.status.paused() {
             return None;
         }
@@ -410,7 +437,7 @@ impl DecisionEngine {
                 }
             }
         }
-        cache.insert(key, (Instant::now(), plan.clone()));
+        cache.insert(key, (Instant::now(), Arc::new(plan.clone())));
     }
 
     /// TCP-probe IPs that accumulated failures and forgive the ones that answer

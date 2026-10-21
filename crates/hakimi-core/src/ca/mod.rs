@@ -36,6 +36,7 @@ const LEAF_ROTATE_HOURS: i64 = 24;
 /// cheap enough to repeat; 512 covers the active set of a normal browser.
 const LEAF_CACHE_MAX: usize = 512;
 const LEAF_CACHE_PRUNE_TO: usize = LEAF_CACHE_MAX * 3 / 4;
+const CA_STATUS_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -151,8 +152,19 @@ impl CertificateAuthority {
         Ok(config)
     }
 
+    /// Trust state only, for the CONNECT hot path. A fresh cached snapshot is
+    /// read in place without cloning every fingerprint/path string; stale or
+    /// missing snapshots fall back to the full probe in [`Self::status`].
+    pub fn installed(&self) -> bool {
+        if let Some((at, status)) = self.status_cache.lock().as_ref() {
+            if at.elapsed() < CA_STATUS_TTL {
+                return status.installed;
+            }
+        }
+        self.status().installed
+    }
+
     pub fn status(&self) -> CaStatus {
-        const STATUS_TTL: Duration = Duration::from_secs(10);
         // Read the snapshot and release the lock before doing anything slow. In
         // particular, never hold it while `security(1)` runs: every CONNECT and
         // every UI tick would otherwise queue behind a Keychain subprocess.
@@ -171,7 +183,7 @@ impl CertificateAuthority {
                 return self.unprobed_status(false);
             }
             match cache.as_ref() {
-                Some((at, status)) if at.elapsed() < STATUS_TTL => {
+                Some((at, status)) if at.elapsed() < CA_STATUS_TTL => {
                     tracing::debug!(
                         age_ms = at.elapsed().as_millis() as u64,
                         installed = status.installed,

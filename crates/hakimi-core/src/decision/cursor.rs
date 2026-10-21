@@ -41,9 +41,10 @@ pub struct RouteCursor {
     domain: String,
     port: u16,
     tls: bool,
-    group: GroupConfig,
+    /// Index into the immutable `config` snapshot. Keeping only the index avoids
+    /// cloning the group (including all of its domain strings) per connection.
+    group_index: usize,
     config: Arc<AppConfig>,
-    network: String,
     max: usize,
     candidates: Vec<Candidate>,
     seen: HashSet<IpAddr>,
@@ -74,15 +75,15 @@ impl RouteCursor {
         domain: String,
         port: u16,
         tls: bool,
-        group: GroupConfig,
+        group_index: usize,
         config: Arc<AppConfig>,
     ) -> Self {
-        let network = network_id();
+        let group = &config.groups[group_index];
         let max = config.advanced.max_candidates_per_domain;
         let skip_once = engine.cache.take_skip_once(&domain);
         let last_good = engine
             .cache
-            .last_good(&domain, config.advanced.last_good_days);
+            .last_good_route(&domain, config.advanced.last_good_days);
         let remote = engine.remote.remote_ips(&domain);
         let remote_available = engine.remote.has_ip_catalog();
 
@@ -104,10 +105,10 @@ impl RouteCursor {
             }
         };
         let add_cache = |candidates: &mut Vec<Candidate>, seen: &mut HashSet<IpAddr>| {
-            if let Some(entry) = &last_good {
-                if candidates.len() < max && seen.insert(entry.ip) {
+            if let Some((ip, _)) = last_good {
+                if candidates.len() < max && seen.insert(ip) {
                     candidates.push(Candidate {
-                        ip: entry.ip,
+                        ip,
                         source: IpSource::Cache,
                     });
                 }
@@ -151,10 +152,7 @@ impl RouteCursor {
         // (and every catalog-triggered re-plan), which is especially visible for image
         // hosts. `auto` still falls back to the normal order on failure.
         if tls && group.strategy == Strategy::Auto {
-            if let Some(preferred) = last_good
-                .as_ref()
-                .map(|entry| mode_for_strategy(entry.strategy))
-            {
+            if let Some(preferred) = last_good.map(|(_, strategy)| mode_for_strategy(strategy)) {
                 if modes.contains(&preferred) && modes.first() != Some(&preferred) {
                     modes.retain(|mode| *mode != preferred);
                     modes.insert(0, preferred);
@@ -162,7 +160,10 @@ impl RouteCursor {
             }
         }
         let sni_candidates = if tls && modes.contains(&TlsMode::FakeSni) {
-            engine.sni_candidates(&config, &group, &domain, &network)
+            // Only fake-SNI routes need the current network identity. Most
+            // connections never touch the OS network cache.
+            let network = network_id();
+            engine.sni_candidates(&config, group, &domain, &network)
         } else {
             Vec::new()
         };
@@ -172,9 +173,8 @@ impl RouteCursor {
             domain,
             port,
             tls,
-            group,
+            group_index,
             config,
-            network,
             max,
             candidates,
             seen,
@@ -200,8 +200,12 @@ impl RouteCursor {
         }
     }
 
+    fn group(&self) -> &GroupConfig {
+        &self.config.groups[self.group_index]
+    }
+
     pub fn group_id(&self) -> &str {
-        &self.group.id
+        self.group().id.as_str()
     }
 
     pub fn domain(&self) -> &str {
@@ -290,7 +294,7 @@ impl RouteCursor {
                 match self
                     .engine
                     .resolver
-                    .doh_ech_config(&self.domain, self.group.ech_shared)
+                    .doh_ech_config(&self.domain, self.group().ech_shared)
                     .await
                 {
                     Ok(EchOutcome {
@@ -314,7 +318,7 @@ impl RouteCursor {
                 // request retries instead of silently dropping the ECH route.
                 self.ech_checked = true;
                 if self.ech_config.is_none() {
-                    if self.group.strategy == Strategy::Ech {
+                    if self.group().strategy == Strategy::Ech {
                         self.last_reason = Some(FailureReason::EchUnavailable);
                         self.last_detail = self
                             .ech_error
@@ -378,7 +382,7 @@ impl RouteCursor {
     ) -> ConnectPlan {
         ConnectPlan {
             domain: self.domain.clone(),
-            group_id: self.group.id.clone(),
+            group_id: self.group().id.clone(),
             ip: candidate.ip,
             port: self.port,
             mode,
@@ -464,9 +468,9 @@ impl RouteCursor {
         );
         if plan.mode == TlsMode::FakeSni {
             self.engine.cache.put_sni(crate::cache::CachedSni {
-                group: self.group.id.clone(),
+                group: self.group().id.clone(),
                 domain: self.domain.clone(),
-                network_id: self.network.clone(),
+                network_id: network_id(),
                 sni: plan.sni.clone(),
                 saved_at: now(),
             });
@@ -485,7 +489,7 @@ impl RouteCursor {
         self.finished = true;
         let reason = if let Some(reason) = self.last_reason {
             reason
-        } else if self.group.strategy == Strategy::Ech && self.ech_config.is_none() {
+        } else if self.group().strategy == Strategy::Ech && self.ech_config.is_none() {
             FailureReason::EchUnavailable
         } else if self.doh.error.is_some() {
             FailureReason::DohFailed
@@ -510,12 +514,13 @@ impl RouteCursor {
         if self.skip_once {
             detail.push("last-good cache was skipped once after a catalog update".into());
         }
+        let attempts = std::mem::take(&mut self.attempts);
         let diagnostics = self.engine.failure_diagnostics(
-            &self.group,
+            self.group(),
             &self.domain,
             &self.config,
             reason,
-            std::mem::take(&mut self.attempts),
+            attempts,
             &self.doh,
             if detail.is_empty() {
                 None

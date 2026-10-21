@@ -792,6 +792,13 @@ impl ConfigManager {
         Arc::clone(&self.inner.read().matcher)
     }
 
+    /// Snapshot the config and matcher under one read lock. Routing needs both
+    /// on every cold connection; taking the lock twice is unnecessary.
+    pub fn snapshot_and_matcher(&self) -> (Arc<AppConfig>, Arc<DomainMatcher>) {
+        let inner = self.inner.read();
+        (Arc::clone(&inner.config), Arc::clone(&inner.matcher))
+    }
+
     pub fn update(&self, config: AppConfig) -> Result<()> {
         config.validate()?;
         let matcher = Arc::new(config.matcher()?);

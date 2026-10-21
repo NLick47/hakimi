@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use http::uri::{Authority, PathAndQuery, Scheme, Uri};
 use http::{header, HeaderMap, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use http_body_util::Either;
@@ -43,6 +44,7 @@ pub(crate) async fn handle_forward(
         port,
         https,
         path_and_query,
+        upstream_uri,
     } = target;
 
     let upgrade_requested = is_upgrade(&req);
@@ -53,18 +55,38 @@ pub(crate) async fn handle_forward(
         None
     };
 
-    match forward_with_pool(
-        &ctx,
-        req,
-        &host,
-        port,
-        https,
-        &path_and_query,
-        upgrade_requested,
-        client_upgrade,
-    )
-    .await
-    {
+    // Absolute-form proxy requests already carry a parsed URI. Reuse it when
+    // the host needed no normalization, which is the normal browser case;
+    // otherwise fall back to rebuilding the authority + path.
+    let result = match upstream_uri {
+        Some(uri) => {
+            forward_with_uri(
+                &ctx,
+                req,
+                &host,
+                port,
+                uri,
+                upgrade_requested,
+                client_upgrade,
+            )
+            .await
+        }
+        None => {
+            let path_and_query = path_and_query.unwrap_or_else(|| "/".to_string());
+            forward_with_pool(
+                &ctx,
+                req,
+                &host,
+                port,
+                https,
+                &path_and_query,
+                upgrade_requested,
+                client_upgrade,
+            )
+            .await
+        }
+    };
+    match result {
         Ok(response) => response,
         Err(detail) => match_forward_error(&ctx, &host, port, https, detail),
     }
@@ -74,15 +96,37 @@ struct Target {
     host: String,
     port: u16,
     https: bool,
-    path_and_query: String,
+    /// Set only when the absolute-form request URI cannot be reused.
+    path_and_query: Option<String>,
+    /// Original absolute-form URI when reusing it is byte-for-byte equivalent
+    /// to rebuilding the authority (lowercase host, no userinfo, path present).
+    upstream_uri: Option<Uri>,
 }
 
-fn target_of(req: &Request<Incoming>) -> Result<Target> {
+/// Immutable authority for one MITM connection. The browser reuses a CONNECT
+/// tunnel for many requests (HTTP/2 can multiplex hundreds), so the normalized
+/// host and parsed authority are built once and shared by every request.
+pub(crate) struct MitmTarget {
+    pub(crate) host: Arc<str>,
+    pub(crate) port: u16,
+    authority: Authority,
+}
+
+impl MitmTarget {
+    pub(crate) fn new(host: &str, port: u16) -> std::result::Result<Arc<Self>, String> {
+        let authority = authority(host, port, true)
+            .parse::<Authority>()
+            .map_err(|error| format!("invalid MITM authority `{host}:{port}`: {error}"))?;
+        Ok(Arc::new(Self {
+            host: Arc::from(host),
+            port,
+            authority,
+        }))
+    }
+}
+
+fn target_of<B>(req: &Request<B>) -> Result<Target> {
     let uri = req.uri();
-    let path_and_query = uri
-        .path_and_query()
-        .map(|value| value.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
     if let (Some(scheme), Some(host)) = (uri.scheme_str(), uri.host()) {
         let https = match scheme {
             "https" => true,
@@ -90,13 +134,38 @@ fn target_of(req: &Request<Incoming>) -> Result<Target> {
             other => bail!("unsupported proxy scheme `{other}`"),
         };
         let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
+        let normalized = normalize_hostname(host).unwrap_or_else(|_| host.to_ascii_lowercase());
+        let default_port = if https { 443 } else { 80 };
+        let reusable = normalized == host
+            && uri.path_and_query().is_some()
+            && uri
+                .authority()
+                .is_none_or(|authority| !authority.as_str().contains('@'))
+            && !matches!(uri.port_u16(), Some(port) if port == default_port);
+        let (path_and_query, upstream_uri) = if reusable {
+            (None, Some(uri.clone()))
+        } else {
+            (
+                Some(
+                    uri.path_and_query()
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_else(|| "/".to_string()),
+                ),
+                None,
+            )
+        };
         return Ok(Target {
-            host: normalize_hostname(host).unwrap_or_else(|_| host.to_ascii_lowercase()),
+            host: normalized,
             port,
             https,
             path_and_query,
+            upstream_uri,
         });
     }
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
     let host_header = req
         .headers()
         .get(header::HOST)
@@ -107,47 +176,59 @@ fn target_of(req: &Request<Incoming>) -> Result<Target> {
         host,
         port,
         https: false,
-        path_and_query,
+        path_and_query: Some(path_and_query),
+        upstream_uri: None,
     })
 }
 
 pub(crate) async fn handle_mitm_request(
     req: Request<Incoming>,
     ctx: Arc<ProxyContext>,
-    connect_host: String,
+    target: Arc<MitmTarget>,
 ) -> Response<ProxyBody> {
-    let target_host = request_host(&req).unwrap_or(Cow::Borrowed(""));
     // The browser almost always repeats the CONNECT host verbatim (possibly
-    // with a different case). Avoid normalizing and allocating it on every
-    // request; only the mismatch path needs a canonical form for the message.
-    if !same_host(&target_host, &connect_host) {
-        let normalized = normalize_hostname(&target_host)
-            .unwrap_or_else(|_| target_host.into_owned());
-        if normalized != connect_host {
+    // with a different case). Compare the header/URI host in place; only the
+    // mismatch path needs to normalize and allocate for the error message.
+    if !request_host_matches(&req, &target.host) {
+        let target_host = request_host(&req).unwrap_or(Cow::Borrowed(""));
+        let normalized =
+            normalize_hostname(&target_host).unwrap_or_else(|_| target_host.into_owned());
+        if normalized != target.host.as_ref() {
             return super::error_response(
                 StatusCode::BAD_REQUEST,
                 "Unexpected host on MITM connection",
-                &format!("CONNECT was for `{connect_host}` but the request targets `{normalized}`."),
+                &format!(
+                    "CONNECT was for `{}` but the request targets `{normalized}`.",
+                    target.host
+                ),
             );
         }
     }
 
-    let port = req
-        .uri()
-        .port_u16()
-        .or_else(|| {
-            req.headers()
-                .get(header::HOST)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| parse_authority(value, 443))
-                .map(|(_, port)| port)
-        })
-        .unwrap_or(443);
+    let port = target.port;
     let path_and_query = req
         .uri()
         .path_and_query()
-        .map(|value| value.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
+        .cloned()
+        .unwrap_or_else(|| PathAndQuery::from_static("/"));
+    let upstream_uri = match Uri::builder()
+        .scheme(Scheme::HTTPS)
+        .authority(target.authority.clone())
+        .path_and_query(path_and_query)
+        .build()
+    {
+        Ok(uri) => uri,
+        Err(error) => {
+            return super::error_response(
+                StatusCode::BAD_REQUEST,
+                "Invalid upstream URI",
+                &format!(
+                    "building upstream URI for {}:{} failed: {error}",
+                    target.host, port
+                ),
+            )
+        }
+    };
     let upgrade_requested = is_upgrade(&req);
     let mut req = req;
     let client_upgrade = if upgrade_requested {
@@ -156,13 +237,12 @@ pub(crate) async fn handle_mitm_request(
         None
     };
 
-    match forward_with_pool(
+    match forward_with_uri(
         &ctx,
         req,
-        &connect_host,
+        &target.host,
         port,
-        true,
-        &path_and_query,
+        upstream_uri,
         upgrade_requested,
         client_upgrade,
     )
@@ -170,18 +250,18 @@ pub(crate) async fn handle_mitm_request(
     {
         Ok(response) => response,
         Err(detail) => {
-            if let Some(diagnostics) = ctx.status.get(&connect_host) {
+            if let Some(diagnostics) = ctx.status.get(&target.host) {
                 if diagnostics.state == State::Failed {
-                    return diagnostics_error_page(&connect_host, &diagnostics, &ctx);
+                    return diagnostics_error_page(&target.host, &diagnostics, &ctx);
                 }
             }
-            if let Some(plan) = ctx.engine.cached_plan(&connect_host, port, true) {
+            if let Some(plan) = ctx.engine.cached_plan(&target.host, port, true) {
                 return super::upstream_failure(&ctx, &plan, FailureReason::TlsError, detail);
             }
             super::error_response(
                 StatusCode::BAD_GATEWAY,
                 "Upstream request failed",
-                &format!("{connect_host}:{port}: {detail}"),
+                &format!("{}:{port}: {detail}", target.host),
             )
         }
     }
@@ -224,6 +304,32 @@ fn request_host<'a>(req: &'a Request<Incoming>) -> Option<Cow<'a, str>> {
         .map(|(host, _)| Cow::Owned(host))
 }
 
+/// Compare the request's host with the CONNECT target without allocating.
+/// HTTP/1.1 MITM requests use the origin-form (`GET / HTTP/1.1` + `Host`), so
+/// this is the common path for every request on an h1 tunnel.
+fn request_host_matches(req: &Request<Incoming>, expected: &str) -> bool {
+    if let Some(host) = req.uri().host() {
+        return same_host(host, expected);
+    }
+    req.headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(host_header_name)
+        .is_some_and(|host| same_host(host, expected))
+}
+
+/// Host portion of a `Host` header, borrowing the original string.
+fn host_header_name(value: &str) -> &str {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('[') {
+        return rest.split_once(']').map_or(rest, |(host, _)| host);
+    }
+    match value.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => value,
+    }
+}
+
 /// Host equality without allocating on the hot path. Browsers may preserve a
 /// trailing root dot or vary ASCII case; anything else is normalized only when
 /// we are about to reject the request.
@@ -260,11 +366,37 @@ async fn forward_with_pool(
         authority,
         path_and_query
     );
-    let (mut parts, body) = req.into_parts();
-    sanitize_request_headers(&mut parts.headers, upgrade_requested);
-    parts.uri = absolute
+    let upstream_uri = absolute
         .parse()
         .map_err(|error| format!("building upstream URI for {host}:{port} failed: {error}"))?;
+    forward_with_uri(
+        ctx,
+        req,
+        host,
+        port,
+        upstream_uri,
+        upgrade_requested,
+        client_upgrade,
+    )
+    .await
+}
+
+/// Send an already-built absolute upstream URI. MITM requests use this path so
+/// a request only clones the connection's pre-parsed `Authority` and the
+/// request's `PathAndQuery` instead of formatting and re-parsing a URI string.
+#[allow(clippy::too_many_arguments)]
+async fn forward_with_uri(
+    ctx: &ProxyContext,
+    req: Request<Incoming>,
+    host: &str,
+    port: u16,
+    upstream_uri: Uri,
+    upgrade_requested: bool,
+    client_upgrade: Option<OnUpgrade>,
+) -> std::result::Result<Response<ProxyBody>, String> {
+    let (mut parts, body) = req.into_parts();
+    sanitize_request_headers(&mut parts.headers, upgrade_requested);
+    parts.uri = upstream_uri;
     // Keep a cheap `Uri` handle for the response body's error logger. Cloning the
     // parsed URI shares its `Bytes`; allocating a fresh host String per response is
     // not necessary on this hot path.
@@ -371,10 +503,16 @@ fn sanitize_response_headers(headers: &mut HeaderMap, upgrade: bool) {
 
 fn authority(host: &str, port: u16, https: bool) -> Cow<'_, str> {
     let default = if https { 443 } else { 80 };
-    if port == default {
+    if host.contains(':') {
+        // IPv6 literals must stay bracketed in an authority, even when the
+        // port is implicit. An unbracketed literal is not a valid URI host.
+        if port == default {
+            Cow::Owned(format!("[{host}]"))
+        } else {
+            Cow::Owned(format!("[{host}]:{port}"))
+        }
+    } else if port == default {
         Cow::Borrowed(host)
-    } else if host.contains(':') {
-        Cow::Owned(format!("[{host}]:{port}"))
     } else {
         Cow::Owned(format!("{host}:{port}"))
     }
@@ -489,7 +627,8 @@ fn attempt_row(attempt: &AttemptRecord) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::same_host;
+    use super::{authority, host_header_name, same_host, target_of, MitmTarget};
+    use http::Request;
 
     #[test]
     fn mitm_host_match_ignores_ascii_case_and_root_dot() {
@@ -497,5 +636,73 @@ mod tests {
         assert!(same_host("example.com.", "example.com"));
         assert!(!same_host("evil.example", "example.com"));
         assert!(!same_host("example.com.evil", "example.com"));
+    }
+
+    #[test]
+    fn host_header_parsing_borrows_host_and_port() {
+        assert_eq!(host_header_name("example.com:8443"), "example.com");
+        assert_eq!(host_header_name("example.com"), "example.com");
+        assert_eq!(host_header_name("[2001:db8::1]:8443"), "2001:db8::1");
+        assert_eq!(host_header_name("example.com."), "example.com.");
+    }
+
+    #[test]
+    fn mitm_target_reuses_a_valid_authority() {
+        let target = MitmTarget::new("example.com", 443).unwrap();
+        assert_eq!(target.authority.as_str(), "example.com");
+        let target = MitmTarget::new("example.com", 8443).unwrap();
+        assert_eq!(target.authority.as_str(), "example.com:8443");
+    }
+
+    #[test]
+    fn authority_brackets_ipv6_literals() {
+        assert_eq!(authority("2001:db8::1", 443, true), "[2001:db8::1]");
+        assert_eq!(authority("2001:db8::1", 8443, true), "[2001:db8::1]:8443");
+        assert_eq!(authority("example.com", 443, true), "example.com");
+        assert_eq!(authority("example.com", 8443, true), "example.com:8443");
+    }
+
+    #[test]
+    fn absolute_form_uri_is_reused_only_when_equivalent() {
+        let req = Request::builder()
+            .uri("https://example.com/path?q=1")
+            .body(())
+            .unwrap();
+        let target = target_of(&req).unwrap();
+        assert!(target.upstream_uri.is_some());
+        assert!(target.path_and_query.is_none());
+
+        let req = Request::builder()
+            .uri("https://EXAMPLE.com/path")
+            .body(())
+            .unwrap();
+        let target = target_of(&req).unwrap();
+        assert_eq!(target.host, "example.com");
+        assert!(target.upstream_uri.is_none());
+        assert_eq!(target.path_and_query.as_deref(), Some("/path"));
+
+        let req = Request::builder()
+            .uri("https://example.com:443/path")
+            .body(())
+            .unwrap();
+        let target = target_of(&req).unwrap();
+        assert!(
+            target.upstream_uri.is_none(),
+            "an explicit default port is rebuilt to the previous authority"
+        );
+    }
+
+    #[test]
+    fn origin_form_uses_host_header() {
+        let req = Request::builder()
+            .uri("/path")
+            .header(http::header::HOST, "example.com:8080")
+            .body(())
+            .unwrap();
+        let target = target_of(&req).unwrap();
+        assert_eq!(target.host, "example.com");
+        assert_eq!(target.port, 8080);
+        assert!(target.upstream_uri.is_none());
+        assert_eq!(target.path_and_query.as_deref(), Some("/path"));
     }
 }

@@ -88,12 +88,12 @@ pub(super) async fn handle_connect(
     let group_id = if is_ip {
         None
     } else {
-        matcher.match_normalized(&host).map(ToOwned::to_owned)
+        matcher.match_normalized(&host)
     };
     let Some(group_id) = group_id else {
         return tunnel_to_host(req, &host, port).await;
     };
-    let Some(group) = config.group(&group_id) else {
+    let Some(group) = config.group(group_id) else {
         return tunnel_to_host(req, &host, port).await;
     };
     if !group.enabled || ctx.status.paused() {
@@ -135,8 +135,8 @@ pub(super) async fn handle_connect(
     // Explicitly direct groups never need MITM. When the CA is not trusted we also keep
     // Auto groups on the raw path: a direct origin still works, while an ECH/fake-SNI
     // origin would only produce a browser certificate error anyway.
-    if group.strategy == Strategy::Direct || !ctx.ca.status().installed {
-        return tunnel_direct_group(req, &ctx, &host, port, stale_plan.as_ref()).await;
+    if group.strategy == Strategy::Direct || !ctx.ca.installed() {
+        return tunnel_direct_group(req, &ctx, &host, port, stale_plan.as_deref()).await;
     }
 
     // ECH / fake SNI / Auto without a direct route: terminate browser TLS locally and let
@@ -152,8 +152,18 @@ pub(super) async fn handle_connect(
             )
         }
     };
+    // Build the normalized authority once for the whole tunnel. Every request
+    // on this connection (HTTP/2 can multiplex many) only clones an `Arc` and
+    // reuses the parsed authority, instead of cloning the host String and
+    // formatting/re-parsing an absolute URI per request.
+    let target = match upstream::MitmTarget::new(&host, port) {
+        Ok(target) => target,
+        Err(error) => {
+            return error_response(StatusCode::BAD_GATEWAY, "Invalid MITM target", &error)
+        }
+    };
+    let log_host = target.host.clone();
     let on_upgrade = upgrade::on(req);
-    let host_for_task = host.clone();
     let ctx_for_task = ctx.clone();
     tokio::spawn(async move {
         let result =
@@ -171,9 +181,9 @@ pub(super) async fn handle_connect(
                     .map(|protocol| protocol.to_vec());
                 let service = service_fn(move |req| {
                     let ctx = ctx_for_task.clone();
-                    let host = host_for_task.clone();
+                    let target = target.clone();
                     async move {
-                        Ok::<_, Infallible>(upstream::handle_mitm_request(req, ctx, host).await)
+                        Ok::<_, Infallible>(upstream::handle_mitm_request(req, ctx, target).await)
                     }
                 });
                 let io = TokioIo::new(tls);
@@ -193,7 +203,7 @@ pub(super) async fn handle_connect(
             }
             .await;
         if let Err(error) = result {
-            tracing::debug!(domain = %host, error = %error, "MITM connection ended");
+            tracing::debug!(domain = %log_host, error = %error, "MITM connection ended");
         }
     });
     empty_response(StatusCode::OK)
@@ -209,7 +219,7 @@ async fn tunnel_direct_group(
     port: u16,
     failed_plan: Option<&ConnectPlan>,
 ) -> Response<ProxyBody> {
-    let mut cursor = match ctx.engine.route(host, port, true) {
+    let mut cursor = match ctx.engine.route_normalized(host, port, true) {
         Route::Bypass(_) => return tunnel_to_host(req, host, port).await,
         Route::Blocked(outcome) => {
             return upstream::diagnostics_error_page(host, &outcome.diagnostics, ctx)
