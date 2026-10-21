@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
@@ -9,6 +10,13 @@ use serde::{Deserialize, Serialize};
 use crate::config::AppConfig;
 use crate::strategy::{CacheStatus, DohSource, FailureReason, IpSource, Strategy, TlsMode};
 use crate::util::now;
+
+/// Wildcard groups can observe an unbounded set of concrete hosts. Keep the
+/// status map bounded so a crawler cannot turn the UI snapshot into a
+/// multi-megabyte clone every second.
+const MAX_STATUS_DOMAINS: usize = 8192;
+/// Evict in bulk so crossing the cap does not sort the map on every insert.
+const STATUS_PRUNE_TO: usize = MAX_STATUS_DOMAINS * 3 / 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -126,7 +134,9 @@ pub struct StatusCounts {
 }
 
 pub struct StatusStore {
-    domains: RwLock<HashMap<String, DomainDiagnostics>>,
+    /// Values are shared so snapshots clone only an `Arc`, not every
+    /// diagnostics record (including attempts/suggestions vectors).
+    domains: RwLock<HashMap<String, Arc<DomainDiagnostics>>>,
     paused: AtomicBool,
     /// Bumped whenever a domain record or the pause flag changes. Pollers
     /// compare it to skip rebuilding a snapshot that cannot have changed.
@@ -170,11 +180,12 @@ impl StatusStore {
         self.paused.load(Ordering::SeqCst)
     }
 
-    pub fn get(&self, domain: &str) -> Option<DomainDiagnostics> {
+    pub fn get(&self, domain: &str) -> Option<Arc<DomainDiagnostics>> {
         self.domains.read().get(domain).cloned()
     }
 
     pub fn record(&self, diagnostics: DomainDiagnostics) {
+        let diagnostics = Arc::new(diagnostics);
         let mut map = self.domains.write();
         let mut unchanged_checking = false;
         if let Some(existing) = map.get_mut(&diagnostics.domain) {
@@ -211,6 +222,9 @@ impl StatusStore {
             *existing = diagnostics;
         } else {
             map.insert(diagnostics.domain.clone(), diagnostics);
+            if map.len() > MAX_STATUS_DOMAINS {
+                prune_status_domains(&mut map);
+            }
         }
         // The record is in the map now: publish the change to pollers. Doing
         // it after the write (and after the early return above) means a
@@ -252,15 +266,16 @@ impl StatusStore {
         ));
     }
 
-    pub fn domains_snapshot(&self) -> Vec<DomainDiagnostics> {
-        let mut values: Vec<DomainDiagnostics> = self.domains.read().values().cloned().collect();
+    pub fn domains_snapshot(&self) -> Vec<Arc<DomainDiagnostics>> {
+        let mut values: Vec<Arc<DomainDiagnostics>> =
+            self.domains.read().values().cloned().collect();
         values.sort_by(|a, b| a.domain.cmp(&b.domain));
         values
     }
 
     /// One pass for the two values the status JSON always needs together.
     /// Avoids a second read lock and a second full scan of the domain map.
-    pub fn domains_snapshot_with_counts(&self) -> (Vec<DomainDiagnostics>, StatusCounts) {
+    pub fn domains_snapshot_with_counts(&self) -> (Vec<Arc<DomainDiagnostics>>, StatusCounts) {
         let map = self.domains.read();
         let mut counts = StatusCounts {
             normal: 0,
@@ -318,7 +333,7 @@ impl StatusStore {
                     .map(|entry| entry.state);
                 let entries: Vec<&DomainDiagnostics> = group
                     .exact_domains()
-                    .filter_map(|domain| domains.get(domain))
+                    .filter_map(|domain| domains.get(domain).map(Arc::as_ref))
                     .collect();
                 let tested = entries
                     .iter()
@@ -367,6 +382,26 @@ impl StatusStore {
 
     pub fn clear(&self) {
         self.domains.write().clear();
+    }
+}
+
+/// Keep failure evidence longer than ordinary success records. If every entry
+/// is failed/degraded, the oldest failures are evicted as a last resort.
+fn prune_status_domains(map: &mut HashMap<String, Arc<DomainDiagnostics>>) {
+    let mut candidates: Vec<(String, DateTime<Utc>, bool)> = map
+        .iter()
+        .map(|(domain, entry)| {
+            (
+                domain.clone(),
+                entry.last_check,
+                matches!(entry.state, State::Failed | State::Degraded),
+            )
+        })
+        .collect();
+    candidates.sort_by_key(|(_, last_check, protected)| (*protected, *last_check));
+    let excess = map.len().saturating_sub(STATUS_PRUNE_TO);
+    for (domain, _, _) in candidates.into_iter().take(excess) {
+        map.remove(&domain);
     }
 }
 
@@ -514,5 +549,22 @@ mod tests {
 
         store.record(report("github.com", State::Normal));
         assert!(store.revision() > paused, "a domain record must publish");
+    }
+
+    #[test]
+    fn wildcard_host_growth_is_bounded() {
+        let store = StatusStore::new();
+        for index in 0..=MAX_STATUS_DOMAINS {
+            store.record(report(
+                &format!("host{index}.wildcard.example"),
+                State::Normal,
+            ));
+        }
+        let snapshot = store.domains_snapshot();
+        assert!(snapshot.len() <= MAX_STATUS_DOMAINS);
+        assert!(
+            snapshot.len() < MAX_STATUS_DOMAINS,
+            "the bulk prune should leave headroom below the cap"
+        );
     }
 }

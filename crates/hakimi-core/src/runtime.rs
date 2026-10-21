@@ -51,6 +51,9 @@ impl StatusProvider {
         let catalogs = self.catalogs.status();
         let groups = self.status.groups_snapshot(&config);
         let (domains, counts) = self.status.domains_snapshot_with_counts();
+        // Serialize borrowed values: the status map stores shared records, and
+        // serde does not implement Serialize for Arc without the `rc` feature.
+        let domains: Vec<&DomainDiagnostics> = domains.iter().map(Arc::as_ref).collect();
         let cache = self.cache.stats();
         let listen = *self.proxy_listen.read();
         let pac_url = listen.map(|addr| format!("http://{addr}/proxy.pac"));
