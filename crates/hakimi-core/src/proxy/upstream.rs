@@ -676,8 +676,8 @@ fn attempt_row(attempt: &AttemptRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        authority, build_upstream_uri, host_header_name, is_upgrade, same_host, target_host,
-        target_of, MitmTarget, Target,
+        authority, build_upstream_uri, host_header_name, is_upgrade, same_host,
+        sanitize_request_headers, target_host, target_of, MitmTarget, Target,
     };
     use http::uri::PathAndQuery;
     use http::{HeaderMap, Request, Uri};
@@ -918,5 +918,38 @@ mod tests {
             target.path_and_query.as_ref().map(|value| value.as_str()),
             Some("/path")
         );
+    }
+
+    /// The CPU cost of preparing one forwarded request, without the network.
+    ///
+    /// The header clone is part of the measurement: a real request brings its
+    /// own header map, and the numbers only compare builds of the same
+    /// measurement.
+    #[test]
+    #[ignore = "micro benchmark"]
+    fn bench_request_preparation() {
+        let request = Request::builder()
+            .method("GET")
+            .uri("https://example.com/assets/app.js?v=2")
+            .header("user-agent", "Mozilla/5.0")
+            .header("accept", "*/*")
+            .header("accept-encoding", "gzip, deflate, br")
+            .header("cookie", "session=0123456789abcdef")
+            .header("referer", "https://example.com/")
+            .header("connection", "keep-alive")
+            .header("proxy-connection", "keep-alive")
+            .body(())
+            .unwrap();
+        crate::bench::measure("proxy.request_prepare", 50_000, || {
+            let target = target_of(&request).unwrap();
+            let upgrade = is_upgrade(request.headers());
+            let mut headers = request.headers().clone();
+            sanitize_request_headers(&mut headers, upgrade);
+            let path = target
+                .path_and_query
+                .clone()
+                .unwrap_or_else(|| PathAndQuery::from_static("/"));
+            let _ = build_upstream_uri(host_of(&target), target.port, target.https, &path).unwrap();
+        });
     }
 }

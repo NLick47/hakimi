@@ -37,7 +37,9 @@ impl IpResolver for SlowResolver {
 }
 
 fn engine_for(dir: &std::path::Path) -> (Arc<DecisionEngine>, Arc<ConfigManager>) {
-    engine_for_with_resolver(dir, None)
+    // A stub resolver, never the real one: the DoH expansion of the cursor
+    // would query the network and make the timing of these tests depend on it.
+    engine_for_with_resolver(dir, Some(std::time::Duration::ZERO))
 }
 
 fn engine_for_with_resolver(
