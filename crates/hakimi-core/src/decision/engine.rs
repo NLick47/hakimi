@@ -1,0 +1,805 @@
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::cache::{CacheManager, LastGoodEntry};
+use crate::catalog::RemoteIpProvider;
+use crate::config::{AppConfig, ConfigManager, GroupConfig};
+use crate::domain::normalize_hostname;
+use crate::resolver::{DohResolution, IpResolver};
+use crate::status::{AttemptRecord, DomainDiagnostics, State, StatusStore};
+use crate::strategy::{CacheStatus, FailureReason, IpSource, TlsMode};
+use crate::util::{network_id, now};
+
+use super::cursor::{Route, RouteCursor};
+use super::plan::{plan_key, ConnectPlan, DecisionOutcome, Prober};
+use super::score::{IpScore, IP_SCORE_CAP, IP_SCORE_PRUNE_TO};
+use super::types::{Candidate, DohExpansion};
+
+pub struct DecisionEngine {
+    pub config: Arc<ConfigManager>,
+    pub cache: Arc<CacheManager>,
+    pub remote: Arc<dyn RemoteIpProvider>,
+    pub resolver: Arc<dyn IpResolver>,
+    pub prober: Arc<dyn Prober>,
+    pub status: Arc<StatusStore>,
+    /// Last successful route per authority. New pooled connections start here, so a
+    /// connection failure is the only event that triggers re-resolution.
+    pub(super) plan_cache: parking_lot::Mutex<HashMap<String, (Instant, ConnectPlan)>>,
+    /// Per (domain, IP) observations. Candidates are ordered by score, so a host picks the
+    /// address that has actually been fast on this network instead of a static list.
+    pub(super) ip_scores: parking_lot::RwLock<HashMap<String, HashMap<IpAddr, IpScore>>>,
+}
+
+pub(super) const PLAN_CACHE_MAX: usize = 2048;
+/// Leave headroom after a prune so a burst of new hosts does not sort the map
+/// on every success.
+pub(super) const PLAN_CACHE_PRUNE_TO: usize = PLAN_CACHE_MAX * 3 / 4;
+
+impl DecisionEngine {
+    pub fn new(
+        config: Arc<ConfigManager>,
+        cache: Arc<CacheManager>,
+        remote: Arc<dyn RemoteIpProvider>,
+        resolver: Arc<dyn IpResolver>,
+        prober: Arc<dyn Prober>,
+        status: Arc<StatusStore>,
+    ) -> Arc<Self> {
+        // Seed the in-memory quality map from the persisted one, so a restart
+        // keeps knowing that an IP was fast or blocked on this network.
+        let mut seeded_scores: HashMap<String, HashMap<IpAddr, IpScore>> = HashMap::new();
+        for (domain, ip, entry) in cache.ip_scores() {
+            seeded_scores.entry(domain).or_default().insert(
+                ip,
+                IpScore {
+                    ewma_ms: entry.ewma_ms,
+                    successes: entry.successes,
+                    failures: entry.failures,
+                },
+            );
+        }
+        Arc::new(Self {
+            config,
+            cache,
+            remote,
+            resolver,
+            prober,
+            status,
+            plan_cache: parking_lot::Mutex::new(HashMap::new()),
+            ip_scores: parking_lot::RwLock::new(seeded_scores),
+        })
+    }
+
+    pub async fn decide_https(self: &Arc<Self>, domain: &str) -> DecisionOutcome {
+        self.decide(domain, 443, true).await
+    }
+
+    /// Decide how to reach `domain` by actually probing candidates. This is used by
+    /// diagnostics and background checks; the proxy hot path uses [`Self::route`] and lets
+    /// the real upstream connection perform validation instead.
+    ///
+    /// `tls` is false for plaintext HTTP, which can only use direct TCP (ECH and fake SNI
+    /// are TLS-only).
+    pub async fn decide(self: &Arc<Self>, domain: &str, port: u16, tls: bool) -> DecisionOutcome {
+        let timeout = Duration::from_millis(self.config.snapshot().advanced.ip_timeout_ms);
+        // A diagnostic probe is an observation, not routing: it must keep
+        // working while acceleration is paused. The paused check belongs to
+        // `route` (the proxy hot path), not to the probe path.
+        match self.route_inner(domain, port, tls, true) {
+            Route::Bypass(outcome) | Route::Blocked(outcome) => outcome,
+            Route::Group(mut cursor) => loop {
+                let Some(plan) = cursor.next_plan().await else {
+                    return cursor
+                        .outcome()
+                        .cloned()
+                        .unwrap_or_else(|| self.internal_failure(domain));
+                };
+                let result = if plan.tls {
+                    self.prober
+                        .probe_tls(
+                            plan.ip,
+                            plan.port,
+                            &plan.domain,
+                            plan.mode,
+                            plan.sni.as_deref(),
+                            plan.ech_config.as_deref(),
+                            timeout,
+                        )
+                        .await
+                        .map(|probe| probe.latency_ms)
+                } else {
+                    self.prober.probe_tcp(plan.ip, plan.port, timeout).await
+                };
+                match result {
+                    Ok(latency_ms) => return cursor.note_success(&plan, latency_ms),
+                    Err(error) => {
+                        cursor.note_failure(&plan, error.reason(), error.detail());
+                    }
+                }
+            },
+        }
+    }
+
+    /// Match a host to its group and return a lazy, probe-free plan generator.
+    ///
+    /// The caller is expected to attempt each plan for real. A successful TLS handshake
+    /// validates the certificate exactly like [`Self::decide`], but costs only one
+    /// handshake instead of a probe plus the actual connection.
+    pub fn route(self: &Arc<Self>, domain: &str, port: u16, tls: bool) -> Route {
+        self.route_inner(domain, port, tls, false)
+    }
+
+    /// Routing variant used by diagnostic probes. `probing` skips the paused
+    /// gate: pausing controls whether traffic is intercepted, not whether a
+    /// manual health check may run.
+    fn route_inner(self: &Arc<Self>, domain: &str, port: u16, tls: bool, probing: bool) -> Route {
+        let config = self.config.snapshot();
+        let normalized = match normalize_hostname(domain) {
+            Ok(domain) => domain,
+            Err(error) => {
+                return Route::Blocked(self.config_failure(
+                    None,
+                    domain,
+                    &config,
+                    FailureReason::ConfigInvalid,
+                    format!("invalid domain: {error}"),
+                ))
+            }
+        };
+        let matcher = self.config.matcher();
+        let Some(group_id) = matcher.match_normalized(&normalized).map(ToOwned::to_owned) else {
+            return Route::Bypass(DecisionOutcome {
+                plan: None,
+                diagnostics: DomainDiagnostics {
+                    group: None,
+                    domain: normalized,
+                    state: State::Direct,
+                    strategy: None,
+                    configured_strategy: None,
+                    ip: None,
+                    ip_source: None,
+                    doh_source: None,
+                    latency_ms: None,
+                    last_check: now(),
+                    catalog_version: config.catalog_version,
+                    cache: CacheStatus::None,
+                    error: None,
+                    detail: Some(
+                        "domain is not covered by any group; traffic is connected directly".into(),
+                    ),
+                    attempts: Vec::new(),
+                    suggestions: Vec::new(),
+                },
+            });
+        };
+        let Some(group) = config.group(&group_id).cloned() else {
+            return Route::Blocked(self.config_failure(
+                Some(group_id),
+                &normalized,
+                &config,
+                FailureReason::ConfigInvalid,
+                "matched group no longer exists in the configuration".into(),
+            ));
+        };
+        if !group.enabled {
+            return Route::Bypass(self.state_only(
+                &group,
+                &normalized,
+                &config,
+                State::Disabled,
+                "group is disabled; traffic is not intercepted",
+            ));
+        }
+        if !probing && self.status.paused() {
+            return Route::Bypass(self.state_only(
+                &group,
+                &normalized,
+                &config,
+                State::Paused,
+                "hakimi is paused; traffic is not intercepted",
+            ));
+        }
+        self.status.mark_checking(
+            Some(group.id.clone()),
+            &normalized,
+            Some(group.strategy),
+            config.catalog_version,
+        );
+        Route::Group(Box::new(RouteCursor::new(
+            self.clone(),
+            normalized,
+            port,
+            tls,
+            group,
+            config,
+        )))
+    }
+
+    /// Last successful plan for a new connection. Established pooled connections never
+    /// consult this, so it only affects cold connections and raw CONNECT tunnels.
+    pub fn cached_plan(&self, domain: &str, port: u16, tls: bool) -> Option<ConnectPlan> {
+        let key = plan_key(domain, port, tls);
+        let config = self.config.snapshot();
+        let ttl = Duration::from_secs(config.advanced.plan_cache_secs);
+        let mut cache = self.plan_cache.lock();
+        let (at, plan) = cache.get(&key)?;
+        if at.elapsed() >= ttl {
+            cache.remove(&key);
+            return None;
+        }
+        let plan = plan.clone();
+        drop(cache);
+
+        // A catalog update marks affected domains skipOnce: do not reuse the old route
+        // before the new remote IPs have been attempted.
+        if self.cache.has_skip_once(&plan.domain) {
+            return None;
+        }
+        let matcher = self.config.matcher();
+        let group_id = matcher.match_normalized(&plan.domain)?.to_string();
+        // The domain may have been moved to another group; its old route (and
+        // especially its old fake SNI) must not leak into the new group.
+        if plan.group_id != group_id {
+            return None;
+        }
+        let group = config.group(&group_id)?;
+        if !group.enabled || self.status.paused() {
+            return None;
+        }
+        if tls {
+            if !group.strategy.attempts().contains(&plan.mode) {
+                return None;
+            }
+            // A group-level fake SNI is authoritative. Editing it must not keep
+            // using the old name for the rest of the plan-cache lifetime.
+            if plan.mode == TlsMode::FakeSni {
+                if let Some(configured) = group.sni.as_deref() {
+                    let configured = configured.trim();
+                    let matches = if configured.is_empty() {
+                        plan.sni.is_none()
+                    } else {
+                        plan.sni
+                            .as_deref()
+                            .is_some_and(|sni| sni.eq_ignore_ascii_case(configured))
+                    };
+                    if !matches {
+                        return None;
+                    }
+                }
+            }
+        } else if plan.mode != TlsMode::Direct {
+            return None;
+        }
+        Some(plan)
+    }
+
+    pub fn forget_plan(&self, domain: &str, port: u16, tls: bool) {
+        self.plan_cache.lock().remove(&plan_key(domain, port, tls));
+    }
+
+    /// Drop every remembered route. A network change invalidates the in-memory
+    /// shortcut even though the persisted last-good entry is kept (the design
+    /// deliberately tests it first on the new network): new connections should
+    /// hedge it against fresh candidates instead of blocking on it through the
+    /// single-route fast path.
+    pub fn forget_all_plans(&self) {
+        self.plan_cache.lock().clear();
+    }
+
+    pub(super) fn score_ip(&self, domain: &str, ip: IpAddr) -> f64 {
+        self.ip_scores
+            .read()
+            .get(domain)
+            .and_then(|by_ip| by_ip.get(&ip))
+            .map(|score| score.rank())
+            .unwrap_or(f64::MAX)
+    }
+
+    pub(super) fn record_ip(
+        &self,
+        domain: &str,
+        ip: IpAddr,
+        latency_ms: Option<u64>,
+        failed: bool,
+    ) -> bool {
+        let mut scores = self.ip_scores.write();
+        let entry = scores
+            .entry(domain.to_string())
+            .or_default()
+            .entry(ip)
+            .or_default();
+        let degraded;
+        if failed {
+            entry.failures += 1;
+            entry.ewma_ms = if entry.ewma_ms == 0.0 {
+                10_000.0
+            } else {
+                entry.ewma_ms * 0.7 + 10_000.0 * 0.3
+            };
+            degraded = false;
+        } else {
+            entry.successes += 1;
+            // Pay down the failure history with each real success. Without
+            // this an IP that ever failed stays in `reprobe_failed_ips`
+            // forever, so the same addresses get re-probed every minute for
+            // the whole session even after they recovered.
+            entry.failures = entry.failures.saturating_sub(1);
+            let sample = latency_ms.unwrap_or(500) as f64;
+            // A sample far worse than the established average means the proven route
+            // degraded (network flap, congestion). Signal the caller to re-race.
+            degraded = entry.successes > 2
+                && sample > 800.0
+                && entry.ewma_ms > 0.0
+                && sample > entry.ewma_ms * 2.5;
+            entry.ewma_ms = if entry.successes == 1 {
+                sample
+            } else {
+                entry.ewma_ms * 0.7 + sample * 0.3
+            };
+        }
+        let snapshot = (entry.ewma_ms, entry.successes, entry.failures);
+        // Bounded map: when full, drop the least valuable entries — the ones
+        // with the worst measured quality — instead of wiping everything. A
+        // flood of dead IPs must never erase knowledge of a proven route.
+        let total: usize = scores.values().map(|by_ip| by_ip.len()).sum();
+        if total > IP_SCORE_CAP {
+            let mut ranked: Vec<((String, IpAddr), f64)> = scores
+                .iter()
+                .flat_map(|(domain, by_ip)| {
+                    by_ip
+                        .iter()
+                        .map(|(ip, score)| ((domain.clone(), *ip), score.rank()))
+                })
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for ((domain, ip), _) in ranked.into_iter().take(total - IP_SCORE_PRUNE_TO) {
+                if let Some(by_ip) = scores.get_mut(&domain) {
+                    by_ip.remove(&ip);
+                    if by_ip.is_empty() {
+                        scores.remove(&domain);
+                    }
+                }
+            }
+        }
+        // Persist both outcomes: a restart must keep knowing that this IP was
+        // fast — or blocked — on this network. The cache batches disk writes.
+        self.cache
+            .put_ip_score(domain, ip, snapshot.0, snapshot.1, snapshot.2);
+        degraded
+    }
+
+    pub(super) fn remember_plan(&self, plan: &ConnectPlan) {
+        let key = plan_key(&plan.domain, plan.port, plan.tls);
+        let mut cache = self.plan_cache.lock();
+        if cache.len() >= PLAN_CACHE_MAX {
+            let ttl = Duration::from_secs(self.config.snapshot().advanced.plan_cache_secs);
+            cache.retain(|_, (at, _)| at.elapsed() < ttl);
+            // A crawler can push more than the cap of *fresh* plans in the TTL
+            // window; keep the newest instead of scanning the full map on every
+            // subsequent success.
+            if cache.len() >= PLAN_CACHE_MAX {
+                let mut ages: Vec<(String, Instant)> = cache
+                    .iter()
+                    .map(|(key, (at, _))| (key.clone(), *at))
+                    .collect();
+                ages.sort_by_key(|(_, at)| *at);
+                let excess = cache.len() - PLAN_CACHE_PRUNE_TO;
+                for (key, _) in ages.into_iter().take(excess) {
+                    cache.remove(&key);
+                }
+            }
+        }
+        cache.insert(key, (Instant::now(), plan.clone()));
+    }
+
+    /// TCP-probe IPs that accumulated failures and forgive the ones that answer
+    /// again. A temporary block (GFW reset, network flap) should not bury a
+    /// working address under its failure score forever.
+    pub async fn reprobe_failed_ips(self: &Arc<Self>, limit: usize) -> usize {
+        let candidates: Vec<(String, IpAddr)> = {
+            let scores = self.ip_scores.read();
+            let mut list: Vec<(&str, IpAddr, u32)> = scores
+                .iter()
+                .flat_map(|(domain, by_ip)| {
+                    by_ip
+                        .iter()
+                        .filter(|(_, score)| score.failures > 0)
+                        .map(|(ip, score)| (domain.as_str(), *ip, score.failures))
+                })
+                .collect();
+            list.sort_by(|a, b| b.2.cmp(&a.2));
+            list.truncate(limit);
+            list.into_iter()
+                .map(|(domain, ip, _)| (domain.to_string(), ip))
+                .collect()
+        };
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        let mut set = tokio::task::JoinSet::new();
+        for (domain, ip) in candidates {
+            let engine = self.clone();
+            set.spawn(async move {
+                match engine
+                    .prober
+                    .probe_tcp(ip, 443, Duration::from_secs(3))
+                    .await
+                {
+                    Ok(latency) => {
+                        // A successful probe is a real sample: the success count
+                        // rises, so the fail rate — and the rank — recover.
+                        engine.record_ip(&domain, ip, Some(latency), false);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            });
+        }
+        let mut restored = 0;
+        while let Some(joined) = set.join_next().await {
+            if matches!(joined, Ok(true)) {
+                restored += 1;
+            }
+        }
+        if restored > 0 {
+            tracing::info!(restored, "failed ip scores restored after re-probe");
+        }
+        restored
+    }
+
+    /// Record a raw-tunnel success (TCP only; the browser's own TLS handshake validates the
+    /// certificate end to end).
+    pub fn note_tunnel_success(&self, plan: &ConnectPlan, latency_ms: u64) {
+        let config = self.config.snapshot();
+        self.record_success(
+            plan,
+            latency_ms,
+            Vec::new(),
+            &DohExpansion::default(),
+            &config,
+        );
+    }
+
+    pub(super) fn record_success(
+        &self,
+        plan: &ConnectPlan,
+        latency_ms: u64,
+        attempts: Vec<AttemptRecord>,
+        doh: &DohExpansion,
+        config: &AppConfig,
+    ) -> DomainDiagnostics {
+        self.cache.put_last_good(LastGoodEntry {
+            domain: plan.domain.clone(),
+            ip: plan.ip,
+            strategy: plan.mode.cache_strategy(),
+            source: plan.source,
+            network_id: network_id(),
+            saved_at: now(),
+            catalog_version: config.catalog_version,
+        });
+        let cache_status = match plan.source {
+            IpSource::Cache => CacheStatus::Fresh,
+            IpSource::DohCache => CacheStatus::Stale,
+            IpSource::Remote | IpSource::Doh => CacheStatus::None,
+        };
+        let doh_source = match plan.source {
+            IpSource::Doh | IpSource::DohCache => doh.source,
+            _ => None,
+        };
+        if attempts.len() > 1 {
+            for (index, attempt) in attempts.iter().enumerate() {
+                tracing::info!(
+                    domain = %plan.domain,
+                    attempt = index + 1,
+                    strategy = ?attempt.strategy,
+                    ip = %attempt.ip,
+                    source = ?attempt.source,
+                    error = ?attempt.error,
+                    "failed candidate before success"
+                );
+            }
+        }
+        let attempts_total = attempts.len();
+        let diagnostics = DomainDiagnostics {
+            group: Some(plan.group_id.clone()),
+            domain: plan.domain.clone(),
+            state: if plan.mode == TlsMode::Direct {
+                State::Direct
+            } else {
+                State::Normal
+            },
+            strategy: Some(plan.mode),
+            configured_strategy: config.group(&plan.group_id).map(|group| group.strategy),
+            ip: Some(plan.ip),
+            ip_source: Some(plan.source),
+            doh_source,
+            latency_ms: Some(latency_ms),
+            last_check: now(),
+            catalog_version: config.catalog_version,
+            cache: cache_status,
+            error: None,
+            detail: None,
+            attempts,
+            suggestions: Vec::new(),
+        };
+        let degraded = self.record_ip(&plan.domain, plan.ip, Some(latency_ms), false);
+        self.remember_plan(plan);
+        if degraded {
+            // The proven route suddenly got slow: drop the cached plan so the next
+            // connection re-races the routes instead of staying pinned to it.
+            tracing::info!(
+                domain = %plan.domain,
+                latency_ms,
+                "route degraded; re-racing routes on the next connection"
+            );
+            self.plan_cache
+                .lock()
+                .remove(&plan_key(&plan.domain, plan.port, plan.tls));
+        }
+        self.status.record(diagnostics.clone());
+        tracing::info!(
+            group = %plan.group_id,
+            domain = %plan.domain,
+            ip = %plan.ip,
+            mode = %plan.mode,
+            source = %plan.source,
+            latency_ms,
+            attempts = attempts_total,
+            "resolved connection strategy"
+        );
+        diagnostics
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn failure_diagnostics(
+        &self,
+        group: &GroupConfig,
+        domain: &str,
+        config: &AppConfig,
+        reason: FailureReason,
+        attempts: Vec<AttemptRecord>,
+        doh: &DohExpansion,
+        detail: Option<String>,
+    ) -> DomainDiagnostics {
+        let mut suggestions = vec![reason.suggestion().to_string()];
+        if !self.remote.has_ip_catalog() {
+            let extra = "No remote IP catalog is loaded; configure catalogs.ip or wait for the next refresh.";
+            if !suggestions.iter().any(|item| item == extra) {
+                suggestions.push(extra.to_string());
+            }
+        }
+        if let Some(error) = &doh.error {
+            suggestions.push(format!("DoH error: {error}"));
+        }
+        let diagnostics = DomainDiagnostics {
+            group: Some(group.id.clone()),
+            domain: domain.to_string(),
+            state: State::Failed,
+            strategy: None,
+            configured_strategy: Some(group.strategy),
+            ip: None,
+            ip_source: None,
+            doh_source: doh.source,
+            latency_ms: None,
+            last_check: now(),
+            catalog_version: config.catalog_version,
+            cache: if doh.stale {
+                CacheStatus::Stale
+            } else {
+                CacheStatus::None
+            },
+            error: Some(reason),
+            detail,
+            attempts,
+            suggestions,
+        };
+        self.status.record(diagnostics.clone());
+        tracing::warn!(
+            group = %group.id,
+            domain = %domain,
+            reason = %reason,
+            "all connection strategies failed"
+        );
+        diagnostics
+    }
+
+    fn internal_failure(&self, domain: &str) -> DecisionOutcome {
+        let config = self.config.snapshot();
+        self.config_failure(
+            None,
+            domain,
+            &config,
+            FailureReason::Internal,
+            "route generator ended without a result".into(),
+        )
+    }
+
+    pub(super) async fn expand_doh(
+        &self,
+        domain: &str,
+        candidates: &mut Vec<Candidate>,
+        seen: &mut HashSet<IpAddr>,
+        max: usize,
+    ) -> DohExpansion {
+        let started = std::time::Instant::now();
+        match self.resolver.doh_ips(domain).await {
+            Ok(DohResolution {
+                ips,
+                hints,
+                source,
+                stale,
+                ..
+            }) => {
+                let elapsed = started.elapsed().as_millis() as u64;
+                let candidate_source = if stale {
+                    IpSource::DohCache
+                } else {
+                    IpSource::Doh
+                };
+                let before = candidates.len();
+                for ip in ips.into_iter().chain(hints) {
+                    if candidates.len() >= max {
+                        break;
+                    }
+                    if seen.insert(ip) {
+                        candidates.push(Candidate {
+                            ip,
+                            source: candidate_source,
+                        });
+                    }
+                }
+                // DoH is the expensive fallback: its cost and yield decide
+                // whether the catalog needs better coverage.
+                if elapsed > 1000 {
+                    tracing::warn!(
+                        domain = %domain,
+                        source = ?source,
+                        stale,
+                        added = candidates.len() - before,
+                        elapsed_ms = elapsed,
+                        "doh expansion was slow"
+                    );
+                } else {
+                    tracing::info!(
+                        domain = %domain,
+                        source = ?source,
+                        stale,
+                        added = candidates.len() - before,
+                        elapsed_ms = elapsed,
+                        "doh expansion"
+                    );
+                }
+                DohExpansion {
+                    source: Some(source),
+                    error: None,
+                    stale,
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    domain = %domain,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    error = %format!("{error:#}"),
+                    "doh expansion failed"
+                );
+                DohExpansion {
+                    source: None,
+                    error: Some(format!("{error:#}")),
+                    stale: false,
+                }
+            }
+        }
+    }
+
+    pub(super) fn sni_candidates(
+        &self,
+        config: &AppConfig,
+        group: &GroupConfig,
+        domain: &str,
+        network: &str,
+    ) -> Vec<Option<String>> {
+        // A group that names its own SNI is authoritative: `Some("")` means
+        // "send no SNI", not "fall back to the shared candidates".
+        if let Some(configured) = &group.sni {
+            let value = configured.trim().to_ascii_lowercase();
+            return vec![if value.is_empty() { None } else { Some(value) }];
+        }
+
+        let mut out: Vec<Option<String>> = Vec::new();
+        let mut push = |candidate: Option<String>| {
+            let normalized = candidate.and_then(|value| {
+                if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value.to_ascii_lowercase())
+                }
+            });
+            if !out.contains(&normalized) {
+                out.push(normalized);
+            }
+        };
+        if let Some(cached) = self.cache.sni(&group.id, domain, network) {
+            push(cached.sni);
+        }
+        if let Some(remote) = self.remote.remote_sni(&group.id) {
+            push(Some(remote));
+        }
+        for candidate in &config.advanced.fake_sni_candidates {
+            push(Some(candidate.clone()));
+        }
+        if out.is_empty() {
+            out.push(None);
+        }
+        // Real fake-SNI hosts race first; a `None` entry (no SNI replacement) is
+        // effectively a duplicate of the direct route on the same IP, so it goes last.
+        out.sort_by_key(|entry| entry.is_none());
+        out
+    }
+
+    fn config_failure(
+        &self,
+        group: Option<String>,
+        domain: &str,
+        config: &AppConfig,
+        reason: FailureReason,
+        detail: String,
+    ) -> DecisionOutcome {
+        let diagnostics = DomainDiagnostics {
+            group,
+            domain: domain.to_string(),
+            state: State::Failed,
+            strategy: None,
+            configured_strategy: None,
+            ip: None,
+            ip_source: None,
+            doh_source: None,
+            latency_ms: None,
+            last_check: now(),
+            catalog_version: config.catalog_version,
+            cache: CacheStatus::None,
+            error: Some(reason),
+            detail: Some(detail),
+            attempts: Vec::new(),
+            suggestions: vec![reason.suggestion().to_string()],
+        };
+        self.status.record(diagnostics.clone());
+        DecisionOutcome {
+            plan: None,
+            diagnostics,
+        }
+    }
+
+    fn state_only(
+        &self,
+        group: &GroupConfig,
+        domain: &str,
+        config: &AppConfig,
+        state: State,
+        detail: &str,
+    ) -> DecisionOutcome {
+        let diagnostics = DomainDiagnostics {
+            group: Some(group.id.clone()),
+            domain: domain.to_string(),
+            state,
+            strategy: None,
+            configured_strategy: Some(group.strategy),
+            ip: None,
+            ip_source: None,
+            doh_source: None,
+            latency_ms: None,
+            last_check: now(),
+            catalog_version: config.catalog_version,
+            cache: CacheStatus::None,
+            error: None,
+            detail: Some(detail.to_string()),
+            attempts: Vec::new(),
+            suggestions: Vec::new(),
+        };
+        DecisionOutcome {
+            plan: None,
+            diagnostics,
+        }
+    }
+}

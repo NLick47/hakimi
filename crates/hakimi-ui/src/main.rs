@@ -7,17 +7,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
+use hakimi_core::config::{AppConfig, GroupConfig};
 use hakimi_core::instance::{InstanceLock, InstanceLockError};
 use hakimi_core::runtime::HakimiRuntime;
-use hakimi_core::config::{AppConfig, GroupConfig};
 use hakimi_core::strategy::Strategy;
 use serde_json::Value;
 use slint::{Color, Model, ModelRc, SharedString, VecModel};
+use ui_state::SettlePhase;
 
 slint::include_modules!();
 
+mod model;
 mod ui_state;
+
+#[cfg(test)]
+pub(crate) use model::icon_key_for;
+pub(crate) use model::{
+    build_sites, build_snapshot, builtin_group_ids, editor_strategy_index, finish_snapshot,
+    strategy_from_index, text, SiteData, SweepState, SITE_ICONS,
+};
 
 pub(crate) fn data_dir() -> Option<PathBuf> {
     std::env::var_os("HAKIMI_DATA_DIR").map(PathBuf::from)
@@ -71,51 +80,11 @@ fn reveal_window(app: &AppWindow) {
     activate_app();
 }
 
-fn text(value: &Value, key: &str) -> String {
-    match value.get(key) {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Bool(flag)) => flag.to_string(),
-        Some(Value::Number(number)) => number.to_string(),
-        _ => String::new(),
-    }
-}
-
-use ui_state::{apply_settle, SettlePhase, BAD_COLOR, IDLE_COLOR, OK_COLOR, SLOW_COLOR};
-
 fn color(hex: &str) -> Color {
     let value = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0x88_88_88);
     Color::from_argb_encoded(0xFF00_0000 | value)
 }
-
 // Plain-data snapshots cross the thread boundary; Slint types are built on the UI thread.
-
-#[derive(Clone, PartialEq)]
-struct DomainData {
-    host: String,
-    status: String,
-    status_hex: &'static str,
-    latency: String,
-}
-
-#[derive(Clone, PartialEq)]
-struct SiteData {
-    id: String,
-    name: String,
-    initial: String,
-    icon_key: String,
-    tile_hex: &'static str,
-    summary: String,
-    summary_hex: &'static str,
-    enabled: bool,
-    open: bool,
-    first: bool,
-    last: bool,
-    url: String,
-    strategy: i32,
-    sni: String,
-    custom: bool,
-    domains: Vec<DomainData>,
-}
 
 fn build_site_entry(site: &SiteData) -> SiteEntry {
     let domains: Vec<DomainEntry> = site
@@ -147,346 +116,6 @@ fn build_site_entry(site: &SiteData) -> SiteEntry {
         sni: SharedString::from(site.sni.clone()),
         custom: site.custom,
         domains: ModelRc::new(VecModel::from(domains)),
-    }
-}
-
-/// Strategy index used by the UI: 0 auto, 1 direct, 2 ech, 3 fake SNI.
-fn strategy_index(raw: &str) -> i32 {
-    match raw {
-        "direct" => 1,
-        "ech" => 2,
-        "sni" => 3,
-        _ => 0,
-    }
-}
-
-fn strategy_from_index(index: i32) -> Strategy {
-    match index {
-        1 => Strategy::Direct,
-        2 => Strategy::Ech,
-        3 => Strategy::FakeSni,
-        _ => Strategy::Auto,
-    }
-}
-
-/// Direct is not offered in the editor: `auto` already tries direct first, so a
-/// group pinned to direct is shown as auto and widened on the next save.
-fn editor_strategy_index(strategy: Strategy) -> i32 {
-    match strategy {
-        Strategy::Ech => 2,
-        Strategy::FakeSni => 3,
-        Strategy::Auto | Strategy::Direct => 0,
-    }
-}
-
-/// Built-in group ids. Anything else was added by the user and may be removed
-/// from the UI.
-fn builtin_group_ids() -> std::collections::HashSet<String> {
-    hakimi_core::config::default_groups()
-        .into_iter()
-        .map(|group| group.id)
-        .collect()
-}
-
-/// Muted brand-ish tiles for groups without a real favicon.
-const TILE_PALETTE: [&str; 8] = [
-    "#5B7A9D", "#4E9E6F", "#C2913A", "#B0685E", "#7D6B9E", "#3F8C8C", "#96693F", "#8A6A8A",
-];
-
-fn tile_color(id: &str) -> &'static str {
-    let hash: usize = id.bytes().map(|b| b as usize).sum();
-    TILE_PALETTE[hash % TILE_PALETTE.len()]
-}
-
-/// Domain status as (word, color hex, latency text) from a diagnostics record.
-fn domain_status(
-    state: &str,
-    latency_ms: Option<u64>,
-    group_enabled: bool,
-) -> (String, &'static str, String) {
-    if !group_enabled {
-        return ("未选择".into(), IDLE_COLOR, "—".into());
-    }
-    match state {
-        "failed" => ("超时".into(), BAD_COLOR, "—".into()),
-        "checking" => ("检测中".into(), IDLE_COLOR, "…".into()),
-        "direct" => ("直连".into(), IDLE_COLOR, "—".into()),
-        "normal" => match latency_ms {
-            Some(ms) if ms > 150 => ("较慢".into(), SLOW_COLOR, format!("{ms} ms")),
-            Some(ms) => ("正常".into(), OK_COLOR, format!("{ms} ms")),
-            None => ("正常".into(), OK_COLOR, "—".into()),
-        },
-        _ => ("—".into(), IDLE_COLOR, "—".into()),
-    }
-}
-
-/// Builds the raw per-site rows from the status/config JSON. Summaries here
-/// are the live values, before the settle/hysteresis pass.
-pub(crate) fn build_sites(
-    status: &Value,
-    config: &Value,
-    expanded: &HashSet<String>,
-) -> (Vec<SiteData>, usize) {
-    let mut diagnostics: HashMap<String, &Value> = HashMap::new();
-    if let Some(domains) = status.get("domains").and_then(Value::as_array) {
-        for record in domains {
-            let host = text(record, "domain");
-            if !host.is_empty() {
-                diagnostics.insert(host, record);
-            }
-        }
-    }
-
-    let mut sites: Vec<SiteData> = Vec::new();
-    let mut selected = 0usize;
-    let builtins = builtin_group_ids();
-
-    if let Some(groups) = config.get("groups").and_then(Value::as_array) {
-        for group in groups {
-            let id = text(group, "id");
-            let name = text(group, "name");
-            let enabled = group
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if enabled {
-                selected += 1;
-            }
-
-            let raw_domains: Vec<String> = group
-                .get("domains")
-                .and_then(Value::as_array)
-                .map(|list| {
-                    list.iter()
-                        .filter_map(Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let domains_config: Vec<String> = raw_domains
-                .iter()
-                .filter(|host| !host.starts_with("*."))
-                .take(12)
-                .cloned()
-                .collect();
-
-            let mut rows: Vec<DomainData> = Vec::new();
-            let mut slow = 0usize;
-            let mut bad = 0usize;
-            let mut checking = 0usize;
-            let mut tested = 0usize;
-            for host in &domains_config {
-                let (word, word_hex, latency) = match diagnostics.get(host) {
-                    Some(record) if enabled => {
-                        let state = text(record, "state");
-                        if state == "paused" || state == "disabled" {
-                            // A routing bypass is not a health result.
-                            domain_status("", None, enabled)
-                        } else {
-                            tested += 1;
-                            let latency_ms = record.get("latencyMs").and_then(Value::as_u64);
-                            // Health is an observation, not a function of the
-                            // global switch: a paused app still knows its sites.
-                            match state.as_str() {
-                                "failed" => bad += 1,
-                                "checking" => checking += 1,
-                                "normal" if latency_ms.map(|ms| ms > 150).unwrap_or(false) => slow += 1,
-                                _ => {}
-                            }
-                            domain_status(&state, latency_ms, enabled)
-                        }
-                    }
-                    _ => domain_status("", None, enabled),
-                };
-                rows.push(DomainData {
-                    host: host.clone(),
-                    status: word,
-                    status_hex: word_hex,
-                    latency,
-                });
-            }
-
-            let count = domains_config.len();
-            let (summary, summary_hex) = if !enabled {
-                (format!("{count} 个域名 · 未选择"), IDLE_COLOR)
-            } else if bad > 0 {
-                let text = match (bad == count, slow) {
-                    (true, _) => format!("{count} 个域名 · 全部超时"),
-                    (false, 0) => format!("{count} 个域名 · {bad} 个超时"),
-                    (false, n) => format!("{count} 个域名 · {bad} 个超时 · {n} 个较慢"),
-                };
-                (text, BAD_COLOR)
-            } else if slow > 0 {
-                let text = if slow == count {
-                    format!("{count} 个域名 · 全部较慢")
-                } else {
-                    format!("{count} 个域名 · {slow} 个较慢")
-                };
-                (text, SLOW_COLOR)
-            } else if checking > 0 {
-                (format!("{count} 个域名 · 检测中"), IDLE_COLOR)
-            } else if tested == 0 {
-                (format!("{count} 个域名 · 待检测"), IDLE_COLOR)
-            } else {
-                (format!("{count} 个域名 · 全部正常"), OK_COLOR)
-            };
-
-            let primary = domains_config
-                .first()
-                .cloned()
-                .or_else(|| {
-                    raw_domains
-                        .iter()
-                        .find_map(|host| host.strip_prefix("*.").map(ToOwned::to_owned))
-                })
-                .unwrap_or_else(|| "example.com".into());
-
-            let initial = name.chars().next().map(String::from).unwrap_or_default();
-            let id_key = id.clone();
-            let tile_hex = tile_color(&id);
-            let icon_key = icon_key_for(&id);
-            let strategy = strategy_index(&text(group, "strategy"));
-            let sni = text(group, "sni");
-            let custom = !builtins.contains(&id);
-            // The preset/catalog owns the canonical landing page; custom groups
-            // fall back to their first exact routed domain.
-            let homepage = group
-                .get("homepage")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|url| {
-                    let lower = url.to_ascii_lowercase();
-                    lower.starts_with("https://") || lower.starts_with("http://")
-                })
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| format!("https://{primary}/"));
-
-            sites.push(SiteData {
-                icon_key,
-                id,
-                name,
-                initial,
-                tile_hex,
-                summary,
-                summary_hex,
-                enabled,
-                open: expanded.contains(&id_key),
-                first: false,
-                last: false,
-                url: homepage,
-                strategy,
-                sni,
-                custom,
-                domains: rows,
-            });
-        }
-    }
-
-    // Mark the first and last rows so the group card can draw its separators.
-    let total = sites.len();
-    for (index, site) in sites.iter_mut().enumerate() {
-        site.first = index == 0;
-        site.last = index + 1 == total;
-    }
-
-    (sites, selected)
-}
-
-/// Applies the display hysteresis and derives the subtitle. Takes the raw rows
-/// by value so an unchanged refresh tick can clone the cached rows and reuse
-/// the expensive part (the status snapshot) without re-reading it.
-pub(crate) fn finish_snapshot(
-    mut sites: Vec<SiteData>,
-    selected: usize,
-    master_running: bool,
-    starting: bool,
-    settle: Option<SettlePhase>,
-) -> (Vec<SiteData>, String) {
-    // Probing makes the raw summaries flap between 超时/较慢 while the engine
-    // hunts for a working IP. With hysteresis a summary is only shown once it
-    // has been stable for a moment; before that a fresh site holds on 测速中.
-    if let Some(phase) = settle {
-        apply_settle(&mut sites, phase);
-    }
-    let failed_sites = sites
-        .iter()
-        .filter(|site| site.enabled && site.summary.contains("超时"))
-        .count();
-
-    let all_untested = sites
-        .iter()
-        .filter(|site| site.enabled)
-        .all(|site| site.domains.iter().all(|domain| domain.status == "—"));
-    let subtitle = if selected == 0 {
-        "未选择站点，勾选后即可加速".to_string()
-    } else if matches!(settle, Some(SettlePhase::Sweeping)) {
-        let total: usize = sites
-            .iter()
-            .filter(|site| site.enabled)
-            .map(|site| site.domains.len())
-            .sum();
-        let pending = sites
-            .iter()
-            .filter(|site| site.enabled)
-            .flat_map(|site| &site.domains)
-            .filter(|domain| domain.status == "检测中")
-            .count();
-        if pending == 0 {
-            format!("正在检测 {total} 个域名 · 结果会自动更新")
-        } else {
-            format!("正在检测 {pending}/{total} 个域名 · 结果会自动更新")
-        }
-    } else if all_untested {
-        // Selection never starts a test: point at the explicit action instead
-        // of leaving "待检测" unexplained.
-        format!("已选择 {selected} 个站点 · 点击检测选中获取健康状态")
-    } else if failed_sites > 0 {
-        if starting || master_running {
-            format!("正在加速 {selected} 个站点 · {failed_sites} 个异常")
-        } else {
-            format!("已选择 {selected} 个站点 · {failed_sites} 个异常 · 加速已暂停")
-        }
-    } else if starting || master_running {
-        format!("正在加速 {selected} 个站点")
-    } else {
-        format!("已选择 {selected} 个站点 · 加速已暂停")
-    };
-
-    (sites, subtitle)
-}
-
-/// Convenience wrapper used by tests and the offscreen `--shot` renderer.
-pub(crate) fn build_snapshot(
-    status: &Value,
-    config: &Value,
-    expanded: &HashSet<String>,
-    master_running: bool,
-    starting: bool,
-    settle: Option<SettlePhase>,
-) -> (Vec<SiteData>, String) {
-    let (sites, selected) = build_sites(status, config, expanded);
-    finish_snapshot(sites, selected, master_running, starting, settle)
-}
-
-/// How long a summary must stay unchanged before it replaces the displayed one.
-/// Lifecycle of a manual 测速 sweep. The flags are read by the refresh path
-/// (`phase`) and written by the sweep task; owning them in one place keeps the
-/// display policy inputs explicit instead of ambient.
-#[derive(Default)]
-struct SweepState {
-    running: AtomicBool,
-    commit_once: AtomicBool,
-}
-
-impl SweepState {
-    fn phase(&self) -> SettlePhase {
-        if self.running.load(Ordering::SeqCst) {
-            SettlePhase::Sweeping
-        } else if self.commit_once.swap(false, Ordering::SeqCst) {
-            SettlePhase::Commit
-        } else {
-            SettlePhase::Tracking
-        }
     }
 }
 
@@ -566,8 +195,7 @@ fn wire_window(app: &AppWindow, ctx: &UiContext) {
         app.on_toggle_master(move || {
             // Turning acceleration on with nothing selected would claim to run
             // an empty set. Leave the switch off; the subtitle explains why.
-            let turning_on =
-                MODEL.with(|m| m.borrow().accel() != ui_state::AccelState::Running);
+            let turning_on = MODEL.with(|m| m.borrow().accel() != ui_state::AccelState::Running);
             if turning_on && !runtime.config().snapshot().groups.iter().any(|g| g.enabled) {
                 return;
             }
@@ -922,10 +550,8 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
                             WINDOW.with(|slot| {
                                 // A tray click may have raced the drop and
                                 // built a newer window; never clear that one.
-                                let stale = slot
-                                    .borrow()
-                                    .as_ref()
-                                    .is_some_and(|shell| shell.id == id);
+                                let stale =
+                                    slot.borrow().as_ref().is_some_and(|shell| shell.id == id);
                                 if stale {
                                     *slot.borrow_mut() = None;
                                 }
@@ -944,29 +570,6 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
         id,
         closing,
     })
-}
-
-/// Bundled site logos, matched against a group id. Exact ids and `<key>-…`
-/// slugs count; a bare `contains` would hand the E-Hentai logo to any domain
-/// that happens to have "eh" in the middle of its slug.
-const SITE_ICONS: [&str; 10] = [
-    "pixiv", "hitomi", "poipiku", "booth", "steam", "github", "ao3", "eh", "hanime",
-    "nhentai",
-];
-
-fn icon_key_for(id: &str) -> String {
-    SITE_ICONS
-        .iter()
-        .copied()
-        .find(|key| {
-            let key = *key;
-            id.eq_ignore_ascii_case(key)
-                || id
-                    .strip_prefix(key)
-                    .is_some_and(|rest| rest.starts_with('-'))
-        })
-        .map(|key| key.to_string())
-        .unwrap_or_default()
 }
 
 /// Sidebar counters for the desktop layout.
@@ -1172,7 +775,6 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
         catalog_doh: field("catalogs", "doh"),
     }
 }
-
 
 // -- settings writes ------------------------------------------------------------
 
@@ -1511,7 +1113,14 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     // Offscreen states for reviewing the environment-check UI.
     let broken = std::env::var("HAKIMI_UI_BROKEN").is_ok();
     let fix_page = std::env::var("HAKIMI_UI_FIXPAGE").is_ok();
-    app.set_ca_installed(!broken && !fix_page && ca.get("installed").and_then(Value::as_bool).unwrap_or(false));
+    app.set_ca_installed(
+        !broken
+            && !fix_page
+            && ca
+                .get("installed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+    );
     if broken || fix_page {
         app.set_ca_error(SharedString::from("已导入，但尚未受信任"));
     }
@@ -1694,8 +1303,12 @@ fn refresh(
                 let ca = &status["ca"];
                 let ca_state = (
                     ca.get("present").and_then(Value::as_bool).unwrap_or(false),
-                    ca.get("supported").and_then(Value::as_bool).unwrap_or(false),
-                    ca.get("installed").and_then(Value::as_bool).unwrap_or(false),
+                    ca.get("supported")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    ca.get("installed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                 );
                 let settings = settings_values(&config);
                 REFRESH_CACHE.with(|cell| {
@@ -1755,7 +1368,9 @@ fn main() -> Result<()> {
     // Single instance: a second long-running app would fight over the proxy port.
     let instance_dir = match data_dir() {
         Some(dir) => dir,
-        None => hakimi_core::paths::Paths::default_location()?.root().to_path_buf(),
+        None => hakimi_core::paths::Paths::default_location()?
+            .root()
+            .to_path_buf(),
     };
     let _instance_lock = match InstanceLock::acquire(&instance_dir) {
         Ok(lock) => lock,
@@ -1884,8 +1499,7 @@ fn main() -> Result<()> {
             }
             // No window: drive the same state machine directly.
             let runtime = ctx.runtime.clone();
-            let turning_on =
-                MODEL.with(|m| m.borrow().accel() != ui_state::AccelState::Running);
+            let turning_on = MODEL.with(|m| m.borrow().accel() != ui_state::AccelState::Running);
             if turning_on && !runtime.config().snapshot().groups.iter().any(|g| g.enabled) {
                 return;
             }
@@ -1994,453 +1608,4 @@ fn main() -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn draft(domains: &str, strategy: Strategy, sni: &str) -> SiteDraft {
-        SiteDraft {
-            id: String::new(),
-            is_new: true,
-            name: String::new(),
-            domains: domains.into(),
-            homepage: String::new(),
-            strategy,
-            sni: sni.into(),
-        }
-    }
-
-    #[test]
-    fn new_site_gets_a_config_safe_id() {
-        let config = AppConfig::default();
-        let group = build_group(&config, &draft("www.example.com", Strategy::Auto, "")).unwrap();
-        assert_eq!(group.id, "www-example-com");
-        assert_eq!(group.name, "www.example.com");
-        assert!(group.enabled);
-        assert_eq!(group.sni, None);
-    }
-
-    #[test]
-    fn empty_sni_is_preserved_for_fake_sni() {
-        let config = AppConfig::default();
-        let group = build_group(&config, &draft("example.com", Strategy::FakeSni, " ")).unwrap();
-        assert_eq!(group.sni.as_deref(), Some(""));
-    }
-
-    #[test]
-    fn sni_is_dropped_for_other_strategies() {
-        let config = AppConfig::default();
-        let group = build_group(&config, &draft("example.com", Strategy::Ech, "")).unwrap();
-        assert_eq!(group.sni, None);
-    }
-
-    #[test]
-    fn rejects_domains_without_an_exact_entry() {
-        let config = AppConfig::default();
-        assert!(build_group(&config, &draft("*.example.com", Strategy::Auto, "")).is_err());
-    }
-
-    #[test]
-    fn rejects_domains_owned_by_another_group() {
-        let config = AppConfig::default();
-        let error = build_group(&config, &draft("github.com", Strategy::Auto, "")).unwrap_err();
-        assert!(format!("{error:#}").contains("GitHub"));
-    }
-
-    #[test]
-    fn rejects_malformed_domains() {
-        let config = AppConfig::default();
-        assert!(build_group(&config, &draft("example..com", Strategy::Auto, "")).is_err());
-    }
-
-    #[test]
-    fn ca_actions_are_judged_by_the_resulting_trust_state() {
-        // A cancelled dialog must never read as success.
-        let cancelled = anyhow::anyhow!("user canceled the authorization dialog");
-        assert_eq!(ca_outcome(Err(cancelled), true), CaOutcome::Cancelled);
-
-        // `security` can exit 0 while nothing got trusted: the store decides.
-        assert_eq!(ca_outcome(Ok(false), true), CaOutcome::Failed);
-        assert_eq!(ca_outcome(Ok(true), false), CaOutcome::Failed);
-        assert_eq!(ca_outcome(Ok(true), true), CaOutcome::Done);
-        assert_eq!(ca_outcome(Ok(false), false), CaOutcome::Done);
-
-        let failed = anyhow::anyhow!("security add-trusted-cert failed: boom");
-        assert_eq!(ca_outcome(Err(failed), true), CaOutcome::Failed);
-
-        assert_eq!(CaOutcome::Cancelled.message(), Some("已取消，未做更改"));
-        assert_eq!(CaOutcome::Failed.message(), Some("未成功，请重试"));
-        assert_eq!(CaOutcome::Done.message(), None);
-    }
-
-
-
-
-    #[test]
-    fn probe_sweep_phases_drive_the_display() {
-        let config = serde_json::json!({
-            "groups": [
-                { "id": "flip", "name": "Flip", "enabled": true, "domains": ["flip.example"] }
-            ]
-        });
-
-        // While the sweep runs, every active site holds 测速中.
-        let status_bad = serde_json::json!({
-            "domains": [{ "domain": "flip.example", "state": "failed" }]
-        });
-        let (sites, _) = build_snapshot(
-            &status_bad, &config, &HashSet::new(), true, false, Some(ui_state::SettlePhase::Sweeping),
-        );
-        assert_eq!(sites[0].summary, "1 个域名 · 测速中");
-
-        // When the sweep finishes the fresh results commit at once.
-        let status_slow = serde_json::json!({
-            "domains": [{ "domain": "flip.example", "state": "normal", "latencyMs": 200 }]
-        });
-        let (sites, _) = build_snapshot(
-            &status_slow, &config, &HashSet::new(), true, false, Some(ui_state::SettlePhase::Commit),
-        );
-        assert_eq!(sites[0].summary, "1 个域名 · 全部较慢");
-
-        // Afterwards background tracking keeps a brief flip from showing.
-        let (sites, _) = build_snapshot(
-            &status_bad, &config, &HashSet::new(), true, false, Some(ui_state::SettlePhase::Tracking),
-        );
-        assert_eq!(sites[0].summary, "1 个域名 · 全部较慢");
-    }
-
-    #[test]
-    fn icon_keys_match_whole_ids_and_slugs_only() {
-        assert_eq!(icon_key_for("eh"), "eh");
-        assert_eq!(icon_key_for("ao3"), "ao3");
-        // A site added from pixiv.net gets the slug `pixiv-net`.
-        assert_eq!(icon_key_for("pixiv-net"), "pixiv");
-        // Must not hand the E-Hentai logo to a slug that merely contains "eh".
-        assert_eq!(icon_key_for("mehta-com"), "");
-        // Sites that ship their own logo match by id.
-        assert_eq!(icon_key_for("nhentai"), "nhentai");
-        assert_eq!(icon_key_for("hanime"), "hanime");
-    }
-
-    fn draft_with(
-        id: &str,
-        is_new: bool,
-        domains: &str,
-        strategy: Strategy,
-        sni: &str,
-    ) -> SiteDraft {
-        SiteDraft {
-            id: id.into(),
-            is_new,
-            name: String::new(),
-            domains: domains.into(),
-            homepage: String::new(),
-            strategy,
-            sni: sni.into(),
-        }
-    }
-
-    #[test]
-    fn new_site_homepage_is_normalized_and_optional() {
-        let config = AppConfig::default();
-        let mut site = draft("www.example.com", Strategy::Auto, "");
-
-        // Blank means "use the first exact domain" at render time.
-        assert_eq!(build_group(&config, &site).unwrap().homepage, None);
-
-        site.homepage = "example.com".into();
-        assert_eq!(
-            build_group(&config, &site).unwrap().homepage.as_deref(),
-            Some("https://example.com")
-        );
-
-        site.homepage = "https://www.example.com/path".into();
-        assert_eq!(
-            build_group(&config, &site).unwrap().homepage.as_deref(),
-            Some("https://www.example.com/path")
-        );
-
-        site.homepage = "file:///etc/passwd".into();
-        assert!(build_group(&config, &site).is_err());
-    }
-
-    #[test]
-    fn editing_a_site_keeps_its_id_and_shared_flags() {
-        let mut config = AppConfig::default();
-        let mut existing = config.group("pixiv").unwrap().clone();
-        existing.ech_shared = true;
-        existing.experimental = true;
-        config.groups = vec![existing];
-
-        let group = build_group(
-            &config,
-            &draft_with("pixiv", false, "pixiv.net\nwww.pixiv.net", Strategy::FakeSni, ""),
-        )
-        .unwrap();
-
-        assert_eq!(group.id, "pixiv");
-        assert!(group.ech_shared, "editing must not drop echShared");
-        assert!(group.experimental, "editing must not drop experimental");
-        assert_eq!(group.domains, vec!["pixiv.net", "www.pixiv.net"]);
-    }
-
-    #[test]
-    fn generated_ids_avoid_existing_groups() {
-        let mut config = AppConfig::default();
-        let mut taken = config.group("pixiv").unwrap().clone();
-        taken.id = "example-com".into();
-        taken.domains = vec!["other.example".into()];
-        config.groups.push(taken);
-
-        let group = build_group(&config, &draft("example.com", Strategy::Auto, "")).unwrap();
-        assert_eq!(group.id, "example-com-2");
-    }
-
-    #[test]
-    fn domains_accept_commas_and_whitespace() {
-        let config = AppConfig::default();
-        let group = build_group(
-            &config,
-            &draft("a.example, b.example，c.example\nd.example", Strategy::Auto, ""),
-        )
-        .unwrap();
-        assert_eq!(
-            group.domains,
-            vec!["a.example", "b.example", "c.example", "d.example"]
-        );
-    }
-
-    #[test]
-    fn domains_are_lowercased_and_deduped() {
-        let config = AppConfig::default();
-        let group = build_group(
-            &config,
-            &draft("Example.COM example.com", Strategy::Auto, ""),
-        )
-        .unwrap();
-        assert_eq!(group.domains, vec!["example.com"]);
-        assert_eq!(group.name, "example.com", "name falls back to the first domain");
-    }
-
-    #[test]
-    fn sni_hostnames_are_normalized() {
-        let config = AppConfig::default();
-        let group = build_group(
-            &config,
-            &draft("example.com", Strategy::FakeSni, "  WWW.Baidu.COM "),
-        )
-        .unwrap();
-        assert_eq!(group.sni.as_deref(), Some("www.baidu.com"));
-    }
-
-    #[test]
-    fn rejects_malformed_sni() {
-        let config = AppConfig::default();
-        assert!(build_group(
-            &config,
-            &draft("example.com", Strategy::FakeSni, "not a host")
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn pasted_urls_contribute_their_host() {
-        let config = AppConfig::default();
-        let group = build_group(
-            &config,
-            &draft(
-                "https://www.example.com/en/\nHTTPS://cdn.example.net:8443/x?q=1",
-                Strategy::Auto,
-                "",
-            ),
-        )
-        .unwrap();
-        assert_eq!(group.domains, vec!["www.example.com", "cdn.example.net"]);
-        assert_eq!(group.name, "www.example.com");
-    }
-
-    #[test]
-    fn urls_without_a_usable_host_are_rejected() {
-        let config = AppConfig::default();
-        for input in ["https://", "https:///path", "://example.com"] {
-            let error = build_group(&config, &draft(input, Strategy::Auto, "")).unwrap_err();
-            assert!(
-                format!("{error:#}").contains("网址"),
-                "{input} should read as a URL problem: {error:#}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_an_empty_domain_list() {
-        let config = AppConfig::default();
-        assert!(build_group(&config, &draft(" ,  , ", Strategy::Auto, "")).is_err());
-    }
-
-    #[test]
-    fn strategies_round_trip_through_the_editor() {
-        assert_eq!(strategy_from_index(editor_strategy_index(Strategy::Auto)), Strategy::Auto);
-        assert_eq!(strategy_from_index(editor_strategy_index(Strategy::Ech)), Strategy::Ech);
-        assert_eq!(
-            strategy_from_index(editor_strategy_index(Strategy::FakeSni)),
-            Strategy::FakeSni
-        );
-        // Direct is intentionally shown as Auto: auto already tries direct first.
-        assert_eq!(editor_strategy_index(Strategy::Direct), 0);
-    }
-
-    fn snapshot() -> (Vec<SiteData>, String) {
-        let config = serde_json::json!({
-            "groups": [
-                { "id": "ok", "name": "OK", "enabled": true,
-                  "domains": ["a.example", "b.example"] },
-                { "id": "slow", "name": "Slow", "enabled": true,
-                  "domains": ["c.example"] },
-                { "id": "bad", "name": "Bad", "enabled": true,
-                  "domains": ["d.example"] },
-                { "id": "off", "name": "Off", "enabled": false,
-                  "domains": ["e.example"] }
-            ]
-        });
-        let status = serde_json::json!({
-            "domains": [
-                { "domain": "a.example", "state": "normal", "latencyMs": 20 },
-                { "domain": "b.example", "state": "normal", "latencyMs": 30 },
-                { "domain": "c.example", "state": "normal", "latencyMs": 200 },
-                { "domain": "d.example", "state": "failed" },
-                { "domain": "e.example", "state": "normal", "latencyMs": 20 }
-            ]
-        });
-        build_snapshot(&status, &config, &HashSet::new(), true, false, None)
-    }
-
-    #[test]
-    fn visit_urls_use_canonical_homepages() {
-        let config = serde_json::json!({
-            "groups": [
-                { "id": "github", "name": "GitHub", "enabled": true, "domains": ["github.com"] },
-                { "id": "pixiv", "name": "Pixiv", "enabled": true, "domains": ["pixiv.net", "www.pixiv.net"], "homepage": "https://www.pixiv.net/" },
-                { "id": "ao3", "name": "AO3", "enabled": true, "domains": ["archiveofourown.org"] },
-                { "id": "eh", "name": "E-Hentai", "enabled": true, "domains": ["e-hentai.org"] },
-                { "id": "hitomi", "name": "Hitomi", "enabled": true, "domains": ["hitomi.la"] },
-                { "id": "nhentai", "name": "nhentai", "enabled": true, "domains": ["nhentai.net"] },
-                { "id": "hanime", "name": "Hanime", "enabled": true, "domains": ["hanime.tv"] },
-                { "id": "steam", "name": "Steam", "enabled": true, "domains": ["store.steampowered.com"] },
-                { "id": "poipiku", "name": "Poipiku", "enabled": true, "domains": ["poipiku.com"] },
-                { "id": "custom", "name": "Custom", "enabled": true, "domains": ["custom.example", "*.custom.example"], "homepage": "https://custom-home.example/" },
-                { "id": "fallback", "name": "Fallback", "enabled": true, "domains": ["fallback.example"] },
-                { "id": "wild", "name": "Wild", "enabled": true, "domains": ["*.wild.example"] }
-            ]
-        });
-        let status = serde_json::json!({ "domains": [] });
-        let (sites, _) = build_sites(&status, &config, &HashSet::new());
-        let url = |id: &str| {
-            sites
-                .iter()
-                .find(|site| site.id == id)
-                .unwrap()
-                .url
-                .as_str()
-        };
-
-        assert_eq!(url("pixiv"), "https://www.pixiv.net/");
-        assert_eq!(url("github"), "https://github.com/");
-        assert_eq!(url("ao3"), "https://archiveofourown.org/");
-        assert_eq!(url("eh"), "https://e-hentai.org/");
-        assert_eq!(url("hitomi"), "https://hitomi.la/");
-        assert_eq!(url("nhentai"), "https://nhentai.net/");
-        assert_eq!(url("hanime"), "https://hanime.tv/");
-        assert_eq!(url("steam"), "https://store.steampowered.com/");
-        assert_eq!(url("poipiku"), "https://poipiku.com/");
-        assert_eq!(url("custom"), "https://custom-home.example/");
-        assert_eq!(url("fallback"), "https://fallback.example/");
-        assert_eq!(url("wild"), "https://wild.example/");
-    }
-
-    #[test]
-    fn site_summaries_reflect_state_with_matching_colours() {
-        let (sites, _) = snapshot();
-        let by_id = |id: &str| sites.iter().find(|site| site.id == id).unwrap();
-
-        assert_eq!(by_id("ok").summary, "2 个域名 · 全部正常");
-        assert_eq!(by_id("ok").summary_hex, OK_COLOR);
-
-        assert_eq!(by_id("slow").summary, "1 个域名 · 全部较慢");
-        assert_eq!(by_id("slow").summary_hex, SLOW_COLOR);
-
-        assert_eq!(by_id("bad").summary, "1 个域名 · 全部超时");
-        assert_eq!(by_id("bad").summary_hex, BAD_COLOR);
-
-        assert_eq!(by_id("off").summary, "1 个域名 · 未选择");
-        assert_eq!(by_id("off").summary_hex, IDLE_COLOR);
-    }
-
-    #[test]
-    fn paused_snapshot_still_reports_health() {
-        let config = serde_json::json!({
-            "groups": [
-                { "id": "ok", "name": "OK", "enabled": true, "domains": ["a.example"] }
-            ]
-        });
-        let status = serde_json::json!({ "domains": [
-            { "domain": "a.example", "state": "failed" }
-        ]});
-        let (sites, subtitle) = build_snapshot(&status, &config, &HashSet::new(), false, false, None);
-        assert_eq!(
-            sites[0].summary, "1 个域名 · 全部超时",
-            "pause is a routing state, not a health result"
-        );
-        assert_eq!(sites[0].summary_hex, BAD_COLOR);
-        assert_eq!(subtitle, "已选择 1 个站点 · 1 个异常 · 加速已暂停");
-    }
-
-    #[test]
-    fn selected_but_untested_sites_point_to_the_explicit_action() {
-        let config = serde_json::json!({
-            "groups": [
-                { "id": "ok", "name": "OK", "enabled": true, "domains": ["a.example"] }
-            ]
-        });
-        let status = serde_json::json!({ "domains": [] });
-        let (sites, subtitle) = build_snapshot(&status, &config, &HashSet::new(), true, false, None);
-        assert_eq!(sites[0].summary, "1 个域名 · 待检测");
-        assert_eq!(
-            subtitle,
-            "已选择 1 个站点 · 点击检测选中获取健康状态",
-            "selection must not imply a test; the subtitle names the explicit action"
-        );
-    }
-
-    #[test]
-    fn a_sweep_is_visible_while_paused() {
-        let config = serde_json::json!({
-            "groups": [
-                { "id": "ok", "name": "OK", "enabled": true, "domains": ["a.example"] }
-            ]
-        });
-        let status = serde_json::json!({ "domains": [] });
-        let (sites, subtitle) = build_snapshot(
-            &status,
-            &config,
-            &HashSet::new(),
-            false,
-            false,
-            Some(SettlePhase::Sweeping),
-        );
-        assert_eq!(sites[0].summary, "1 个域名 · 测速中");
-        assert_eq!(subtitle, "正在检测 1 个域名 · 结果会自动更新");
-    }
-
-    #[test]
-    fn custom_groups_are_marked_for_deletion() {
-        let config = serde_json::json!({
-            "groups": [
-                { "id": "pixiv", "name": "Pixiv", "enabled": true, "domains": ["pixiv.net"] },
-                { "id": "mine", "name": "Mine", "enabled": true, "domains": ["mine.example"] }
-            ]
-        });
-        let (sites, _) = build_snapshot(&serde_json::json!({}), &config, &HashSet::new(), true, false, None);
-        assert!(!sites.iter().find(|s| s.id == "pixiv").unwrap().custom);
-        assert!(sites.iter().find(|s| s.id == "mine").unwrap().custom);
-    }
-
-}
+mod tests;
