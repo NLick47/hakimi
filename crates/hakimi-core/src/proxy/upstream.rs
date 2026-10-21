@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use http::uri::{Authority, PathAndQuery, Scheme, Uri};
-use http::{header, HeaderMap, Request, Response, StatusCode};
+use http::{header, HeaderMap, HeaderName, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use http_body_util::Either;
 use hyper::body::Incoming;
@@ -492,6 +492,11 @@ fn into_proxy_response(
     Response::from_parts(parts, body)
 }
 
+/// `HeaderName::from_static` does not allocate, while removing a header by
+/// `&str` builds a new name on every call.
+const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
+const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
+
 fn sanitize_request_headers(headers: &mut HeaderMap, upgrade: bool) {
     for name in [
         header::CONNECTION,
@@ -507,8 +512,8 @@ fn sanitize_request_headers(headers: &mut HeaderMap, upgrade: bool) {
             headers.remove(name);
         }
     }
-    headers.remove("keep-alive");
-    headers.remove("proxy-connection");
+    headers.remove(&KEEP_ALIVE);
+    headers.remove(&PROXY_CONNECTION);
 }
 
 fn sanitize_response_headers(headers: &mut HeaderMap, upgrade: bool) {
@@ -525,8 +530,8 @@ fn sanitize_response_headers(headers: &mut HeaderMap, upgrade: bool) {
             headers.remove(name);
         }
     }
-    headers.remove("keep-alive");
-    headers.remove("proxy-connection");
+    headers.remove(&KEEP_ALIVE);
+    headers.remove(&PROXY_CONNECTION);
 }
 
 fn authority(host: &str, port: u16, https: bool) -> Cow<'_, str> {
