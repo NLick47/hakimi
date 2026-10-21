@@ -42,9 +42,11 @@ struct OriginState {
     connections: AtomicUsize,
     h2_requests: AtomicUsize,
     versions: Mutex<Vec<http::Version>>,
+    alpn: Mutex<Vec<Vec<u8>>>,
 }
 
-/// An origin that only speaks HTTP/2 over TLS.
+/// An origin that speaks HTTP/1.1 and HTTP/2 over TLS and records what the
+/// client negotiated.
 async fn spawn_h2_origin(tls: Arc<rustls::ServerConfig>) -> (SocketAddr, Arc<OriginState>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -63,6 +65,11 @@ async fn spawn_h2_origin(tls: Arc<rustls::ServerConfig>) -> (SocketAddr, Arc<Ori
                 let Ok(tls) = acceptor.accept(stream).await else {
                     return;
                 };
+                state
+                    .alpn
+                    .lock()
+                    .unwrap()
+                    .push(tls.get_ref().1.alpn_protocol().unwrap_or_default().to_vec());
                 let service = service_fn(move |req: hyper::Request<Incoming>| {
                     let state = state.clone();
                     async move {
@@ -80,8 +87,9 @@ async fn spawn_h2_origin(tls: Arc<rustls::ServerConfig>) -> (SocketAddr, Arc<Ori
                         Ok::<_, Infallible>(hyper::Response::new(Full::new(body)))
                     }
                 });
-                let _ = http2::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(tls), service)
+                // `auto` speaks whichever protocol the client picked.
+                let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                    .serve_connection_with_upgrades(TokioIo::new(tls), service)
                     .await;
             });
         }
@@ -96,6 +104,7 @@ async fn spawn_h2_origin(tls: Arc<rustls::ServerConfig>) -> (SocketAddr, Arc<Ori
 async fn spawn_proxy(
     ca: Arc<CertificateAuthority>,
     origin: SocketAddr,
+    http1_hosts: Vec<String>,
 ) -> (SocketAddr, proxy::ProxyHandle, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::new(dir.path());
@@ -140,6 +149,7 @@ async fn spawn_proxy(
             // and the test must not reach the real resolvers.
             config.doh.primary = "https://127.0.0.1:1/dns-query".into();
             config.doh.fallback = "https://127.0.0.1:1/dns-query".into();
+            config.advanced.http1_hosts = http1_hosts;
             Ok(())
         })
         .unwrap();
@@ -235,7 +245,7 @@ async fn request(proxy: SocketAddr, port: u16, path: &str) -> (u16, Vec<u8>) {
 }
 
 /// An origin plus a proxy that reaches it.
-async fn setup() -> (
+async fn setup_with(http1_hosts: Vec<String>) -> (
     SocketAddr,
     SocketAddr,
     Arc<OriginState>,
@@ -250,13 +260,13 @@ async fn setup() -> (
     let ca = CertificateAuthority::load_or_create(&ca_paths).unwrap();
     let origin_tls = ca.server_config("origin.test").unwrap();
     let (origin_addr, state) = spawn_h2_origin(origin_tls).await;
-    let (proxy_addr, handle, dir) = spawn_proxy(ca.clone(), origin_addr).await;
+    let (proxy_addr, handle, dir) = spawn_proxy(ca.clone(), origin_addr, http1_hosts).await;
     (proxy_addr, origin_addr, state, handle, dir, ca_dir)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_upstream_connection_uses_http2() {
-    let (proxy_addr, origin_addr, state, _handle, _dir, _ca_dir) = setup().await;
+    let (proxy_addr, origin_addr, state, _handle, _dir, _ca_dir) = setup_with(Vec::new()).await;
 
     let (status, body) = request(proxy_addr, origin_addr.port(), "/").await;
     assert_eq!(
@@ -279,7 +289,7 @@ async fn the_upstream_connection_uses_http2() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sequential_requests_share_one_http2_connection() {
-    let (proxy_addr, origin_addr, state, _handle, _dir, _ca_dir) = setup().await;
+    let (proxy_addr, origin_addr, state, _handle, _dir, _ca_dir) = setup_with(Vec::new()).await;
 
     for _ in 0..3 {
         let (status, body) = request(proxy_addr, origin_addr.port(), "/").await;
@@ -296,7 +306,7 @@ async fn sequential_requests_share_one_http2_connection() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_large_body_survives_the_http2_flow_control() {
-    let (proxy_addr, origin_addr, state, _handle, _dir, _ca_dir) = setup().await;
+    let (proxy_addr, origin_addr, state, _handle, _dir, _ca_dir) = setup_with(Vec::new()).await;
 
     let size = 1024 * 1024;
     let (status, body) = request(
@@ -316,7 +326,7 @@ async fn a_large_body_survives_the_http2_flow_control() {
 /// the request to the origin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_browser_can_use_http2_through_the_mitm_tunnel() {
-    let (proxy_addr, origin_addr, state, _handle, _dir, ca_dir) = setup().await;
+    let (proxy_addr, origin_addr, state, _handle, _dir, ca_dir) = setup_with(Vec::new()).await;
 
     // The MITM path needs a trusted local CA; a harness cannot install one.
     std::env::set_var("HAKIMI_ASSUME_CA_INSTALLED", "1");
@@ -404,4 +414,36 @@ async fn a_browser_can_use_http2_through_the_mitm_tunnel() {
         1,
         "the origin must have seen the HTTP/2 request"
     );
+}
+
+/// An image host has to be fetched over HTTP/1.1 even when the origin
+/// offers h2: some CDNs throttle a single multiplexed connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_image_host_is_forced_to_http1() {
+    let (proxy_addr, origin_addr, state, _handle, _dir, _ca_dir) =
+        setup_with(vec!["origin.test".to_string()]).await;
+
+    let (status, body) = request(proxy_addr, origin_addr.port(), "/").await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(body, b"origin-ok");
+    let alpn = state.alpn.lock().unwrap().clone();
+    assert_eq!(
+        alpn,
+        vec![b"http/1.1".to_vec()],
+        "the image host must be fetched over HTTP/1.1"
+    );
+    assert_eq!(state.h2_requests.load(Ordering::Relaxed), 0);
+}
+
+/// Without the image host rule the same origin is fetched over h2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_normal_host_keeps_http2() {
+    let (proxy_addr, origin_addr, state, _handle, _dir, _ca_dir) = setup_with(Vec::new()).await;
+
+    let (status, body) = request(proxy_addr, origin_addr.port(), "/").await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(body, b"origin-ok");
+    let alpn = state.alpn.lock().unwrap().clone();
+    assert_eq!(alpn, vec![b"h2".to_vec()]);
+    assert_eq!(state.h2_requests.load(Ordering::Relaxed), 1);
 }
