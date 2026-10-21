@@ -279,10 +279,12 @@ impl UpstreamPool {
         Arc::new(Self {
             auto: build_client(config, auto_connector.clone(), max_idle),
             upgrade: build_client(config, upgrade_connector, max_idle),
-            // No idle connections: after a slow response, use this client to
-            // guarantee that the next request starts on a fresh connection
-            // instead of reusing the stalled one.
-            recovery: build_client(config, auto_connector, 0),
+            // The recovery pool starts empty, so the first request after a
+            // slow response opens a fresh connection instead of reusing the
+            // stalled one.  It keeps that connection afterwards: without idle
+            // reuse every request in the recovery window would pay for a
+            // handshake, which is exactly the cost the recovery avoids.
+            recovery: build_client(config, auto_connector, max_idle),
             engine,
             slow_hosts: RwLock::new(HashMap::new()),
             http1_hosts,
