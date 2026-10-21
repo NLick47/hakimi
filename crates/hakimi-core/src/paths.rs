@@ -24,11 +24,19 @@ impl Paths {
         Self { root: root.into() }
     }
 
+    #[cfg(not(target_os = "android"))]
     pub fn default_location() -> Result<Self> {
         let base = dirs::data_dir()
             .or_else(dirs::home_dir)
             .context("unable to determine a data directory")?;
         Ok(Self::new(base.join("hakimi")))
+    }
+
+    /// Android has no `dirs`-style data directory; the JNI shell passes the app files
+    /// directory to [`crate::runtime::HakimiRuntime::new`] explicitly.
+    #[cfg(target_os = "android")]
+    pub fn default_location() -> Result<Self> {
+        anyhow::bail!("Android callers must pass the app data directory explicitly")
     }
 
     pub fn ensure(&self) -> Result<()> {

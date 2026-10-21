@@ -9,10 +9,10 @@ description = "hakimi shared Rust core: catalogs, DoH/ECH, IP testing, local MIT
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+aws-lc-rs.workspace = true
 base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true
-dirs.workspace = true
 hex.workspace = true
 http.workspace = true
 http-body-util.workspace = true
@@ -24,13 +24,11 @@ parking_lot.workspace = true
 rand.workspace = true
 rcgen.workspace = true
 reqwest.workspace = true
-ring.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 socket2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tempfile.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
@@ -40,6 +38,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 webpki-roots.workspace = true
+x509-parser = "0.16"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+dirs.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

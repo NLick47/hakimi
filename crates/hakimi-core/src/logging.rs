@@ -9,7 +9,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde_json::json;
 use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::EnvFilter;
 
 use crate::config::LogFormat;
 use crate::paths::Paths;
@@ -41,11 +40,9 @@ pub fn init(paths: &Paths, level: &str, format: LogFormat) -> Result<()> {
             rotate_logs(&log_path);
         }
     }
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level.to_ascii_lowercase()));
     let file = open_log_file(&log_path);
     match spawn_log_writer(file, log_path.clone()) {
-        Ok(sink) => install(NonBlockingMakeWriter::new(sink), filter, format),
+        Ok(sink) => install(NonBlockingMakeWriter::new(sink), level, format),
         Err(error) => {
             // Thread creation is the only fallible part; if it fails, keep the
             // previous synchronous behavior rather than losing logging entirely.
@@ -54,7 +51,7 @@ pub fn init(paths: &Paths, level: &str, format: LogFormat) -> Result<()> {
             );
             install(
                 std::sync::Mutex::new(open_log_file(&log_path)),
-                filter,
+                level,
                 format,
             );
         }
@@ -77,10 +74,15 @@ fn open_log_file(path: &Path) -> File {
         })
 }
 
-fn install<W>(writer: W, filter: EnvFilter, format: LogFormat)
+/// Desktop keeps `RUST_LOG`-style filtering; the regex machinery behind
+/// `EnvFilter` is too large for the Android binary.
+#[cfg(not(target_os = "android"))]
+fn install<W>(writer: W, level: &str, format: LogFormat)
 where
     W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
 {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level.to_ascii_lowercase()));
     match format {
         LogFormat::Text => {
             let subscriber = tracing_subscriber::fmt()
@@ -95,6 +97,37 @@ where
             // for local analysis (jq/SQLite/ClickHouse) without a text parser.
             let subscriber = tracing_subscriber::fmt()
                 .with_env_filter(filter)
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_target(true)
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(false);
+            let _ = subscriber.try_init();
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn install<W>(writer: W, level: &str, format: LogFormat)
+where
+    W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+{
+    let filter: tracing::level_filters::LevelFilter =
+        level.trim().parse().unwrap_or(tracing::level_filters::LevelFilter::INFO);
+    match format {
+        LogFormat::Text => {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(filter)
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_target(true);
+            let _ = subscriber.try_init();
+        }
+        LogFormat::Json => {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(filter)
                 .with_writer(writer)
                 .with_ansi(false)
                 .with_target(true)

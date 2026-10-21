@@ -57,6 +57,7 @@
       "domains": [
         "pixiv.net",
         "www.pixiv.net",
+        "*.pixiv.net",
         "i.pximg.net",
         "s.pximg.net",
         "booth.pximg.net",

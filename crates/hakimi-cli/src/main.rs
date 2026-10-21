@@ -348,6 +348,7 @@ async fn try_live_status(runtime: &HakimiRuntime) -> Option<Value> {
         "http://{}:{}/hakimi/status",
         config.proxy.bind, config.proxy.port
     );
+    hakimi_core::util::install_crypto_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(600))
         .no_proxy()

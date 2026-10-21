@@ -1,11 +1,32 @@
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
+#[cfg(any(windows, target_os = "macos"))]
+use anyhow::Context;
 
 #[cfg(target_os = "macos")]
 use super::CA_COMMON_NAME;
+#[cfg(target_os = "android")]
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "macos")]
 use std::time::Duration;
+
+/// Android cannot install or probe the user CA store from Rust: the user must
+/// install the certificate through Settings, and the JNI shell reports the
+/// result back with [`set_android_ca_trusted`]. Chrome and WebView read
+/// `AndroidCAStore` directly and trust user CAs; most other apps do not.
+#[cfg(target_os = "android")]
+static ANDROID_CA_TRUSTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "android")]
+pub fn set_android_ca_trusted(trusted: bool) {
+    ANDROID_CA_TRUSTED.store(trusted, Ordering::SeqCst);
+}
+
+/// The JNI shell is part of the workspace and must also compile for the host,
+/// where there is no Android user CA store to update.
+#[cfg(not(target_os = "android"))]
+pub fn set_android_ca_trusted(_trusted: bool) {}
 
 /// Cap command output before it lands in the log.
 #[cfg(any(target_os = "macos", test))]
@@ -44,7 +65,7 @@ pub(super) fn classify_security_output(success: bool, stderr: &str) -> SecurityO
 // ---------------------------------------------------------------------------
 
 pub(super) fn trust_supported() -> bool {
-    cfg!(any(windows, target_os = "macos"))
+    cfg!(any(windows, target_os = "macos", target_os = "android"))
 }
 
 pub(super) fn trust_note() -> Option<String> {
@@ -62,7 +83,14 @@ pub(super) fn trust_note() -> Option<String> {
                 .to_string(),
         )
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "android")]
+    {
+        Some(
+            "Installed as a user CA. Chrome/WebView and Chromium-based browsers trust it; most native apps do not."
+                .to_string(),
+        )
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "android")))]
     {
         Some("Automatic CA installation is only implemented on Windows and macOS.".to_string())
     }
@@ -381,7 +409,15 @@ pub(super) fn uninstall_by_sha1(sha1_hex: &str, remove_trust: bool) -> Result<()
     Ok(())
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "android")]
+pub(super) fn trust_status(
+    _sha1_hex: &str,
+    _cert_path: &Path,
+) -> Result<(bool, bool, Option<String>)> {
+    Ok((true, ANDROID_CA_TRUSTED.load(Ordering::SeqCst), None))
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "android")))]
 pub(super) fn trust_status(
     _sha1_hex: &str,
     _cert_path: &Path,
@@ -393,12 +429,22 @@ pub(super) fn trust_status(
     ))
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "android")))]
 pub(super) fn install_cert(_der: &[u8], _pem_path: &Path) -> Result<()> {
     bail!("automatic CA installation is only implemented on Windows and macOS")
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "android")]
+pub(super) fn install_cert(_der: &[u8], _pem_path: &Path) -> Result<()> {
+    bail!("install the exported CA manually via Android Settings (user CA)")
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "android")))]
 pub(super) fn uninstall_by_sha1(_sha1_hex: &str, _remove_trust: bool) -> Result<()> {
     bail!("automatic CA removal is only implemented on Windows and macOS")
+}
+
+#[cfg(target_os = "android")]
+pub(super) fn uninstall_by_sha1(_sha1_hex: &str, _remove_trust: bool) -> Result<()> {
+    bail!("remove the CA manually from Android Settings")
 }

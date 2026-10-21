@@ -21,10 +21,19 @@ pub(super) struct CaMaterial {
     pub(super) key: KeyPair,
     pub(super) der: Vec<u8>,
     pub(super) pem: String,
+    pub(super) subject: String,
     pub(super) fingerprint_sha1: String,
     pub(super) fingerprint_sha256: String,
     pub(super) not_before: String,
     pub(super) not_after: String,
+}
+
+/// Subject from the actual certificate, not a hardcoded preset: the Android
+/// probe ships a pre-generated CA whose CN differs from the desktop default.
+fn parse_subject(der: &[u8]) -> Result<String> {
+    let (_, certificate) = x509_parser::parse_x509_certificate(der)
+        .map_err(|error| anyhow::anyhow!("parsing CA subject: {error}"))?;
+    Ok(certificate.subject().to_string())
 }
 
 pub(super) fn build_leaf_config(
@@ -115,6 +124,7 @@ pub(super) fn load_material(
         .self_signed(&key)
         .context("reconstructing CA issuer parameters")?;
     let original_der = pem_to_der(&pem)?;
+    let subject = parse_subject(&original_der)?;
     Ok(CaMaterial {
         issuer,
         key,
@@ -122,6 +132,7 @@ pub(super) fn load_material(
         fingerprint_sha256: sha256_hex(&original_der),
         der: original_der,
         pem,
+        subject,
         not_before,
         not_after,
     })
@@ -130,6 +141,7 @@ pub(super) fn load_material(
 fn material_from_parts(issuer: Certificate, key: KeyPair) -> CaMaterial {
     let der = issuer.der().to_vec();
     let pem = issuer.pem();
+    let subject = parse_subject(&der).unwrap_or_else(|_| format!("CN={CA_COMMON_NAME}"));
     let not_before = issuer.params().not_before.to_string();
     let not_after = issuer.params().not_after.to_string();
     CaMaterial {
@@ -137,6 +149,7 @@ fn material_from_parts(issuer: Certificate, key: KeyPair) -> CaMaterial {
         fingerprint_sha256: sha256_hex(&der),
         der,
         pem,
+        subject,
         not_before,
         not_after,
         issuer,

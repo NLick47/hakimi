@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
-use ring::signature;
-use ring::signature::KeyPair as _;
+use aws_lc_rs::signature;
+use aws_lc_rs::signature::KeyPair as _;
 
 use crate::util::decode_key_material;
 
