@@ -620,7 +620,8 @@ impl RouteConnector {
                 outcome
                     .diagnostics
                     .detail
-                    .unwrap_or_else(|| "route blocked".into())
+                    .as_deref()
+                    .unwrap_or("route blocked")
             )),
             Route::Group(cursor) => self.connect_group(*cursor, true, force_http1).await,
         }
@@ -646,7 +647,8 @@ impl RouteConnector {
                 outcome
                     .diagnostics
                     .detail
-                    .unwrap_or_else(|| "route blocked".into())
+                    .as_deref()
+                    .unwrap_or("route blocked")
             )),
             Route::Group(cursor) => self.connect_group(*cursor, false, false).await,
         }

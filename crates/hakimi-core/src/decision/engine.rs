@@ -178,7 +178,7 @@ impl DecisionEngine {
         let Some(group_id) = matcher.match_normalized(&normalized) else {
             return Route::Bypass(DecisionOutcome {
                 plan: None,
-                diagnostics: DomainDiagnostics {
+                diagnostics: Arc::new(DomainDiagnostics {
                     group: None,
                     domain: normalized.into_owned(),
                     state: State::Direct,
@@ -197,7 +197,7 @@ impl DecisionEngine {
                     ),
                     attempts: Vec::new(),
                     suggestions: Vec::new(),
-                },
+                }),
             });
         };
         let Some(group) = config.group(group_id) else {
@@ -521,7 +521,7 @@ impl DecisionEngine {
         attempts: Vec<AttemptRecord>,
         doh: &DohExpansion,
         config: &AppConfig,
-    ) -> DomainDiagnostics {
+    ) -> Arc<DomainDiagnostics> {
         self.cache.put_last_good(LastGoodEntry {
             domain: plan.domain.clone(),
             ip: plan.ip,
@@ -554,7 +554,7 @@ impl DecisionEngine {
             }
         }
         let attempts_total = attempts.len();
-        let diagnostics = DomainDiagnostics {
+        let diagnostics = Arc::new(DomainDiagnostics {
             group: Some(plan.group_id.clone()),
             domain: plan.domain.clone(),
             state: if plan.mode == TlsMode::Direct {
@@ -575,7 +575,7 @@ impl DecisionEngine {
             detail: None,
             attempts,
             suggestions: Vec::new(),
-        };
+        });
         let degraded = self.record_ip(&plan.domain, plan.ip, Some(latency_ms), false);
         self.remember_plan(plan);
         if degraded {
@@ -590,7 +590,7 @@ impl DecisionEngine {
                 .lock()
                 .remove(&plan_key(&plan.domain, plan.port, plan.tls));
         }
-        self.status.record(diagnostics.clone());
+        self.status.record_arc(diagnostics.clone());
         tracing::info!(
             group = %plan.group_id,
             domain = %plan.domain,
@@ -614,7 +614,7 @@ impl DecisionEngine {
         attempts: Vec<AttemptRecord>,
         doh: &DohExpansion,
         detail: Option<String>,
-    ) -> DomainDiagnostics {
+    ) -> Arc<DomainDiagnostics> {
         let mut suggestions = vec![reason.suggestion().to_string()];
         if !self.remote.has_ip_catalog() {
             let extra = "No remote IP catalog is loaded; configure catalogs.ip or wait for the next refresh.";
@@ -625,7 +625,7 @@ impl DecisionEngine {
         if let Some(error) = &doh.error {
             suggestions.push(format!("DoH error: {error}"));
         }
-        let diagnostics = DomainDiagnostics {
+        let diagnostics = Arc::new(DomainDiagnostics {
             group: Some(group.id.clone()),
             domain: domain.to_string(),
             state: State::Failed,
@@ -646,8 +646,8 @@ impl DecisionEngine {
             detail,
             attempts,
             suggestions,
-        };
-        self.status.record(diagnostics.clone());
+        });
+        self.status.record_arc(diagnostics.clone());
         tracing::warn!(
             group = %group.id,
             domain = %domain,
@@ -798,7 +798,7 @@ impl DecisionEngine {
         reason: FailureReason,
         detail: String,
     ) -> DecisionOutcome {
-        let diagnostics = DomainDiagnostics {
+        let diagnostics = Arc::new(DomainDiagnostics {
             group,
             domain: domain.to_string(),
             state: State::Failed,
@@ -815,8 +815,8 @@ impl DecisionEngine {
             detail: Some(detail),
             attempts: Vec::new(),
             suggestions: vec![reason.suggestion().to_string()],
-        };
-        self.status.record(diagnostics.clone());
+        });
+        self.status.record_arc(diagnostics.clone());
         DecisionOutcome {
             plan: None,
             diagnostics,
@@ -831,7 +831,7 @@ impl DecisionEngine {
         state: State,
         detail: &str,
     ) -> DecisionOutcome {
-        let diagnostics = DomainDiagnostics {
+        let diagnostics = Arc::new(DomainDiagnostics {
             group: Some(group.id.clone()),
             domain: domain.to_string(),
             state,
@@ -848,7 +848,7 @@ impl DecisionEngine {
             detail: Some(detail.to_string()),
             attempts: Vec::new(),
             suggestions: Vec::new(),
-        };
+        });
         DecisionOutcome {
             plan: None,
             diagnostics,

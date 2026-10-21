@@ -185,7 +185,13 @@ impl StatusStore {
     }
 
     pub fn record(&self, diagnostics: DomainDiagnostics) {
-        let diagnostics = Arc::new(diagnostics);
+        self.record_arc(Arc::new(diagnostics));
+    }
+
+    /// Record an already-shared diagnostics value. The decision engine returns
+    /// the same allocation in its outcome, so storing it here does not require
+    /// a deep clone of attempts/suggestions.
+    pub(crate) fn record_arc(&self, diagnostics: Arc<DomainDiagnostics>) {
         let mut map = self.domains.write();
         let mut unchanged_checking = false;
         if let Some(existing) = map.get_mut(&diagnostics.domain) {

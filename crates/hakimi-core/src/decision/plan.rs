@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -47,7 +48,9 @@ impl ConnectPlan {
 #[derive(Debug, Clone)]
 pub struct DecisionOutcome {
     pub plan: Option<ConnectPlan>,
-    pub diagnostics: DomainDiagnostics,
+    /// Shared with the status store so publishing a decision does not clone
+    /// the attempts/suggestions vectors.
+    pub diagnostics: Arc<DomainDiagnostics>,
 }
 
 /// Network prober abstraction so decision rules can be unit-tested without sockets.

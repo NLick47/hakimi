@@ -569,7 +569,7 @@ impl HakimiRuntime {
     }
 
     pub async fn diagnose(&self, domain: &str) -> DomainDiagnostics {
-        self.engine.decide_https(domain).await.diagnostics
+        self.engine.decide_https(domain).await.diagnostics.as_ref().clone()
     }
 
     pub async fn refresh_catalogs(&self, force: bool) -> Vec<Result<RefreshReport>> {
@@ -676,7 +676,7 @@ impl HakimiRuntime {
     }
 
     pub async fn probe_domain(&self, domain: &str) -> DomainDiagnostics {
-        self.engine.decide_https(domain).await.diagnostics
+        self.engine.decide_https(domain).await.diagnostics.as_ref().clone()
     }
 
     /// Probe every exact domain of every enabled group once, honouring the
