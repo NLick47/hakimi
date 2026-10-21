@@ -78,7 +78,8 @@ pub(crate) async fn handle_forward(
             .await
         }
         None => {
-            let path_and_query = path_and_query.unwrap_or_else(|| "/".to_string());
+            let path_and_query =
+                path_and_query.unwrap_or_else(|| PathAndQuery::from_static("/"));
             forward_with_pool(
                 &ctx,
                 req,
@@ -104,8 +105,9 @@ struct Target {
     normalized_host: Option<String>,
     port: u16,
     https: bool,
-    /// Set only when the absolute-form request URI cannot be reused.
-    path_and_query: Option<String>,
+    /// Set only when the absolute-form request URI cannot be reused. Keeping
+    /// the parsed `PathAndQuery` avoids copying the path into a new String.
+    path_and_query: Option<PathAndQuery>,
     /// Original absolute-form URI when reusing it is byte-for-byte equivalent
     /// to rebuilding the authority (lowercase host, no userinfo, path present).
     upstream_uri: Option<Uri>,
@@ -178,16 +180,16 @@ fn target_of<B>(req: &Request<B>) -> Result<Target> {
             https,
             path_and_query: Some(
                 uri.path_and_query()
-                    .map(|value| value.as_str().to_string())
-                    .unwrap_or_else(|| "/".to_string()),
+                    .cloned()
+                    .unwrap_or_else(|| PathAndQuery::from_static("/")),
             ),
             upstream_uri: None,
         });
     }
     let path_and_query = uri
         .path_and_query()
-        .map(|value| value.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
+        .cloned()
+        .unwrap_or_else(|| PathAndQuery::from_static("/"));
     let host_header = req
         .headers()
         .get(header::HOST)
@@ -384,7 +386,7 @@ async fn forward_with_pool(
     host: &str,
     port: u16,
     https: bool,
-    path_and_query: &str,
+    path_and_query: &PathAndQuery,
     upgrade_requested: bool,
     client_upgrade: Option<OnUpgrade>,
 ) -> std::result::Result<Response<ProxyBody>, String> {
@@ -545,12 +547,12 @@ fn build_upstream_uri(
     host: &str,
     port: u16,
     https: bool,
-    path_and_query: &str,
+    path_and_query: &PathAndQuery,
 ) -> std::result::Result<Uri, http::Error> {
     Uri::builder()
         .scheme(if https { Scheme::HTTPS } else { Scheme::HTTP })
         .authority(authority(host, port, https).as_ref())
-        .path_and_query(path_and_query)
+        .path_and_query(path_and_query.clone())
         .build()
 }
 
@@ -668,6 +670,7 @@ mod tests {
         MitmTarget, Target,
     };
     use http::{Request, Uri};
+    use http::uri::PathAndQuery;
 
     fn host_of(target: &Target) -> &str {
         target_host(
@@ -725,7 +728,8 @@ mod tests {
             )
             .parse()
             .unwrap();
-            let built = build_upstream_uri(host, port, https, path).unwrap();
+            let path_and_query = PathAndQuery::try_from(path).unwrap();
+            let built = build_upstream_uri(host, port, https, &path_and_query).unwrap();
             assert_eq!(built, expected, "host={host} port={port}");
             assert_eq!(built.to_string(), expected.to_string());
         }
@@ -753,7 +757,10 @@ mod tests {
         let target = target_of(&req).unwrap();
         assert_eq!(host_of(&target), "example.com");
         assert!(target.upstream_uri.is_none());
-        assert_eq!(target.path_and_query.as_deref(), Some("/path"));
+        assert_eq!(
+            target.path_and_query.as_ref().map(|value| value.as_str()),
+            Some("/path")
+        );
 
         let req = Request::builder()
             .uri("https://example.com:443/path")
@@ -777,6 +784,9 @@ mod tests {
         assert_eq!(host_of(&target), "example.com");
         assert_eq!(target.port, 8080);
         assert!(target.upstream_uri.is_none());
-        assert_eq!(target.path_and_query.as_deref(), Some("/path"));
+        assert_eq!(
+            target.path_and_query.as_ref().map(|value| value.as_str()),
+            Some("/path")
+        );
     }
 }
