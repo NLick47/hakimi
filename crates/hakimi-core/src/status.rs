@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -305,8 +305,22 @@ impl StatusStore {
         (values, counts)
     }
 
-    pub fn counts(&self) -> StatusCounts {
+    /// The records of the given domains, sorted by name.
+    ///
+    /// The polled snapshot only needs the domains of the configured groups.
+    /// Looking them up directly avoids copying and sorting every known
+    /// domain, which dominated the poll once a session had seen thousands.
+    pub fn domains_for(&self, wanted: &HashSet<&str>) -> Vec<Arc<DomainDiagnostics>> {
         let map = self.domains.read();
+        let mut values: Vec<Arc<DomainDiagnostics>> = wanted
+            .iter()
+            .filter_map(|domain| map.get(*domain).cloned())
+            .collect();
+        values.sort_by(|a, b| a.domain.cmp(&b.domain));
+        values
+    }
+
+    pub fn counts(&self) -> StatusCounts {        let map = self.domains.read();
         let mut counts = StatusCounts {
             normal: 0,
             direct: 0,

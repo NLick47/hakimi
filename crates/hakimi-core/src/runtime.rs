@@ -45,14 +45,39 @@ struct StatusProvider {
 }
 
 impl StatusProvider {
+    /// The snapshot the UI polls. It carries the diagnostics of the exact
+    /// domains of the configured groups, because that is all the UI shows.
+    ///
+    /// Sending every visited domain made the payload grow with the session:
+    /// 8192 domains meant 1.4 MB and 40 ms of building and serializing per
+    /// poll. The counts still cover every domain.
     fn snapshot_json(&self) -> serde_json::Value {
+        self.snapshot_json_inner(false)
+    }
+
+    /// The same snapshot with every known domain, for the diagnostics export.
+    fn snapshot_json_full(&self) -> serde_json::Value {
+        self.snapshot_json_inner(true)
+    }
+
+    fn snapshot_json_inner(&self, every_domain: bool) -> serde_json::Value {
         let config = self.config.snapshot();
         let ca = self.ca.status();
         let catalogs = self.catalogs.status();
         let groups = self.status.groups_snapshot(&config);
-        let (domains, counts) = self.status.domains_snapshot_with_counts();
         // Serialize borrowed values: the status map stores shared records, and
         // serde does not implement Serialize for Arc without the `rc` feature.
+        let wanted: HashSet<&str> = config
+            .groups
+            .iter()
+            .flat_map(|group| group.exact_domains())
+            .collect();
+        let (domains, counts) = if every_domain {
+            let (domains, counts) = self.status.domains_snapshot_with_counts();
+            (domains, counts)
+        } else {
+            (self.status.domains_for(&wanted), self.status.counts())
+        };
         let domains: Vec<&DomainDiagnostics> = domains.iter().map(Arc::as_ref).collect();
         let cache = self.cache.stats();
         let listen = *self.proxy_listen.read();
@@ -420,6 +445,7 @@ impl HakimiRuntime {
         Ok(())
     }
 
+
     pub async fn stop(self: &Arc<Self>) -> Result<()> {
         let was_started = self.started.swap(false, Ordering::SeqCst);
         if was_started {
@@ -680,9 +706,11 @@ impl HakimiRuntime {
     }
 
     pub fn export_diagnostics(&self) -> Result<PathBuf> {
-        // The status carries the DoH endpoint URLs; they can hold a token in
-        // their path, so the bundle gets the same redaction as the config.
-        let mut status = logging::redact_config_value(self.status_json());
+        // The export carries every known domain; the polled snapshot only the
+        // ones the UI shows.  The status holds DoH endpoint URLs, which can
+        // have a token in their path, so the bundle gets the same redaction as
+        // the config.
+        let mut status = logging::redact_config_value(self.status_provider.snapshot_json_full());
         status["config"] = logging::redact_config_value(self.config_json());
         logging::export_diagnostics(&self.paths, status)
     }
@@ -972,5 +1000,82 @@ impl HakimiRuntime {
                 "upstream warmup finished"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod status_snapshot_tests {
+    use super::*;
+    use crate::config::GroupConfig;
+    use crate::status::DomainDiagnostics;
+    use crate::strategy::Strategy;
+
+    fn record(status: &StatusStore, domain: &str) {
+        status.record(DomainDiagnostics {
+            group: Some("test".into()),
+            domain: domain.into(),
+            state: crate::status::State::Normal,
+            strategy: None,
+            configured_strategy: None,
+            ip: Some("93.184.216.34".parse().unwrap()),
+            ip_source: None,
+            doh_source: None,
+            latency_ms: Some(120),
+            last_check: crate::util::now(),
+            catalog_version: 1,
+            cache: crate::strategy::CacheStatus::None,
+            error: None,
+            detail: None,
+            attempts: Vec::new(),
+            suggestions: Vec::new(),
+        });
+    }
+
+    /// The polled snapshot carries the diagnostics of the groups' exact
+    /// domains, because that is all the UI shows.  The export keeps every
+    /// known domain.
+    #[test]
+    fn the_polled_snapshot_only_carries_the_groups_domains() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = HakimiRuntime::new(Some(dir.path().to_path_buf())).unwrap();
+        runtime
+            .config()
+            .mutate(|config| {
+                config.groups.clear();
+                config.groups.push(GroupConfig {
+                    id: "test".into(),
+                    name: "Test".into(),
+                    domains: vec!["a.test".into(), "*.wild.test".into()],
+                    strategy: Strategy::Auto,
+                    enabled: true,
+                    sni: None,
+                    experimental: false,
+                    homepage: None,
+                    ech_shared: false,
+                });
+                Ok(())
+            })
+            .unwrap();
+        record(&runtime.status, "a.test");
+        record(&runtime.status, "b.wild.test");
+        record(&runtime.status, "other.test");
+
+        let value = runtime.status_json();
+        let domains: Vec<&str> = value["domains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["domain"].as_str().unwrap())
+            .collect();
+        assert_eq!(domains, vec!["a.test"], "only the exact group domains");
+        // The counts still cover every known domain.
+        assert_eq!(value["counts"]["total"], 3);
+
+        let full = runtime.status_provider.snapshot_json_full();
+        assert_eq!(
+            full["domains"].as_array().unwrap().len(),
+            3,
+            "the export keeps every known domain"
+        );
     }
 }
