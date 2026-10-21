@@ -30,7 +30,7 @@ use crate::cache::CacheManager;
 use crate::catalog::CatalogManager;
 use crate::config::ConfigManager;
 use crate::decision::{ConnectPlan, DecisionEngine, Route, RouteCursor};
-use crate::domain::is_ip_literal;
+use crate::domain::{is_ip_literal, normalize_hostname};
 use crate::ip_tester::TlsContext;
 use crate::resolver::Resolver;
 use crate::status::StatusStore;
@@ -271,13 +271,20 @@ async fn handle_connect(
             &format!("Could not parse `{authority}`."),
         );
     };
+    // Normalize once here: the raw tunnel, plan cache and the MITM Host check
+    // must all agree on one spelling (trailing root dot, IDNA, case).
+    let host = if is_ip_literal(&host) {
+        host
+    } else {
+        normalize_hostname(&host).unwrap_or(host)
+    };
 
     let config = ctx.config.snapshot();
     let matcher = ctx.config.matcher();
     let group_id = if is_ip_literal(&host) {
         None
     } else {
-        matcher.match_host(&host).map(ToOwned::to_owned)
+        matcher.match_normalized(&host).map(ToOwned::to_owned)
     };
     let Some(group_id) = group_id else {
         return tunnel_to_host(req, &host, port).await;
@@ -402,6 +409,11 @@ async fn tunnel_direct_group(
         }
         Route::Group(cursor) => cursor,
     };
+    // The browser performs the TLS handshake itself on a raw CONNECT tunnel, so only
+    // direct plans can be used. Without this, an auto group whose last-good strategy
+    // was ECH generates (and awaits DoH for) an ECH plan before every direct
+    // candidate, and a fast-failing first address starves the rest of the list.
+    cursor.restrict_to_direct();
     if let Some(plan) = failed_plan {
         cursor.skip_plan(plan);
     }
@@ -901,10 +913,36 @@ mod tests {
         }
     }
 
-    fn engine_for_direct_test(
+    #[derive(Default)]
+    struct SlowEchResolver {
+        ech_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl IpResolver for SlowEchResolver {
+        async fn doh_ips(&self, _domain: &str) -> anyhow::Result<DohResolution> {
+            Err(anyhow::anyhow!("no doh in this test"))
+        }
+
+        async fn doh_ech_config(
+            &self,
+            _domain: &str,
+            _allow_shared: bool,
+        ) -> anyhow::Result<EchOutcome> {
+            self.ech_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Err(anyhow::anyhow!("slow ECH resolver intentionally failed"))
+        }
+    }
+
+    fn engine_for_test(
         dir: &std::path::Path,
+        strategy: Strategy,
         cached_ip: IpAddr,
+        last_good_strategy: Strategy,
         remote_ips: Vec<IpAddr>,
+        resolver: Arc<dyn IpResolver>,
     ) -> Arc<DecisionEngine> {
         let paths = Paths::new(dir);
         paths.ensure().unwrap();
@@ -914,7 +952,7 @@ mod tests {
                 id: "test".into(),
                 name: "Test".into(),
                 domains: vec!["upstream.test".into()],
-                strategy: Strategy::Direct,
+                strategy,
                 enabled: true,
                 sni: None,
                 experimental: false,
@@ -926,7 +964,7 @@ mod tests {
         cache.put_last_good(LastGoodEntry {
             domain: "upstream.test".into(),
             ip: cached_ip,
-            strategy: Strategy::Direct,
+            strategy: last_good_strategy,
             source: IpSource::Cache,
             network_id: "test".into(),
             saved_at: now(),
@@ -938,9 +976,24 @@ mod tests {
             config,
             cache,
             Arc::new(FakeRemote { ips: remote_ips }),
-            Arc::new(FakeResolver),
+            resolver,
             tls,
             status,
+        )
+    }
+
+    fn engine_for_direct_test(
+        dir: &std::path::Path,
+        cached_ip: IpAddr,
+        remote_ips: Vec<IpAddr>,
+    ) -> Arc<DecisionEngine> {
+        engine_for_test(
+            dir,
+            Strategy::Direct,
+            cached_ip,
+            Strategy::Direct,
+            remote_ips,
+            Arc::new(FakeResolver),
         )
     }
 
@@ -986,6 +1039,41 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(800),
             "serial fallback would wait for the black-holed candidate; elapsed={elapsed:?}"
+        );
+    }
+
+    /// The raw CONNECT path can only use direct plans, but an auto group whose
+    /// last-good strategy is ECH used to put that route first and await an HTTPS-RR
+    /// DoH query before every direct candidate. With a fast-failing first address that
+    /// lookup restarted forever and later candidates were never tried.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_tunnel_never_waits_for_ech() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolver = Arc::new(SlowEchResolver::default());
+        let engine = engine_for_test(
+            dir.path(),
+            Strategy::Auto,
+            "192.0.2.1".parse().unwrap(),
+            Strategy::Ech,
+            vec!["198.51.100.1".parse().unwrap()],
+            resolver.clone(),
+        );
+        let mut cursor = match engine.route("upstream.test", 443, true) {
+            Route::Group(cursor) => cursor,
+            _ => panic!("expected a group route"),
+        };
+        assert!(cursor.restrict_to_direct());
+        let plan = tokio::time::timeout(Duration::from_secs(1), cursor.next_plan())
+            .await
+            .expect("next_plan waited for an ECH lookup")
+            .expect("a direct plan");
+        assert_eq!(plan.mode, TlsMode::Direct);
+        assert_eq!(
+            resolver
+                .ech_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the raw tunnel must not resolve ECH"
         );
     }
 

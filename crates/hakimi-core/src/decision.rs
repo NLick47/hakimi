@@ -324,6 +324,30 @@ impl RouteCursor {
         self.skip_once
     }
 
+    /// Restrict this cursor to raw direct tunnels.
+    ///
+    /// A raw tunnel forwards bytes to the origin and lets the browser perform the TLS
+    /// handshake itself, so only `Direct` plans are usable. Restricting the mode list
+    /// avoids generating (and, for ECH, awaiting a DoH lookup for) plans the caller
+    /// would immediately discard. That lookup used to sit between direct candidates,
+    /// which could keep a later address from ever being tried when the first one failed
+    /// quickly.
+    ///
+    /// Locked ECH/fake-SNI groups have no direct mode; their cursor is left untouched so
+    /// the usual failure diagnostics still apply. Must be called before the first plan.
+    pub fn restrict_to_direct(&mut self) -> bool {
+        if !self.modes.contains(&TlsMode::Direct) {
+            return false;
+        }
+        self.modes.retain(|mode| *mode == TlsMode::Direct);
+        self.mode_index = 0;
+        self.sni_candidates.clear();
+        self.sni_index = 0;
+        // Nothing can request ECH after the mode was removed.
+        self.ech_checked = true;
+        true
+    }
+
     /// Skip an already-attempted plan (for example one taken from the plan cache).
     pub fn skip_plan(&mut self, plan: &ConnectPlan) {
         self.skipped.insert(plan.identity());
@@ -472,6 +496,12 @@ impl RouteCursor {
     }
 
     fn take_skipped(&mut self, plan: &ConnectPlan) -> bool {
+        // The common case has no skip set at all (only a failed cached plan
+        // populates it); avoid hashing and formatting a plan identity for
+        // every candidate in the race.
+        if self.skipped.is_empty() {
+            return false;
+        }
         self.skipped.remove(&plan.identity())
     }
 
@@ -646,6 +676,9 @@ impl IpScore {
 }
 
 const PLAN_CACHE_MAX: usize = 2048;
+/// Leave headroom after a prune so a burst of new hosts does not sort the map
+/// on every success.
+const PLAN_CACHE_PRUNE_TO: usize = PLAN_CACHE_MAX * 3 / 4;
 /// How many (domain, ip) quality entries to keep in memory. The active set of a
 /// heavy user stays well below this; growth past it evicts the worst-ranked.
 /// A page loading assets from dozens of hosts already produces several hundred
@@ -862,6 +895,11 @@ impl DecisionEngine {
         }
         let matcher = self.config.matcher();
         let group_id = matcher.match_normalized(&plan.domain)?.to_string();
+        // The domain may have been moved to another group; its old route (and
+        // especially its old fake SNI) must not leak into the new group.
+        if plan.group_id != group_id {
+            return None;
+        }
         let group = config.group(&group_id)?;
         if !group.enabled || self.status.paused() {
             return None;
@@ -869,6 +907,23 @@ impl DecisionEngine {
         if tls {
             if !group.strategy.attempts().contains(&plan.mode) {
                 return None;
+            }
+            // A group-level fake SNI is authoritative. Editing it must not keep
+            // using the old name for the rest of the plan-cache lifetime.
+            if plan.mode == TlsMode::FakeSni {
+                if let Some(configured) = group.sni.as_deref() {
+                    let configured = configured.trim();
+                    let matches = if configured.is_empty() {
+                        plan.sni.is_none()
+                    } else {
+                        plan.sni
+                            .as_deref()
+                            .is_some_and(|sni| sni.eq_ignore_ascii_case(configured))
+                    };
+                    if !matches {
+                        return None;
+                    }
+                }
             }
         } else if plan.mode != TlsMode::Direct {
             return None;
@@ -878,6 +933,15 @@ impl DecisionEngine {
 
     pub fn forget_plan(&self, domain: &str, port: u16, tls: bool) {
         self.plan_cache.lock().remove(&plan_key(domain, port, tls));
+    }
+
+    /// Drop every remembered route. A network change invalidates the in-memory
+    /// shortcut even though the persisted last-good entry is kept (the design
+    /// deliberately tests it first on the new network): new connections should
+    /// hedge it against fresh candidates instead of blocking on it through the
+    /// single-route fast path.
+    pub fn forget_all_plans(&self) {
+        self.plan_cache.lock().clear();
     }
 
     fn score_ip(&self, domain: &str, ip: IpAddr) -> f64 {
@@ -959,9 +1023,23 @@ impl DecisionEngine {
     fn remember_plan(&self, plan: &ConnectPlan) {
         let key = plan_key(&plan.domain, plan.port, plan.tls);
         let mut cache = self.plan_cache.lock();
-        if cache.len() > PLAN_CACHE_MAX {
+        if cache.len() >= PLAN_CACHE_MAX {
             let ttl = Duration::from_secs(self.config.snapshot().advanced.plan_cache_secs);
             cache.retain(|_, (at, _)| at.elapsed() < ttl);
+            // A crawler can push more than the cap of *fresh* plans in the TTL
+            // window; keep the newest instead of scanning the full map on every
+            // subsequent success.
+            if cache.len() >= PLAN_CACHE_MAX {
+                let mut ages: Vec<(String, Instant)> = cache
+                    .iter()
+                    .map(|(key, (at, _))| (key.clone(), *at))
+                    .collect();
+                ages.sort_by_key(|(_, at)| *at);
+                let excess = cache.len() - PLAN_CACHE_PRUNE_TO;
+                for (key, _) in ages.into_iter().take(excess) {
+                    cache.remove(&key);
+                }
+            }
         }
         cache.insert(key, (Instant::now(), plan.clone()));
     }
@@ -1807,6 +1885,69 @@ mod tests {
             .engine
             .cached_plan("example.com", 443, true)
             .is_none());
+    }
+
+    fn test_plan(mode: TlsMode, sni: Option<&str>) -> ConnectPlan {
+        ConnectPlan {
+            domain: "example.com".into(),
+            group_id: "test".into(),
+            ip: "1.1.1.1".parse().unwrap(),
+            port: 443,
+            mode,
+            sni: sni.map(ToOwned::to_owned),
+            ech_config: None,
+            tls: true,
+            source: IpSource::Remote,
+        }
+    }
+
+    #[test]
+    fn plan_cache_stays_bounded_when_every_entry_is_fresh() {
+        let h = harness(&["example.com"], Strategy::Direct);
+        for i in 0..(PLAN_CACHE_MAX + 100) {
+            let mut plan = test_plan(TlsMode::Direct, None);
+            plan.domain = format!("h{i}.example.com");
+            h.engine.remember_plan(&plan);
+        }
+        let cache = h.engine.plan_cache.lock();
+        assert!(cache.len() <= PLAN_CACHE_MAX);
+        assert!(
+            cache.contains_key(&plan_key(
+                &format!("h{}.example.com", PLAN_CACHE_MAX + 99),
+                443,
+                true
+            )),
+            "the newest plan must survive the prune"
+        );
+    }
+
+    #[test]
+    fn network_change_drops_remembered_plans() {
+        let h = harness(&["example.com"], Strategy::Direct);
+        h.engine.remember_plan(&test_plan(TlsMode::Direct, None));
+        assert!(h.engine.cached_plan("example.com", 443, true).is_some());
+
+        h.engine.forget_all_plans();
+        assert!(
+            h.engine.cached_plan("example.com", 443, true).is_none(),
+            "a plan remembered on the old network must not survive"
+        );
+    }
+
+    #[test]
+    fn cached_fake_sni_plan_follows_the_configured_sni() {
+        let h = harness(&["example.com"], Strategy::FakeSni);
+        h.engine
+            .remember_plan(&test_plan(TlsMode::FakeSni, Some("old.example")));
+        assert!(h.engine.cached_plan("example.com", 443, true).is_some());
+
+        let mut group = h.engine.config.snapshot().group("test").unwrap().clone();
+        group.sni = Some("new.example".into());
+        h.engine.config.upsert_group(group).unwrap();
+        assert!(
+            h.engine.cached_plan("example.com", 443, true).is_none(),
+            "the cached plan still used the previous fake SNI"
+        );
     }
 
     #[tokio::test]

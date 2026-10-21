@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 /// Held for the whole process lifetime; dropping it releases the lock.
 pub struct InstanceLock {
     _file: File,
-    path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -48,7 +47,7 @@ impl InstanceLock {
             .open(&path)
             .map_err(InstanceLockError::Io)?;
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file, path }),
+            Ok(()) => Ok(Self { _file: file }),
             Err(std::fs::TryLockError::WouldBlock) => {
                 Err(InstanceLockError::AlreadyRunning { path })
             }

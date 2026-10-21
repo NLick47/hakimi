@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -115,14 +116,20 @@ pub(crate) async fn handle_mitm_request(
     ctx: Arc<ProxyContext>,
     connect_host: String,
 ) -> Response<ProxyBody> {
-    let target_host = request_host(&req).unwrap_or_default();
-    let normalized = normalize_hostname(&target_host).unwrap_or(target_host);
-    if normalized != connect_host {
-        return super::error_response(
-            StatusCode::BAD_REQUEST,
-            "Unexpected host on MITM connection",
-            &format!("CONNECT was for `{connect_host}` but the request targets `{normalized}`."),
-        );
+    let target_host = request_host(&req).unwrap_or(Cow::Borrowed(""));
+    // The browser almost always repeats the CONNECT host verbatim (possibly
+    // with a different case). Avoid normalizing and allocating it on every
+    // request; only the mismatch path needs a canonical form for the message.
+    if !same_host(&target_host, &connect_host) {
+        let normalized = normalize_hostname(&target_host)
+            .unwrap_or_else(|_| target_host.into_owned());
+        if normalized != connect_host {
+            return super::error_response(
+                StatusCode::BAD_REQUEST,
+                "Unexpected host on MITM connection",
+                &format!("CONNECT was for `{connect_host}` but the request targets `{normalized}`."),
+            );
+        }
     }
 
     let port = req
@@ -152,7 +159,7 @@ pub(crate) async fn handle_mitm_request(
     match forward_with_pool(
         &ctx,
         req,
-        &normalized,
+        &connect_host,
         port,
         true,
         &path_and_query,
@@ -163,18 +170,18 @@ pub(crate) async fn handle_mitm_request(
     {
         Ok(response) => response,
         Err(detail) => {
-            if let Some(diagnostics) = ctx.status.get(&normalized) {
+            if let Some(diagnostics) = ctx.status.get(&connect_host) {
                 if diagnostics.state == State::Failed {
-                    return diagnostics_error_page(&normalized, &diagnostics, &ctx);
+                    return diagnostics_error_page(&connect_host, &diagnostics, &ctx);
                 }
             }
-            if let Some(plan) = ctx.engine.cached_plan(&normalized, port, true) {
+            if let Some(plan) = ctx.engine.cached_plan(&connect_host, port, true) {
                 return super::upstream_failure(&ctx, &plan, FailureReason::TlsError, detail);
             }
             super::error_response(
                 StatusCode::BAD_GATEWAY,
                 "Upstream request failed",
-                &format!("{normalized}:{port}: {detail}"),
+                &format!("{connect_host}:{port}: {detail}"),
             )
         }
     }
@@ -206,14 +213,23 @@ fn match_forward_error(
     )
 }
 
-fn request_host(req: &Request<Incoming>) -> Option<String> {
-    req.uri().host().map(ToOwned::to_owned).or_else(|| {
-        req.headers()
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| parse_authority(value, 443))
-            .map(|(host, _)| host)
-    })
+fn request_host<'a>(req: &'a Request<Incoming>) -> Option<Cow<'a, str>> {
+    if let Some(host) = req.uri().host() {
+        return Some(Cow::Borrowed(host));
+    }
+    req.headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_authority(value, 443))
+        .map(|(host, _)| Cow::Owned(host))
+}
+
+/// Host equality without allocating on the hot path. Browsers may preserve a
+/// trailing root dot or vary ASCII case; anything else is normalized only when
+/// we are about to reject the request.
+fn same_host(candidate: &str, expected: &str) -> bool {
+    let candidate = candidate.strip_suffix('.').unwrap_or(candidate);
+    candidate.eq_ignore_ascii_case(expected)
 }
 
 fn is_upgrade(req: &Request<Incoming>) -> bool {
@@ -461,4 +477,17 @@ fn attempt_row(attempt: &AttemptRecord) -> String {
         escape_html(attempt.error.map(|error| error.as_str()).unwrap_or("")),
         escape_html(attempt.detail.as_deref().unwrap_or("")),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_host;
+
+    #[test]
+    fn mitm_host_match_ignores_ascii_case_and_root_dot() {
+        assert!(same_host("EXAMPLE.com", "example.com"));
+        assert!(same_host("example.com.", "example.com"));
+        assert!(!same_host("evil.example", "example.com"));
+        assert!(!same_host("example.com.evil", "example.com"));
+    }
 }

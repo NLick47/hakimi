@@ -795,6 +795,10 @@ impl HakimiRuntime {
                     tracing::info!(from = %current, to = %next, "network changed");
                     current = next.clone();
                     *runtime.status_provider.current_network.write() = next;
+                    // A remembered route may be unreachable on the new network. Force
+                    // new connections to re-race routes while still testing the
+                    // last-good IP first.
+                    runtime.engine.forget_all_plans();
                     let _ = runtime.resolver.health_check().await;
                     runtime.warm_groups().await;
                 }

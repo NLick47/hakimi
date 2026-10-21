@@ -11,6 +11,7 @@
 //! - the last successful route is remembered per authority and reused for new
 //!   connections until it fails.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -267,9 +268,11 @@ impl UpstreamPool {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
         let host = request.uri().host().map(ToOwned::to_owned);
         let permit = if !upgrade {
+            // Forwarded URIs are built from an already-normalized host, so the
+            // per-request image-host check does not need to normalize again.
             match host
                 .as_deref()
-                .filter(|host| self.http1_hosts.match_host(host).is_some())
+                .filter(|host| self.http1_hosts.match_normalized(host).is_some())
             {
                 Some(host) => {
                     let semaphore = self.host_slots(host);
@@ -316,7 +319,7 @@ impl UpstreamPool {
                 }
                 if response.status().is_client_error() || response.status().is_server_error() {
                     if let Some(host) = debug_host.as_deref() {
-                        if self.http1_hosts.match_host(host).is_some() {
+                        if self.http1_hosts.match_normalized(host).is_some() {
                             tracing::warn!(
                                 host,
                                 path = %debug_path,
@@ -466,10 +469,16 @@ impl RouteConnector {
         };
         let host = uri
             .host()
-            .ok_or_else(|| anyhow!("upstream URI has no host"))?
-            .to_ascii_lowercase();
+            .ok_or_else(|| anyhow!("upstream URI has no host"))?;
+        // Forwarded URIs normally carry an already-lowercase host; only pay
+        // for a new string when the caller preserved uppercase.
+        let host = if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            Cow::Owned(host.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(host)
+        };
         let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
-        let force_http1 = self.http1_only || self.http1_hosts.match_host(&host).is_some();
+        let force_http1 = self.http1_only || self.http1_hosts.match_normalized(&host).is_some();
         let result = if https {
             self.connect_tls(&host, port, force_http1).await
         } else {
@@ -575,7 +584,7 @@ impl RouteConnector {
         if leader {
             // Cleanup is tied to the leader's lifetime: cancelling the request
             // mid-race still publishes a result and removes the entry.
-            let mut guard = DiscoveryGuard {
+            let guard = DiscoveryGuard {
                 map: &self.discovery.inflight,
                 key: key.clone(),
                 entry: inflight.clone(),
@@ -768,20 +777,29 @@ impl RouteConnector {
         port: u16,
         force_http1: bool,
     ) -> Result<PooledIo> {
-        let addresses: Vec<std::net::IpAddr> = tokio::time::timeout(
-            SYSTEM_CONNECT_TIMEOUT,
-            tokio::net::lookup_host((host, port)),
-        )
-        .await
-        .map_err(|_| anyhow!("resolving {host}:{port} timed out"))?
-        .with_context(|| format!("resolving {host}:{port}"))?
-        .map(|address| address.ip())
-        .collect();
+        // DNS and every address batch share one deadline. Without this a host
+        // with several batches of black-holed addresses could keep the caller
+        // waiting for `SYSTEM_CONNECT_TIMEOUT` per batch.
+        let deadline = tokio::time::Instant::now() + SYSTEM_CONNECT_TIMEOUT;
+        let dns_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let addresses: Vec<std::net::IpAddr> =
+            tokio::time::timeout(dns_timeout, tokio::net::lookup_host((host, port)))
+                .await
+                .map_err(|_| anyhow!("resolving {host}:{port} timed out"))?
+                .with_context(|| format!("resolving {host}:{port}"))?
+                .map(|address| address.ip())
+                .collect();
         // Staggered race across resolved addresses (Happy-Eyeballs style): a black-holed
         // IPv6 route no longer delays the IPv4 fallback by a full timeout.
         let mut index = 0;
         let mut last_error: Option<String> = None;
         loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "{}",
+                    last_error.unwrap_or_else(|| format!("connecting to {host} timed out"))
+                ));
+            }
             let batch: Vec<std::net::IpAddr> =
                 addresses.iter().skip(index).take(RACE_SIZE).copied().collect();
             index += batch.len();
@@ -804,9 +822,19 @@ impl RouteConnector {
                     // the group race): a linear ramp would make the 8th address
                     // of a blackholed host wait over a second before trying.
                     if i > 0 {
-                        tokio::time::sleep(RACE_STAGGER).await;
+                        let head_start = deadline
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .min(RACE_STAGGER);
+                        if !head_start.is_zero() {
+                            tokio::time::sleep(head_start).await;
+                        }
                     }
-                    let result = tokio::time::timeout(SYSTEM_CONNECT_TIMEOUT, async {
+                    let remaining =
+                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err("TLS connection timed out".into());
+                    }
+                    let result = tokio::time::timeout(remaining, async {
                         if force {
                             this.tls
                                 .connect_http1(address, port, &host, TlsMode::Direct, None, None)

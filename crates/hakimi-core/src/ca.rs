@@ -21,6 +21,11 @@ use crate::util::{atomic_write, atomic_write_private, sha1_hex, sha256_hex};
 const CA_COMMON_NAME: &str = "hakimi Local CA";
 const LEAF_VALIDITY_DAYS: i64 = 7;
 const LEAF_ROTATE_HOURS: i64 = 24;
+/// Wildcard groups can expose an unbounded set of concrete hosts, so the
+/// per-domain leaf cache must not grow forever. Certificate generation is
+/// cheap enough to repeat; 512 covers the active set of a normal browser.
+const LEAF_CACHE_MAX: usize = 512;
+const LEAF_CACHE_PRUNE_TO: usize = LEAF_CACHE_MAX * 3 / 4;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +70,11 @@ pub struct CertificateAuthority {
     // Trust status costs a `security find-certificate` subprocess on macOS;
     // it only changes when the user (de)installs, so cache it briefly.
     status_cache: Mutex<Option<(Instant, CaStatus)>>,
+    // A subprocess must never run under `status_cache` (that would block every
+    // CONNECT and UI probe behind Keychain). Concurrent callers reuse the last
+    // snapshot instead of piling up more `security` processes; operations that
+    // need an authoritative pre/post state wait for this lock instead.
+    probe_lock: Mutex<()>,
     // `security add-trusted-cert` imports the certificate before asking for
     // authorization. Probing the store while an operation is in flight would
     // see that half-applied state and report "trusted" while the password
@@ -92,6 +102,7 @@ impl CertificateAuthority {
             material: RwLock::new(Arc::new(material)),
             leaves: RwLock::new(HashMap::new()),
             status_cache: Mutex::new(None),
+            probe_lock: Mutex::new(()),
             busy: AtomicBool::new(false),
         }))
     }
@@ -122,50 +133,94 @@ impl CertificateAuthority {
             }
         }
 
-        let material = Arc::clone(&self.material.read());
+        // Hold the CA material while building and inserting the leaf. Otherwise
+        // `regenerate` could swap the CA and clear the cache between those two
+        // steps, leaving a leaf signed by the retired CA in the fresh cache.
+        let material = self.material.read();
         let config = build_leaf_config(&domain, &material, self.provider.clone())?;
-        self.leaves.write().insert(
+        let mut leaves = self.leaves.write();
+        leaves.insert(
             domain,
             Arc::new(LeafEntry {
                 config: config.clone(),
                 created_at: OffsetDateTime::now_utc(),
             }),
         );
+        if leaves.len() > LEAF_CACHE_MAX {
+            prune_leaves(&mut leaves, LEAF_CACHE_PRUNE_TO);
+        }
         Ok(config)
     }
 
     pub fn status(&self) -> CaStatus {
-        const STATUS_TTL: Duration = Duration::from_secs(3);
-        let mut cache = self.status_cache.lock();
-        if self.busy.load(Ordering::SeqCst) {
-            // The store is mid-change: answer with the state from before the
-            // operation instead of the half-applied one.
-            if let Some((_, status)) = cache.as_ref() {
-                tracing::debug!(
-                    installed = status.installed,
-                    "ca status asked during an operation; using the previous state"
-                );
-                return status.clone();
+        const STATUS_TTL: Duration = Duration::from_secs(10);
+        // Read the snapshot and release the lock before doing anything slow. In
+        // particular, never hold it while `security(1)` runs: every CONNECT and
+        // every UI tick would otherwise queue behind a Keychain subprocess.
+        let cached = {
+            let cache = self.status_cache.lock();
+            if self.busy.load(Ordering::SeqCst) {
+                // The store is mid-change: answer with the state from before the
+                // operation instead of the half-applied one.
+                if let Some((_, status)) = cache.as_ref() {
+                    tracing::debug!(
+                        installed = status.installed,
+                        "ca status asked during an operation; using the previous state"
+                    );
+                    return status.clone();
+                }
+                return self.unprobed_status(false);
             }
-            return self.unprobed_status(false);
-        }
-        if let Some((at, status)) = cache.as_ref() {
-            if at.elapsed() < STATUS_TTL {
-                tracing::debug!(
-                    age_ms = at.elapsed().as_millis() as u64,
-                    installed = status.installed,
-                    "ca status served from cache"
-                );
-                return status.clone();
+            match cache.as_ref() {
+                Some((at, status)) if at.elapsed() < STATUS_TTL => {
+                    tracing::debug!(
+                        age_ms = at.elapsed().as_millis() as u64,
+                        installed = status.installed,
+                        "ca status served from cache"
+                    );
+                    return status.clone();
+                }
+                Some((_, status)) => Some(status.clone()),
+                None => None,
             }
-        }
-        let previous = cache
+        };
+
+        // One probe at a time. A second caller gets the previous snapshot
+        // immediately rather than waiting for the Keychain or spawning another
+        // `security` process.
+        let Some(_probe) = self.probe_lock.try_lock() else {
+            return cached.unwrap_or_else(|| self.unprobed_status(false));
+        };
+        self.probe_and_cache(cached)
+    }
+
+    /// Authoritative status for CA operations and their result reporting. Waits
+    /// for any concurrent background probe, then performs a fresh one.
+    fn status_now(&self) -> CaStatus {
+        let _probe = self.probe_lock.lock();
+        let cached = self
+            .status_cache
+            .lock()
             .as_ref()
-            .map(|(_, status)| (status.supported, status.installed, status.error.clone()));
-        let material = self.material.read();
-        let fingerprint = short_fingerprint(&material.fingerprint_sha1);
+            .map(|(_, status)| status.clone());
+        self.probe_and_cache(cached)
+    }
+
+    /// Probe the trust store and update the snapshot. Callers must hold
+    /// `probe_lock`; `cached` is the previous snapshot used only for logging.
+    fn probe_and_cache(&self, cached: Option<CaStatus>) -> CaStatus {
+        let (fingerprint_sha1, fingerprint_sha256, not_before, not_after) = {
+            let material = self.material.read();
+            (
+                material.fingerprint_sha1.clone(),
+                material.fingerprint_sha256.clone(),
+                material.not_before.clone(),
+                material.not_after.clone(),
+            )
+        };
+        let fingerprint = short_fingerprint(&fingerprint_sha1);
         let (supported, installed, error) =
-            match trust_status(&material.fingerprint_sha1, &self.paths.ca_cert_file()) {
+            match trust_status(&fingerprint_sha1, &self.paths.ca_cert_file()) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     tracing::warn!(
@@ -177,6 +232,9 @@ impl CertificateAuthority {
                 }
             };
         // The UI probes every second; only a change is worth an INFO line.
+        let previous = cached
+            .as_ref()
+            .map(|status| (status.supported, status.installed, status.error.clone()));
         let signature = (supported, installed, error.clone());
         if previous.as_ref() == Some(&signature) {
             tracing::debug!(fingerprint, installed, "ca status unchanged");
@@ -194,15 +252,15 @@ impl CertificateAuthority {
             supported,
             installed,
             subject: Some(format!("CN={CA_COMMON_NAME}")),
-            fingerprint_sha1: Some(material.fingerprint_sha1.clone()),
-            fingerprint_sha256: Some(material.fingerprint_sha256.clone()),
+            fingerprint_sha1: Some(fingerprint_sha1),
+            fingerprint_sha256: Some(fingerprint_sha256),
             cert_path: Some(self.paths.ca_cert_file().display().to_string()),
-            not_before: Some(material.not_before.clone()),
-            not_after: Some(material.not_after.clone()),
+            not_before: Some(not_before),
+            not_after: Some(not_after),
             error,
             note: trust_note(),
         };
-        *cache = Some((Instant::now(), status.clone()));
+        *self.status_cache.lock() = Some((Instant::now(), status.clone()));
         status
     }
 
@@ -234,7 +292,7 @@ impl CertificateAuthority {
     /// Install the CA into the current user's trust store.
     pub fn install(&self) -> Result<CaStatus> {
         *self.status_cache.lock() = None;
-        let was_installed = self.status().installed;
+        let was_installed = self.status_now().installed;
         self.install_with_rollback(was_installed)
     }
 
@@ -270,7 +328,7 @@ impl CertificateAuthority {
                 tracing::warn!(fingerprint, error = %format!("{error:#}"), "ca install failed")
             }
         }
-        let mut status = self.status();
+        let mut status = self.status_now();
         if should_roll_back(was_installed, result.is_err()) {
             // A cancelled dialog still imports the certificate, so undo the
             // import whether or not the trust setting landed.
@@ -289,7 +347,7 @@ impl CertificateAuthority {
                 ),
             }
             *self.status_cache.lock() = None;
-            status = self.status();
+            status = self.status_now();
         }
         tracing::info!(
             fingerprint,
@@ -308,7 +366,7 @@ impl CertificateAuthority {
         tracing::info!(fingerprint, "ca uninstall starting");
         *self.status_cache.lock() = None;
         // Fill the cache with the pre-operation state for mid-flight queries.
-        let _ = self.status();
+        let _ = self.status_now();
         let result = {
             let _guard = self.begin_operation();
             // Explicit removal should drop the trust settings as well.
@@ -321,7 +379,7 @@ impl CertificateAuthority {
                 tracing::warn!(fingerprint, error = %format!("{error:#}"), "ca uninstall failed")
             }
         }
-        let status = self.status();
+        let status = self.status_now();
         tracing::info!(
             fingerprint,
             installed = status.installed,
@@ -338,7 +396,7 @@ impl CertificateAuthority {
         *self.status_cache.lock() = None;
         // A repair that gets cancelled should end where it started: if the CA
         // was trusted before, the re-imported copy may stay trusted.
-        let was_installed = self.status().installed;
+        let was_installed = self.status_now().installed;
         let removed = {
             let _guard = self.begin_operation();
             // The following install re-adds trust; no need for a second prompt.
@@ -368,7 +426,30 @@ impl CertificateAuthority {
         let material = generate_and_save(&self.paths)?;
         *self.material.write() = Arc::new(material);
         self.leaves.write().clear();
-        Ok(self.status())
+        // The cached trust snapshot describes the old certificate; the new one
+        // has not been imported anywhere yet.
+        *self.status_cache.lock() = None;
+        Ok(self.status_now())
+    }
+}
+
+/// Bound the leaf cache: drop expired certificates first, then the oldest
+/// entries until `target` remain.
+fn prune_leaves(leaves: &mut HashMap<String, Arc<LeafEntry>>, target: usize) {
+    let now = OffsetDateTime::now_utc();
+    let rotate = TimeDuration::hours(LEAF_ROTATE_HOURS);
+    leaves.retain(|_, entry| now - entry.created_at < rotate);
+    if leaves.len() <= target {
+        return;
+    }
+    let mut ages: Vec<(String, OffsetDateTime)> = leaves
+        .iter()
+        .map(|(domain, entry)| (domain.clone(), entry.created_at))
+        .collect();
+    ages.sort_by_key(|(_, created_at)| *created_at);
+    let excess = leaves.len() - target;
+    for (domain, _) in ages.into_iter().take(excess) {
+        leaves.remove(&domain);
     }
 }
 
@@ -542,6 +623,7 @@ fn persist_material(paths: &Paths, material: &CaMaterial) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 const DPAPI_MAGIC: &[u8] = b"HAKIMI-DPAPI";
 
 fn encode_key_file(pem: &[u8]) -> Result<Vec<u8>> {
@@ -1054,6 +1136,32 @@ mod tests {
     }
 
     #[test]
+    fn leaf_cache_prunes_oldest_entries_without_touching_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+        let base = OffsetDateTime::now_utc() - TimeDuration::minutes(10);
+        for i in 0..6 {
+            let domain = format!("h{i}.test");
+            let config = ca.server_config(&domain).unwrap();
+            ca.leaves.write().insert(
+                domain,
+                Arc::new(LeafEntry {
+                    config,
+                    created_at: base + TimeDuration::seconds(i),
+                }),
+            );
+        }
+
+        prune_leaves(&mut ca.leaves.write(), 4);
+        let leaves = ca.leaves.read();
+        assert_eq!(leaves.len(), 4);
+        assert!(!leaves.contains_key("h0.test"));
+        assert!(!leaves.contains_key("h1.test"));
+        assert!(leaves.contains_key("h5.test"));
+    }
+
+    #[test]
     fn status_reports_the_pre_operation_state_while_busy() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path());
@@ -1077,6 +1185,24 @@ mod tests {
             let _guard = ca.begin_operation();
             assert!(!ca.status().installed);
         }
+    }
+
+    #[test]
+    fn stale_status_is_reused_while_another_probe_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+        let mut cached = ca.status();
+        cached.installed = true;
+        *ca.status_cache.lock() =
+            Some((Instant::now() - Duration::from_secs(60), cached));
+        let _probe = ca.probe_lock.lock();
+
+        let status = ca.status();
+        assert!(
+            status.installed,
+            "a concurrent probe must not make callers wait or lose the snapshot"
+        );
     }
 
     #[test]
