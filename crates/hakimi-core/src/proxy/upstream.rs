@@ -12,7 +12,7 @@ use hyper_util::rt::TokioIo;
 
 use super::pool::{UpstreamBody, UpstreamResponseBody};
 use super::{escape_html, full_body, ProxyBody, ProxyContext, COPY_BUFFER_SIZE};
-use crate::domain::{is_ip_literal, normalize_hostname};
+use crate::domain::{is_ip_literal, normalize_hostname, normalize_hostname_cow};
 use crate::status::{AttemptRecord, DomainDiagnostics, State};
 use crate::strategy::FailureReason;
 use crate::util::parse_authority;
@@ -40,12 +40,18 @@ pub(crate) async fn handle_forward(
         }
     };
     let Target {
-        host,
+        normalized_host,
         port,
         https,
         path_and_query,
         upstream_uri,
     } = target;
+
+    // Borrow the host for the error path. A canonical absolute-form request
+    // keeps it inside the reused URI, so the common case allocates nothing;
+    // a rebuilt request owns the normalized copy.
+    let host_uri = upstream_uri.clone();
+    let host: &str = target_host(normalized_host.as_deref(), host_uri.as_ref());
 
     let upgrade_requested = is_upgrade(&req);
     let mut req = req;
@@ -63,7 +69,7 @@ pub(crate) async fn handle_forward(
             forward_with_uri(
                 &ctx,
                 req,
-                &host,
+                host,
                 port,
                 uri,
                 upgrade_requested,
@@ -76,7 +82,7 @@ pub(crate) async fn handle_forward(
             forward_with_pool(
                 &ctx,
                 req,
-                &host,
+                host,
                 port,
                 https,
                 &path_and_query,
@@ -88,12 +94,14 @@ pub(crate) async fn handle_forward(
     };
     match result {
         Ok(response) => response,
-        Err(detail) => match_forward_error(&ctx, &host, port, https, detail),
+        Err(detail) => match_forward_error(&ctx, host, port, https, detail),
     }
 }
 
 struct Target {
-    host: String,
+    /// Normalized host, owned only when the request URI had to be rebuilt.
+    /// `None` means the host is borrowed from [`Self::upstream_uri`].
+    normalized_host: Option<String>,
     port: u16,
     https: bool,
     /// Set only when the absolute-form request URI cannot be reused.
@@ -101,6 +109,15 @@ struct Target {
     /// Original absolute-form URI when reusing it is byte-for-byte equivalent
     /// to rebuilding the authority (lowercase host, no userinfo, path present).
     upstream_uri: Option<Uri>,
+}
+
+/// The normalized host of a target: the owned copy when the request URI had
+/// to be rebuilt, otherwise borrowed from the reused upstream URI.
+fn target_host<'a>(normalized_host: Option<&'a str>, upstream_uri: Option<&'a Uri>) -> &'a str {
+    match normalized_host {
+        Some(host) => host,
+        None => upstream_uri.and_then(|uri| uri.host()).unwrap_or(""),
+    }
 }
 
 /// Immutable authority for one MITM connection. The browser reuses a CONNECT
@@ -134,32 +151,37 @@ fn target_of<B>(req: &Request<B>) -> Result<Target> {
             other => bail!("unsupported proxy scheme `{other}`"),
         };
         let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
-        let normalized = normalize_hostname(host).unwrap_or_else(|_| host.to_ascii_lowercase());
+        // Borrow the normalized host while it is already canonical. The old
+        // code always allocated a lowercase copy, even for the common case of
+        // a browser sending an already-normalized host.
+        let normalized =
+            normalize_hostname_cow(host).unwrap_or_else(|_| Cow::Owned(host.to_ascii_lowercase()));
         let default_port = if https { 443 } else { 80 };
-        let reusable = normalized == host
+        let reusable = normalized.as_ref() == host
             && uri.path_and_query().is_some()
             && uri
                 .authority()
                 .is_none_or(|authority| !authority.as_str().contains('@'))
             && !matches!(uri.port_u16(), Some(port) if port == default_port);
-        let (path_and_query, upstream_uri) = if reusable {
-            (None, Some(uri.clone()))
-        } else {
-            (
-                Some(
-                    uri.path_and_query()
-                        .map(|value| value.as_str().to_string())
-                        .unwrap_or_else(|| "/".to_string()),
-                ),
-                None,
-            )
-        };
+        if reusable {
+            return Ok(Target {
+                normalized_host: None,
+                port,
+                https,
+                path_and_query: None,
+                upstream_uri: Some(uri.clone()),
+            });
+        }
         return Ok(Target {
-            host: normalized,
+            normalized_host: Some(normalized.into_owned()),
             port,
             https,
-            path_and_query,
-            upstream_uri,
+            path_and_query: Some(
+                uri.path_and_query()
+                    .map(|value| value.as_str().to_string())
+                    .unwrap_or_else(|| "/".to_string()),
+            ),
+            upstream_uri: None,
         });
     }
     let path_and_query = uri
@@ -173,7 +195,7 @@ fn target_of<B>(req: &Request<B>) -> Result<Target> {
         .context("request has neither absolute URI nor Host header")?;
     let (host, port) = parse_authority(host_header, 80).context("invalid Host header")?;
     Ok(Target {
-        host,
+        normalized_host: Some(host),
         port,
         https: false,
         path_and_query: Some(path_and_query),
@@ -344,7 +366,14 @@ fn is_upgrade(req: &Request<Incoming>) -> bool {
             .headers()
             .get(header::CONNECTION)
             .and_then(|value| value.to_str().ok())
-            .map(|value| value.to_ascii_lowercase().contains("upgrade"))
+            // Same substring test as the old lowercase+contains, without
+            // allocating a String for every WebSocket request.
+            .map(|value| {
+                value
+                    .as_bytes()
+                    .windows(7)
+                    .any(|window| window.eq_ignore_ascii_case(b"upgrade"))
+            })
             .unwrap_or(true)
 }
 
@@ -359,15 +388,7 @@ async fn forward_with_pool(
     upgrade_requested: bool,
     client_upgrade: Option<OnUpgrade>,
 ) -> std::result::Result<Response<ProxyBody>, String> {
-    let authority = authority(host, port, https);
-    let absolute = format!(
-        "{}://{}{}",
-        if https { "https" } else { "http" },
-        authority,
-        path_and_query
-    );
-    let upstream_uri = absolute
-        .parse()
+    let upstream_uri = build_upstream_uri(host, port, https, path_and_query)
         .map_err(|error| format!("building upstream URI for {host}:{port} failed: {error}"))?;
     forward_with_uri(
         ctx,
@@ -518,6 +539,21 @@ fn authority(host: &str, port: u16, https: bool) -> Cow<'_, str> {
     }
 }
 
+/// Build the absolute upstream URI directly instead of formatting a string and
+/// parsing it back. Same result, one allocation less and no re-parse.
+fn build_upstream_uri(
+    host: &str,
+    port: u16,
+    https: bool,
+    path_and_query: &str,
+) -> std::result::Result<Uri, http::Error> {
+    Uri::builder()
+        .scheme(if https { Scheme::HTTPS } else { Scheme::HTTP })
+        .authority(authority(host, port, https).as_ref())
+        .path_and_query(path_and_query)
+        .build()
+}
+
 pub(crate) fn diagnostics_error_page(
     domain: &str,
     diagnostics: &DomainDiagnostics,
@@ -627,8 +663,18 @@ fn attempt_row(attempt: &AttemptRecord) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{authority, host_header_name, same_host, target_of, MitmTarget};
-    use http::Request;
+    use super::{
+        authority, build_upstream_uri, host_header_name, same_host, target_host, target_of,
+        MitmTarget, Target,
+    };
+    use http::{Request, Uri};
+
+    fn host_of(target: &Target) -> &str {
+        target_host(
+            target.normalized_host.as_deref(),
+            target.upstream_uri.as_ref(),
+        )
+    }
 
     #[test]
     fn mitm_host_match_ignores_ascii_case_and_root_dot() {
@@ -663,6 +709,29 @@ mod tests {
     }
 
     #[test]
+    fn built_upstream_uri_matches_the_former_string_form() {
+        for (host, port, https, path) in [
+            ("example.com", 443u16, true, "/a/b?c=1"),
+            ("example.com", 8080, false, "/"),
+            ("example.com", 8443, true, "/index.html"),
+            ("2001:db8::1", 443, true, "/"),
+            ("2001:db8::1", 8443, true, "/x"),
+        ] {
+            let authority = authority(host, port, https);
+            let expected: Uri = format!(
+                "{}://{}{path}",
+                if https { "https" } else { "http" },
+                authority
+            )
+            .parse()
+            .unwrap();
+            let built = build_upstream_uri(host, port, https, path).unwrap();
+            assert_eq!(built, expected, "host={host} port={port}");
+            assert_eq!(built.to_string(), expected.to_string());
+        }
+    }
+
+    #[test]
     fn absolute_form_uri_is_reused_only_when_equivalent() {
         let req = Request::builder()
             .uri("https://example.com/path?q=1")
@@ -671,13 +740,18 @@ mod tests {
         let target = target_of(&req).unwrap();
         assert!(target.upstream_uri.is_some());
         assert!(target.path_and_query.is_none());
+        assert!(
+            target.normalized_host.is_none(),
+            "a canonical absolute-form request keeps no owned host copy"
+        );
+        assert_eq!(host_of(&target), "example.com");
 
         let req = Request::builder()
             .uri("https://EXAMPLE.com/path")
             .body(())
             .unwrap();
         let target = target_of(&req).unwrap();
-        assert_eq!(target.host, "example.com");
+        assert_eq!(host_of(&target), "example.com");
         assert!(target.upstream_uri.is_none());
         assert_eq!(target.path_and_query.as_deref(), Some("/path"));
 
@@ -700,7 +774,7 @@ mod tests {
             .body(())
             .unwrap();
         let target = target_of(&req).unwrap();
-        assert_eq!(target.host, "example.com");
+        assert_eq!(host_of(&target), "example.com");
         assert_eq!(target.port, 8080);
         assert!(target.upstream_uri.is_none());
         assert_eq!(target.path_and_query.as_deref(), Some("/path"));

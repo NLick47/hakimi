@@ -113,6 +113,18 @@ pub trait RemoteIpProvider: Send + Sync {
     fn remote_ips(&self, domain: &str) -> Option<(String, Vec<std::net::IpAddr>)>;
     fn remote_sni(&self, group_id: &str) -> Option<String>;
     fn has_ip_catalog(&self) -> bool;
+
+    /// Remote IPs for a domain plus the "an IP catalog is loaded" flag.
+    ///
+    /// The decision cursor needs both for every new connection. The default
+    /// keeps existing providers working; implementations that can answer both
+    /// from one snapshot should override it.
+    fn remote_ips_with_catalog(
+        &self,
+        domain: &str,
+    ) -> (Option<(String, Vec<std::net::IpAddr>)>, bool) {
+        (self.remote_ips(domain), self.has_ip_catalog())
+    }
 }
 
 impl RemoteIpProvider for CatalogManager {
@@ -126,6 +138,13 @@ impl RemoteIpProvider for CatalogManager {
 
     fn has_ip_catalog(&self) -> bool {
         CatalogManager::has_ip_catalog(self)
+    }
+
+    fn remote_ips_with_catalog(
+        &self,
+        domain: &str,
+    ) -> (Option<(String, Vec<std::net::IpAddr>)>, bool) {
+        CatalogManager::remote_ips_with_catalog(self, domain)
     }
 }
 
@@ -204,6 +223,21 @@ impl CatalogManager {
             .as_ref()
             .and_then(|catalog| catalog.lookup_ips_normalized(domain))
             .map(|(pattern, ips)| (pattern.clone(), ips.clone()))
+    }
+
+    /// One read-lock acquisition for the domain's IPs and the catalog flag.
+    /// The decision cursor asks for both on every new connection.
+    pub fn remote_ips_with_catalog(
+        &self,
+        domain: &str,
+    ) -> (Option<(String, Vec<std::net::IpAddr>)>, bool) {
+        let catalog = self.ip_catalog.read();
+        let available = catalog.is_some();
+        let ips = catalog
+            .as_ref()
+            .and_then(|catalog| catalog.lookup_ips_normalized(domain))
+            .map(|(pattern, ips)| (pattern.clone(), ips.clone()));
+        (ips, available)
     }
 
     pub fn remote_sni(&self, group_id: &str) -> Option<String> {

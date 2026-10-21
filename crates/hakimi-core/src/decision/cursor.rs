@@ -87,8 +87,8 @@ impl RouteCursor {
         // The common case is an empty set. Only take the write lock (and
         // re-check) when the read-only hint saw a marker.
         let skip_once = skip_hint && engine.cache.take_skip_once(&domain);
-        let remote = engine.remote.remote_ips(&domain);
-        let remote_available = engine.remote.has_ip_catalog();
+        // One catalog snapshot for both the IPs and the "catalog loaded" flag.
+        let (remote, remote_available) = engine.remote.remote_ips_with_catalog(&domain);
 
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut seen = HashSet::new();
