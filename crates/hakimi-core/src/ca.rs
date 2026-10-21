@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -64,6 +65,11 @@ pub struct CertificateAuthority {
     // Trust status costs a `security find-certificate` subprocess on macOS;
     // it only changes when the user (de)installs, so cache it briefly.
     status_cache: Mutex<Option<(Instant, CaStatus)>>,
+    // `security add-trusted-cert` imports the certificate before asking for
+    // authorization. Probing the store while an operation is in flight would
+    // see that half-applied state and report "trusted" while the password
+    // dialog is still on screen.
+    busy: AtomicBool,
 }
 
 impl CertificateAuthority {
@@ -86,6 +92,7 @@ impl CertificateAuthority {
             material: RwLock::new(Arc::new(material)),
             leaves: RwLock::new(HashMap::new()),
             status_cache: Mutex::new(None),
+            busy: AtomicBool::new(false),
         }))
     }
 
@@ -130,17 +137,58 @@ impl CertificateAuthority {
     pub fn status(&self) -> CaStatus {
         const STATUS_TTL: Duration = Duration::from_secs(3);
         let mut cache = self.status_cache.lock();
+        if self.busy.load(Ordering::SeqCst) {
+            // The store is mid-change: answer with the state from before the
+            // operation instead of the half-applied one.
+            if let Some((_, status)) = cache.as_ref() {
+                tracing::debug!(
+                    installed = status.installed,
+                    "ca status asked during an operation; using the previous state"
+                );
+                return status.clone();
+            }
+            return self.unprobed_status(false);
+        }
         if let Some((at, status)) = cache.as_ref() {
             if at.elapsed() < STATUS_TTL {
+                tracing::debug!(
+                    age_ms = at.elapsed().as_millis() as u64,
+                    installed = status.installed,
+                    "ca status served from cache"
+                );
                 return status.clone();
             }
         }
+        let previous = cache
+            .as_ref()
+            .map(|(_, status)| (status.supported, status.installed, status.error.clone()));
         let material = self.material.read();
+        let fingerprint = short_fingerprint(&material.fingerprint_sha1);
         let (supported, installed, error) =
             match trust_status(&material.fingerprint_sha1, &self.paths.ca_cert_file()) {
-            Ok(outcome) => outcome,
-            Err(error) => (trust_supported(), false, Some(format!("{error:#}"))),
-        };
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::warn!(
+                        fingerprint,
+                        error = %format!("{error:#}"),
+                        "ca trust probe failed; reporting untrusted"
+                    );
+                    (trust_supported(), false, Some(format!("{error:#}")))
+                }
+            };
+        // The UI probes every second; only a change is worth an INFO line.
+        let signature = (supported, installed, error.clone());
+        if previous.as_ref() == Some(&signature) {
+            tracing::debug!(fingerprint, installed, "ca status unchanged");
+        } else {
+            tracing::info!(
+                fingerprint,
+                supported,
+                installed,
+                error = error.as_deref().unwrap_or(""),
+                "ca status changed"
+            );
+        }
         let status = CaStatus {
             present: true,
             supported,
@@ -158,25 +206,153 @@ impl CertificateAuthority {
         status
     }
 
+    /// Status without touching the store, for the rare case where one is asked
+    /// for mid-operation and no previous answer is cached.
+    fn unprobed_status(&self, installed: bool) -> CaStatus {
+        let material = self.material.read();
+        CaStatus {
+            present: true,
+            supported: trust_supported(),
+            installed,
+            subject: Some(format!("CN={CA_COMMON_NAME}")),
+            fingerprint_sha1: Some(material.fingerprint_sha1.clone()),
+            fingerprint_sha256: Some(material.fingerprint_sha256.clone()),
+            cert_path: Some(self.paths.ca_cert_file().display().to_string()),
+            not_before: Some(material.not_before.clone()),
+            not_after: Some(material.not_after.clone()),
+            error: None,
+            note: trust_note(),
+        }
+    }
+
+    /// Marks the trust store as being modified for as long as the guard lives.
+    fn begin_operation(&self) -> OperationGuard<'_> {
+        self.busy.store(true, Ordering::SeqCst);
+        OperationGuard { busy: &self.busy }
+    }
+
     /// Install the CA into the current user's trust store.
     pub fn install(&self) -> Result<CaStatus> {
-        let der = self.material.read().der.clone();
-        install_cert(&der, &self.paths.ca_cert_file())?;
         *self.status_cache.lock() = None;
-        Ok(self.status())
+        let was_installed = self.status().installed;
+        self.install_with_rollback(was_installed)
+    }
+
+    /// Install the CA. `was_installed` is the trust state before the whole
+    /// action (for [`Self::repair`] that means before its uninstall step).
+    ///
+    /// `security add-trusted-cert` imports the certificate *before* it asks for
+    /// authorization, and trust settings survive `delete-certificate`; so a
+    /// cancelled dialog can leave a previously-trusted certificate trusted
+    /// again. When the CA was not trusted before the action, a failed install
+    /// rolls the import back instead of silently reporting success.
+    fn install_with_rollback(&self, was_installed: bool) -> Result<CaStatus> {
+        let (der, fingerprint, fingerprint_sha1) = {
+            let material = self.material.read();
+            (
+                material.der.clone(),
+                short_fingerprint(&material.fingerprint_sha1),
+                material.fingerprint_sha1.clone(),
+            )
+        };
+        tracing::info!(fingerprint, was_installed, "ca install starting");
+        let result = {
+            let _guard = self.begin_operation();
+            install_cert(&der, &self.paths.ca_cert_file())
+        };
+        // The pre-operation cache is stale now; the next status re-reads the
+        // store. A failed or cancelled install must never be reported through
+        // a leftover "installed" entry.
+        *self.status_cache.lock() = None;
+        match &result {
+            Ok(()) => tracing::info!(fingerprint, "ca install command succeeded"),
+            Err(error) => {
+                tracing::warn!(fingerprint, error = %format!("{error:#}"), "ca install failed")
+            }
+        }
+        let mut status = self.status();
+        if should_roll_back(was_installed, result.is_err()) {
+            // A cancelled dialog still imports the certificate, so undo the
+            // import whether or not the trust setting landed.
+            tracing::info!(fingerprint, "install did not complete; removing the imported certificate");
+            // Silent: the user just cancelled a dialog, do not ask again.
+            let rollback = {
+                let _guard = self.begin_operation();
+                uninstall_by_sha1(&fingerprint_sha1, false)
+            };
+            match rollback {
+                Ok(()) => tracing::info!(fingerprint, "imported certificate rolled back"),
+                Err(error) => tracing::debug!(
+                    fingerprint,
+                    error = %format!("{error:#}"),
+                    "nothing to roll back"
+                ),
+            }
+            *self.status_cache.lock() = None;
+            status = self.status();
+        }
+        tracing::info!(
+            fingerprint,
+            installed = status.installed,
+            error = status.error.as_deref().unwrap_or(""),
+            ok = result.is_ok(),
+            "ca install finished"
+        );
+        result?;
+        Ok(status)
     }
 
     pub fn uninstall(&self) -> Result<CaStatus> {
         let sha1 = self.material.read().fingerprint_sha1.clone();
-        uninstall_by_sha1(&sha1)?;
+        let fingerprint = short_fingerprint(&sha1);
+        tracing::info!(fingerprint, "ca uninstall starting");
         *self.status_cache.lock() = None;
-        Ok(self.status())
+        // Fill the cache with the pre-operation state for mid-flight queries.
+        let _ = self.status();
+        let result = {
+            let _guard = self.begin_operation();
+            // Explicit removal should drop the trust settings as well.
+            uninstall_by_sha1(&sha1, true)
+        };
+        *self.status_cache.lock() = None;
+        match &result {
+            Ok(()) => tracing::info!(fingerprint, "ca uninstall command succeeded"),
+            Err(error) => {
+                tracing::warn!(fingerprint, error = %format!("{error:#}"), "ca uninstall failed")
+            }
+        }
+        let status = self.status();
+        tracing::info!(
+            fingerprint,
+            installed = status.installed,
+            ok = result.is_ok(),
+            "ca uninstall finished"
+        );
+        result?;
+        Ok(status)
     }
 
     pub fn repair(&self) -> Result<CaStatus> {
         let sha1 = self.material.read().fingerprint_sha1.clone();
-        let _ = uninstall_by_sha1(&sha1);
-        self.install()
+        tracing::info!(fingerprint = short_fingerprint(&sha1), "ca repair starting");
+        *self.status_cache.lock() = None;
+        // A repair that gets cancelled should end where it started: if the CA
+        // was trusted before, the re-imported copy may stay trusted.
+        let was_installed = self.status().installed;
+        let removed = {
+            let _guard = self.begin_operation();
+            // The following install re-adds trust; no need for a second prompt.
+            uninstall_by_sha1(&sha1, false)
+        };
+        if let Err(error) = removed {
+            // Not fatal: a repair on a never-installed CA lands here.
+            tracing::info!(
+                fingerprint = short_fingerprint(&sha1),
+                error = %format!("{error:#}"),
+                "ca repair could not remove the old certificate; installing anyway"
+            );
+        }
+        self.install_with_rollback(was_installed)
     }
 
     /// Create a new CA, replacing the current files (old files are kept as `.bak`). The CA must
@@ -193,6 +369,61 @@ impl CertificateAuthority {
         *self.material.write() = Arc::new(material);
         self.leaves.write().clear();
         Ok(self.status())
+    }
+}
+
+/// Clears [`CertificateAuthority::busy`] however the operation ends.
+struct OperationGuard<'a> {
+    busy: &'a AtomicBool,
+}
+
+impl Drop for OperationGuard<'_> {
+    fn drop(&mut self) {
+        self.busy.store(false, Ordering::SeqCst);
+    }
+}
+
+/// First 12 hex chars of a SHA-1, enough to tell certificates apart in logs
+/// without dumping a full fingerprint on every line.
+fn short_fingerprint(sha1: &str) -> String {
+    sha1.chars().take(12).collect::<String>().to_ascii_uppercase()
+}
+
+/// A failed install may still have imported (and re-trusted) the certificate.
+/// Rolling back is only correct when the CA was not trusted beforehand; during a
+/// repair it was, so leaving it trusted restores the starting point.
+fn should_roll_back(was_installed: bool, failed: bool) -> bool {
+    failed && !was_installed
+}
+
+/// Cap command output before it lands in the log.
+fn truncate_for_log(text: &str, max: usize) -> String {
+    let one_line = text.trim().replace('\n', " ");
+    if one_line.chars().count() <= max {
+        return one_line;
+    }
+    let head: String = one_line.chars().take(max).collect();
+    format!("{head}…")
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum SecurityOutcome {
+    Ok,
+    Cancelled,
+    Failed,
+}
+
+/// `security` may exit 0 after the user dismisses the authorization dialog, so
+/// the output decides first and the exit status only breaks the tie.
+#[cfg(target_os = "macos")]
+fn classify_security_output(success: bool, stderr: &str) -> SecurityOutcome {
+    if stderr.to_ascii_lowercase().contains("cancel") {
+        SecurityOutcome::Cancelled
+    } else if success {
+        SecurityOutcome::Ok
+    } else {
+        SecurityOutcome::Failed
     }
 }
 
@@ -467,7 +698,7 @@ fn trust_note() -> Option<String> {
 }
 
 #[cfg(windows)]
-fn trust_status(sha1_hex: &str) -> Result<(bool, bool, Option<String>)> {
+fn trust_status(sha1_hex: &str, _cert_path: &Path) -> Result<(bool, bool, Option<String>)> {
     let hash = hex::decode(sha1_hex).context("decoding SHA-1 fingerprint")?;
     let found = unsafe { win_store_find(&hash)? };
     Ok((true, found, None))
@@ -558,7 +789,7 @@ unsafe fn win_store_add(der: &[u8]) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn uninstall_by_sha1(sha1_hex: &str) -> Result<()> {
+fn uninstall_by_sha1(sha1_hex: &str, _remove_trust: bool) -> Result<()> {
     let hash = hex::decode(sha1_hex).context("decoding SHA-1 fingerprint")?;
     unsafe { win_store_delete(&hash) }
 }
@@ -639,6 +870,21 @@ fn trust_status(sha1_hex: &str, cert_path: &Path) -> Result<(bool, bool, Option<
     let text = String::from_utf8_lossy(&output.stdout).to_uppercase();
     let needle = sha1_hex.to_uppercase();
     let present = text.contains(&needle);
+    let listed = text.matches("SHA-1 HASH:").count();
+    tracing::debug!(
+        keychain = %keychain,
+        exit = output.status.code().unwrap_or(-1),
+        certificates_with_our_cn = listed,
+        present,
+        "ca keychain lookup"
+    );
+    if !output.status.success() {
+        tracing::warn!(
+            keychain = %keychain,
+            stderr = %truncate_for_log(&String::from_utf8_lossy(&output.stderr), 300),
+            "security find-certificate failed; treating the CA as not installed"
+        );
+    }
     if !present {
         return Ok((true, false, None));
     }
@@ -650,16 +896,16 @@ fn trust_status(sha1_hex: &str, cert_path: &Path) -> Result<(bool, bool, Option<
         .output()
         .context("running security verify-cert")?;
     if verify.status.success() {
+        tracing::debug!("ca verify-cert passed; reporting trusted");
         Ok((true, true, None))
     } else {
-        Ok((
-            true,
-            false,
-            Some(
-                "the certificate is imported but not trusted; run install again and confirm the dialog"
-                    .into(),
-            ),
-        ))
+        tracing::info!(
+            exit = verify.status.code().unwrap_or(-1),
+            stderr = %truncate_for_log(&String::from_utf8_lossy(&verify.stderr), 300),
+            "ca is imported but not trusted"
+        );
+        // Keep it short: the UI only shows one status line here.
+        Ok((true, false, Some("已导入，但尚未受信任".into())))
     }
 }
 
@@ -671,32 +917,78 @@ fn install_cert(_der: &[u8], pem_path: &Path) -> Result<()> {
         .args(["add-trusted-cert", "-r", "trustRoot", "-k", &keychain, &pem])
         .output()
         .context("running security add-trusted-cert")?;
-    if !output.status.success() {
-        bail!(
-            "security add-trusted-cert failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let outcome = classify_security_output(output.status.success(), &stderr);
+    tracing::info!(
+        exit = output.status.code().unwrap_or(-1),
+        outcome = ?outcome,
+        stderr = %truncate_for_log(&stderr, 400),
+        "security add-trusted-cert finished"
+    );
+    // `security` can exit 0 after the user dismisses the authorization dialog,
+    // and an already-trusted copy would still verify — so a cancellation has to
+    // be detected from the output, not from the exit status alone.
+    match outcome {
+        SecurityOutcome::Ok => {}
+        SecurityOutcome::Cancelled => bail!("user canceled the authorization dialog"),
+        SecurityOutcome::Failed => {
+            bail!("security add-trusted-cert failed: {}", stderr.trim())
+        }
     }
     // The trust dialog can be cancelled: the certificate imports but the trust
     // setting never lands. Only report success when the system really trusts it.
-    let verify = Command::new("security")
-        .args(["verify-cert", "-c", &pem, "-p", "ssl"])
-        .output()
-        .context("running security verify-cert")?;
-    if !verify.status.success() {
-        bail!("the certificate was imported but the trust dialog was not confirmed; run install again");
+    // Trust settings can take a moment to propagate, so retry briefly instead
+    // of rolling back an install that actually worked.
+    const VERIFY_ATTEMPTS: u32 = 5;
+    let mut stderr = String::new();
+    for attempt in 1..=VERIFY_ATTEMPTS {
+        let verify = Command::new("security")
+            .args(["verify-cert", "-c", &pem, "-p", "ssl"])
+            .output()
+            .context("running security verify-cert")?;
+        stderr = String::from_utf8_lossy(&verify.stderr).to_string();
+        if verify.status.success() {
+            tracing::info!(attempt, "security verify-cert after install: trusted");
+            return Ok(());
+        }
+        tracing::debug!(
+            attempt,
+            stderr = %truncate_for_log(&stderr, 200),
+            "security verify-cert after install: not trusted yet"
+        );
+        if attempt < VERIFY_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(150));
+        }
     }
-    Ok(())
+    tracing::info!(
+        stderr = %truncate_for_log(&stderr, 300),
+        "security verify-cert after install: still untrusted"
+    );
+    bail!("the certificate was imported but the trust dialog was not confirmed; run install again")
 }
 
 #[cfg(target_os = "macos")]
-fn uninstall_by_sha1(sha1_hex: &str) -> Result<()> {
+fn uninstall_by_sha1(sha1_hex: &str, remove_trust: bool) -> Result<()> {
     let keychain = keychain_path();
     let thumbprint = sha1_hex.to_uppercase();
+    // `-t` also drops the user trust settings, but macOS asks for authorization
+    // again — fine for an explicit "remove", wrong for a silent rollback after
+    // the user already cancelled one dialog.
+    let mut args = vec!["delete-certificate"];
+    if remove_trust {
+        args.push("-t");
+    }
+    args.extend(["-Z", thumbprint.as_str(), keychain.as_str()]);
     let output = Command::new("security")
-        .args(["delete-certificate", "-Z", &thumbprint, &keychain])
+        .args(&args)
         .output()
         .context("running security delete-certificate")?;
+    tracing::info!(
+        thumbprint = %thumbprint,
+        exit = output.status.code().unwrap_or(-1),
+        stderr = %truncate_for_log(&String::from_utf8_lossy(&output.stderr), 300),
+        "security delete-certificate finished"
+    );
     if !output.status.success() {
         bail!(
             "security delete-certificate failed: {}",
@@ -707,7 +999,7 @@ fn uninstall_by_sha1(sha1_hex: &str) -> Result<()> {
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn trust_status(_sha1_hex: &str) -> Result<(bool, bool, Option<String>)> {
+fn trust_status(_sha1_hex: &str, _cert_path: &Path) -> Result<(bool, bool, Option<String>)> {
     Ok((
         false,
         false,
@@ -721,7 +1013,7 @@ fn install_cert(_der: &[u8], _pem_path: &Path) -> Result<()> {
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn uninstall_by_sha1(_sha1_hex: &str) -> Result<()> {
+fn uninstall_by_sha1(_sha1_hex: &str, _remove_trust: bool) -> Result<()> {
     bail!("automatic CA removal is only implemented on Windows and macOS")
 }
 
@@ -759,6 +1051,74 @@ mod tests {
         // Cached leaf is reused.
         let config2 = ca.server_config("github.com").unwrap();
         assert!(Arc::ptr_eq(&config, &config2));
+    }
+
+    #[test]
+    fn status_reports_the_pre_operation_state_while_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+
+        // Pretend the CA was trusted before the operation. A real probe on this
+        // temp CA would say "not installed", so seeing `true` proves the store
+        // was not queried mid-operation.
+        let mut cached = ca.status();
+        cached.installed = true;
+        *ca.status_cache.lock() = Some((Instant::now(), cached));
+
+        {
+            let _guard = ca.begin_operation();
+            assert!(ca.status().installed);
+        }
+
+        // Without a cache it still refuses to probe and reports untrusted.
+        *ca.status_cache.lock() = None;
+        {
+            let _guard = ca.begin_operation();
+            assert!(!ca.status().installed);
+        }
+    }
+
+    #[test]
+    fn a_failed_install_only_rolls_back_a_new_certificate() {
+        // The dialog may have imported it, trusted or not: remove it.
+        assert!(should_roll_back(false, true));
+        // A repair starts from "trusted": removing would be worse than leaving.
+        assert!(!should_roll_back(true, true));
+        // Successful installs stay.
+        assert!(!should_roll_back(false, false));
+    }
+
+    #[test]
+    fn fingerprints_are_shortened_for_logs() {
+        assert_eq!(
+            short_fingerprint("17655f91461cb5436e520be1a76b9b5eff83c83f"),
+            "17655F91461C"
+        );
+        assert_eq!(short_fingerprint("abc"), "ABC");
+    }
+
+    #[test]
+    fn long_output_is_truncated_for_logs() {
+        assert_eq!(truncate_for_log("  a\nb  ", 10), "a b");
+        let truncated = truncate_for_log("0123456789abcdef", 8);
+        assert_eq!(truncated, "01234567…");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cancellation_is_detected_even_when_security_exits_zero() {
+        use SecurityOutcome::*;
+        assert_eq!(
+            classify_security_output(true, "User canceled the operation."),
+            Cancelled
+        );
+        assert_eq!(
+            classify_security_output(false, "security: authorization was cancelled"),
+            Cancelled
+        );
+        assert_eq!(classify_security_output(false, "boom"), Failed);
+        assert_eq!(classify_security_output(true, ""), Ok);
     }
 
     #[test]

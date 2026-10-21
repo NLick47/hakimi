@@ -156,7 +156,7 @@ pub struct RouteCursor {
     port: u16,
     tls: bool,
     group: GroupConfig,
-    config: AppConfig,
+    config: Arc<AppConfig>,
     network: String,
     max: usize,
     candidates: Vec<Candidate>,
@@ -189,7 +189,7 @@ impl RouteCursor {
         port: u16,
         tls: bool,
         group: GroupConfig,
-        config: AppConfig,
+        config: Arc<AppConfig>,
     ) -> Self {
         let network = network_id();
         let max = config.advanced.max_candidates_per_domain;
@@ -606,7 +606,7 @@ pub struct DecisionEngine {
     plan_cache: parking_lot::Mutex<HashMap<String, (Instant, ConnectPlan)>>,
     /// Per (domain, IP) observations. Candidates are ordered by score, so a host picks the
     /// address that has actually been fast on this network instead of a static list.
-    ip_scores: parking_lot::RwLock<HashMap<(String, IpAddr), IpScore>>,
+    ip_scores: parking_lot::RwLock<HashMap<String, HashMap<IpAddr, IpScore>>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -634,6 +634,9 @@ impl IpScore {
 }
 
 const PLAN_CACHE_MAX: usize = 2048;
+/// How many (domain, ip) quality entries to keep in memory. The active set of a
+/// heavy user stays well below this; growth past it evicts the worst-ranked.
+const IP_SCORE_CAP: usize = 128;
 
 impl DecisionEngine {
     pub fn new(
@@ -644,6 +647,19 @@ impl DecisionEngine {
         prober: Arc<dyn Prober>,
         status: Arc<StatusStore>,
     ) -> Arc<Self> {
+        // Seed the in-memory quality map from the persisted one, so a restart
+        // keeps knowing that an IP was fast or blocked on this network.
+        let mut seeded_scores: HashMap<String, HashMap<IpAddr, IpScore>> = HashMap::new();
+        for (domain, ip, entry) in cache.ip_scores() {
+            seeded_scores.entry(domain).or_default().insert(
+                ip,
+                IpScore {
+                    ewma_ms: entry.ewma_ms,
+                    successes: entry.successes,
+                    failures: entry.failures,
+                },
+            );
+        }
         Arc::new(Self {
             config,
             cache,
@@ -652,7 +668,7 @@ impl DecisionEngine {
             prober,
             status,
             plan_cache: parking_lot::Mutex::new(HashMap::new()),
-            ip_scores: parking_lot::RwLock::new(HashMap::new()),
+            ip_scores: parking_lot::RwLock::new(seeded_scores),
         })
     }
 
@@ -723,7 +739,7 @@ impl DecisionEngine {
             }
         };
         let matcher = self.config.matcher();
-        let Some(group_id) = matcher.match_host(&normalized).map(ToOwned::to_owned) else {
+        let Some(group_id) = matcher.match_normalized(&normalized).map(ToOwned::to_owned) else {
             return Route::Bypass(DecisionOutcome {
                 plan: None,
                 diagnostics: DomainDiagnostics {
@@ -795,7 +811,8 @@ impl DecisionEngine {
     /// consult this, so it only affects cold connections and raw CONNECT tunnels.
     pub fn cached_plan(&self, domain: &str, port: u16, tls: bool) -> Option<ConnectPlan> {
         let key = plan_key(domain, port, tls);
-        let ttl = Duration::from_secs(self.config.snapshot().advanced.plan_cache_secs);
+        let config = self.config.snapshot();
+        let ttl = Duration::from_secs(config.advanced.plan_cache_secs);
         let mut cache = self.plan_cache.lock();
         let (at, plan) = cache.get(&key)?;
         if at.elapsed() >= ttl {
@@ -810,9 +827,8 @@ impl DecisionEngine {
         if self.cache.has_skip_once(&plan.domain) {
             return None;
         }
-        let config = self.config.snapshot();
         let matcher = self.config.matcher();
-        let group_id = matcher.match_host(&plan.domain)?.to_string();
+        let group_id = matcher.match_normalized(&plan.domain)?.to_string();
         let group = config.group(&group_id)?;
         if !group.enabled || self.status.paused() {
             return None;
@@ -834,17 +850,20 @@ impl DecisionEngine {
     fn score_ip(&self, domain: &str, ip: IpAddr) -> f64 {
         self.ip_scores
             .read()
-            .get(&(domain.to_string(), ip))
+            .get(domain)
+            .and_then(|by_ip| by_ip.get(&ip))
             .map(|score| score.rank())
             .unwrap_or(f64::MAX)
     }
 
     fn record_ip(&self, domain: &str, ip: IpAddr, latency_ms: Option<u64>, failed: bool) -> bool {
         let mut scores = self.ip_scores.write();
-        if scores.len() > 4096 {
-            scores.clear();
-        }
-        let entry = scores.entry((domain.to_string(), ip)).or_default();
+        let entry = scores
+            .entry(domain.to_string())
+            .or_default()
+            .entry(ip)
+            .or_default();
+        let degraded;
         if failed {
             entry.failures += 1;
             entry.ewma_ms = if entry.ewma_ms == 0.0 {
@@ -852,19 +871,51 @@ impl DecisionEngine {
             } else {
                 entry.ewma_ms * 0.7 + 10_000.0 * 0.3
             };
-            return false;
-        }
-        entry.successes += 1;
-        let sample = latency_ms.unwrap_or(500) as f64;
-        // A sample far worse than the established average means the proven route
-        // degraded (network flap, congestion). Signal the caller to re-race.
-        let degraded =
-            entry.successes > 2 && sample > 800.0 && entry.ewma_ms > 0.0 && sample > entry.ewma_ms * 2.5;
-        entry.ewma_ms = if entry.successes == 1 {
-            sample
+            degraded = false;
         } else {
-            entry.ewma_ms * 0.7 + sample * 0.3
-        };
+            entry.successes += 1;
+            let sample = latency_ms.unwrap_or(500) as f64;
+            // A sample far worse than the established average means the proven route
+            // degraded (network flap, congestion). Signal the caller to re-race.
+            degraded = entry.successes > 2
+                && sample > 800.0
+                && entry.ewma_ms > 0.0
+                && sample > entry.ewma_ms * 2.5;
+            entry.ewma_ms = if entry.successes == 1 {
+                sample
+            } else {
+                entry.ewma_ms * 0.7 + sample * 0.3
+            };
+        }
+        let snapshot = (entry.ewma_ms, entry.successes, entry.failures);
+        drop(entry);
+        // Bounded map: when full, drop the least valuable entries — the ones
+        // with the worst measured quality — instead of wiping everything. A
+        // flood of dead IPs must never erase knowledge of a proven route.
+        let total: usize = scores.values().map(|by_ip| by_ip.len()).sum();
+        if total > IP_SCORE_CAP {
+            let mut ranked: Vec<((String, IpAddr), f64)> = scores
+                .iter()
+                .flat_map(|(domain, by_ip)| {
+                    by_ip
+                        .iter()
+                        .map(|(ip, score)| ((domain.clone(), *ip), score.rank()))
+                })
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for ((domain, ip), _) in ranked.into_iter().take(total - IP_SCORE_CAP) {
+                if let Some(by_ip) = scores.get_mut(&domain) {
+                    by_ip.remove(&ip);
+                    if by_ip.is_empty() {
+                        scores.remove(&domain);
+                    }
+                }
+            }
+        }
+        // Persist both outcomes: a restart must keep knowing that this IP was
+        // fast — or blocked — on this network. The cache batches disk writes.
+        self.cache
+            .put_ip_score(domain, ip, snapshot.0, snapshot.1, snapshot.2);
         degraded
     }
 
@@ -876,6 +927,58 @@ impl DecisionEngine {
             cache.retain(|_, (at, _)| at.elapsed() < ttl);
         }
         cache.insert(key, (Instant::now(), plan.clone()));
+    }
+
+    /// TCP-probe IPs that accumulated failures and forgive the ones that answer
+    /// again. A temporary block (GFW reset, network flap) should not bury a
+    /// working address under its failure score forever.
+    pub async fn reprobe_failed_ips(self: &Arc<Self>, limit: usize) -> usize {
+        let candidates: Vec<(String, IpAddr)> = {
+            let scores = self.ip_scores.read();
+            let mut list: Vec<(&str, IpAddr, u32)> = scores
+                .iter()
+                .flat_map(|(domain, by_ip)| {
+                    by_ip
+                        .iter()
+                        .filter(|(_, score)| score.failures > 0)
+                        .map(|(ip, score)| (domain.as_str(), *ip, score.failures))
+                })
+                .collect();
+            list.sort_by(|a, b| b.2.cmp(&a.2));
+            list.truncate(limit);
+            list.into_iter()
+                .map(|(domain, ip, _)| (domain.to_string(), ip))
+                .collect()
+        };
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        let mut set = tokio::task::JoinSet::new();
+        for (domain, ip) in candidates {
+            let engine = self.clone();
+            set.spawn(async move {
+                match engine.prober.probe_tcp(ip, 443, Duration::from_secs(3)).await {
+                    Ok(latency) => {
+                        // A successful probe is a real sample: the success count
+                        // rises, so the fail rate — and the rank — recover.
+                        engine.record_ip(&domain, ip, Some(latency), false);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            });
+        }
+        let mut restored = 0;
+        while let Some(joined) = set.join_next().await {
+            if matches!(joined, Ok(true)) {
+                restored += 1;
+            }
+        }
+        if restored > 0 {
+            tracing::info!(restored, "failed ip scores restored after re-probe");
+        }
+        restored
     }
 
     /// Record a raw-tunnel success (TCP only; the browser's own TLS handshake validates the
@@ -917,6 +1020,20 @@ impl DecisionEngine {
             IpSource::Doh | IpSource::DohCache => doh.source,
             _ => None,
         };
+        if attempts.len() > 1 {
+            for (index, attempt) in attempts.iter().enumerate() {
+                tracing::info!(
+                    domain = %plan.domain,
+                    attempt = index + 1,
+                    strategy = ?attempt.strategy,
+                    ip = %attempt.ip,
+                    source = ?attempt.source,
+                    error = ?attempt.error,
+                    "failed candidate before success"
+                );
+            }
+        }
+        let attempts_total = attempts.len();
         let diagnostics = DomainDiagnostics {
             group: Some(plan.group_id.clone()),
             domain: plan.domain.clone(),
@@ -961,6 +1078,7 @@ impl DecisionEngine {
             mode = %plan.mode,
             source = %plan.source,
             latency_ms,
+            attempts = attempts_total,
             "resolved connection strategy"
         );
         diagnostics
@@ -1037,6 +1155,7 @@ impl DecisionEngine {
         seen: &mut HashSet<IpAddr>,
         max: usize,
     ) -> DohExpansion {
+        let started = std::time::Instant::now();
         match self.resolver.doh_ips(domain).await {
             Ok(DohResolution {
                 ips,
@@ -1045,11 +1164,13 @@ impl DecisionEngine {
                 stale,
                 ..
             }) => {
+                let elapsed = started.elapsed().as_millis() as u64;
                 let candidate_source = if stale {
                     IpSource::DohCache
                 } else {
                     IpSource::Doh
                 };
+                let before = candidates.len();
                 for ip in ips.into_iter().chain(hints) {
                     if candidates.len() >= max {
                         break;
@@ -1061,17 +1182,46 @@ impl DecisionEngine {
                         });
                     }
                 }
+                // DoH is the expensive fallback: its cost and yield decide
+                // whether the catalog needs better coverage.
+                if elapsed > 1000 {
+                    tracing::warn!(
+                        domain = %domain,
+                        source = ?source,
+                        stale,
+                        added = candidates.len() - before,
+                        elapsed_ms = elapsed,
+                        "doh expansion was slow"
+                    );
+                } else {
+                    tracing::info!(
+                        domain = %domain,
+                        source = ?source,
+                        stale,
+                        added = candidates.len() - before,
+                        elapsed_ms = elapsed,
+                        "doh expansion"
+                    );
+                }
                 DohExpansion {
                     source: Some(source),
                     error: None,
                     stale,
                 }
             }
-            Err(error) => DohExpansion {
-                source: None,
-                error: Some(format!("{error:#}")),
-                stale: false,
-            },
+            Err(error) => {
+                tracing::warn!(
+                    domain = %domain,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    error = %format!("{error:#}"),
+                    "doh expansion failed"
+                );
+                DohExpansion {
+                    source: None,
+                    error: Some(format!("{error:#}")),
+                    stale: false,
+                }
+            }
         }
     }
 
@@ -1082,6 +1232,13 @@ impl DecisionEngine {
         domain: &str,
         network: &str,
     ) -> Vec<Option<String>> {
+        // A group that names its own SNI is authoritative: `Some("")` means
+        // "send no SNI", not "fall back to the shared candidates".
+        if let Some(configured) = &group.sni {
+            let value = configured.trim().to_ascii_lowercase();
+            return vec![if value.is_empty() { None } else { Some(value) }];
+        }
+
         let mut out: Vec<Option<String>> = Vec::new();
         let mut push = |candidate: Option<String>| {
             let normalized = candidate.and_then(|value| {
@@ -1100,9 +1257,6 @@ impl DecisionEngine {
         }
         if let Some(remote) = self.remote.remote_sni(&group.id) {
             push(Some(remote));
-        }
-        if let Some(configured) = &group.sni {
-            push(Some(configured.clone()));
         }
         for candidate in &config.advanced.fake_sni_candidates {
             push(Some(candidate.clone()));
@@ -1317,6 +1471,76 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn reprobe_restores_ips_that_answer_again() {
+        let h = harness(&["example.com"], Strategy::Auto);
+        let ip: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        h.engine.record_ip("example.com", ip, None, true);
+        let before = h.engine.score_ip("example.com", ip);
+
+        // The fake prober answers for IPs in `working`.
+        h.prober.working.lock().insert(ip);
+        let restored = h.engine.reprobe_failed_ips(16).await;
+        assert_eq!(restored, 1, "the answering ip must be restored");
+
+        let after = h.engine.score_ip("example.com", ip);
+        assert!(after < before, "rank {before} should drop to {after}");
+
+        // An IP that still refuses connections gains nothing.
+        let dead: std::net::IpAddr = "203.0.113.99".parse().unwrap();
+        h.engine.record_ip("example.com", dead, None, true);
+        let before_dead = h.engine.score_ip("example.com", dead);
+        let restored = h.engine.reprobe_failed_ips(16).await;
+        assert_eq!(restored, 1, "only the working ip is restored this round");
+        assert_eq!(
+            h.engine.score_ip("example.com", dead),
+            before_dead,
+            "a dead ip must not be forgiven"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_scores_keep_a_blocked_ip_demoted_after_restart() {
+        let h = harness(&["example.com"], Strategy::Auto);
+        let ip: std::net::IpAddr = "203.0.113.30".parse().unwrap();
+        h.engine.record_ip("example.com", ip, None, true);
+        let demoted = h.engine.score_ip("example.com", ip);
+
+        // A "restart": a fresh engine seeded from the same cache.
+        let restarted = DecisionEngine::new(
+            h.engine.config.clone(),
+            h.cache.clone(),
+            h.remote.clone(),
+            h.resolver.clone(),
+            h.prober.clone(),
+            Arc::new(StatusStore::new()),
+        );
+        assert_eq!(
+            restarted.score_ip("example.com", ip),
+            demoted,
+            "the restart must remember that this ip was blocked"
+        );
+    }
+
+    #[test]
+    fn ip_score_overflow_keeps_known_good_ips() {
+        let h = harness(&["example.com"], Strategy::Auto);
+        let good: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        h.engine.record_ip("example.com", good, Some(80), false);
+
+        // Flood the map past its cap with failed routes.
+        for i in 0..5000u32 {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, (i >> 16) as u8, (i >> 8) as u8, i as u8));
+            h.engine.record_ip("example.com", ip, None, true);
+        }
+
+        let rank = h.engine.score_ip("example.com", good);
+        assert!(
+            rank < f64::MAX,
+            "overflow wiped the known-good ip; its measured quality must survive"
+        );
+    }
+
     struct Harness {
         _dir: tempfile::TempDir,
         engine: Arc<DecisionEngine>,
@@ -1364,6 +1588,37 @@ mod tests {
             prober,
             resolver,
         }
+    }
+
+    #[test]
+    fn explicit_group_sni_replaces_the_shared_candidates() {
+        let harness = harness(&["example.com"], Strategy::FakeSni);
+        let config = harness.engine.config.snapshot();
+        let mut group = config.group("test").unwrap().clone();
+
+        // An explicit empty value means "send no SNI", not "use the defaults".
+        group.sni = Some(String::new());
+        assert_eq!(
+            harness
+                .engine
+                .sni_candidates(&config, &group, "example.com", "net"),
+            vec![None]
+        );
+
+        group.sni = Some("WWW.Baidu.com".into());
+        assert_eq!(
+            harness
+                .engine
+                .sni_candidates(&config, &group, "example.com", "net"),
+            vec![Some("www.baidu.com".to_string())]
+        );
+
+        // Without an explicit value the shared candidates still apply.
+        group.sni = None;
+        let candidates = harness
+            .engine
+            .sni_candidates(&config, &group, "example.com", "net");
+        assert!(candidates.iter().any(|candidate| candidate.is_some()));
     }
 
     #[tokio::test]

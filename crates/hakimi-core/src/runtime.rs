@@ -246,7 +246,7 @@ impl HakimiRuntime {
     }
 
     pub fn config_json(&self) -> serde_json::Value {
-        serde_json::to_value(self.config.snapshot()).unwrap_or(serde_json::Value::Null)
+        serde_json::to_value(self.config.snapshot().as_ref()).unwrap_or(serde_json::Value::Null)
     }
 
     /// Bumped on every configuration mutation, so pollers can reuse a cached
@@ -429,6 +429,8 @@ impl HakimiRuntime {
     }
 
     fn apply_system_proxy_inner(&self) -> Result<SystemProxyStatus> {
+        let started = std::time::Instant::now();
+        tracing::info!("applying the system proxy");
         let config = self.config.snapshot();
         if !config.proxy.takeover || config.proxy.mode == ProxyMode::Off {
             return self.system_proxy.status(Some(config.proxy.mode), None);
@@ -443,6 +445,10 @@ impl HakimiRuntime {
             ProxyMode::Http => self.system_proxy.apply_http(listen),
             ProxyMode::Off => unreachable!(),
         };
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "system proxy apply finished"
+        );
         match &result {
             Ok(status) if status.applied => {
                 *self.proxy_error.write() = None;
@@ -543,8 +549,8 @@ impl HakimiRuntime {
     }
 
     pub fn update_config(&self, config: AppConfig) -> Result<()> {
+        let current = self.config.snapshot();
         if self.is_started() {
-            let current = self.config.snapshot();
             if current.proxy != config.proxy {
                 anyhow::bail!(
                     "proxy bind/port/mode/takeover changes require a restart; stop the runtime first"
@@ -561,6 +567,21 @@ impl HakimiRuntime {
                 );
             }
         }
+        // Record which sections changed: settings edits are a common source of
+        // "it stopped working" reports, and the diff points straight at cause.
+        let sections: Vec<&str> = [
+            ("groups", current.groups != config.groups),
+            ("doh", current.doh != config.doh),
+            ("catalogs", current.catalogs != config.catalogs),
+            ("advanced", current.advanced != config.advanced),
+        ]
+        .into_iter()
+        .filter(|(_, changed)| *changed)
+        .map(|(name, _)| name)
+        .collect();
+        if !sections.is_empty() {
+            tracing::info!(sections = ?sections, "configuration updated");
+        }
         self.config.update(config)
     }
 
@@ -572,6 +593,42 @@ impl HakimiRuntime {
 
     pub async fn probe_domain(&self, domain: &str) -> DomainDiagnostics {
         self.engine.decide_https(domain).await.diagnostics
+    }
+
+    /// Probe every exact domain of every enabled group once, honouring the
+    /// shared concurrency limit. Resolves when the whole sweep is done, so a
+    /// manual 测速 is one atomic operation instead of N futures the caller
+    /// has to count.
+    pub async fn probe_sweep(&self) {
+        let started = std::time::Instant::now();
+        let config = self.config.snapshot();
+        let semaphore = Arc::new(Semaphore::new(8));
+        let mut seen = HashSet::new();
+        let mut tasks = Vec::new();
+        for group in config.enabled_groups() {
+            for host in group.exact_domains() {
+                if !seen.insert(host.to_string()) {
+                    continue;
+                }
+                let permit = semaphore.clone();
+                let engine = self.engine.clone();
+                let host = host.to_string();
+                tasks.push(tokio::spawn(async move {
+                    let _permit = permit.acquire_owned().await;
+                    let _ = engine.decide_https(&host).await;
+                }));
+            }
+        }
+        let total = tasks.len();
+        tracing::info!(domains = total, "manual probe sweep started");
+        for task in tasks {
+            let _ = task.await;
+        }
+        tracing::info!(
+            domains = total,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "manual probe sweep finished"
+        );
     }
 
     fn spawn_background_tasks(self: &Arc<Self>, shutdown: watch::Sender<bool>) {
@@ -590,7 +647,8 @@ impl HakimiRuntime {
             }
         });
 
-        // Startup catalog refresh and periodic refresh.
+        // Catalog refresh: once per launch. A failed fetch keeps the cached copy,
+        // so an offline start still uses the last known good catalog.
         let runtime = self.clone();
         let mut receiver = shutdown.subscribe();
         self.spawn(async move {
@@ -598,32 +656,41 @@ impl HakimiRuntime {
                 _ = receiver.changed() => return,
                 _ = tokio::time::sleep(Duration::from_millis(300)) => {}
             }
-            loop {
-                let results = tokio::select! {
-                    _ = receiver.changed() => break,
-                    results = runtime.refresh_catalogs(false) => results,
-                };
-                for result in results {
-                    match result {
-                        Ok(report) => tracing::info!(
-                            kind = %report.kind,
-                            updated = report.updated,
-                            version = report.version,
-                            "catalog refresh finished"
-                        ),
-                        Err(error) => tracing::warn!(error = %error, "catalog refresh failed"),
-                    }
+            let results = tokio::select! {
+                _ = receiver.changed() => return,
+                results = runtime.refresh_catalogs(false) => results,
+            };
+            for result in results {
+                match result {
+                    Ok(report) => tracing::info!(
+                        kind = %report.kind,
+                        updated = report.updated,
+                        version = report.version,
+                        "catalog refresh finished"
+                    ),
+                    Err(error) => tracing::warn!(error = %error, "catalog refresh failed"),
                 }
-                let hours = runtime
-                    .config
-                    .snapshot()
-                    .catalogs
-                    .refresh_hours
-                    .clamp(1, 168);
+            }
+        });
+
+        // Re-probe IPs that failed recently so a temporary block does not bury
+        // a working address under its failure score forever.
+        let runtime = self.clone();
+        let mut receiver = shutdown.subscribe();
+        self.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
                 tokio::select! {
                     _ = receiver.changed() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(hours * 3600)) => {}
+                    _ = interval.tick() => {}
                 }
+                runtime.engine.reprobe_failed_ips(16).await;
+                let stats = runtime.upstream.stats_json();
+                tracing::info!(
+                    stats = %serde_json::to_string(&stats).unwrap_or_default(),
+                    "pool stats"
+                );
             }
         });
 
@@ -660,11 +727,17 @@ impl HakimiRuntime {
     /// Warm every exact domain of every enabled group. Wildcards stay lazy because their
     /// concrete host set is unbounded. A HEAD request establishes (or reuses) the pooled
     /// upstream connection, resolves DoH/ECH only when needed, and records a reusable route.
+    /// True when `host` belongs to an enabled group, so warming it is useful.
+    fn host_in_enabled_group(config: &AppConfig, matcher: &crate::domain::DomainMatcher, host: &str) -> bool {
+        matcher
+            .match_host(host)
+            .and_then(|id| config.group(id))
+            .map(|group| group.enabled)
+            .unwrap_or(false)
+    }
+
     async fn warm_groups(self: &Arc<Self>) {
         let config = self.config.snapshot();
-        if !config.advanced.prewarm {
-            return;
-        }
         let limit = config.advanced.prewarm_concurrency.clamp(1, 32);
         let semaphore = Arc::new(Semaphore::new(limit));
         let mut seen = HashSet::new();
@@ -681,6 +754,36 @@ impl HakimiRuntime {
                 } else {
                     rest.push(domain.to_string());
                 }
+            }
+        }
+        // Wildcard-matched hosts never appear in `exact_domains`, but the catalog
+        // names concrete subdomains (github.githubassets.com, ...) and lastGood
+        // remembers what was active before the last shutdown. Pre-warm both so a
+        // page's asset burst reuses pooled connections instead of paying ~1s
+        // cold dials per request.
+        let matcher = config.matcher().unwrap_or_default();
+        if let Some(catalog) = self.catalogs.ip_catalog() {
+            for host in catalog.ips.keys() {
+                if host.starts_with("*.") || !seen.insert(host.clone()) {
+                    continue;
+                }
+                if Self::host_in_enabled_group(&config, &matcher, host) {
+                    rest.push(host.clone());
+                } else {
+                    seen.remove(host);
+                }
+            }
+        }
+        // Cap the lastGood tail: an unbounded warm list would dial hundreds of
+        // hosts after months of use. The 20 most recent cover the active set.
+        for host in self.cache.last_good_hosts().into_iter().take(20) {
+            if !seen.insert(host.clone()) {
+                continue;
+            }
+            if Self::host_in_enabled_group(&config, &matcher, &host) {
+                rest.push(host);
+            } else {
+                seen.remove(&host);
             }
         }
         tracing::info!(
@@ -703,16 +806,24 @@ impl HakimiRuntime {
             }
         }
 
+        let mut handles = Vec::new();
         for domain in primaries {
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => return,
             };
             let upstream = self.upstream.clone();
-            tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 let _permit = permit;
-                upstream.warm(&domain, 443).await;
-            });
+                if upstream.warm(&domain, 443).await {
+                    return true;
+                }
+                // The first attempt can race the DoH expansion and come back
+                // empty-handed; one quiet retry converts it into a pooled
+                // connection once the resolution has landed.
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                upstream.warm(&domain, 443).await
+            }));
         }
         // Give primary checks a head start so group state becomes useful earlier.
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -722,10 +833,32 @@ impl HakimiRuntime {
                 Err(_) => return,
             };
             let upstream = self.upstream.clone();
-            tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 let _permit = permit;
-                upstream.warm(&domain, 443).await;
-            });
+                if upstream.warm(&domain, 443).await {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                upstream.warm(&domain, 443).await
+            }));
         }
+        // Summarize the warmup: how many routes are hot before the user opens
+        // a browser, and how many hosts stayed cold.
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let (mut ok, mut fail) = (0usize, 0usize);
+            for handle in handles {
+                match handle.await {
+                    Ok(true) => ok += 1,
+                    _ => fail += 1,
+                }
+            }
+            tracing::info!(
+                ok,
+                cold = fail,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "upstream warmup finished"
+            );
+        });
     }
 }

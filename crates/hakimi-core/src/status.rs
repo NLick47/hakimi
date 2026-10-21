@@ -172,6 +172,23 @@ impl StatusStore {
             {
                 return;
             }
+            // A state flip is the single most useful troubleshooting signal:
+            // it tells whether a site just broke or just recovered, and when.
+            // `Checking` is a transient marker, not a real transition — logging
+            // it buries the Failed<->Normal lines that actually matter.
+            if existing.state != diagnostics.state
+                && existing.state != State::Checking
+                && diagnostics.state != State::Checking
+            {
+                tracing::info!(
+                    domain = %diagnostics.domain,
+                    from = ?existing.state,
+                    to = ?diagnostics.state,
+                    latency_ms = diagnostics.latency_ms,
+                    error = ?diagnostics.error,
+                    "domain state changed"
+                );
+            }
         }
         map.insert(diagnostics.domain.clone(), diagnostics);
     }

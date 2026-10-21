@@ -169,7 +169,32 @@ struct Discovery {
 #[derive(Default)]
 struct Inflight {
     notify: Notify,
-    result: tokio::sync::Mutex<Option<Result<ConnectPlan, String>>>,
+    /// Set exactly once — by the leader or, on cancellation, by its guard.
+    /// Sync so `Drop` can publish without an async context.
+    result: Mutex<Option<Result<ConnectPlan, String>>>,
+}
+
+/// Guarantees single-flight cleanup no matter how the leader's future ends.
+/// A cancelled race (the browser aborts the navigation) still publishes an
+/// error result and removes the map entry, so followers and later requests
+/// never wait on a dead entry.
+struct DiscoveryGuard<'a> {
+    map: &'a Mutex<HashMap<String, Arc<Inflight>>>,
+    key: String,
+    entry: Arc<Inflight>,
+}
+
+impl Drop for DiscoveryGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut slot = self.entry.result.lock();
+            if slot.is_none() {
+                *slot = Some(Err("route discovery was cancelled".into()));
+            }
+        }
+        self.entry.notify.notify_waiters();
+        self.map.lock().remove(&self.key);
+    }
 }
 
 impl UpstreamPool {
@@ -185,6 +210,11 @@ impl UpstreamPool {
             .pool_max_idle_per_host(max_idle)
             .timer(TokioTimer::new())
             .http2_adaptive_window(true)
+            // Larger than the 64 KiB h2 defaults: a 1 MB image over a 50 ms
+            // link would otherwise need ~16 window updates before reaching
+            // line rate. Adaptive window still grows beyond these.
+            .http2_initial_stream_window_size(1024 * 1024)
+            .http2_initial_connection_window_size(4 * 1024 * 1024)
             .http2_keep_alive_interval(Duration::from_secs(30))
             .http2_keep_alive_timeout(Duration::from_secs(10))
             .http2_keep_alive_while_idle(true);
@@ -254,14 +284,35 @@ impl UpstreamPool {
             None
         };
         let client = if upgrade { &self.upgrade } else { &self.auto };
-        let debug_host = request.uri().host().map(ToOwned::to_owned);
+        let debug_host = host;
         let debug_path = request.uri().path().to_string();
+        let started = std::time::Instant::now();
         match client.request(request).await {
             Ok(response) => {
                 if response.version() == http::Version::HTTP_2 {
                     self.stats.responses_h2.fetch_add(1, Ordering::Relaxed);
                 } else {
                     self.stats.responses_h1.fetch_add(1, Ordering::Relaxed);
+                }
+                // Slow upstream responses are the raw material for latency
+                // optimization: they point at candidates that deserve a re-race.
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                if elapsed_ms > 2000 {
+                    tracing::warn!(
+                        host = ?debug_host,
+                        path = %debug_path,
+                        status = response.status().as_u16(),
+                        elapsed_ms,
+                        "slow upstream response"
+                    );
+                } else {
+                    tracing::debug!(
+                        host = ?debug_host,
+                        path = %debug_path,
+                        status = response.status().as_u16(),
+                        elapsed_ms,
+                        "upstream response"
+                    );
                 }
                 if response.status().is_client_error() || response.status().is_server_error() {
                     if let Some(host) = debug_host.as_deref() {
@@ -312,7 +363,10 @@ impl UpstreamPool {
     /// Warm one exact host: a HEAD request makes hyper establish (or reuse) the pooled
     /// connection, resolving DoH/ECH only if no plan is cached. Status codes are ignored;
     /// the point is the transport.
-    pub(crate) async fn warm(&self, host: &str, port: u16) {
+    /// Returns true when a pooled connection for `host` is (still) established.
+    /// The result lets the pre-warm loop retry: a first attempt can race the DoH
+    /// expansion and come back empty-handed even though the host resolves fine.
+    pub(crate) async fn warm(&self, host: &str, port: u16) -> bool {
         let authority = if port == 443 {
             host.to_string()
         } else {
@@ -322,7 +376,7 @@ impl UpstreamPool {
             Ok(uri) => uri,
             Err(error) => {
                 tracing::debug!(host, error = %error, "cannot build warm-up URI");
-                return;
+                return false;
             }
         };
         let request = match Request::builder()
@@ -334,7 +388,7 @@ impl UpstreamPool {
             Ok(request) => request,
             Err(error) => {
                 tracing::debug!(host, error = %error, "cannot build warm-up request");
-                return;
+                return false;
             }
         };
         match tokio::time::timeout(WARM_TIMEOUT, self.auto.request(request)).await {
@@ -348,6 +402,7 @@ impl UpstreamPool {
                 );
                 // HEAD responses have no body; dropping keeps the connection in the pool.
                 drop(response);
+                return true;
             }
             Ok(Err(error)) => {
                 self.stats.warm_failures.fetch_add(1, Ordering::Relaxed);
@@ -358,6 +413,7 @@ impl UpstreamPool {
                 tracing::debug!(host, "upstream warm-up timed out");
             }
         }
+        false
     }
 
     pub(crate) fn stats_json(&self) -> serde_json::Value {
@@ -518,20 +574,34 @@ impl RouteConnector {
             }
         };
         if leader {
+            // Cleanup is tied to the leader's lifetime: cancelling the request
+            // mid-race still publishes a result and removes the entry.
+            let mut guard = DiscoveryGuard {
+                map: &self.discovery.inflight,
+                key: key.clone(),
+                entry: inflight.clone(),
+            };
             let outcome = self.race_plans(cursor, force_http1).await;
             let shared = match &outcome {
                 Ok((plan, _)) => Ok(plan.clone()),
                 Err(error) => Err(error.clone()),
             };
-            *inflight.result.lock().await = Some(shared);
-            inflight.notify.notify_waiters();
-            self.discovery.inflight.lock().remove(&key);
+            *guard.entry.result.lock() = Some(shared);
+            drop(guard); // notifies waiters and removes the map entry
             return outcome.map(|(_, io)| io).map_err(anyhow::Error::msg);
         }
 
-        inflight.notify.notified().await;
+        // Register the waiter before checking the result: this closes the
+        // window where the leader finishes between our map lookup and our
+        // wait (a lost wakeup would hang the request forever).
+        let notified = inflight.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if inflight.result.lock().is_none() {
+            notified.await;
+        }
         let plan = {
-            let guard = inflight.result.lock().await;
+            let guard = inflight.result.lock();
             match guard.as_ref() {
                 Some(Ok(plan)) => plan.clone(),
                 Some(Err(error)) => return Err(anyhow!("{error}")),
@@ -715,8 +785,11 @@ impl RouteConnector {
                 let host = host.to_string();
                 let force = force_http1;
                 pending.push(Box::pin(async move {
+                    // One shared head-start for the preferred address (matching
+                    // the group race): a linear ramp would make the 8th address
+                    // of a blackholed host wait over a second before trying.
                     if i > 0 {
-                        tokio::time::sleep(RACE_STAGGER * i as u32).await;
+                        tokio::time::sleep(RACE_STAGGER).await;
                     }
                     let result = tokio::time::timeout(SYSTEM_CONNECT_TIMEOUT, async {
                         if force {
@@ -869,6 +942,66 @@ mod tests {
         let tls = TlsContext::new().unwrap();
         let engine = DecisionEngine::new(config.clone(), cache, catalogs, resolver, tls, status);
         (engine, config)
+    }
+
+    /// A cancelled route discovery must not poison the domain. The leader's
+    /// cleanup code only runs when `race_plans` returns; if the caller cancels
+    /// (browser abort) mid-race the inflight entry stays behind and every later
+    /// request for that host waits on a notify that never fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_discovery_does_not_poison_the_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, config) = engine_for(dir.path());
+        // Point the domain at TEST-NET-1 so the race hangs until the connect timeout.
+        let cache = engine.cache.clone();
+        cache.put_last_good(LastGoodEntry {
+            domain: "upstream.test".into(),
+            ip: "192.0.2.1".parse().unwrap(),
+            strategy: Strategy::Direct,
+            source: IpSource::Cache,
+            network_id: "test".into(),
+            saved_at: now(),
+            catalog_version: 0,
+        });
+        config
+            .mutate(|c| {
+                c.advanced.ip_timeout_ms = 1_000;
+                Ok(())
+            })
+            .unwrap();
+        let tls = TlsContext::new().unwrap();
+        let pool = Arc::new(UpstreamPool::new(engine, tls, &config.snapshot()));
+        let uri = "https://upstream.test/".to_string();
+
+        // First request becomes the discovery leader and hangs in the race.
+        let first = {
+            let pool = pool.clone();
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                let request = Request::builder()
+                    .method(Method::GET)
+                    .uri(&uri)
+                    .body(Either::Right(Full::new(Bytes::new())))
+                    .unwrap();
+                let _ = pool.send(request, false).await;
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        first.abort(); // browser cancelled the navigation
+        let _ = first.await;
+
+        // A later request for the same host must not hang on the stale entry.
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(Either::Right(Full::new(Bytes::new())))
+            .unwrap();
+        let second = pool.send(request, false);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(4), second).await;
+        assert!(
+            outcome.is_ok(),
+            "second request hung: the cancelled leader left a poisoned single-flight entry"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

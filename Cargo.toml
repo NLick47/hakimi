@@ -63,9 +63,14 @@ url = "2.5"
 webpki-roots = "1.0"
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+# Dependencies are size-optimised (and still fast enough); the workspace's own
+# code keeps opt-level 3 where the hot proxy path lives.
+[profile.release.package."*"]
+opt-level = "s"
 
 [profile.dev]
 # Large debug-info rlibs exhaust the Windows page file on constrained machines.

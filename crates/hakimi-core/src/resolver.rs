@@ -171,10 +171,10 @@ impl Resolver {
         for endpoint in config
             .doh
             .custom
-            .into_iter()
+            .iter()
             .filter(|endpoint| endpoint.enabled)
         {
-            push(endpoint, DohSource::Custom, &mut endpoints);
+            push(endpoint.clone(), DohSource::Custom, &mut endpoints);
         }
         for endpoint in self.catalogs.remote_doh_endpoints() {
             push(endpoint, DohSource::Custom, &mut endpoints);

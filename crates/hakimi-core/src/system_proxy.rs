@@ -344,14 +344,8 @@ fn platform_snapshot() -> Result<SavedState> {
 
 #[cfg(target_os = "macos")]
 fn list_network_services() -> Result<Vec<String>> {
-    let output = std::process::Command::new("networksetup")
-        .arg("-listallnetworkservices")
-        .output()
-        .context("running networksetup -listallnetworkservices")?;
-    if !output.status.success() {
-        bail!("networksetup failed");
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = run_networksetup_with_timeout(&["-listallnetworkservices"], NETWORKSETUP_TIMEOUT_SECS)?;
+    let text = text.as_str();
     Ok(text
         .lines()
         .skip(1)
@@ -362,18 +356,59 @@ fn list_network_services() -> Result<Vec<String>> {
 
 #[cfg(target_os = "macos")]
 fn run_networksetup(args: &[&str]) -> Result<()> {
-    let output = std::process::Command::new("networksetup")
+    run_networksetup_with_timeout(args, NETWORKSETUP_TIMEOUT_SECS).map(|_| ())
+}
+
+/// `networksetup` serialises on the system configuration daemon and is known
+/// to hang for seconds when that daemon is busy. Every call is bounded so a
+/// stuck invocation cannot stall the health check or a self-heal.
+fn run_networksetup_with_timeout(args: &[&str], timeout_secs: u64) -> Result<String> {
+    run_command_with_timeout("networksetup", args, timeout_secs)
+}
+
+/// Run a child process with a hard deadline. The program is a parameter so the
+/// timeout behavior can be tested without a hanging `networksetup`.
+fn run_command_with_timeout(program: &str, args: &[&str], timeout_secs: u64) -> Result<String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(program)
         .args(args)
-        .output()
-        .with_context(|| format!("running networksetup {args:?}"))?;
-    if !output.status.success() {
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning {program} {args:?}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    // Poll for exit FIRST and read the pipes only after: `read_to_string`
+    // blocks until the pipe closes, which only happens when the child exits,
+    // so reading first would make the deadline unreachable for a hung child.
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("{program} {args:?} timed out after {timeout_secs}s");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    if !status.success() {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
         bail!(
-            "networksetup failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "{program} failed: {}",
+            String::from_utf8_lossy(stderr.as_bytes()).trim()
         );
     }
-    Ok(())
+    Ok(stdout)
 }
+
+const NETWORKSETUP_TIMEOUT_SECS: u64 = 3;
 
 #[cfg(target_os = "macos")]
 fn platform_apply_pac(_state_path: &Path, pac_url: &str) -> Result<()> {
@@ -407,20 +442,32 @@ fn platform_apply_http(_state_path: &Path, proxy: SocketAddr) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn platform_pac_health(expected_url: &str) -> bool {
+    // `scutil --proxy` is one fast subprocess that reports the effective system
+    // configuration; the per-service `networksetup` path spawns 6-10 calls that
+    // serialise on configd and occasionally hang for seconds.
+    if let Ok(output) = std::process::Command::new("scutil").arg("--proxy").output() {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let enabled = text
+                .lines()
+                .any(|line| line.contains("ProxyAutoConfigEnable : 1"));
+            let url_matches = text
+                .lines()
+                .any(|line| line.contains("ProxyAutoConfigURLString") && line.contains(expected_url));
+            return enabled && url_matches;
+        }
+    }
+    // Fallback: the per-service check, now bounded by the networksetup timeout.
     let Ok(services) = list_network_services() else {
         return false;
     };
     services.iter().any(|service| {
-        let Ok(output) = std::process::Command::new("networksetup")
-            .args(["-getautoproxyurl", service])
-            .output()
-        else {
+        let Ok(output) = run_networksetup_with_timeout(&["-getautoproxyurl", service], 2) else {
             return false;
         };
-        let text = String::from_utf8_lossy(&output.stdout);
         // A matching URL alone is not enough: the enabled flag is what actually
         // routes traffic through the PAC.
-        text.contains("Enabled: Yes") && text.contains(expected_url)
+        output.contains("Enabled: Yes") && output.contains(expected_url)
     })
 }
 
@@ -456,11 +503,7 @@ fn platform_current(mode: Option<ProxyMode>) -> Result<CurrentProxy> {
         Some(ProxyMode::Http) => vec!["-getwebproxy", service.as_str()],
         _ => vec!["-getautoproxyurl", service.as_str()],
     };
-    let output = std::process::Command::new("networksetup")
-        .args(args)
-        .output()
-        .context("running networksetup query")?;
-    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    let text = run_networksetup_with_timeout(&args, NETWORKSETUP_TIMEOUT_SECS)?;
     let current = text
         .lines()
         .find(|line| line.trim_start().starts_with("URL:"))
@@ -523,5 +566,25 @@ mod tests {
     fn snapshot_has_platform() {
         let state = platform_snapshot().unwrap();
         assert_eq!(state.platform, "windows");
+    }
+}
+
+#[cfg(test)]
+mod process_timeout_tests {
+    use super::*;
+
+    /// A hung child must be killed at the deadline, not waited out. The old
+    /// implementation blocked in `read_to_string` until the child exited, so
+    /// the timeout never fired.
+    #[test]
+    fn process_timeout_is_enforced() {
+        let started = std::time::Instant::now();
+        let result = run_command_with_timeout("/bin/sh", &["-c", "sleep 8"], 1);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "timeout not enforced: waited {elapsed:?} for a hung child"
+        );
+        assert!(result.is_err(), "a killed child must surface as an error");
     }
 }

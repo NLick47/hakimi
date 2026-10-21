@@ -46,7 +46,6 @@ async fn refresh_ip_catalog_with_etag_and_skip_once() {
     let config = Arc::new(ConfigManager::load_or_create(&paths).unwrap());
     let mut value = AppConfig::default();
     value.catalogs.ip = format!("http://{addr}/ips.json");
-    value.catalogs.refresh_hours = 6;
     config.update(value).unwrap();
     let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
     let catalogs = CatalogManager::load(&paths, config.clone(), cache.clone()).unwrap();

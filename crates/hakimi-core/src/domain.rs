@@ -83,8 +83,14 @@ pub fn normalize_hostname(input: &str) -> Result<String> {
     if host.contains(':') {
         bail!("`{input}` is not a domain name");
     }
-    let ascii = idna::domain_to_ascii(&host)
-        .map_err(|err| anyhow::anyhow!("invalid internationalized domain `{input}`: {err:?}"))?;
+    // Fast path: an ASCII host needs no IDNA processing. The label checks below
+    // reject the same invalid characters, and this runs on every request twice.
+    let ascii = if host.is_ascii() {
+        host
+    } else {
+        idna::domain_to_ascii(&host)
+            .map_err(|err| anyhow::anyhow!("invalid internationalized domain `{input}`: {err:?}"))?
+    };
     if ascii.len() > 253 {
         bail!("domain name is longer than 253 characters");
     }
@@ -106,6 +112,28 @@ pub fn normalize_hostname(input: &str) -> Result<String> {
         }
     }
     Ok(ascii)
+}
+
+/// Host of a pasted URL: `https://user@www.example.com:443/path?q#f` yields
+/// `www.example.com`. `None` when the input isn't URL-shaped at all.
+pub fn host_from_url(input: &str) -> Option<&str> {
+    let (scheme, rest) = input.split_once("://")?;
+    if scheme.is_empty()
+        || !scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    // The authority ends at the first path, query or fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = match host.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or(rest, |(host, _)| host),
+        None => host.split_once(':').map_or(host, |(host, _)| host),
+    };
+    let host = host.trim();
+    (!host.is_empty()).then_some(host)
 }
 
 pub fn is_ip_literal(host: &str) -> bool {
@@ -295,6 +323,20 @@ mod tests {
             .unwrap()
             .matches("A.Example.COM"));
         assert!(DomainPattern::parse("bad*pattern.com").is_err());
+    }
+
+    #[test]
+    fn urls_reduce_to_their_host() {
+        assert_eq!(host_from_url("https://www.example.com").unwrap(), "www.example.com");
+        assert_eq!(
+            host_from_url("HTTPS://user:pw@www.example.com:8443/en/?q=1#top").unwrap(),
+            "www.example.com"
+        );
+        assert_eq!(host_from_url("http://example.com/").unwrap(), "example.com");
+        assert_eq!(host_from_url("ftp://*.example.com").unwrap(), "*.example.com");
+        assert!(host_from_url("www.example.com").is_none());
+        assert!(host_from_url("https://").is_none());
+        assert!(host_from_url("https:// ").is_none());
     }
 
     #[test]

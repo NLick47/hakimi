@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::strategy::{IpSource, Strategy};
-use crate::util::{atomic_write_json, now, read_json};
+use crate::util::{atomic_write, atomic_write_json, now, read_json};
 
 const MAX_STALE_AGE_DAYS: i64 = 7;
 const MAX_SNI_AGE_DAYS: i64 = 30;
@@ -88,10 +88,33 @@ pub struct CachedSni {
     pub saved_at: DateTime<Utc>,
 }
 
+/// Measured quality of one (domain, ip) pair. Persisted so a restart keeps the
+/// knowledge that an IP was blocked or slow on this network.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IpScoreEntry {
+    pub ewma_ms: f64,
+    pub successes: u32,
+    pub failures: u32,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// How many (domain, ip) quality entries to keep at most. The active set of a
+/// heavy user stays well below this.
+const MAX_IP_SCORES: usize = 1024;
+/// Entries older than the widest freshness window can never be used again.
+const MAX_IP_SCORE_AGE_DAYS: i64 = 30;
+/// Same cap and age window for remembered routes; the pre-warm loop takes the
+/// newest 20, and 30 days is the widest freshness setting any config can use.
+const MAX_LAST_GOOD: usize = 512;
+const MAX_LAST_GOOD_AGE_DAYS: i64 = 30;
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct CacheData {
     last_good: HashMap<String, LastGoodEntry>,
+    #[serde(default)]
+    ip_scores: HashMap<String, IpScoreEntry>,
     skip_once: HashSet<String>,
     doh: HashMap<String, CachedAnswer>,
     ech: HashMap<String, CachedEch>,
@@ -171,14 +194,25 @@ impl CacheManager {
         }
     }
 
-    /// Write once if anything changed since the last flush. The snapshot is taken under a
-    /// read lock and written outside every lock, so a slow disk never blocks lookups.
+    /// Write once if anything changed since the last flush. The JSON is encoded
+    /// under a read lock and written outside every lock, so a slow disk never
+    /// blocks lookups and nothing deep-clones the whole cache on the way out.
     pub fn flush_if_dirty(&self) -> bool {
         if !self.dirty.swap(false, Ordering::SeqCst) {
             return false;
         }
-        let snapshot = { self.data.read().clone() };
-        self.persist_locked(&snapshot);
+        let json = {
+            let data = self.data.read();
+            serde_json::to_string(&*data)
+        };
+        match json {
+            Ok(json) => {
+                if let Err(error) = atomic_write(&self.path, json.as_bytes()) {
+                    tracing::warn!(error = %error, "failed to persist cache");
+                }
+            }
+            Err(error) => tracing::warn!(error = %error, "failed to encode cache"),
+        }
         true
     }
 
@@ -221,6 +255,100 @@ impl CacheManager {
         }
     }
 
+    /// Persisted quality entries, for seeding the decision engine on startup.
+    /// Entries beyond the widest freshness window are dropped on the way in.
+    pub fn ip_scores(&self) -> Vec<(String, IpAddr, IpScoreEntry)> {
+        let now = now();
+        let data = self.data.read();
+        data.ip_scores
+            .iter()
+            .filter_map(|(key, entry)| {
+                if now.signed_duration_since(entry.updated_at) > Duration::days(MAX_IP_SCORE_AGE_DAYS)
+                {
+                    return None;
+                }
+                let (domain, ip) = key.split_once('|')?;
+                let ip = ip.parse().ok()?;
+                Some((domain.to_string(), ip, entry.clone()))
+            })
+            .collect()
+    }
+
+    /// Upsert one quality entry. Keeps the map bounded: entries past the widest
+    /// freshness window are dropped, then the oldest beyond the cap.
+    pub fn put_ip_score(&self, domain: &str, ip: IpAddr, ewma_ms: f64, successes: u32, failures: u32) {
+        let mut data = self.data.write();
+        let now = now();
+        let key = format!("{domain}|{ip}");
+        data.ip_scores.insert(
+            key,
+            IpScoreEntry {
+                ewma_ms,
+                successes,
+                failures,
+                updated_at: now,
+            },
+        );
+        // Prune lazily: a full scan on every write (record_ip runs on every
+        // connection outcome) is wasted work; the map is bounded and the
+        // periodic flush already drops aged entries via `expire`.
+        if data.ip_scores.len() > MAX_IP_SCORES {
+            let mut by_age: Vec<(String, DateTime<Utc>)> = data
+                .ip_scores
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.updated_at))
+                .collect();
+            by_age.sort_by_key(|(_, at)| *at);
+            let overflow = data.ip_scores.len() - MAX_IP_SCORES;
+            for (key, _) in by_age.into_iter().take(overflow) {
+                data.ip_scores.remove(&key);
+            }
+        }
+        self.mark_dirty(&data);
+    }
+
+    /// Drop remembered routes that no freshness setting can use anymore, and cap
+    /// the map so months of browsing do not grow state.json forever.
+    fn prune_last_good(&self, data: &mut CacheData) {
+        let now = now();
+        let stale: Vec<String> = data
+            .last_good
+            .iter()
+            .filter(|(_, entry)| {
+                now.signed_duration_since(entry.saved_at) > Duration::days(MAX_LAST_GOOD_AGE_DAYS)
+            })
+            .map(|(domain, _)| domain.clone())
+            .collect();
+        for domain in stale {
+            data.last_good.remove(&domain);
+        }
+        if data.last_good.len() > MAX_LAST_GOOD {
+            let mut by_age: Vec<(String, DateTime<Utc>)> = data
+                .last_good
+                .iter()
+                .map(|(domain, entry)| (domain.clone(), entry.saved_at))
+                .collect();
+            by_age.sort_by_key(|(_, at)| *at);
+            let overflow = data.last_good.len() - MAX_LAST_GOOD;
+            for (domain, _) in by_age.into_iter().take(overflow) {
+                data.last_good.remove(&domain);
+            }
+        }
+    }
+
+    /// Domains with a remembered route, most recently used first. The desktop app
+    /// re-warms these after a restart so an active host does not pay a cold dial.
+    pub fn last_good_hosts(&self) -> Vec<String> {
+        let data = self.data.read();
+        let mut hosts: Vec<(chrono::DateTime<chrono::Utc>, String)> = data
+            .last_good
+            .iter()
+            .map(|(domain, entry)| (entry.saved_at, domain.clone()))
+            .collect();
+        hosts.sort_by(|a, b| b.0.cmp(&a.0));
+        hosts.into_iter().map(|(_, host)| host).collect()
+    }
+
     pub fn put_last_good(&self, entry: LastGoodEntry) {
         let mut data = self.data.write();
         let timestamp = now();
@@ -234,6 +362,7 @@ impl CacheManager {
             }
         }
         data.last_good.insert(entry.domain.clone(), entry);
+        self.prune_last_good(&mut data);
         self.mark_dirty(&data);
     }
 
@@ -455,6 +584,70 @@ mod tests {
         let answer = cache.doh_answer("example.com", 1).unwrap();
         assert!(!answer.is_fresh(now()));
         assert!(answer.is_usable(now()));
+    }
+
+    #[test]
+    fn ip_scores_survive_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        {
+            let cache = CacheManager::load(&path).unwrap();
+            cache.put_ip_score("example.com", "203.0.113.10".parse().unwrap(), 120.0, 3, 1);
+            cache.put_ip_score("example.com", "203.0.113.11".parse().unwrap(), 90.0, 5, 0);
+            cache.save().unwrap();
+        }
+        let reloaded = CacheManager::load(&path).unwrap();
+        let mut scores = reloaded.ip_scores();
+        scores.sort_by(|a, b| (a.0.clone(), a.1).cmp(&(b.0.clone(), b.1)));
+        assert_eq!(scores.len(), 2);
+        assert_eq!(scores[0].0, "example.com");
+        assert_eq!(scores[0].1.to_string(), "203.0.113.10");
+        assert_eq!((scores[0].2.successes, scores[0].2.failures), (3, 1));
+        assert_eq!(scores[1].2.ewma_ms, 90.0);
+    }
+
+    #[test]
+    fn ip_scores_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheManager::load(dir.path().join("state.json")).unwrap();
+        for i in 0..1100u32 {
+            let ip = format!("10.0.{}.{}", i / 250, i % 250);
+            cache.put_ip_score("example.com", ip.parse().unwrap(), 100.0, 1, 0);
+        }
+        assert!(cache.ip_scores().len() <= 1024, "cap must hold");
+    }
+
+    #[test]
+    fn last_good_is_pruned_by_age_and_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheManager::load(dir.path().join("state.json")).unwrap();
+
+        // An entry older than the widest freshness window cannot be used by any
+        // config (last_good_days caps at 30): it must not survive the next write.
+        let mut ancient = sample_entry("old.example.com", "203.0.113.1");
+        ancient.saved_at = now() - chrono::Duration::days(40);
+        cache.put_last_good(ancient);
+        assert!(cache.last_good("old.example.com", 30).is_none());
+
+        for i in 0..520u32 {
+            let domain = format!("site{i}.example.com");
+            let ip = format!("10.0.{}.{}", i / 250, i % 250);
+            cache.put_last_good(sample_entry(&domain, &ip));
+        }
+        assert!(cache.last_good_hosts().len() <= 512, "count cap must hold");
+        assert!(cache.last_good("old.example.com", 30).is_none(), "ancient entry pruned");
+    }
+
+    fn sample_entry(domain: &str, ip: &str) -> LastGoodEntry {
+        LastGoodEntry {
+            domain: domain.into(),
+            ip: ip.parse().unwrap(),
+            strategy: Strategy::Auto,
+            source: IpSource::Remote,
+            network_id: "ip:test".into(),
+            saved_at: now(),
+            catalog_version: 1,
+        }
     }
 
     #[test]

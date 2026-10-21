@@ -209,21 +209,32 @@ async fn handle_request(mut req: Request<Incoming>, ctx: Arc<ProxyContext>) -> R
 }
 
 fn is_local_request(req: &Request<Incoming>, ctx: &ProxyContext) -> bool {
-    let host = req.uri().host().map(ToOwned::to_owned).or_else(|| {
-        req.headers()
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| parse_authority(value, 80))
-            .map(|(host, _)| host)
-    });
-    let Some(host) = host else {
-        return false;
+    // Borrowed where possible: this runs on every single request, so no
+    // `to_owned`/`to_string` just to compare a host name.
+    let borrowed = req.uri().host();
+    let owned;
+    let host: &str = match borrowed {
+        Some(host) => host,
+        None => {
+            let Some(parsed) = req
+                .headers()
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| parse_authority(value, 80))
+            else {
+                return false;
+            };
+            owned = parsed.0;
+            &owned
+        }
     };
     let host = host.trim_matches(['[', ']']);
     host.eq_ignore_ascii_case("localhost")
         || host == "127.0.0.1"
         || host == "::1"
-        || host == ctx.proxy_addr().ip().to_string()
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip == ctx.proxy_addr().ip())
 }
 
 async fn handle_connect(
@@ -440,7 +451,14 @@ async fn connect_tcp_upstream(
 async fn tunnel_to_host(req: &mut Request<Incoming>, host: &str, port: u16) -> Response<ProxyBody> {
     let upstream =
         match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
-            Ok(Ok(stream)) => stream,
+            Ok(Ok(stream)) => {
+                // Same socket tuning as every other upstream path: Nagle adds
+                // latency to interactive tunnels (SSH/WebSocket), and keepalive
+                // lets a dead peer release the tunnel instead of hanging it.
+                let _ = stream.set_nodelay(true);
+                crate::util::apply_tcp_keepalive(&stream);
+                stream
+            }
             Ok(Err(error)) => {
                 return error_response(
                     StatusCode::BAD_GATEWAY,

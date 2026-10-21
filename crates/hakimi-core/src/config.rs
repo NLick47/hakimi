@@ -45,7 +45,7 @@ impl Default for AppConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DohConfig {
     pub primary: String,
@@ -63,7 +63,7 @@ impl Default for DohConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DohEndpoint {
     pub name: String,
@@ -96,7 +96,7 @@ impl DohEndpoint {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CatalogSources {
     /// Primary remote IP catalog. Empty disables remote IP catalogs.
@@ -110,7 +110,6 @@ pub struct CatalogSources {
     pub signature_public_key: Option<String>,
     /// Optional signature URL. Defaults to `<catalog url>.sig`.
     pub signature_url: Option<String>,
-    pub refresh_hours: u64,
     pub timeout_secs: u64,
 }
 
@@ -123,7 +122,6 @@ impl Default for CatalogSources {
             doh_mirrors: Vec::new(),
             signature_public_key: None,
             signature_url: None,
-            refresh_hours: 6,
             timeout_secs: 5,
         }
     }
@@ -159,7 +157,7 @@ impl Default for ProxyConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AdvancedConfig {
     /// Fake SNI candidates in order. An empty string means "send no SNI".
@@ -167,9 +165,6 @@ pub struct AdvancedConfig {
     pub max_candidates_per_domain: usize,
     pub ip_timeout_ms: u64,
     pub last_good_days: i64,
-    /// Resolve and open upstream connections for every exact catalog domain at startup.
-    /// Wildcards stay lazy because their concrete hosts are unbounded.
-    pub prewarm: bool,
     /// Concurrent startup warm-up connections. Higher values shorten cold start but generate
     /// more simultaneous DNS/TLS traffic.
     pub prewarm_concurrency: usize,
@@ -202,7 +197,6 @@ impl Default for AdvancedConfig {
             max_candidates_per_domain: 8,
             ip_timeout_ms: 2_000,
             last_good_days: 7,
-            prewarm: true,
             prewarm_concurrency: 8,
             plan_cache_secs: 600,
             upstream_idle_secs: 300,
@@ -233,7 +227,7 @@ impl Default for LogConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GroupConfig {
     pub id: String,
@@ -372,6 +366,35 @@ pub fn default_groups() -> Vec<GroupConfig> {
             true,
         ),
         group(
+            "hitomi",
+            "Hitomi",
+            &[
+                "hitomi.la",
+                "*.hitomi.la",
+                "ltn.gold-usergeneratedcontent.net",
+                "*.gold-usergeneratedcontent.net",
+            ],
+            Strategy::Auto,
+            true,
+            false,
+        ),
+        group(
+            "nhentai",
+            "nhentai",
+            &["nhentai.net", "*.nhentai.net"],
+            Strategy::Auto,
+            true,
+            false,
+        ),
+        group(
+            "hanime",
+            "Hanime",
+            &["hanime.tv", "www.hanime.tv", "*.hanime.tv"],
+            Strategy::Auto,
+            true,
+            false,
+        ),
+        group(
             "steam",
             "Steam",
             &[
@@ -411,9 +434,6 @@ impl AppConfig {
                 "proxy.bind must be a loopback address ({} is not)",
                 self.proxy.bind
             );
-        }
-        if !(1..=168).contains(&self.catalogs.refresh_hours) {
-            bail!("catalogs.refreshHours must be between 1 and 168");
         }
         if !(1..=60).contains(&self.catalogs.timeout_secs) {
             bail!("catalogs.timeoutSecs must be between 1 and 60");
@@ -620,6 +640,19 @@ pub fn validate_catalog_url(raw: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Append built-in groups a config predates, keeping custom groups untouched.
+/// Returns how many were added.
+fn merge_missing_defaults(config: &mut AppConfig) -> usize {
+    let mut added = 0;
+    for group in default_groups() {
+        if config.group(&group.id).is_none() {
+            config.groups.push(group);
+            added += 1;
+        }
+    }
+    added
+}
+
 /// Thread-safe configuration holder that keeps the derived domain matcher in sync.
 pub struct ConfigManager {
     path: PathBuf,
@@ -628,7 +661,9 @@ pub struct ConfigManager {
 }
 
 struct Inner {
-    config: AppConfig,
+    /// Shared immutably: `snapshot()` hands out an `Arc`, so the hot path
+    /// (every new connection) never deep-clones the whole configuration.
+    config: Arc<AppConfig>,
     matcher: Arc<DomainMatcher>,
 }
 
@@ -636,7 +671,7 @@ impl ConfigManager {
     pub fn load_or_create(paths: &Paths) -> Result<Self> {
         paths.ensure()?;
         let path = paths.config_file();
-        let config = if path.exists() {
+        let mut config = if path.exists() {
             read_json::<AppConfig>(&path).with_context(|| {
                 format!(
                     "failed to parse {}; fix or remove the file to regenerate defaults",
@@ -648,6 +683,14 @@ impl ConfigManager {
             atomic_write_json(&path, &config)?;
             config
         };
+        // A config written by an older build lacks sites that have since been
+        // added to the defaults. Built-in groups cannot be deleted from the UI,
+        // so a missing id means "predates this site", not "user removed it".
+        let restored = merge_missing_defaults(&mut config);
+        if restored > 0 {
+            tracing::info!(restored, "added new built-in sites to the config");
+            atomic_write_json(&path, &config)?;
+        }
         Self::new(path, config)
     }
 
@@ -662,7 +705,7 @@ impl ConfigManager {
         let matcher = Arc::new(config.matcher()?);
         Ok(Self {
             path,
-            inner: RwLock::new(Inner { config, matcher }),
+            inner: RwLock::new(Inner { config: Arc::new(config), matcher }),
             revision: AtomicU64::new(1),
         })
     }
@@ -677,8 +720,8 @@ impl ConfigManager {
         &self.path
     }
 
-    pub fn snapshot(&self) -> AppConfig {
-        self.inner.read().config.clone()
+    pub fn snapshot(&self) -> Arc<AppConfig> {
+        Arc::clone(&self.inner.read().config)
     }
 
     pub fn matcher(&self) -> Arc<DomainMatcher> {
@@ -690,7 +733,7 @@ impl ConfigManager {
         let matcher = Arc::new(config.matcher()?);
         atomic_write_json(&self.path, &config)?;
         let mut guard = self.inner.write();
-        guard.config = config;
+        guard.config = Arc::new(config);
         guard.matcher = matcher;
         drop(guard);
         self.revision.fetch_add(1, Ordering::Relaxed);
@@ -701,7 +744,7 @@ impl ConfigManager {
     where
         F: FnOnce(&mut AppConfig) -> Result<()>,
     {
-        let mut config = self.snapshot();
+        let mut config = (*self.snapshot()).clone();
         f(&mut config)?;
         self.update(config.clone())?;
         Ok(config)
@@ -783,11 +826,30 @@ mod tests {
     fn defaults_validate_and_match_document() {
         let config = AppConfig::default();
         config.validate().unwrap();
-        assert_eq!(config.groups.len(), 6);
+        assert_eq!(config.groups.len(), 9);
         let eh = config.group("eh").unwrap();
         assert!(!eh.enabled);
         assert!(eh.experimental);
         assert_eq!(config.group("poipiku").unwrap().strategy, Strategy::Direct);
+        // The three adult sites ship enabled with their own CDN domains.
+        let hitomi = config.group("hitomi").unwrap();
+        assert!(hitomi.enabled);
+        assert!(hitomi
+            .domains
+            .iter()
+            .any(|domain| domain == "*.gold-usergeneratedcontent.net"));
+        assert!(config
+            .group("nhentai")
+            .unwrap()
+            .domains
+            .iter()
+            .any(|domain| domain == "*.nhentai.net"));
+        assert!(config
+            .group("hanime")
+            .unwrap()
+            .domains
+            .iter()
+            .any(|domain| domain == "*.hanime.tv"));
         assert!(config.group("pixiv").unwrap().ech_shared);
         assert!(config
             .group("pixiv")
@@ -843,6 +905,58 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
+    /// Number of groups in the shipped defaults, derived instead of hard-coded
+    /// so adding a site does not break unrelated tests.
+    fn config_defaults() -> usize {
+        AppConfig::default().groups.len()
+    }
+
+    #[test]
+    fn merge_adds_only_missing_builtin_sites() {
+        let mut config = AppConfig::default();
+        config.groups.retain(|group| group.id != "nhentai");
+        let mut custom = GroupConfig::default();
+        custom.id = "custom".into();
+        custom.name = "Custom".into();
+        custom.domains = vec!["custom.example".into()];
+        config.groups.push(custom);
+
+        assert_eq!(merge_missing_defaults(&mut config), 1);
+        assert!(config.group("nhentai").is_some());
+        assert_eq!(
+            config
+                .groups
+                .iter()
+                .filter(|group| group.id == "custom")
+                .count(),
+            1,
+            "custom groups must keep working"
+        );
+
+        // Idempotent: a second pass adds nothing.
+        assert_eq!(merge_missing_defaults(&mut config), 0);
+    }
+
+    #[test]
+    fn an_old_config_gains_new_sites_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let mut old = AppConfig::default();
+        old.groups
+            .retain(|group| !matches!(group.id.as_str(), "hitomi" | "nhentai" | "hanime"));
+        atomic_write_json(&paths.config_file(), &old).unwrap();
+
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        let snapshot = manager.snapshot();
+        for id in ["hitomi", "nhentai", "hanime"] {
+            assert!(snapshot.group(id).is_some(), "{id} should be restored");
+        }
+
+        // The merge is persisted, so the next load starts from the new list.
+        let reloaded = ConfigManager::load_or_create(&paths).unwrap();
+        assert_eq!(reloaded.snapshot().groups.len(), AppConfig::default().groups.len());
+    }
+
     #[test]
     fn config_roundtrip_uses_camel_case() {
         let dir = tempfile::tempdir().unwrap();
@@ -852,7 +966,7 @@ mod tests {
         assert!(text.contains("\"catalogVersion\""));
         assert!(text.contains("\"maxCandidatesPerDomain\""));
         let manager2 = ConfigManager::load(paths.config_file()).unwrap();
-        assert_eq!(manager2.snapshot().groups.len(), 6);
+        assert_eq!(manager2.snapshot().groups.len(), config_defaults());
         manager.set_group_enabled("eh", true).unwrap();
         assert!(!manager2.snapshot().group("eh").unwrap().enabled); // other holders are not auto-reloaded
         let manager3 = ConfigManager::load(paths.config_file()).unwrap();

@@ -11,15 +11,14 @@
 //!
 //! - [`AccelState::Running`] — acceleration is on.
 //! - [`AccelState::Stopped`] — the user stopped it; the PAC (if any) serves
-//!   DIRECT, browsing is untouched.
+//!   DIRECT, browsing is untouched. A launch with a broken environment also
+//!   lands here: the banner explains the problem, nothing is forced on screen.
 //! - [`AccelState::AwaitingEnvironment`] — the user asked to run but the
 //!   environment check failed. The runtime stays paused and the fix page
 //!   takes over; the moment the environment passes, the model resumes
 //!   itself.
 
-use std::cell::RefCell;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use hakimi_core::runtime::HakimiRuntime;
 
@@ -88,6 +87,17 @@ impl Effects {
 pub struct AppModel {
     accel: AccelState,
     env: EnvState,
+    /// The user opened the fix page from the warning banner. This is separate
+    /// from [`AccelState::AwaitingEnvironment`]: a manual visit must survive the
+    /// once-a-second environment sync, which recomputes the page from state and
+    /// would otherwise bounce the user back to the home page immediately.
+    fix_page_open: bool,
+    /// Consecutive unhealthy probes. A single flaky health check must not flip
+    /// the whole acceleration off; two in a row are treated as real.
+    unhealthy_streak: u32,
+    /// The system proxy was taken over by other software while running:
+    /// acceleration auto-paused and the UI shows a hint. Never auto-fought.
+    takeover: bool,
 }
 
 impl Default for AppModel {
@@ -99,25 +109,41 @@ impl Default for AppModel {
                 ca_error: String::new(),
                 proxy_ok: true,
             },
+            fix_page_open: false,
+            unhealthy_streak: 0,
+            takeover: false,
         }
     }
 }
 
 impl AppModel {
-    /// App launch: an unhealthy environment blocks acceleration right away.
+    /// App launch. A healthy environment starts accelerating right away; a
+    /// broken one stays stopped and only raises the banner — the app never
+    /// hijacks the window on its own, the user decides when to go fix it.
     pub fn startup(&mut self, env: EnvState) -> Effects {
         self.env = env;
-        self.accel = if self.env.allows_acceleration() {
-            AccelState::Running
+        if self.env.allows_acceleration() {
+            self.accel = AccelState::Running;
+            self.effects()
         } else {
-            AccelState::AwaitingEnvironment
-        };
-        self.effects()
+            // Same shape as a gated start (pause + leave the OS proxy alone),
+            // minus the fix page: `fix_page_open` stays false.
+            self.accel = AccelState::Stopped;
+            Effects::awaiting()
+        }
     }
 
     /// The master switch. Turning acceleration ON with a broken environment
     /// does not accelerate: it parks in [`AccelState::AwaitingEnvironment`].
     pub fn toggle(&mut self, env: EnvState) -> Effects {
+        let mut env = env;
+        if self.takeover {
+            // Turning acceleration on after a takeover is explicit user
+            // intent: re-assert our PAC even though the check says unhealthy.
+            self.takeover = false;
+            self.unhealthy_streak = 0;
+            env.proxy_ok = true;
+        }
         self.env = env;
         self.accel = match self.accel {
             AccelState::Running => AccelState::Stopped,
@@ -135,7 +161,26 @@ impl AppModel {
     /// Periodic environment probe. A pending resume completes itself the
     /// moment the environment passes.
     pub fn env_changed(&mut self, env: EnvState) -> Effects {
+        let mut env = env;
+        // One flaky health check must not flip the whole acceleration: a
+        // single unhealthy probe is absorbed, two in a row are real.
+        if !env.proxy_ok && self.env.proxy_ok {
+            self.unhealthy_streak += 1;
+            if self.unhealthy_streak < 2 {
+                env.proxy_ok = true;
+            }
+        } else {
+            self.unhealthy_streak = 0;
+        }
         self.env = env;
+        if self.accel == AccelState::Running && !self.env.proxy_ok {
+            // The system proxy was taken over by other software (or cleared
+            // externally). Pause and yield: fighting for the setting would be
+            // a proxy war with whatever the user chose to run instead.
+            self.takeover = true;
+            self.accel = AccelState::Stopped;
+            return Effects::stopped();
+        }
         if self.accel == AccelState::AwaitingEnvironment && self.env.allows_acceleration() {
             self.accel = AccelState::Running;
             return self.effects_apply_if_needed();
@@ -143,8 +188,15 @@ impl AppModel {
         Effects::default()
     }
 
+    /// The user asked to see the fix page from the warning banner. Does not
+    /// touch acceleration: the page is shown, the runtime is untouched.
+    pub fn open_fix(&mut self) {
+        self.fix_page_open = true;
+    }
+
     /// The user left the fix page without fixing: stay stopped.
     pub fn dismiss_fix(&mut self) -> Effects {
+        self.fix_page_open = false;
         if self.accel == AccelState::AwaitingEnvironment {
             self.accel = AccelState::Stopped;
             return self.effects();
@@ -156,12 +208,24 @@ impl AppModel {
         self.accel
     }
 
+    /// The system proxy was taken over while running and acceleration
+    /// auto-paused. Drives the home page hint.
+    pub fn takeover(&self) -> bool {
+        self.takeover
+    }
+
     pub fn env(&self) -> &EnvState {
         &self.env
     }
 
     /// True when the fix page owns the window.
     pub fn fix_page(&self) -> bool {
+        self.fix_page_open || self.accel == AccelState::AwaitingEnvironment
+    }
+
+    /// True when the page was forced by a blocked start (as opposed to the
+    /// user opening it just to check). Drives the wording of the fix page.
+    pub fn fix_blocked(&self) -> bool {
         self.accel == AccelState::AwaitingEnvironment
     }
 
@@ -256,12 +320,18 @@ pub fn execute(effects: &Effects, runtime: &Arc<HakimiRuntime>) {
 pub fn sync_window(model: &AppModel, app: &AppWindow) {
     let env = model.env();
     app.set_show_onboarding(model.fix_page());
+    app.set_fix_blocked(model.fix_blocked());
     app.set_ca_installed(env.ca_ok);
     app.set_ca_error(SharedString::from(env.ca_error.clone()));
     app.set_proxy_ok(env.proxy_ok);
+    app.set_proxy_taken_over(model.takeover());
     if env.ca_ok || !env.ca_error.is_empty() {
         // Install finished (or failed loudly): the wait-for-dialog state can go.
         app.set_ob_installing(false);
+    }
+    if env.ca_ok && !app.get_ca_action_error().is_empty() {
+        // A later successful install clears the stale password/cancel message.
+        app.set_ca_action_error(SharedString::new());
     }
 }
 
@@ -270,7 +340,6 @@ pub fn sync_window(model: &AppModel, app: &AppWindow) {
 thread_local! {
     static TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static PROXY_CACHE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-    static LAST_APPLY: RefCell<Option<Instant>> = const { RefCell::new(None) };
 }
 
 /// Probe the environment. Spawns subprocesses (`security`, `networksetup`),
@@ -284,7 +353,7 @@ pub fn probe_env(runtime: &HakimiRuntime) -> EnvState {
         t.set(value);
         value
     });
-    if tick % 10 == 1 {
+    if tick == 1 || tick % 60 == 0 {
         PROXY_CACHE.with(|t| t.set(runtime.system_proxy_healthy()));
     }
     EnvState {
@@ -294,32 +363,119 @@ pub fn probe_env(runtime: &HakimiRuntime) -> EnvState {
     }
 }
 
-/// Self-heal for a running instance whose system proxy got rewritten by
-/// something else. Maintenance, not a state transition: only runs while
-/// accelerating and at most once per 30 seconds.
-pub fn maybe_self_heal(runtime: &Arc<HakimiRuntime>, model: &AppModel) {
-    if model.accel() != AccelState::Running || model.env().proxy_ok {
-        return;
-    }
-    let cooldown_over = LAST_APPLY.with(|t| {
-        t.borrow()
-            .map(|at| at.elapsed())
-            .unwrap_or(Duration::from_secs(3600))
-            > Duration::from_secs(30)
-    });
-    if cooldown_over {
-        LAST_APPLY.with(|t| *t.borrow_mut() = Some(Instant::now()));
-        let runtime = runtime.clone();
-        std::thread::spawn(move || {
-            if let Err(error) = runtime.apply_system_proxy() {
-                eprintln!("hakimi-ui: self-heal of the system proxy failed: {error:#}");
-            }
-        });
-    }
-}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn one_flaky_health_check_does_not_flip_proxy_ok() {
+        let mut model = AppModel::default();
+        model.startup(EnvState {
+            ca_ok: true,
+            ca_error: String::new(),
+            proxy_ok: true,
+        });
+
+        // One flaky health check is absorbed.
+        let flaky = EnvState { ca_ok: true, ca_error: String::new(), proxy_ok: false };
+        let _ = model.env_changed(flaky.clone());
+        assert!(model.env().proxy_ok, "a single unhealthy probe must be absorbed");
+
+        // Two in a row are real.
+        let _ = model.env_changed(flaky);
+        assert!(!model.env().proxy_ok);
+
+        // Recovery is immediate.
+        let _ = model.env_changed(EnvState {
+            ca_ok: true,
+            ca_error: String::new(),
+            proxy_ok: true,
+        });
+        assert!(model.env().proxy_ok);
+    }
+
+    #[test]
+    fn settle_holds_probing_sites_on_testing() {
+        let mut entry = SiteSettle::default();
+        let (summary, hex) = settle_display(&mut entry, "3 个域名 · 全部超时", BAD_COLOR, false);
+        assert_eq!(summary, "3 个域名 · 测速中");
+        assert_eq!(hex, IDLE_COLOR);
+
+        // Flapping to 较慢 within the window must not change the display.
+        let (summary, _) = settle_display(&mut entry, "3 个域名 · 全部较慢", SLOW_COLOR, false);
+        assert_eq!(summary, "3 个域名 · 测速中");
+
+        // Once a summary persists long enough it is committed verbatim.
+        let (summary, hex) = settle_display(&mut entry, "3 个域名 · 全部超时", BAD_COLOR, true);
+        assert_eq!(summary, "3 个域名 · 全部超时");
+        assert_eq!(hex, BAD_COLOR);
+    }
+
+    #[test]
+    fn settle_keeps_the_previous_state_during_a_brief_flip() {
+        let mut entry = SiteSettle::default();
+        let (summary, _) = settle_display(&mut entry, "2 个域名 · 全部正常", OK_COLOR, true);
+        assert_eq!(summary, "2 个域名 · 全部正常");
+
+        // A brief flip to 超时 that has not persisted yet keeps the shown state.
+        let (summary, _) = settle_display(&mut entry, "2 个域名 · 全部超时", BAD_COLOR, false);
+        assert_eq!(summary, "2 个域名 · 全部正常");
+    }
+
+    fn sample_site(id: &str, summary: &str) -> crate::SiteData {
+        crate::SiteData {
+            id: id.into(),
+            name: id.into(),
+            initial: "M".into(),
+            icon_key: String::new(),
+            tile_hex: "",
+            summary: summary.into(),
+            summary_hex: IDLE_COLOR,
+            enabled: true,
+            open: false,
+            first: false,
+            last: false,
+            url: String::new(),
+            strategy: 0,
+            sni: String::new(),
+            custom: false,
+            domains: vec![],
+        }
+    }
+
+    #[test]
+    fn starting_phase_holds_instead_of_claiming_paused() {
+        let mut sites = vec![sample_site("mp", "1 个域名 · 已暂停")];
+        apply_settle(&mut sites, SettlePhase::Starting);
+        assert_eq!(sites[0].summary, "1 个域名 · 启动中");
+
+        // The starting state is never committed: once the runtime is up the
+        // summaries start from a clean slate (测速中 → results).
+        sites[0].summary = "1 个域名 · 全部正常".into();
+        apply_settle(&mut sites, SettlePhase::Tracking);
+        assert_eq!(sites[0].summary, "1 个域名 · 测速中");
+    }
+
+    #[test]
+    fn sweep_phases_drive_the_summary() {
+        let mut sites = vec![sample_site("mp", "1 个域名 · 全部正常")];
+
+        // While the sweep runs the summary holds 测速中.
+        apply_settle(&mut sites, SettlePhase::Sweeping);
+        assert_eq!(sites[0].summary, "1 个域名 · 测速中");
+
+        // The finished results commit at once when the sweep ends.
+        sites[0].summary = "1 个域名 · 全部较慢".into();
+        apply_settle(&mut sites, SettlePhase::Commit);
+        assert_eq!(sites[0].summary, "1 个域名 · 全部较慢");
+
+        // Tracking keeps a brief flip hidden.
+        sites[0].summary = "1 个域名 · 全部超时".into();
+        apply_settle(&mut sites, SettlePhase::Tracking);
+        assert_eq!(sites[0].summary, "1 个域名 · 全部较慢");
+    }
+
     use super::*;
 
     fn env(healthy: bool) -> EnvState {
@@ -335,11 +491,14 @@ mod tests {
     }
 
     #[test]
-    fn startup_with_broken_environment_blocks_acceleration() {
+    fn startup_with_broken_environment_stays_stopped_without_the_fix_page() {
         let mut model = AppModel::default();
         let effects = model.startup(env(false));
-        assert_eq!(model.accel(), AccelState::AwaitingEnvironment);
-        assert!(model.fix_page());
+        assert_eq!(model.accel(), AccelState::Stopped);
+        assert!(
+            !model.fix_page(),
+            "launch must not hijack the window; the banner is enough"
+        );
         assert!(effects.pause && effects.disable_proxy && !effects.resume);
         assert_eq!(start_mode(&effects), StartMode::Deferred);
     }
@@ -376,7 +535,9 @@ mod tests {
     #[test]
     fn pending_resume_completes_itself_when_environment_passes() {
         let mut model = AppModel::default();
-        model.startup(env(false));
+        model.startup(env(true));
+        model.toggle(env(true)); // running → stopped
+        model.toggle(env(false)); // user wants it on, env broken
         assert_eq!(model.accel(), AccelState::AwaitingEnvironment);
 
         let effects = model.env_changed(env(false));
@@ -396,9 +557,43 @@ mod tests {
     }
 
     #[test]
+    fn manually_opened_fix_page_survives_environment_ticks() {
+        let mut model = AppModel::default();
+        model.startup(env(true));
+        // The environment degrades after launch (e.g. the CA was removed).
+        model.env_changed(env(false));
+        assert!(!model.fix_page(), "a degraded env alone must not hijack the window");
+
+        model.open_fix();
+        assert!(model.fix_page());
+        assert!(!model.fix_blocked(), "opened by hand, not by a blocked start");
+
+        // The once-a-second sync recomputes the page from state; the manual
+        // visit has to survive it.
+        model.env_changed(env(false));
+        assert!(model.fix_page());
+    }
+
+    #[test]
+    fn dismissing_a_manual_visit_does_not_stop_acceleration() {
+        let mut model = AppModel::default();
+        model.startup(env(true));
+        model.open_fix();
+
+        let effects = model.dismiss_fix();
+        assert!(!model.fix_page());
+        assert_eq!(model.accel(), AccelState::Running);
+        assert_eq!(effects, Effects::default());
+    }
+
+    #[test]
     fn dismissing_the_fix_page_stays_stopped() {
         let mut model = AppModel::default();
-        model.startup(env(false));
+        model.startup(env(true));
+        model.toggle(env(true)); // running → stopped
+        model.toggle(env(false)); // user wants it on, env broken → gated
+        assert!(model.fix_page());
+
         let effects = model.dismiss_fix();
         assert_eq!(model.accel(), AccelState::Stopped);
         assert!(effects.pause && !effects.resume);
@@ -428,4 +623,138 @@ mod tests {
         model.toggle(env(false)); // → Stopped
         assert_eq!(model.accel(), AccelState::Stopped);
     }
+}
+
+// -- site summary display lifecycle ------------------------------------------
+//
+// The home page summaries are derived from a noisy stream: while the engine
+// hunts for a working IP the per-domain states flap between 超时 and 较慢 every
+// second. The display therefore has an explicit lifecycle with three phases,
+// and the phase is an input of the policy — never inferred from ambient flags.
+
+pub const OK_COLOR: &str = "#2E7D53";
+pub const SLOW_COLOR: &str = "#B88325";
+pub const BAD_COLOR: &str = "#C05B5B";
+pub const IDLE_COLOR: &str = "#8A95A2";
+
+/// How long a summary must stay unchanged before it replaces the displayed one.
+const SETTLE_MILLIS: u128 = 3000;
+
+/// Where the site summaries are in their display lifecycle.
+#[derive(Clone, Copy, PartialEq)]
+pub enum SettlePhase {
+    /// The user asked to run but the runtime has not finished starting: hold
+    /// 启动中 instead of misreporting 已暂停.
+    Starting,
+    /// A manual sweep is running: hold 测速中 for every active site.
+    Sweeping,
+    /// The sweep just finished: commit the fresh results at once.
+    Commit,
+    /// Background tracking: show a summary once it has been stable for a moment.
+    Tracking,
+}
+
+/// Display bookkeeping per site. Lives in a thread-local keyed by site id and
+/// only ever touched on the UI thread.
+#[derive(Default, Clone)]
+struct SiteSettle {
+    shown: String,
+    shown_hex: &'static str,
+    pending: Option<(String, &'static str, std::time::Instant)>,
+}
+
+thread_local! {
+    static SITE_SETTLE: std::cell::RefCell<std::collections::HashMap<String, SiteSettle>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Pure display policy: decide what a site should show given its raw summary
+/// and whether that raw summary has been stable long enough (`stable`).
+fn settle_display(
+    entry: &mut SiteSettle,
+    raw: &str,
+    raw_hex: &'static str,
+    stable: bool,
+) -> (String, &'static str) {
+    // Disabled / paused are not probing states: always display them directly.
+    if raw.ends_with("未选择") || raw.ends_with("已暂停") {
+        entry.shown = raw.into();
+        entry.shown_hex = raw_hex;
+        entry.pending = None;
+        return (raw.into(), raw_hex);
+    }
+    if raw == entry.shown && raw_hex == entry.shown_hex {
+        entry.pending = None;
+        return (raw.into(), raw_hex);
+    }
+    if stable {
+        entry.shown = raw.into();
+        entry.shown_hex = raw_hex;
+        entry.pending = None;
+        return (raw.into(), raw_hex);
+    }
+    match &entry.pending {
+        Some((sum, hex, _)) if sum == raw && *hex == raw_hex => {}
+        _ => entry.pending = Some((raw.into(), raw_hex, std::time::Instant::now())),
+    }
+    if entry.shown.is_empty() {
+        // Nothing committed yet: hold a stable 测速中 instead of the flapping
+        // 超时/较慢 while the engine hunts for a working IP.
+        let prefix = raw.split(" · ").next().unwrap_or(raw);
+        (format!("{prefix} · 测速中"), IDLE_COLOR)
+    } else {
+        (entry.shown.clone(), entry.shown_hex)
+    }
+}
+
+/// Apply the display lifecycle to a freshly built snapshot, in place.
+pub fn apply_settle(sites: &mut [crate::SiteData], phase: SettlePhase) {
+    SITE_SETTLE.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let live: std::collections::HashSet<String> =
+            sites.iter().map(|site| site.id.clone()).collect();
+        map.retain(|id, _| live.contains(id));
+        for site in sites.iter_mut() {
+            let entry = map.entry(site.id.clone()).or_default();
+            let (summary, hex) = match phase {
+                SettlePhase::Starting => {
+                    // Never commit this state: when the runtime comes up the
+                    // summaries start from a clean slate (测速中 → results).
+                    if !site.enabled {
+                        (site.summary.clone(), site.summary_hex)
+                    } else {
+                        let prefix = site.summary.split(" · ").next().unwrap_or(&site.summary);
+                        (format!("{prefix} · 启动中"), IDLE_COLOR)
+                    }
+                }
+                SettlePhase::Sweeping => {
+                    if site.summary.ends_with("未选择") || site.summary.ends_with("已暂停") {
+                        (site.summary.clone(), site.summary_hex)
+                    } else {
+                        let prefix = site.summary.split(" · ").next().unwrap_or(&site.summary);
+                        (format!("{prefix} · 测速中"), IDLE_COLOR)
+                    }
+                }
+                SettlePhase::Commit => {
+                    entry.shown = site.summary.clone();
+                    entry.shown_hex = site.summary_hex;
+                    entry.pending = None;
+                    (site.summary.clone(), site.summary_hex)
+                }
+                SettlePhase::Tracking => {
+                    let stable = match &entry.pending {
+                        Some((sum, hex, since)) => {
+                            *sum == site.summary
+                                && *hex == site.summary_hex
+                                && since.elapsed().as_millis() >= SETTLE_MILLIS
+                        }
+                        None => false,
+                    };
+                    settle_display(entry, &site.summary, &site.summary_hex, stable)
+                }
+            };
+            site.summary = summary;
+            site.summary_hex = hex;
+        }
+    });
 }
