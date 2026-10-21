@@ -251,7 +251,7 @@ async fn tunnel_direct_group(
     );
     match race_tcp_plans(&mut cursor, timeout).await {
         Some((plan, stream, latency)) => {
-            let _ = cursor.note_success(&plan, latency);
+            let _ = cursor.note_success(plan, latency);
             tunnel_connect(req, stream, TunnelInfo::new(host, port, "raw-direct"))
         }
         None => {
@@ -275,7 +275,7 @@ async fn tunnel_direct_group(
 pub(super) async fn race_tcp_plans(
     cursor: &mut RouteCursor,
     timeout: Duration,
-) -> Option<(ConnectPlan, TcpStream, u64)> {
+) -> Option<(Arc<ConnectPlan>, TcpStream, u64)> {
     type RaceResult = Result<(ConnectPlan, TcpStream, u64), (ConnectPlan, FailureReason, String)>;
     enum Event {
         Plan(Option<ConnectPlan>),
@@ -342,7 +342,7 @@ pub(super) async fn race_tcp_plans(
             }
             Event::Plan(None) => exhausted = true,
             Event::Result(result) => match result {
-                Ok(success) => return Some(success),
+                Ok((plan, stream, latency)) => return Some((Arc::new(plan), stream, latency)),
                 Err((plan, reason, detail)) => cursor.note_failure(&plan, reason, detail),
             },
         }

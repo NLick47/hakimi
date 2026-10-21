@@ -215,7 +215,9 @@ struct Inflight {
     notify: Notify,
     /// Set exactly once — by the leader or, on cancellation, by its guard.
     /// Sync so `Drop` can publish without an async context.
-    result: Mutex<Option<Result<ConnectPlan, String>>>,
+    /// The plan is shared, so publishing it to the followers of one discovery
+    /// does not copy the domain, group and SNI strings.
+    result: Mutex<Option<Result<Arc<ConnectPlan>, String>>>,
 }
 
 /// Guarantees single-flight cleanup no matter how the leader's future ends.
@@ -672,7 +674,9 @@ impl RouteConnector {
                 let started = std::time::Instant::now();
                 match self.connect_plan(&plan, force_http1, timeout).await {
                     Ok(io) => {
-                        cursor.note_success(&plan, started.elapsed().as_millis() as u64);
+                        // The cached plan is shared with the plan cache; hand
+                        // over the reference instead of copying it again.
+                        cursor.note_success(plan, started.elapsed().as_millis() as u64);
                         return Ok(io);
                     }
                     Err((reason, detail)) => {
@@ -759,9 +763,9 @@ impl RouteConnector {
         mut cursor: RouteCursor,
         force_http1: bool,
         timeout: Duration,
-    ) -> std::result::Result<(ConnectPlan, PooledIo), String> {
+    ) -> std::result::Result<(Arc<ConnectPlan>, PooledIo), String> {
         type RaceResult =
-            Result<(ConnectPlan, PooledIo, u64), (ConnectPlan, FailureReason, String)>;
+            Result<(Arc<ConnectPlan>, PooledIo, u64), (ConnectPlan, FailureReason, String)>;
         enum Event {
             Plan(Option<ConnectPlan>),
             Result(RaceResult),
@@ -806,7 +810,11 @@ impl RouteConnector {
                         }
                         let started = Instant::now();
                         match this.connect_plan(&plan, force_http1, timeout).await {
-                            Ok(io) => Ok((plan, io, started.elapsed().as_millis() as u64)),
+                            Ok(io) => Ok((
+                                Arc::new(plan),
+                                io,
+                                started.elapsed().as_millis() as u64,
+                            )),
                             Err((reason, detail)) => Err((plan, reason, detail)),
                         }
                     }));
@@ -814,7 +822,7 @@ impl RouteConnector {
                 Event::Plan(None) => exhausted = true,
                 Event::Result(result) => match result {
                     Ok((plan, io, latency)) => {
-                        cursor.note_success(&plan, latency);
+                        cursor.note_success(plan.clone(), latency);
                         // Dropping `pending` cancels the losing handshakes mid-flight.
                         return Ok((plan, io));
                     }

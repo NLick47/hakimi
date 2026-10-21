@@ -119,7 +119,7 @@ impl DecisionEngine {
                     self.prober.probe_tcp(plan.ip, plan.port, timeout).await
                 };
                 match result {
-                    Ok(latency_ms) => return cursor.note_success(&plan, latency_ms),
+                    Ok(latency_ms) => return cursor.note_success(Arc::new(plan), latency_ms),
                     Err(error) => {
                         cursor.note_failure(&plan, error.reason(), error.detail());
                     }
@@ -421,7 +421,10 @@ impl DecisionEngine {
         degraded
     }
 
-    pub(super) fn remember_plan(&self, plan: &ConnectPlan) {
+    /// Store a plan that is already shared. The plan cache keeps the same
+    /// allocation, so a successful connection no longer deep-copies the
+    /// domain, group and SNI strings.
+    pub(super) fn remember_plan_arc(&self, plan: Arc<ConnectPlan>) {
         let key = plan_key(&plan.domain, plan.port, plan.tls);
         let mut cache = self.plan_cache.lock();
         if cache.len() >= PLAN_CACHE_MAX {
@@ -442,7 +445,7 @@ impl DecisionEngine {
                 }
             }
         }
-        cache.insert(key, (Instant::now(), Arc::new(plan.clone())));
+        cache.insert(key, (Instant::now(), plan));
     }
 
     /// TCP-probe IPs that accumulated failures and forgive the ones that answer
@@ -503,7 +506,7 @@ impl DecisionEngine {
 
     /// Record a raw-tunnel success (TCP only; the browser's own TLS handshake validates the
     /// certificate end to end).
-    pub fn note_tunnel_success(&self, plan: &ConnectPlan, latency_ms: u64) {
+    pub fn note_tunnel_success(&self, plan: &Arc<ConnectPlan>, latency_ms: u64) {
         let config = self.config.snapshot();
         self.record_success(
             plan,
@@ -516,7 +519,7 @@ impl DecisionEngine {
 
     pub(super) fn record_success(
         &self,
-        plan: &ConnectPlan,
+        plan: &Arc<ConnectPlan>,
         latency_ms: u64,
         attempts: Vec<AttemptRecord>,
         doh: &DohExpansion,
@@ -577,7 +580,7 @@ impl DecisionEngine {
             suggestions: Vec::new(),
         });
         let degraded = self.record_ip(&plan.domain, plan.ip, Some(latency_ms), false);
-        self.remember_plan(plan);
+        self.remember_plan_arc(plan.clone());
         if degraded {
             // The proven route suddenly got slow: drop the cached plan so the next
             // connection re-races the routes instead of staying pinned to it.

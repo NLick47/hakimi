@@ -461,9 +461,13 @@ impl RouteCursor {
     }
 
     /// Record a successful real connection (TLS + certificate validation already passed).
-    pub fn note_success(&mut self, plan: &ConnectPlan, latency_ms: u64) -> DecisionOutcome {
+    ///
+    /// The plan is taken by value: the caller usually owns the only copy, and
+    /// the plan cache and the outcome can share it instead of deep-copying
+    /// the domain, group and SNI strings.
+    pub fn note_success(&mut self, plan: Arc<ConnectPlan>, latency_ms: u64) -> DecisionOutcome {
         let diagnostics = self.engine.record_success(
-            plan,
+            &plan,
             latency_ms,
             std::mem::take(&mut self.attempts),
             &self.doh,
@@ -480,7 +484,7 @@ impl RouteCursor {
         }
         self.finished = true;
         DecisionOutcome {
-            plan: Some(plan.clone()),
+            plan: Some(plan),
             diagnostics,
         }
     }

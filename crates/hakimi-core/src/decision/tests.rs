@@ -387,13 +387,14 @@ async fn route_cursor_needs_no_probe_and_caches_the_plan() {
     assert_eq!(plan.ip.to_string(), "1.1.1.1");
     assert!(harness.prober.calls.lock().is_empty());
 
-    let outcome = cursor.note_success(&plan, 7);
+    let plan_ip = plan.ip;
+    let outcome = cursor.note_success(Arc::new(plan), 7);
     assert_eq!(outcome.diagnostics.state, State::Direct);
     let cached = harness
         .engine
         .cached_plan("example.com", 443, true)
         .expect("successful plan should be cached");
-    assert_eq!(cached.ip, plan.ip);
+    assert_eq!(cached.ip, plan_ip);
     assert_eq!(cached.source, IpSource::Remote);
     assert!(harness.prober.calls.lock().is_empty());
 }
@@ -446,7 +447,7 @@ fn plan_cache_stays_bounded_when_every_entry_is_fresh() {
     for i in 0..(PLAN_CACHE_MAX + 100) {
         let mut plan = test_plan(TlsMode::Direct, None);
         plan.domain = format!("h{i}.example.com");
-        h.engine.remember_plan(&plan);
+        h.engine.remember_plan_arc(Arc::new(plan));
     }
     let cache = h.engine.plan_cache.lock();
     assert!(cache.len() <= PLAN_CACHE_MAX);
@@ -463,7 +464,7 @@ fn plan_cache_stays_bounded_when_every_entry_is_fresh() {
 #[test]
 fn network_change_drops_remembered_plans() {
     let h = harness(&["example.com"], Strategy::Direct);
-    h.engine.remember_plan(&test_plan(TlsMode::Direct, None));
+    h.engine.remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
     assert!(h.engine.cached_plan("example.com", 443, true).is_some());
 
     h.engine.forget_all_plans();
@@ -477,7 +478,7 @@ fn network_change_drops_remembered_plans() {
 fn cached_fake_sni_plan_follows_the_configured_sni() {
     let h = harness(&["example.com"], Strategy::FakeSni);
     h.engine
-        .remember_plan(&test_plan(TlsMode::FakeSni, Some("old.example")));
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::FakeSni, Some("old.example"))));
     assert!(h.engine.cached_plan("example.com", 443, true).is_some());
 
     let mut group = h.engine.config.snapshot().group("test").unwrap().clone();

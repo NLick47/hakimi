@@ -47,7 +47,9 @@ impl ConnectPlan {
 
 #[derive(Debug, Clone)]
 pub struct DecisionOutcome {
-    pub plan: Option<ConnectPlan>,
+    /// Shared with the plan cache and with the followers of one discovery, so
+    /// a winning plan is not deep-copied for every consumer.
+    pub plan: Option<Arc<ConnectPlan>>,
     /// Shared with the status store so publishing a decision does not clone
     /// the attempts/suggestions vectors.
     pub diagnostics: Arc<DomainDiagnostics>,
