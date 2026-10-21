@@ -253,18 +253,22 @@ pub(crate) fn build_sites(
                 selected += 1;
             }
 
-            let domains_config: Vec<String> = group
+            let raw_domains: Vec<String> = group
                 .get("domains")
                 .and_then(Value::as_array)
                 .map(|list| {
                     list.iter()
                         .filter_map(Value::as_str)
-                        .filter(|host| !host.starts_with("*."))
-                        .take(12)
                         .map(ToOwned::to_owned)
                         .collect()
                 })
                 .unwrap_or_default();
+            let domains_config: Vec<String> = raw_domains
+                .iter()
+                .filter(|host| !host.starts_with("*."))
+                .take(12)
+                .cloned()
+                .collect();
 
             let mut rows: Vec<DomainData> = Vec::new();
             let mut slow = 0usize;
@@ -330,6 +334,11 @@ pub(crate) fn build_sites(
             let primary = domains_config
                 .first()
                 .cloned()
+                .or_else(|| {
+                    raw_domains
+                        .iter()
+                        .find_map(|host| host.strip_prefix("*.").map(ToOwned::to_owned))
+                })
                 .unwrap_or_else(|| "example.com".into());
 
             let initial = name.chars().next().map(String::from).unwrap_or_default();
@@ -339,6 +348,18 @@ pub(crate) fn build_sites(
             let strategy = strategy_index(&text(group, "strategy"));
             let sni = text(group, "sni");
             let custom = !builtins.contains(&id);
+            // The preset/catalog owns the canonical landing page; custom groups
+            // fall back to their first exact routed domain.
+            let homepage = group
+                .get("homepage")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|url| {
+                    let lower = url.to_ascii_lowercase();
+                    lower.starts_with("https://") || lower.starts_with("http://")
+                })
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("https://{primary}/"));
 
             sites.push(SiteData {
                 icon_key,
@@ -352,7 +373,7 @@ pub(crate) fn build_sites(
                 open: expanded.contains(&id_key),
                 first: false,
                 last: false,
-                url: format!("https://{primary}/"),
+                url: homepage,
                 strategy,
                 sni,
                 custom,
@@ -2242,6 +2263,49 @@ mod tests {
             ]
         });
         build_snapshot(&status, &config, &HashSet::new(), true, false, None)
+    }
+
+    #[test]
+    fn visit_urls_use_canonical_homepages() {
+        let config = serde_json::json!({
+            "groups": [
+                { "id": "github", "name": "GitHub", "enabled": true, "domains": ["github.com"] },
+                { "id": "pixiv", "name": "Pixiv", "enabled": true, "domains": ["pixiv.net", "www.pixiv.net"], "homepage": "https://www.pixiv.net/" },
+                { "id": "ao3", "name": "AO3", "enabled": true, "domains": ["archiveofourown.org"] },
+                { "id": "eh", "name": "E-Hentai", "enabled": true, "domains": ["e-hentai.org"] },
+                { "id": "hitomi", "name": "Hitomi", "enabled": true, "domains": ["hitomi.la"] },
+                { "id": "nhentai", "name": "nhentai", "enabled": true, "domains": ["nhentai.net"] },
+                { "id": "hanime", "name": "Hanime", "enabled": true, "domains": ["hanime.tv"] },
+                { "id": "steam", "name": "Steam", "enabled": true, "domains": ["store.steampowered.com"] },
+                { "id": "poipiku", "name": "Poipiku", "enabled": true, "domains": ["poipiku.com"] },
+                { "id": "custom", "name": "Custom", "enabled": true, "domains": ["custom.example", "*.custom.example"], "homepage": "https://custom-home.example/" },
+                { "id": "fallback", "name": "Fallback", "enabled": true, "domains": ["fallback.example"] },
+                { "id": "wild", "name": "Wild", "enabled": true, "domains": ["*.wild.example"] }
+            ]
+        });
+        let status = serde_json::json!({ "domains": [] });
+        let (sites, _) = build_sites(&status, &config, &HashSet::new());
+        let url = |id: &str| {
+            sites
+                .iter()
+                .find(|site| site.id == id)
+                .unwrap()
+                .url
+                .as_str()
+        };
+
+        assert_eq!(url("pixiv"), "https://www.pixiv.net/");
+        assert_eq!(url("github"), "https://github.com/");
+        assert_eq!(url("ao3"), "https://archiveofourown.org/");
+        assert_eq!(url("eh"), "https://e-hentai.org/");
+        assert_eq!(url("hitomi"), "https://hitomi.la/");
+        assert_eq!(url("nhentai"), "https://nhentai.net/");
+        assert_eq!(url("hanime"), "https://hanime.tv/");
+        assert_eq!(url("steam"), "https://store.steampowered.com/");
+        assert_eq!(url("poipiku"), "https://poipiku.com/");
+        assert_eq!(url("custom"), "https://custom-home.example/");
+        assert_eq!(url("fallback"), "https://fallback.example/");
+        assert_eq!(url("wild"), "https://wild.example/");
     }
 
     #[test]

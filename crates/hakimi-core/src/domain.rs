@@ -281,6 +281,7 @@ mod tests {
             enabled: true,
             sni: None,
             experimental: false,
+            homepage: None,
             ech_shared: false,
         }
     }

@@ -237,6 +237,12 @@ pub struct GroupConfig {
     pub enabled: bool,
     pub sni: Option<String>,
     pub experimental: bool,
+    /// Canonical page opened by the UI's "visit" button. `None` falls back to
+    /// the first exact routed domain, which is the right default for custom
+    /// groups but not for presets such as Pixiv (bare `pixiv.net` is not the
+    /// canonical `www.pixiv.net` host).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
     /// Use Cloudflare's shared ECH config (cloudflare-ech.com) when the domain itself
     /// publishes no ECHConfig. Needed for Cloudflare-fronted sites such as www.pixiv.net.
     pub ech_shared: bool,
@@ -252,6 +258,7 @@ impl Default for GroupConfig {
             enabled: true,
             sni: None,
             experimental: false,
+            homepage: None,
             ech_shared: false,
         }
     }
@@ -296,6 +303,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
         strategy: Strategy,
         enabled: bool,
         experimental: bool,
+        homepage: &str,
     ) -> GroupConfig {
         GroupConfig {
             id: id.to_string(),
@@ -305,6 +313,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
             enabled,
             sni: None,
             experimental,
+            homepage: Some(homepage.to_string()),
             ech_shared: false,
         }
     }
@@ -322,6 +331,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
             Strategy::Auto,
             true,
             false,
+            "https://github.com/",
         ),
         {
             let mut group = group(
@@ -338,6 +348,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
                 Strategy::Auto,
                 true,
                 false,
+                "https://www.pixiv.net/",
             );
             group.ech_shared = true;
             group
@@ -349,6 +360,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
             Strategy::Auto,
             true,
             false,
+            "https://archiveofourown.org/",
         ),
         group(
             "eh",
@@ -364,6 +376,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
             Strategy::Auto,
             false,
             true,
+            "https://e-hentai.org/",
         ),
         group(
             "hitomi",
@@ -377,6 +390,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
             Strategy::Auto,
             true,
             false,
+            "https://hitomi.la/",
         ),
         group(
             "nhentai",
@@ -385,6 +399,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
             Strategy::Auto,
             true,
             false,
+            "https://nhentai.net/",
         ),
         group(
             "hanime",
@@ -393,6 +408,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
             Strategy::Auto,
             true,
             false,
+            "https://hanime.tv/",
         ),
         group(
             "steam",
@@ -407,6 +423,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
             Strategy::Auto,
             true,
             false,
+            "https://store.steampowered.com/",
         ),
         group(
             "poipiku",
@@ -420,6 +437,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
             Strategy::Direct,
             true,
             false,
+            "https://poipiku.com/",
         ),
     ]
 }
@@ -540,6 +558,22 @@ impl AppConfig {
             if group.name.trim().is_empty() {
                 bail!("group `{}` has an empty name", group.id);
             }
+            if let Some(homepage) = &group.homepage {
+                let raw = homepage.trim();
+                if !raw.is_empty() {
+                    let parsed = url::Url::parse(raw).with_context(|| {
+                        format!("group `{}` homepage is not a URL", group.id)
+                    })?;
+                    if !matches!(parsed.scheme(), "http" | "https")
+                        || parsed.host_str().is_none()
+                    {
+                        bail!(
+                            "group `{}` homepage must be an absolute http(s) URL",
+                            group.id
+                        );
+                    }
+                }
+            }
             if group.domains.is_empty() {
                 bail!("group `{}` has no domains", group.id);
             }
@@ -640,17 +674,37 @@ pub fn validate_catalog_url(raw: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// Append built-in groups a config predates, keeping custom groups untouched.
-/// Returns how many were added.
+/// Append built-in groups a config predates and fill in newly introduced
+/// built-in metadata (currently the homepage URL), keeping custom groups and
+/// explicit user values untouched. Returns how many entries changed.
 fn merge_missing_defaults(config: &mut AppConfig) -> usize {
-    let mut added = 0;
-    for group in default_groups() {
-        if config.group(&group.id).is_none() {
-            config.groups.push(group);
-            added += 1;
+    let mut changed = 0;
+    for mut default_group in default_groups() {
+        match config
+            .groups
+            .iter_mut()
+            .find(|group| group.id == default_group.id)
+        {
+            Some(existing) => {
+                let has_homepage = existing
+                    .homepage
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|url| !url.is_empty());
+                if !has_homepage {
+                    if let Some(homepage) = default_group.homepage.take() {
+                        existing.homepage = Some(homepage);
+                        changed += 1;
+                    }
+                }
+            }
+            None => {
+                config.groups.push(default_group);
+                changed += 1;
+            }
         }
     }
-    added
+    changed
 }
 
 /// Thread-safe configuration holder that keeps the derived domain matcher in sync.
@@ -688,7 +742,7 @@ impl ConfigManager {
         // so a missing id means "predates this site", not "user removed it".
         let restored = merge_missing_defaults(&mut config);
         if restored > 0 {
-            tracing::info!(restored, "added new built-in sites to the config");
+            tracing::info!(restored, "updated built-in site defaults in the config");
             atomic_write_json(&path, &config)?;
         }
         Self::new(path, config)
@@ -851,6 +905,17 @@ mod tests {
             .iter()
             .any(|domain| domain == "*.hanime.tv"));
         assert!(config.group("pixiv").unwrap().ech_shared);
+        assert_eq!(
+            config.group("pixiv").unwrap().homepage.as_deref(),
+            Some("https://www.pixiv.net/")
+        );
+        assert!(config
+            .groups
+            .iter()
+            .all(|group| group
+                .homepage
+                .as_deref()
+                .is_some_and(|url| url.starts_with("https://"))));
         assert!(config
             .group("pixiv")
             .unwrap()
@@ -920,9 +985,15 @@ mod tests {
         custom.name = "Custom".into();
         custom.domains = vec!["custom.example".into()];
         config.groups.push(custom);
+        // Older configs predate the homepage field: fill it from defaults too.
+        config.group_mut("github").unwrap().homepage = None;
 
-        assert_eq!(merge_missing_defaults(&mut config), 1);
+        assert_eq!(merge_missing_defaults(&mut config), 2);
         assert!(config.group("nhentai").is_some());
+        assert_eq!(
+            config.group("github").unwrap().homepage.as_deref(),
+            Some("https://github.com/")
+        );
         assert_eq!(
             config
                 .groups
@@ -944,6 +1015,7 @@ mod tests {
         let mut old = AppConfig::default();
         old.groups
             .retain(|group| !matches!(group.id.as_str(), "hitomi" | "nhentai" | "hanime"));
+        old.group_mut("github").unwrap().homepage = None;
         atomic_write_json(&paths.config_file(), &old).unwrap();
 
         let manager = ConfigManager::load_or_create(&paths).unwrap();
@@ -951,6 +1023,11 @@ mod tests {
         for id in ["hitomi", "nhentai", "hanime"] {
             assert!(snapshot.group(id).is_some(), "{id} should be restored");
         }
+        assert_eq!(
+            snapshot.group("github").unwrap().homepage.as_deref(),
+            Some("https://github.com/"),
+            "existing built-ins gain newly introduced homepage defaults"
+        );
 
         // The merge is persisted, so the next load starts from the new list.
         let reloaded = ConfigManager::load_or_create(&paths).unwrap();
@@ -978,5 +1055,14 @@ mod tests {
         let mut config = AppConfig::default();
         config.groups[0].domains.push("bad domain.com".into());
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_non_http_homepages() {
+        let mut config = AppConfig::default();
+        config.groups[0].homepage = Some("file:///etc/passwd".into());
+        assert!(config.validate().is_err());
+        config.groups[0].homepage = Some("https://example.com/".into());
+        assert!(config.validate().is_ok());
     }
 }

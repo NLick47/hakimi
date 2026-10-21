@@ -618,6 +618,7 @@ disabled / paused / checking / normal / direct / degraded / failed
 {
   "id": "github",
   "name": "GitHub",
+  "homepage": "https://github.com/",
   "domains": [
     "github.com",
     "api.github.com",
@@ -634,6 +635,7 @@ disabled / paused / checking / normal / direct / degraded / failed
 - 没有 `dohId`。
 - 没有 `ipMode`。
 - 没有手动 IP 列表。
+- `homepage` 是 UI「访问」按钮使用的 canonical 地址；缺省时回退到第一个精确域名。
 
 ### 12.3 缓存
 
