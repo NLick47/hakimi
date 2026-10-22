@@ -465,15 +465,20 @@ async fn concurrent_cold_connections_share_one_discovery() {
         }
     });
 
-    // The dead candidate: the same port on the other loopback address, but a
-    // plain TCP server, so the TLS handshake fails right away.
+    // The stale cached candidate: the same port on the other loopback
+    // address. It accepts TCP but never sends a ServerHello, so the cached
+    // route hangs in its TLS handshake instead of failing fast.
     let dead = TcpListener::bind(("::1", port)).await.unwrap();
     let dead_accepts = Arc::new(AtomicUsize::new(0));
     let counter = dead_accepts.clone();
     tokio::spawn(async move {
         while let Ok((socket, _)) = dead.accept().await {
             counter.fetch_add(1, Ordering::SeqCst);
-            drop(socket);
+            tokio::spawn(async move {
+                // Hold the socket open; the test drops the runtime at the end.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(socket);
+            });
         }
     });
 
@@ -497,11 +502,27 @@ async fn concurrent_cold_connections_share_one_discovery() {
         engine.prober.clone(),
         engine.status.clone(),
     );
+    // Seed the plan cache with the hanging route. The next request must race
+    // it against the catalog rather than waiting out its full timeout.
+    let cached = Arc::new(ConnectPlan {
+        domain: "upstream.test".into(),
+        group_id: "test".into(),
+        ip: "::1".parse().unwrap(),
+        port,
+        mode: TlsMode::Direct,
+        sni: None,
+        ech_config: None,
+        tls: true,
+        source: IpSource::Cache,
+    });
+    engine.note_tunnel_success(&cached, 5);
+
     let tls = TlsContext::new().unwrap();
     let pool = Arc::new(UpstreamPool::new(engine, tls, &config.snapshot()));
     let uri = format!("https://upstream.test:{port}/");
 
     // Ten requests at once, all to the same cold domain.
+    let started = std::time::Instant::now();
     let mut tasks = Vec::new();
     for _ in 0..10 {
         let pool = pool.clone();
@@ -527,5 +548,10 @@ async fn concurrent_cold_connections_share_one_discovery() {
         dead_accepts.load(Ordering::SeqCst),
         1,
         "the dead candidate must be dialled once, not once per request"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1_000),
+        "the stalled cached route blocked the healthy candidate for {:?}",
+        started.elapsed()
     );
 }

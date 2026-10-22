@@ -117,49 +117,24 @@ pub(super) async fn handle_connect(
         return tunnel_to_host(req, host, port).await;
     }
 
-    // Fast path: a previously successful direct route turns CONNECT into a raw TCP tunnel,
-    // with no probe, no local certificate and no extra TLS handshake.
-    //
-    // Only groups that never use MITM may take it.  A group that can use ECH or
-    // fake SNI has to terminate the browser's TLS locally, and the browser
-    // must not see a different certificate on the next connection to the same
-    // host: the first CONNECT was intercepted, the next one must be too.
-    let candidate_timeout = Duration::from_millis(config.advanced.ip_timeout_ms.clamp(500, 10_000));
-    let mut stale_plan = None;
-    if let Some(plan) = ctx.engine.cached_plan(&host, port, true) {
-        if may_tunnel_directly(group.route_for(&host).is_direct_only(), plan.mode) {
-            let started = std::time::Instant::now();
-            match connect_tcp_upstream(plan.ip, plan.port, candidate_timeout).await {
-                Ok(stream) => {
-                    let latency = started.elapsed().as_millis() as u64;
-                    ctx.engine.note_tunnel_success(&plan, latency);
-                    return tunnel_connect(
-                        req,
-                        stream,
-                        // No later path in this branch needs the string.
-                        TunnelInfo::new(host, port, "cached-direct"),
-                    );
-                }
-                Err((reason, detail)) => {
-                    tracing::debug!(
-                        domain = %host,
-                        ip = %plan.ip,
-                        reason = %reason,
-                        detail = %detail,
-                        "cached direct route failed; re-planning"
-                    );
-                    ctx.engine.forget_plan(&host, port, true);
-                    stale_plan = Some(plan);
-                }
-            }
-        }
-    }
-
     // Explicitly direct groups never need MITM. When the CA is not trusted we also keep
     // Auto groups on the raw path: a direct origin still works, while an ECH/fake-SNI
     // origin would only produce a browser certificate error anyway.
-    if group.route_for(&host).is_direct_only() || !ctx.ca.installed() {
-        return tunnel_direct_group(req, &ctx, host, port, stale_plan.as_deref()).await;
+    //
+    // A cached direct route is passed into the same race as the other candidates
+    // instead of being awaited by itself. A stale cached address that accepts TCP
+    // but never completes the handshake would otherwise hold CONNECT for the full
+    // per-candidate timeout before the healthy catalog/DNS route is tried.
+    let direct_only = group.route_for(&host).is_direct_only();
+    let cached_plan = if direct_only {
+        ctx.engine
+            .cached_plan(&host, port, true)
+            .filter(|plan| may_tunnel_directly(direct_only, plan.mode))
+    } else {
+        None
+    };
+    if direct_only || !ctx.ca.installed() {
+        return tunnel_direct_group(req, &ctx, host, port, cached_plan).await;
     }
 
     // ECH / fake SNI / Auto without a direct route: terminate browser TLS locally and let
@@ -244,7 +219,7 @@ async fn tunnel_direct_group(
     ctx: &Arc<ProxyContext>,
     host: String,
     port: u16,
-    failed_plan: Option<&ConnectPlan>,
+    cached_plan: Option<Arc<ConnectPlan>>,
 ) -> Response<ProxyBody> {
     let mut cursor = match ctx.engine.route_normalized(&host, port, true) {
         Route::Bypass(_) => return tunnel_to_host(req, host, port).await,
@@ -258,7 +233,8 @@ async fn tunnel_direct_group(
     // was ECH generates (and awaits DoH for) an ECH plan before every direct
     // candidate, and a fast-failing first address starves the rest of the list.
     cursor.restrict_to_direct();
-    if let Some(plan) = failed_plan {
+    if let Some(plan) = cached_plan.as_ref() {
+        // The cached route is seeded into the race, not generated again.
         cursor.skip_plan(plan);
     }
     let timeout = Duration::from_millis(
@@ -268,7 +244,7 @@ async fn tunnel_direct_group(
             .ip_timeout_ms
             .clamp(500, 10_000),
     );
-    match race_tcp_plans(&mut cursor, timeout).await {
+    match race_tcp_plans(&mut cursor, cached_plan, timeout).await {
         Some((plan, stream, latency)) => {
             let _ = cursor.note_success(plan, latency);
             tunnel_connect(req, stream, TunnelInfo::new(host, port, "raw-direct"))
@@ -293,6 +269,7 @@ async fn tunnel_direct_group(
 /// direct candidate is the only usable one here).
 pub(super) async fn race_tcp_plans(
     cursor: &mut RouteCursor,
+    cached_plan: Option<Arc<ConnectPlan>>,
     timeout: Duration,
 ) -> Option<(Arc<ConnectPlan>, TcpStream, u64)> {
     type RaceResult = Result<(ConnectPlan, TcpStream, u64), (ConnectPlan, FailureReason, String)>;
@@ -308,6 +285,40 @@ pub(super) async fn race_tcp_plans(
     // As in the pooled race, a failed candidate releases the remaining
     // hedge delay immediately instead of making the fallback wait it out.
     let (failure_tx, failure_rx) = tokio::sync::watch::channel(false);
+
+    // Seed the cached route as the first race member. Generated plans join
+    // after the normal stagger, or immediately if this route fails. The old
+    // code awaited the cached TCP connect alone and could spend the full
+    // per-candidate timeout before even starting the fallback.
+    if let Some(plan) = cached_plan {
+        let address = SocketAddr::new(plan.ip, plan.port);
+        let failed_plan = plan.clone();
+        pending.push(Box::pin(async move {
+            let started = Instant::now();
+            match tokio::time::timeout(timeout, TcpStream::connect(address)).await {
+                Ok(Ok(stream)) => {
+                    let _ = stream.set_nodelay(true);
+                    crate::util::apply_tcp_keepalive(&stream);
+                    Ok((
+                        (*plan).clone(),
+                        stream,
+                        started.elapsed().as_millis() as u64,
+                    ))
+                }
+                Ok(Err(error)) => Err((
+                    (*failed_plan).clone(),
+                    FailureReason::TcpRefused,
+                    format!("connecting to {address} failed: {error}"),
+                )),
+                Err(_) => Err((
+                    (*failed_plan).clone(),
+                    FailureReason::TcpTimeout,
+                    format!("connecting to {address} timed out"),
+                )),
+            }
+        }));
+        first_start = Some(Instant::now());
+    }
 
     loop {
         let event = if !exhausted && pending.len() < RAW_RACE_SIZE {
@@ -372,6 +383,7 @@ pub(super) async fn race_tcp_plans(
             Event::Result(result) => match result {
                 Ok((plan, stream, latency)) => return Some((Arc::new(plan), stream, latency)),
                 Err((plan, reason, detail)) => {
+                    cursor.forget_plan(&plan);
                     cursor.note_failure(&plan, reason, detail);
                     // Same rule as the pooled race: once a candidate has
                     // failed, the fallback is no longer speculative and should
@@ -384,6 +396,7 @@ pub(super) async fn race_tcp_plans(
     }
 }
 
+#[cfg(test)]
 pub(super) async fn connect_tcp_upstream(
     ip: std::net::IpAddr,
     port: u16,

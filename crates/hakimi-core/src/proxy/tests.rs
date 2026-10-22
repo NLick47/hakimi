@@ -238,7 +238,7 @@ async fn raw_tunnel_races_past_a_blackholed_candidate() {
     let serial_elapsed = serial_started.elapsed();
 
     let started = Instant::now();
-    let result = race_tcp_plans(&mut cursor, Duration::from_secs(1)).await;
+    let result = race_tcp_plans(&mut cursor, None, Duration::from_secs(1)).await;
     let elapsed = started.elapsed();
     println!("serial fallback took {serial_elapsed:?}; raw candidate race finished in {elapsed:?}");
     let (plan, _stream, _) = result.expect("the reachable candidate must win");
@@ -271,13 +271,57 @@ async fn raw_tunnel_releases_hedge_after_refusal() {
     };
 
     let started = Instant::now();
-    let result = race_tcp_plans(&mut cursor, Duration::from_secs(1)).await;
+    let result = race_tcp_plans(&mut cursor, None, Duration::from_secs(1)).await;
     let elapsed = started.elapsed();
     let (plan, _stream, _) = result.expect("the reachable candidate must win");
     assert_eq!(plan.ip.to_string(), "127.0.0.1");
     assert!(
         elapsed < Duration::from_millis(120),
         "a refused candidate made the raw tunnel wait for the hedge window: {elapsed:?}"
+    );
+}
+
+/// The cached direct route is the first race member now. A refused cached
+/// address must release the catalog candidate immediately, exactly like any
+/// other first candidate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_cached_plan_releases_hedge_after_refusal() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _listener = listener;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_for_direct_test(
+        dir.path(),
+        "::1".parse().unwrap(),
+        vec!["127.0.0.1".parse().unwrap()],
+    );
+    let mut cursor = match engine.route("upstream.test", port, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    cursor.restrict_to_direct();
+    let cached = Arc::new(crate::decision::ConnectPlan {
+        domain: "upstream.test".into(),
+        group_id: "test".into(),
+        ip: "::1".parse().unwrap(),
+        port,
+        mode: TlsMode::Direct,
+        sni: None,
+        ech_config: None,
+        tls: true,
+        source: IpSource::Cache,
+    });
+    cursor.skip_plan(&cached);
+
+    let started = Instant::now();
+    let result = race_tcp_plans(&mut cursor, Some(cached), Duration::from_secs(1)).await;
+    let elapsed = started.elapsed();
+    let (plan, _stream, _) = result.expect("the reachable catalog candidate must win");
+    assert_eq!(plan.ip.to_string(), "127.0.0.1");
+    assert!(
+        elapsed < Duration::from_millis(120),
+        "the refused cached route made the fallback wait for the hedge window: {elapsed:?}"
     );
 }
 

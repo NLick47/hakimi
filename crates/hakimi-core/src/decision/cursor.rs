@@ -314,6 +314,12 @@ impl RouteCursor {
         self.skipped.insert(plan.identity());
     }
 
+    /// Drop a failed plan so the next cold connection re-races instead of
+    /// pinning the same address again.
+    pub fn forget_plan(&self, plan: &ConnectPlan) {
+        self.engine.forget_plan(&plan.domain, plan.port, plan.tls);
+    }
+
     pub fn outcome(&self) -> Option<&DecisionOutcome> {
         self.failure.as_ref()
     }

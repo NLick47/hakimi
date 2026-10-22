@@ -704,26 +704,20 @@ impl RouteConnector {
         // many candidates. Read the timeout once per new connection, not once
         // per candidate attempt.
         let timeout = self.candidate_timeout();
-        // A previously successful route wins. If it fails, it is forgotten and the lazy
-        // candidate generator continues with the normal priority order. After a catalog
-        // update the cursor tells us to try the new remote IPs first.
-        if !cursor.skip_once() {
-            if let Some(plan) = self.engine.cached_plan(cursor.domain(), cursor.port(), tls) {
-                let started = std::time::Instant::now();
-                match self.connect_plan(&plan, force_http1, timeout).await {
-                    Ok(io) => {
-                        // The cached plan is shared with the plan cache; hand
-                        // over the reference instead of copying it again.
-                        cursor.note_success(plan, started.elapsed().as_millis() as u64);
-                        return Ok(io);
-                    }
-                    Err((reason, detail)) => {
-                        self.engine.forget_plan(&plan.domain, plan.port, plan.tls);
-                        cursor.note_failure(&plan, reason, detail);
-                        cursor.skip_plan(&plan);
-                    }
-                }
-            }
+        // A previously successful route starts immediately, but it no longer
+        // blocks the normal candidate race until its full timeout. A stale
+        // cached route can otherwise add seconds to a page load before the
+        // healthy candidates are even tried; instead the cached route gets the
+        // same hedge window as any other first candidate.
+        let cached_plan = if cursor.skip_once() {
+            None
+        } else {
+            self.engine.cached_plan(cursor.domain(), cursor.port(), tls)
+        };
+        if let Some(plan) = cached_plan.as_ref() {
+            // The cached route will be inserted as the first race future, so
+            // do not generate the same plan again from the cursor.
+            cursor.skip_plan(plan);
         }
 
         let key = format!("{}|{}|{}", cursor.domain(), cursor.port(), tls);
@@ -745,7 +739,9 @@ impl RouteConnector {
                 key: key.clone(),
                 entry: inflight.clone(),
             };
-            let outcome = self.race_plans(cursor, force_http1, timeout).await;
+            let outcome = self
+                .race_plans(cursor, cached_plan, force_http1, timeout)
+                .await;
             let shared = match &outcome {
                 Ok((plan, _)) => Ok(plan.clone()),
                 Err(error) => Err(error.clone()),
@@ -799,6 +795,7 @@ impl RouteConnector {
     async fn race_plans(
         &self,
         mut cursor: RouteCursor,
+        cached_plan: Option<Arc<ConnectPlan>>,
         force_http1: bool,
         timeout: Duration,
     ) -> std::result::Result<(Arc<ConnectPlan>, PooledIo), String> {
@@ -820,6 +817,23 @@ impl RouteConnector {
         // refused first candidate still costs the full 150 ms before the
         // healthy fallback is allowed to start.
         let (failure_tx, failure_rx) = tokio::sync::watch::channel(false);
+
+        // The cached route is the first member of the race. It starts
+        // immediately; generated candidates join after the normal stagger (or
+        // as soon as the cached route fails), so a stale cached route can no
+        // longer hold the request for its full 2 s timeout before fallback.
+        if let Some(plan) = cached_plan {
+            let this = self.clone();
+            let failed_plan = plan.clone();
+            pending.push(Box::pin(async move {
+                let started = Instant::now();
+                match this.connect_plan(&plan, force_http1, timeout).await {
+                    Ok(io) => Ok((plan, io, started.elapsed().as_millis() as u64)),
+                    Err((reason, detail)) => Err(((*failed_plan).clone(), reason, detail)),
+                }
+            }));
+            first_start = Some(Instant::now());
+        }
 
         loop {
             let event = if !exhausted && pending.len() < RACE_SIZE {
