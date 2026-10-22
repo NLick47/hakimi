@@ -9,7 +9,7 @@ use http::StatusCode;
 
 use crate::cache::{CacheManager, IpScoreUpdate, LastGoodEntry};
 use crate::catalog::RemoteIpProvider;
-use crate::config::{AppConfig, ConfigManager, GroupConfig};
+use crate::config::{AppConfig, ConfigManager, EchSource, GroupConfig, RoutePolicy};
 use crate::domain::normalize_hostname;
 use crate::resolver::{DohResolution, IpResolver};
 use crate::status::{AttemptRecord, DomainDiagnostics, State, StatusStore};
@@ -366,6 +366,63 @@ impl DecisionEngine {
             return None;
         }
         Some(plan)
+    }
+
+    /// Start cold DNS/ECH work while the browser is still doing its local TLS
+    /// handshake. A MITM CONNECT already knows the destination before the
+    /// first HTTP request arrives, so doing this from the request path leaves
+    /// the DoH round trip on the critical path for no reason.
+    ///
+    /// Only cold routes are touched: a valid plan cache entry or a cached
+    /// catalog/last-good address means the route already has an IP to race.
+    pub(crate) fn prefetch_cold_route(&self, domain: &str, port: u16, route: &RoutePolicy) {
+        if self.cached_plan(domain, port, true).is_some() {
+            return;
+        }
+        let config = self.config.snapshot();
+        let (_, last_good) = self
+            .cache
+            .route_hints(domain, config.advanced.last_good_days);
+        let (remote, _) = self.remote.remote_ips_with_catalog(domain);
+        if last_good.is_none() && remote.as_ref().is_none_or(Vec::is_empty) {
+            let resolver = self.resolver.clone();
+            let domain = domain.to_string();
+            tokio::spawn(async move {
+                let _ = resolver.doh_ips(&domain).await;
+            });
+        }
+
+        // ECH is a second independent DoH lookup. Kick it off too so a route
+        // that needs ECH does not pay for it after the browser request lands.
+        let mut prefetch_own = false;
+        let mut prefetch_shared = false;
+        for attempt in &route.attempts {
+            let Some(source) = attempt.ech_source() else {
+                continue;
+            };
+            if self.cache.ech(domain, true).is_some() {
+                continue;
+            }
+            match source {
+                EchSource::Own => prefetch_own = true,
+                EchSource::Shared => prefetch_shared = true,
+            }
+        }
+        for allow_shared in [false, true] {
+            let should = if allow_shared {
+                prefetch_shared
+            } else {
+                prefetch_own
+            };
+            if !should {
+                continue;
+            }
+            let resolver = self.resolver.clone();
+            let domain = domain.to_string();
+            tokio::spawn(async move {
+                let _ = resolver.doh_ech_config(&domain, allow_shared).await;
+            });
+        }
     }
 
     /// True while an HTTP rejection (403/421/451) keeps this mode out of the

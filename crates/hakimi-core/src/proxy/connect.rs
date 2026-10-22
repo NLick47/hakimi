@@ -137,6 +137,12 @@ pub(super) async fn handle_connect(
         return tunnel_direct_group(req, &ctx, host, port, cached_plan).await;
     }
 
+    // The browser is about to perform its local TLS handshake. Use that time
+    // to resolve the cold DoH/ECH route instead of waiting for the first HTTP
+    // request to trigger it.
+    ctx.engine
+        .prefetch_cold_route(&host, port, group.route_for(&host));
+
     // ECH / fake SNI / Auto without a direct route: terminate browser TLS locally and let
     // the pooled upstream client pick direct/ECH/SNI on the real request. The real
     // handshake is the probe; there is no separate decision connection.

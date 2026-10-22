@@ -1,5 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,11 +39,14 @@ impl RemoteIpProvider for FakeRemote {
 #[derive(Default)]
 struct FakeResolver {
     answers: Mutex<VecDeque<Result<DohResolution, String>>>,
+    doh_calls: AtomicUsize,
+    ech_calls: AtomicUsize,
 }
 
 #[async_trait]
 impl IpResolver for FakeResolver {
     async fn doh_ips(&self, _domain: &str) -> Result<DohResolution> {
+        self.doh_calls.fetch_add(1, Ordering::SeqCst);
         match self.answers.lock().pop_front() {
             Some(Ok(answer)) => Ok(answer),
             Some(Err(error)) => Err(anyhow::anyhow!(error)),
@@ -51,6 +55,7 @@ impl IpResolver for FakeResolver {
     }
 
     async fn doh_ech_config(&self, _domain: &str, _allow_shared: bool) -> Result<EchOutcome> {
+        self.ech_calls.fetch_add(1, Ordering::SeqCst);
         Err(anyhow::anyhow!("no ECH"))
     }
 }
@@ -258,6 +263,33 @@ fn harness(group_domains: &[&str], default_route: RoutePolicy) -> Harness {
         prober,
         resolver,
     }
+}
+
+#[tokio::test]
+async fn cold_route_prefetch_starts_dns_and_ech_work() {
+    let route = RoutePolicy::ech_shared();
+    let h = harness(&["example.com"], route.clone());
+
+    h.engine.prefetch_cold_route("example.com", 443, &route);
+
+    for _ in 0..50 {
+        if h.resolver.doh_calls.load(Ordering::SeqCst) > 0
+            && h.resolver.ech_calls.load(Ordering::SeqCst) > 0
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        h.resolver.doh_calls.load(Ordering::SeqCst),
+        1,
+        "a cold route should start one DoH IP lookup"
+    );
+    assert_eq!(
+        h.resolver.ech_calls.load(Ordering::SeqCst),
+        1,
+        "a cold ECH route should start one ECH lookup"
+    );
 }
 
 #[tokio::test]
