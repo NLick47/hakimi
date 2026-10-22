@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -123,7 +123,7 @@ pub struct GroupStatus {
     pub last_check: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusCounts {
     pub normal: usize,
@@ -133,10 +133,35 @@ pub struct StatusCounts {
     pub total: usize,
 }
 
+impl StatusCounts {
+    fn add(&mut self, state: State) {
+        match state {
+            State::Normal => self.normal += 1,
+            State::Direct => self.direct += 1,
+            State::Failed => self.failed += 1,
+            State::Checking => self.checking += 1,
+            _ => {}
+        }
+    }
+
+    fn remove(&mut self, state: State) {
+        match state {
+            State::Normal => self.normal = self.normal.saturating_sub(1),
+            State::Direct => self.direct = self.direct.saturating_sub(1),
+            State::Failed => self.failed = self.failed.saturating_sub(1),
+            State::Checking => self.checking = self.checking.saturating_sub(1),
+            _ => {}
+        }
+    }
+}
+
 pub struct StatusStore {
     /// Values are shared so snapshots clone only an `Arc`, not every
     /// diagnostics record (including attempts/suggestions vectors).
     domains: RwLock<HashMap<String, Arc<DomainDiagnostics>>>,
+    /// Maintained together with `domains` under its write lock. Keeping the
+    /// counters separate lets pollers read them without scanning all domains.
+    counts: RwLock<StatusCounts>,
     paused: AtomicBool,
     /// Bumped whenever a domain record or the pause flag changes. Pollers
     /// compare it to skip rebuilding a snapshot that cannot have changed.
@@ -154,6 +179,7 @@ impl StatusStore {
     pub fn new() -> Self {
         Self {
             domains: RwLock::new(HashMap::new()),
+            counts: RwLock::new(StatusCounts::default()),
             paused: AtomicBool::new(false),
             revision: AtomicU64::new(0),
             started_at: now(),
@@ -194,6 +220,7 @@ impl StatusStore {
     pub(crate) fn record_arc(&self, diagnostics: Arc<DomainDiagnostics>) {
         let mut map = self.domains.write();
         let mut unchanged_checking = false;
+        let mut state_change: Option<(State, State)> = None;
         if let Some(existing) = map.get_mut(&diagnostics.domain) {
             // Never let a slower, older probe overwrite a newer result.
             if existing.last_check > diagnostics.last_check
@@ -223,14 +250,30 @@ impl StatusStore {
                     "domain state changed"
                 );
             }
+            if existing.state != diagnostics.state {
+                state_change = Some((existing.state, diagnostics.state));
+            }
             // Reuse the existing key: the common path is an update of a known
             // domain, so there is no reason to clone its name for the map.
             *existing = diagnostics;
         } else {
+            let state = diagnostics.state;
             map.insert(diagnostics.domain.clone(), diagnostics);
             if map.len() > MAX_STATUS_DOMAINS {
                 prune_status_domains(&mut map);
+                // The prune removes a bulk of domains at once; recomputing is
+                // cheaper than trying to maintain every removal individually.
+                *self.counts.write() = counts_for(&map);
+            } else {
+                let mut counts = self.counts.write();
+                counts.total += 1;
+                counts.add(state);
             }
+        }
+        if let Some((old, new)) = state_change {
+            let mut counts = self.counts.write();
+            counts.remove(old);
+            counts.add(new);
         }
         // The record is in the map now: publish the change to pollers. Doing
         // it after the write (and after the early return above) means a
@@ -284,65 +327,47 @@ impl StatusStore {
     }
 
     /// One pass for the two values the status JSON always needs together.
-    /// Avoids a second read lock and a second full scan of the domain map.
+    /// The counts are maintained incrementally, so this only clones the
+    /// shared records and sorts them; it does not rescan the whole map.
     pub fn domains_snapshot_with_counts(&self) -> (Vec<Arc<DomainDiagnostics>>, StatusCounts) {
         let map = self.domains.read();
-        let mut counts = StatusCounts {
-            normal: 0,
-            direct: 0,
-            failed: 0,
-            checking: 0,
-            total: map.len(),
-        };
-        let mut values = Vec::with_capacity(map.len());
-        for entry in map.values() {
-            match entry.state {
-                State::Normal => counts.normal += 1,
-                State::Direct => counts.direct += 1,
-                State::Failed => counts.failed += 1,
-                State::Checking => counts.checking += 1,
-                _ => {}
-            }
-            values.push(entry.clone());
-        }
+        let counts = *self.counts.read();
+        let mut values: Vec<Arc<DomainDiagnostics>> = map.values().cloned().collect();
         values.sort_by(|a, b| a.domain.cmp(&b.domain));
         (values, counts)
     }
 
-    /// The records of the given domains, sorted by name.
+    /// The records of `wanted`, which must already be sorted by domain name.
     ///
     /// The polled snapshot only needs the domains of the configured groups.
     /// Looking them up directly avoids copying and sorting every known
     /// domain, which dominated the poll once a session had seen thousands.
-    pub fn domains_for(&self, wanted: &HashSet<&str>) -> Vec<Arc<DomainDiagnostics>> {
+    pub fn domains_for(&self, wanted: &[String]) -> Vec<Arc<DomainDiagnostics>> {
         let map = self.domains.read();
-        let mut values: Vec<Arc<DomainDiagnostics>> = wanted
+        wanted
             .iter()
-            .filter_map(|domain| map.get(*domain).cloned())
+            .filter_map(|domain| map.get(domain).cloned())
+            .collect()
+    }
+
+    /// The same lookup as [`Self::domains_for`], plus the cached counts.
+    /// Both locks are taken in the same order as the writer (domains, then
+    /// counts), so a reader never observes a record/count mismatch.
+    pub fn domains_for_with_counts(
+        &self,
+        wanted: &[String],
+    ) -> (Vec<Arc<DomainDiagnostics>>, StatusCounts) {
+        let map = self.domains.read();
+        let values: Vec<Arc<DomainDiagnostics>> = wanted
+            .iter()
+            .filter_map(|domain| map.get(domain).cloned())
             .collect();
-        values.sort_by(|a, b| a.domain.cmp(&b.domain));
-        values
+        let counts = *self.counts.read();
+        (values, counts)
     }
 
     pub fn counts(&self) -> StatusCounts {
-        let map = self.domains.read();
-        let mut counts = StatusCounts {
-            normal: 0,
-            direct: 0,
-            failed: 0,
-            checking: 0,
-            total: map.len(),
-        };
-        for entry in map.values() {
-            match entry.state {
-                State::Normal => counts.normal += 1,
-                State::Direct => counts.direct += 1,
-                State::Failed => counts.failed += 1,
-                State::Checking => counts.checking += 1,
-                _ => {}
-            }
-        }
-        counts
+        *self.counts.read()
     }
 
     pub fn groups_snapshot(&self, config: &AppConfig) -> Vec<GroupStatus> {
@@ -357,24 +382,29 @@ impl StatusStore {
                     .as_ref()
                     .and_then(|domain| domains.get(domain))
                     .map(|entry| entry.state);
-                let entries: Vec<&DomainDiagnostics> = group
-                    .exact_domains()
-                    .filter_map(|domain| domains.get(domain).map(Arc::as_ref))
-                    .collect();
-                let tested = entries
-                    .iter()
-                    .filter(|entry| {
-                        !matches!(
-                            entry.state,
-                            State::Checking | State::Disabled | State::Paused
-                        )
-                    })
-                    .count();
-                let failed = entries
-                    .iter()
-                    .filter(|entry| entry.state == State::Failed)
-                    .count();
-                let last_check = entries.iter().map(|entry| entry.last_check).max();
+                // Count the group's records in one pass. Collecting them into
+                // an intermediate Vec and scanning it three times allocated
+                // (and kept the read lock held) for no reason.
+                let mut tested = 0;
+                let mut failed = 0;
+                let mut last_check = None;
+                for domain in group.exact_domains() {
+                    let Some(entry) = domains.get(domain) else {
+                        continue;
+                    };
+                    if !matches!(
+                        entry.state,
+                        State::Checking | State::Disabled | State::Paused
+                    ) {
+                        tested += 1;
+                    }
+                    if entry.state == State::Failed {
+                        failed += 1;
+                    }
+                    if last_check.is_none_or(|at| entry.last_check > at) {
+                        last_check = Some(entry.last_check);
+                    }
+                }
 
                 let state = if !group.enabled {
                     State::Disabled
@@ -407,8 +437,21 @@ impl StatusStore {
     }
 
     pub fn clear(&self) {
-        self.domains.write().clear();
+        let mut map = self.domains.write();
+        map.clear();
+        *self.counts.write() = StatusCounts::default();
     }
+}
+
+fn counts_for(map: &HashMap<String, Arc<DomainDiagnostics>>) -> StatusCounts {
+    let mut counts = StatusCounts {
+        total: map.len(),
+        ..StatusCounts::default()
+    };
+    for entry in map.values() {
+        counts.add(entry.state);
+    }
+    counts
 }
 
 /// Keep failure evidence longer than ordinary success records. If every entry
@@ -572,6 +615,57 @@ mod tests {
     }
 
     #[test]
+    fn counts_follow_transitions_and_clear() {
+        let store = StatusStore::new();
+        assert_eq!(store.counts().total, 0);
+
+        store.record(report("a.example", State::Normal));
+        store.record(report("b.example", State::Direct));
+        store.record(report("c.example", State::Failed));
+        store.record(report("d.example", State::Checking));
+        store.record(report("e.example", State::Paused));
+        store.record(report("f.example", State::Degraded));
+        let counts = store.counts();
+        assert_eq!(
+            counts,
+            StatusCounts {
+                normal: 1,
+                direct: 1,
+                failed: 1,
+                checking: 1,
+                total: 6,
+            }
+        );
+
+        // A state transition adjusts the old and new buckets, without
+        // changing the total.
+        store.record(report("a.example", State::Failed));
+        let counts = store.counts();
+        assert_eq!(
+            counts,
+            StatusCounts {
+                normal: 0,
+                direct: 1,
+                failed: 2,
+                checking: 1,
+                total: 6,
+            }
+        );
+
+        // Re-recording the same state is not a count change.
+        store.record(report("b.example", State::Direct));
+        assert_eq!(store.counts(), counts);
+
+        // The combined snapshot returns the same counters as the cheap read.
+        let (domains, snapshot_counts) = store.domains_snapshot_with_counts();
+        assert_eq!(snapshot_counts, counts);
+        assert_eq!(domains.len(), counts.total);
+
+        store.clear();
+        assert_eq!(store.counts(), StatusCounts::default());
+    }
+
+    #[test]
     fn wildcard_host_growth_is_bounded() {
         let store = StatusStore::new();
         for index in 0..=MAX_STATUS_DOMAINS {
@@ -581,6 +675,9 @@ mod tests {
             ));
         }
         let snapshot = store.domains_snapshot();
+        let counts = store.counts();
+        assert_eq!(counts.total, snapshot.len());
+        assert_eq!(counts.normal, snapshot.len());
         assert!(snapshot.len() <= MAX_STATUS_DOMAINS);
         assert!(
             snapshot.len() < MAX_STATUS_DOMAINS,

@@ -836,6 +836,17 @@ impl ConfigManager {
         Arc::clone(&self.inner.read().config)
     }
 
+    /// Snapshot the config together with the revision that describes it.
+    /// Reading both while holding the inner lock prevents a poller from
+    /// caching an old domain set under a newer revision.
+    pub fn snapshot_with_revision(&self) -> (Arc<AppConfig>, u64) {
+        let inner = self.inner.read();
+        (
+            Arc::clone(&inner.config),
+            self.revision.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn matcher(&self) -> Arc<DomainMatcher> {
         Arc::clone(&self.inner.read().matcher)
     }
@@ -854,8 +865,11 @@ impl ConfigManager {
         let mut guard = self.inner.write();
         guard.config = Arc::new(config);
         guard.matcher = matcher;
-        drop(guard);
+        // Publish the revision while the new config is still write-locked, so
+        // `snapshot_with_revision` can never pair a new config with an old
+        // revision (or vice versa).
         self.revision.fetch_add(1, Ordering::Relaxed);
+        drop(guard);
         Ok(())
     }
 

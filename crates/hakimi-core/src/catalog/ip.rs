@@ -36,6 +36,9 @@ pub struct IpCatalog {
     /// Group id -> fake SNI. An empty string means the empty-SNI candidate.
     pub sni: HashMap<String, String>,
     pub warnings: Vec<String>,
+    /// Sum of every domain's IP list. Status polling reads this while holding
+    /// the catalog lock; recomputing it there scanned the whole catalog.
+    ip_count: usize,
     matcher: DomainMatcher,
     /// `suffix -> full wildcard key` for every `*.` entry. Matching walks the
     /// host's label boundaries, so a cold connection does not scan unrelated
@@ -85,7 +88,7 @@ impl IpCatalog {
     }
 
     pub fn ip_count(&self) -> usize {
-        self.ips.values().map(Vec::len).sum()
+        self.ip_count
     }
 
     /// All configured exact domains that are affected by this catalog's wildcard entries.
@@ -256,6 +259,7 @@ pub fn validate(raw: IpCatalogRaw, config: &AppConfig) -> Result<IpCatalog> {
                 .map(|suffix| (suffix.to_string(), key.clone()))
         })
         .collect();
+    let ip_count = ips.values().map(Vec::len).sum();
 
     Ok(IpCatalog {
         schema_version: raw.v,
@@ -263,6 +267,7 @@ pub fn validate(raw: IpCatalogRaw, config: &AppConfig) -> Result<IpCatalog> {
         ips,
         sni,
         warnings,
+        ip_count,
         matcher,
         wildcards,
     })
@@ -357,6 +362,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(catalog.ips.len(), 4);
+        assert_eq!(catalog.domain_count(), 4);
+        assert_eq!(catalog.ip_count(), 6);
         assert_eq!(
             catalog
                 .lookup_ips("raw.githubusercontent.com")

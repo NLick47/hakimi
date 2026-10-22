@@ -2,6 +2,7 @@ pub mod doh;
 pub mod ip;
 pub mod signature;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,6 +107,9 @@ pub struct CatalogManager {
     doh_catalog: RwLock<Option<Vec<DohEndpoint>>>,
     doh_meta: RwLock<Option<CatalogMeta>>,
     refresh_lock: tokio::sync::Mutex<()>,
+    /// Bumped when either catalog is replaced, so derived endpoint lists can
+    /// be cached without re-cloning the catalogs on every DoH query.
+    revision: AtomicU64,
 }
 
 /// Read-only catalog surface used by the decision engine. It can be mocked in tests.
@@ -210,7 +214,12 @@ impl CatalogManager {
             doh_catalog: RwLock::new(doh_catalog),
             doh_meta: RwLock::new(doh_meta),
             refresh_lock: tokio::sync::Mutex::new(()),
+            revision: AtomicU64::new(0),
         }))
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
     }
 
     pub fn ip_catalog(&self) -> Option<IpCatalog> {
@@ -415,6 +424,7 @@ impl CatalogManager {
                     atomic_write_json(&self.paths.catalog_ip_meta_file(), &meta)?;
                     *self.ip_meta.write() = Some(meta);
                     *self.ip_catalog.write() = Some(validated);
+                    self.revision.fetch_add(1, Ordering::Relaxed);
                     if let Err(error) = self.config.set_catalog_version(version) {
                         tracing::warn!(error = %error, "failed to persist catalog version");
                     }
@@ -563,6 +573,7 @@ impl CatalogManager {
                     atomic_write_json(&self.paths.catalog_doh_meta_file(), &meta)?;
                     *self.doh_meta.write() = Some(meta);
                     *self.doh_catalog.write() = Some(endpoints);
+                    self.revision.fetch_add(1, Ordering::Relaxed);
                     tracing::info!(
                         source = %redact_url(&source),
                         version,

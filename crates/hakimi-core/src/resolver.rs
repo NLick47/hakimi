@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::cache::{CacheManager, CachedAnswer, CachedEch};
 use crate::catalog::CatalogManager;
-use crate::config::{ConfigManager, DohEndpoint};
+use crate::config::{AppConfig, ConfigManager, DohEndpoint};
 use crate::dns::{self, ResolvedAnswer, TYPE_A, TYPE_AAAA, TYPE_HTTPS};
 use crate::strategy::DohSource;
 use crate::util::{now, redact_url};
@@ -97,6 +97,8 @@ impl IpResolver for Resolver {
 /// Global DoH resolver. Endpoint order is primary -> fallback -> user custom -> remote catalog,
 /// deduplicated by URL. A live query is attempted before stale cache; fresh cache entries are
 /// used directly according to their TTL.
+type EndpointCache = Option<(u64, u64, Arc<Vec<EffectiveEndpoint>>)>;
+
 pub struct Resolver {
     cache: Arc<CacheManager>,
     config: Arc<ConfigManager>,
@@ -105,6 +107,9 @@ pub struct Resolver {
     health: RwLock<HashMap<String, DohHealth>>,
     shared_ech_lock: tokio::sync::Mutex<()>,
     query_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Config/catalog revisions plus the derived endpoint list. A DoH query
+    /// used to rebuild and re-clone this list on every cache miss.
+    endpoint_cache: RwLock<EndpointCache>,
 }
 
 impl Resolver {
@@ -121,11 +126,38 @@ impl Resolver {
             health: RwLock::new(HashMap::new()),
             shared_ech_lock: tokio::sync::Mutex::new(()),
             query_locks: parking_lot::Mutex::new(HashMap::new()),
+            endpoint_cache: RwLock::new(None),
         })
     }
 
-    pub fn effective_endpoints(&self) -> Vec<EffectiveEndpoint> {
-        let config = self.config.snapshot();
+    /// The configured endpoints in race order.
+    ///
+    /// This list only changes when the config or the remote DoH catalog
+    /// changes, so a DoH cache miss reuses the previous allocation instead of
+    /// re-cloning every URL and custom endpoint.
+    pub fn effective_endpoints(&self) -> Arc<Vec<EffectiveEndpoint>> {
+        let (config, config_revision) = self.config.snapshot_with_revision();
+        // Read the catalog revision before taking the catalog snapshot: a
+        // concurrent refresh can then only cache a newer list under an older
+        // revision, which the next call refreshes again. The reverse order
+        // could pin stale endpoints under the new revision indefinitely.
+        let catalog_revision = self.catalogs.revision();
+        if let Some((cached_config, cached_catalog, endpoints)) =
+            self.endpoint_cache.read().as_ref()
+        {
+            if *cached_config == config_revision && *cached_catalog == catalog_revision {
+                return endpoints.clone();
+            }
+        }
+        let endpoints = Arc::new(Self::build_endpoints(
+            &config,
+            self.catalogs.remote_doh_endpoints(),
+        ));
+        *self.endpoint_cache.write() = Some((config_revision, catalog_revision, endpoints.clone()));
+        endpoints
+    }
+
+    fn build_endpoints(config: &AppConfig, remote: Vec<DohEndpoint>) -> Vec<EffectiveEndpoint> {
         let mut endpoints = Vec::new();
         let push = |endpoint: DohEndpoint, source: DohSource, out: &mut Vec<EffectiveEndpoint>| {
             let url = endpoint.url.trim().to_string();
@@ -168,15 +200,10 @@ impl Resolver {
             DohSource::Fallback,
             &mut endpoints,
         );
-        for endpoint in config
-            .doh
-            .custom
-            .iter()
-            .filter(|endpoint| endpoint.enabled)
-        {
+        for endpoint in config.doh.custom.iter().filter(|endpoint| endpoint.enabled) {
             push(endpoint.clone(), DohSource::Custom, &mut endpoints);
         }
-        for endpoint in self.catalogs.remote_doh_endpoints() {
+        for endpoint in remote {
             push(endpoint, DohSource::Custom, &mut endpoints);
         }
         endpoints
@@ -919,6 +946,33 @@ mod tests {
         let catalogs = CatalogManager::load(&paths, config.clone(), cache.clone()).unwrap();
         let resolver = Resolver::new(cache.clone(), config.clone(), catalogs);
         (config, cache, resolver)
+    }
+
+    #[test]
+    fn endpoint_cache_reuses_the_list_until_the_config_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _, resolver) = resolver(dir.path());
+        let first = resolver.effective_endpoints();
+        let same = resolver.effective_endpoints();
+        assert!(
+            Arc::ptr_eq(&first, &same),
+            "an unchanged config must reuse the cached endpoint list"
+        );
+
+        config
+            .mutate(|config| {
+                config.doh.custom.push(crate::config::DohEndpoint {
+                    name: "added".into(),
+                    url: "https://added.example/dns-query".into(),
+                    bootstrap_ip: None,
+                    enabled: true,
+                });
+                Ok(())
+            })
+            .unwrap();
+        let changed = resolver.effective_endpoints();
+        assert_eq!(changed.len(), first.len() + 1);
+        assert!(!Arc::ptr_eq(&first, &changed));
     }
 
     #[test]

@@ -132,14 +132,18 @@ impl RouteCursor {
 
         // Order by measured quality on this network: proven fast IPs lead, failures sink.
         // Unknown addresses keep the catalog order, so a fresh start is still deterministic.
-        // Score each candidate once instead of taking the score lock on every comparison.
+        // Score the whole candidate list under one read lock. The previous
+        // per-candidate lookups took the same lock up to `max` times for every
+        // cold connection.
+        let scores = engine.score_candidates(&domain, &candidates);
         let mut ranked: Vec<(f64, Candidate)> = candidates
             .into_iter()
-            .map(|candidate| {
+            .zip(scores)
+            .map(|(candidate, score)| {
                 let score = if skip_once && candidate.source == IpSource::Remote {
                     0.0
                 } else {
-                    engine.score_ip(&domain, candidate.ip)
+                    score
                 };
                 (score, candidate)
             })

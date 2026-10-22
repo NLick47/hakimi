@@ -42,9 +42,31 @@ struct StatusProvider {
     proxy_error: Arc<RwLock<Option<String>>>,
     proxy_applied: Arc<RwLock<Option<bool>>>,
     current_network: Arc<RwLock<String>>,
+    /// Config revision + the exact domain set the UI snapshot needs, kept in
+    /// display order so a status poll does not have to sort it again.
+    wanted_cache: RwLock<Option<(u64, Arc<Vec<String>>)>>,
 }
 
 impl StatusProvider {
+    fn wanted_domains(&self, config: &AppConfig, revision: u64) -> Arc<Vec<String>> {
+        if let Some((cached_revision, wanted)) = self.wanted_cache.read().as_ref() {
+            if *cached_revision == revision {
+                return wanted.clone();
+            }
+        }
+        let mut wanted: Vec<String> = config
+            .groups
+            .iter()
+            .flat_map(|group| group.exact_domains())
+            .map(str::to_owned)
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let wanted = Arc::new(wanted);
+        *self.wanted_cache.write() = Some((revision, wanted.clone()));
+        wanted
+    }
+
     /// The snapshot the UI polls. It carries the diagnostics of the exact
     /// domains of the configured groups, because that is all the UI shows.
     ///
@@ -61,22 +83,17 @@ impl StatusProvider {
     }
 
     fn snapshot_json_inner(&self, every_domain: bool) -> serde_json::Value {
-        let config = self.config.snapshot();
+        let (config, config_revision) = self.config.snapshot_with_revision();
         let ca = self.ca.status();
         let catalogs = self.catalogs.status();
         let groups = self.status.groups_snapshot(&config);
         // Serialize borrowed values: the status map stores shared records, and
         // serde does not implement Serialize for Arc without the `rc` feature.
-        let wanted: HashSet<&str> = config
-            .groups
-            .iter()
-            .flat_map(|group| group.exact_domains())
-            .collect();
         let (domains, counts) = if every_domain {
-            let (domains, counts) = self.status.domains_snapshot_with_counts();
-            (domains, counts)
+            self.status.domains_snapshot_with_counts()
         } else {
-            (self.status.domains_for(&wanted), self.status.counts())
+            let wanted = self.wanted_domains(&config, config_revision);
+            self.status.domains_for_with_counts(&wanted)
         };
         let domains: Vec<&DomainDiagnostics> = domains.iter().map(Arc::as_ref).collect();
         let cache = self.cache.stats();
@@ -215,6 +232,7 @@ impl HakimiRuntime {
             proxy_error: proxy_error.clone(),
             proxy_applied: proxy_applied.clone(),
             current_network,
+            wanted_cache: RwLock::new(None),
         });
         let runtime = Arc::new(Self {
             paths,
@@ -1064,5 +1082,24 @@ mod status_snapshot_tests {
             3,
             "the export keeps every known domain"
         );
+
+        // The domain-set cache is keyed by the config revision: adding an
+        // exact domain must show its diagnostics on the very next poll.
+        runtime
+            .config()
+            .mutate(|config| {
+                config.groups[0].domains.push("c.test".into());
+                Ok(())
+            })
+            .unwrap();
+        record(&runtime.status, "c.test");
+        let value = runtime.status_json();
+        let domains: Vec<&str> = value["domains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["domain"].as_str().unwrap())
+            .collect();
+        assert_eq!(domains, vec!["a.test", "c.test"]);
     }
 }

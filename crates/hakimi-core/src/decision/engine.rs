@@ -38,6 +38,11 @@ pub struct DecisionEngine {
     /// Number of entries in `ip_scores`, maintained under its write lock. Avoids a
     /// full-map sum on every connection outcome.
     ip_score_count: AtomicUsize,
+    /// Number of entries in `plan_cache`, maintained under its write lock. The
+    /// cache is read on every cold connection and written on every success, so
+    /// a full-map sum there would put an O(cache size) scan under an exclusive
+    /// lock on the success path.
+    plan_cache_count: AtomicUsize,
 }
 
 pub(super) const PLAN_CACHE_MAX: usize = 2048;
@@ -89,6 +94,7 @@ impl DecisionEngine {
             plan_cache: parking_lot::RwLock::new(HashMap::new()),
             ip_scores: parking_lot::RwLock::new(seeded_scores),
             ip_score_count: AtomicUsize::new(ip_score_count),
+            plan_cache_count: AtomicUsize::new(0),
         })
     }
 
@@ -330,7 +336,9 @@ impl DecisionEngine {
         let mut cache = self.plan_cache.write();
         let mut empty = false;
         if let Some(inner) = cache.get_mut(key.as_ref()) {
-            inner.remove(&(port, tls));
+            if inner.remove(&(port, tls)).is_some() {
+                self.plan_cache_count.fetch_sub(1, Ordering::Relaxed);
+            }
             empty = inner.is_empty();
         }
         if empty {
@@ -344,9 +352,12 @@ impl DecisionEngine {
     /// hedge it against fresh candidates instead of blocking on it through the
     /// single-route fast path.
     pub fn forget_all_plans(&self) {
-        self.plan_cache.write().clear();
+        let mut cache = self.plan_cache.write();
+        cache.clear();
+        self.plan_cache_count.store(0, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     pub(super) fn score_ip(&self, domain: &str, ip: IpAddr) -> f64 {
         self.ip_scores
             .read()
@@ -354,6 +365,23 @@ impl DecisionEngine {
             .and_then(|by_ip| by_ip.get(&ip))
             .map(|score| score.rank())
             .unwrap_or(f64::MAX)
+    }
+
+    /// Score a cursor's candidate list under one read lock. A cold route can
+    /// have several candidates; taking the score lock once per candidate adds
+    /// avoidable synchronization to every new connection.
+    pub(super) fn score_candidates(&self, domain: &str, candidates: &[Candidate]) -> Vec<f64> {
+        let scores = self.ip_scores.read();
+        let by_ip = scores.get(domain);
+        candidates
+            .iter()
+            .map(|candidate| {
+                by_ip
+                    .and_then(|by_ip| by_ip.get(&candidate.ip))
+                    .map(IpScore::rank)
+                    .unwrap_or(f64::MAX)
+            })
+            .collect()
     }
 
     pub(super) fn record_ip(
@@ -472,17 +500,19 @@ impl DecisionEngine {
     /// domain, group and SNI strings.
     pub(super) fn remember_plan_arc(&self, plan: Arc<ConnectPlan>) {
         let mut cache = self.plan_cache.write();
-        let total: usize = cache.values().map(|inner| inner.len()).sum();
+        let mut total = self.plan_cache_count.load(Ordering::Relaxed);
         if total >= PLAN_CACHE_MAX {
             let ttl = Duration::from_secs(self.config.snapshot().advanced.plan_cache_secs);
-            for inner in cache.values_mut() {
+            let mut retained = 0;
+            cache.retain(|_, inner| {
                 inner.retain(|_, (at, _)| at.elapsed() < ttl);
-            }
-            cache.retain(|_, inner| !inner.is_empty());
+                retained += inner.len();
+                !inner.is_empty()
+            });
+            total = retained;
             // A crawler can push more than the cap of *fresh* plans in the TTL
             // window; keep the newest instead of scanning the full map on every
             // subsequent success.
-            let total: usize = cache.values().map(|inner| inner.len()).sum();
             if total >= PLAN_CACHE_MAX {
                 let mut ages: Vec<(String, u16, bool, Instant)> = Vec::new();
                 for (domain, inner) in cache.iter() {
@@ -492,17 +522,22 @@ impl DecisionEngine {
                 }
                 ages.sort_by_key(|(_, _, _, at)| *at);
                 let excess = total - PLAN_CACHE_PRUNE_TO;
+                let mut removed = 0;
                 for (domain, port, tls, _) in ages.into_iter().take(excess) {
                     let mut empty = false;
                     if let Some(inner) = cache.get_mut(&domain) {
-                        inner.remove(&(port, tls));
+                        if inner.remove(&(port, tls)).is_some() {
+                            removed += 1;
+                        }
                         empty = inner.is_empty();
                     }
                     if empty {
                         cache.remove(&domain);
                     }
                 }
+                total = total.saturating_sub(removed);
             }
+            self.plan_cache_count.store(total, Ordering::Relaxed);
         }
         let domain = plan_cache_domain(&plan.domain).into_owned();
         let port = plan.port;
@@ -510,14 +545,22 @@ impl DecisionEngine {
         let entry = (Instant::now(), plan);
         match cache.get_mut(&domain) {
             Some(inner) => {
-                inner.insert((port, tls), entry);
+                if inner.insert((port, tls), entry).is_none() {
+                    self.plan_cache_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
             None => {
                 let mut inner = HashMap::new();
                 inner.insert((port, tls), entry);
                 cache.insert(domain, inner);
+                self.plan_cache_count.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn plan_cache_len(&self) -> usize {
+        self.plan_cache_count.load(Ordering::Relaxed)
     }
 
     /// TCP-probe IPs that accumulated failures and forgive the ones that answer

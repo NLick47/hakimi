@@ -480,12 +480,49 @@ fn plan_cache_stays_bounded_when_every_entry_is_fresh() {
     let cache = h.engine.plan_cache.read();
     let total: usize = cache.values().map(|inner| inner.len()).sum();
     assert!(total <= PLAN_CACHE_MAX);
+    assert_eq!(
+        h.engine.plan_cache_len(),
+        total,
+        "the maintained count must match the cache after pruning"
+    );
     assert!(
         cache
             .get(&format!("h{}.example.com", PLAN_CACHE_MAX + 99))
             .is_some_and(|inner| inner.contains_key(&(443, true))),
         "the newest plan must survive the prune"
     );
+}
+
+#[test]
+fn plan_cache_count_tracks_inserts_replacements_and_removals() {
+    let h = harness(&["example.com"], Strategy::Direct);
+    assert_eq!(h.engine.plan_cache_len(), 0);
+
+    h.engine.remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
+    h.engine.remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
+    assert_eq!(
+        h.engine.plan_cache_len(),
+        1,
+        "replacing the same route must not double-count it"
+    );
+
+    let mut plain = test_plan(TlsMode::Direct, None);
+    plain.port = 80;
+    plain.tls = false;
+    h.engine.remember_plan_arc(Arc::new(plain));
+    assert_eq!(h.engine.plan_cache_len(), 2);
+
+    h.engine.forget_plan("example.com", 80, false);
+    assert_eq!(h.engine.plan_cache_len(), 1);
+    h.engine.forget_plan("example.com", 80, false);
+    assert_eq!(
+        h.engine.plan_cache_len(),
+        1,
+        "forgetting an absent route must not underflow the count"
+    );
+
+    h.engine.forget_all_plans();
+    assert_eq!(h.engine.plan_cache_len(), 0);
 }
 
 #[test]
@@ -499,6 +536,7 @@ fn network_change_drops_remembered_plans() {
         h.engine.cached_plan("example.com", 443, true).is_none(),
         "a plan remembered on the old network must not survive"
     );
+    assert_eq!(h.engine.plan_cache_len(), 0);
 }
 
 #[test]
@@ -540,6 +578,7 @@ fn an_expired_plan_is_dropped() {
             .is_some_and(|inner| inner.contains_key(&(443, true))),
         "an expired plan must be removed"
     );
+    assert_eq!(h.engine.plan_cache_len(), 0);
 }
 
 #[test]
