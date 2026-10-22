@@ -439,6 +439,13 @@ impl GroupConfig {
             .map(|rule| rule.pattern.as_str())
     }
 
+    /// GitHub's edge occasionally answers a valid TLS route with an abuse
+    /// page for one address. Only the built-in GitHub group opts into
+    /// dropping that candidate; every other site keeps the old behavior.
+    pub fn recovers_blocked_ips(&self) -> bool {
+        self.id == "github"
+    }
+
     pub fn patterns(&self) -> impl Iterator<Item = &str> {
         self.domains.iter().map(|rule| rule.pattern.as_str())
     }
@@ -1275,6 +1282,20 @@ mod tests {
             steam.route_for("steamcommunity.com").attempts[0].mode(),
             TlsMode::FakeSni
         );
+    }
+
+    #[test]
+    fn only_github_recovers_blocked_ips() {
+        let config = AppConfig::default();
+        assert!(config.group("github").unwrap().recovers_blocked_ips());
+        for id in [
+            "pixiv", "ao3", "eh", "hitomi", "nhentai", "hanime", "steam", "poipiku",
+        ] {
+            assert!(
+                !config.group(id).unwrap().recovers_blocked_ips(),
+                "{id} must keep the normal warm-up behavior"
+            );
+        }
     }
 
     #[test]

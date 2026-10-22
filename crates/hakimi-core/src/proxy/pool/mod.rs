@@ -531,10 +531,28 @@ impl UpstreamPool {
         };
         match tokio::time::timeout(WARM_TIMEOUT, client.request(request)).await {
             Ok(Ok(response)) => {
+                let status = response.status();
+                if matches!(status.as_u16(), 400 | 403 | 429 | 451)
+                    && self
+                        .engine
+                        .note_blocked_candidate(host, port, true, status)
+                {
+                    // Only opted-in groups (GitHub) treat this as a route
+                    // failure; other sites keep the previous warm-up behavior.
+                    self.stats.warm_failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        host,
+                        status = status.as_u16(),
+                        version = ?response.version(),
+                        "upstream warm-up returned a block page"
+                    );
+                    drop(response);
+                    return false;
+                }
                 self.stats.warm_success.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     host,
-                    status = response.status().as_u16(),
+                    status = status.as_u16(),
                     version = ?response.version(),
                     "upstream warmed"
                 );

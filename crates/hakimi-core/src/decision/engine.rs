@@ -48,6 +48,10 @@ pub struct DecisionEngine {
     /// Routes that produced an HTTP rejection (403/421/451). Keyed by
     /// `domain|mode`; entries expire after [`ROUTE_REJECTION_TTL`].
     route_rejections: parking_lot::RwLock<HashMap<String, Instant>>,
+    /// Individual IPs that returned an abuse/block page for a domain. Unlike
+    /// `route_rejections`, only the address is dropped; other IPs on the same
+    /// route mode may still work.
+    ip_rejections: parking_lot::RwLock<HashMap<String, HashMap<IpAddr, Instant>>>,
     /// True while the initial warmup is probing. Failures are published as
     /// Checking instead of Failed so the first probe's retry does not flash
     /// red; the runtime settles the remaining ones after warmup.
@@ -60,6 +64,8 @@ pub(super) const PLAN_CACHE_MAX: usize = 2048;
 pub(super) const PLAN_CACHE_PRUNE_TO: usize = PLAN_CACHE_MAX * 3 / 4;
 /// How long an HTTP-rejected route stays out of the candidate set.
 const ROUTE_REJECTION_TTL: Duration = Duration::from_secs(300);
+/// How long a block-page IP stays out of a domain's candidate set.
+const IP_REJECTION_TTL: Duration = Duration::from_secs(300);
 
 /// The key a plan is stored under.  Hot-path callers already pass a
 /// normalized host, so the common case borrows.
@@ -107,6 +113,7 @@ impl DecisionEngine {
             ip_score_count: AtomicUsize::new(ip_score_count),
             plan_cache_count: AtomicUsize::new(0),
             route_rejections: parking_lot::RwLock::new(HashMap::new()),
+            ip_rejections: parking_lot::RwLock::new(HashMap::new()),
             warming: AtomicBool::new(false),
         })
     }
@@ -315,6 +322,10 @@ impl DecisionEngine {
             self.forget_plan(domain, port, tls);
             return None;
         }
+        if self.ip_rejected(&plan.domain, plan.ip) {
+            self.forget_plan(domain, port, tls);
+            return None;
+        }
         let plan = plan;
 
         // A catalog update marks affected domains skipOnce: do not reuse the old route
@@ -490,6 +501,62 @@ impl DecisionEngine {
             format!("{}|{}", plan.domain, plan.mode.as_str()),
             Instant::now(),
         );
+    }
+
+    /// A block or rate-limit page is tied to the candidate IP, not necessarily
+    /// to the route mode. Penalize just that IP and re-plan; rejecting the
+    /// whole mode would also discard its healthy addresses. Only groups that
+    /// opt in (currently GitHub) are affected; for every other site the
+    /// response remains a normal warm-up result.
+    pub fn note_blocked_candidate(
+        &self,
+        domain: &str,
+        port: u16,
+        tls: bool,
+        status: StatusCode,
+    ) -> bool {
+        let Some(plan) = self.cached_plan(domain, port, tls) else {
+            return false;
+        };
+        let config = self.config.snapshot();
+        let Some(group) = config.group(&plan.group_id) else {
+            return false;
+        };
+        if !group.recovers_blocked_ips() {
+            return false;
+        }
+        tracing::warn!(
+            domain = %plan.domain,
+            ip = %plan.ip,
+            mode = %plan.mode,
+            status = status.as_u16(),
+            "upstream returned a block page; penalizing the candidate IP"
+        );
+        self.forget_plan(&plan.domain, plan.port, plan.tls);
+        self.cache.mark_skip_once([plan.domain.clone()]);
+        self.record_ip(&plan.domain, plan.ip, None, true);
+        let mut rejected = self.ip_rejections.write();
+        if rejected.len() > 1024 {
+            let now = Instant::now();
+            for by_ip in rejected.values_mut() {
+                by_ip.retain(|_, at| now.duration_since(*at) < IP_REJECTION_TTL);
+            }
+            rejected.retain(|_, by_ip| !by_ip.is_empty());
+        }
+        rejected
+            .entry(plan.domain.clone())
+            .or_default()
+            .insert(plan.ip, Instant::now());
+        true
+    }
+
+    /// True while `ip` is excluded for `domain` after an abuse/block response.
+    pub(super) fn ip_rejected(&self, domain: &str, ip: IpAddr) -> bool {
+        self.ip_rejections
+            .read()
+            .get(domain)
+            .and_then(|by_ip| by_ip.get(&ip))
+            .is_some_and(|at| at.elapsed() < IP_REJECTION_TTL)
     }
 
     /// Configuration edits can change the route a rejection belonged to.
@@ -993,7 +1060,9 @@ impl DecisionEngine {
                     }
                     // The candidate list is capped at eight entries, so a
                     // linear scan replaces the per-cursor hash set.
-                    if !candidates.iter().any(|candidate| candidate.ip == ip) {
+                    if !candidates.iter().any(|candidate| candidate.ip == ip)
+                        && !self.ip_rejected(domain, ip)
+                    {
                         candidates.push(Candidate {
                             ip,
                             source: candidate_source,

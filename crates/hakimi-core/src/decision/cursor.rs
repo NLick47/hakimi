@@ -109,7 +109,7 @@ impl RouteCursor {
                     if candidates.len() >= max {
                         break;
                     }
-                    if !contains_ip(candidates, *ip) {
+                    if !contains_ip(candidates, *ip) && !engine.ip_rejected(&domain, *ip) {
                         candidates.push(Candidate {
                             ip: *ip,
                             source: IpSource::Remote,
@@ -120,7 +120,10 @@ impl RouteCursor {
         };
         let add_cache = |candidates: &mut Vec<Candidate>| {
             if let Some(ip) = last_good {
-                if candidates.len() < max && !contains_ip(candidates, ip) {
+                if candidates.len() < max
+                    && !contains_ip(candidates, ip)
+                    && !engine.ip_rejected(&domain, ip)
+                {
                     candidates.push(Candidate {
                         ip,
                         source: IpSource::Cache,

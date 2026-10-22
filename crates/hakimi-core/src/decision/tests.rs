@@ -670,6 +670,65 @@ fn http_rejection_drops_the_cached_route() {
 }
 
 #[tokio::test]
+async fn blocked_warmup_penalizes_only_the_cached_ip() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let bad: IpAddr = "1.1.1.1".parse().unwrap();
+    let good: IpAddr = "8.8.8.8".parse().unwrap();
+
+    // The unopted test group keeps the old behavior: a block page is not a
+    // candidate failure.
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
+    assert!(!h.engine.note_blocked_candidate(
+        "example.com",
+        443,
+        true,
+        http::StatusCode::BAD_REQUEST
+    ));
+    assert!(h.engine.cached_plan("example.com", 443, true).is_some());
+    assert!(!h.engine.ip_rejected("example.com", bad));
+
+    // GitHub opts in: the same status drops only that IP.
+    let mut github_plan = test_plan(TlsMode::Direct, None);
+    github_plan.domain = "github.com".into();
+    github_plan.group_id = "github".into();
+    h.engine.remember_plan_arc(Arc::new(github_plan));
+    assert!(h.engine.note_blocked_candidate(
+        "github.com",
+        443,
+        true,
+        http::StatusCode::BAD_REQUEST
+    ));
+
+    assert!(h.engine.cached_plan("github.com", 443, true).is_none());
+    let scores = h.engine.ip_scores.read();
+    let entry = scores
+        .get("github.com")
+        .and_then(|by_ip| by_ip.get(&bad))
+        .expect("the blocked IP should have a failure score");
+    assert!(entry.failures > 0);
+    drop(scores);
+    assert!(h.engine.ip_rejected("github.com", bad));
+    assert!(!h.engine.ip_rejected("github.com", good));
+    // Only the IP is penalized; the direct mode may still work via another IP.
+    assert!(!h.engine.route_rejected("github.com", TlsMode::Direct));
+
+    h.engine
+        .config
+        .set_group_default_route("github", RoutePolicy::direct())
+        .unwrap();
+    *h.remote.catalog.lock() = true;
+    *h.remote.ips.lock() = Some(vec![bad, good]);
+    h.prober.working.lock().insert(good);
+    let mut cursor = match h.engine.route("github.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let plan = cursor.next_plan().await.expect("good IP plan");
+    assert_eq!(plan.ip, good);
+}
+
+#[tokio::test]
 async fn catalog_update_bypasses_cached_plan_once() {
     let harness = harness(&["example.com"], RoutePolicy::auto());
     *harness.remote.catalog.lock() = true;
