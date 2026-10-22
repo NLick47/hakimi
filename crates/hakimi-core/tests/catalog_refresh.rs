@@ -57,10 +57,6 @@ async fn refresh_ip_catalog_with_etag_and_skip_once() {
     assert!(cache.has_skip_once("example.com"));
     let ips = catalogs.remote_ips("example.com").unwrap();
     assert_eq!(ips.len(), 2);
-    assert_eq!(
-        catalogs.remote_sni("test").as_deref(),
-        Some("www.baidu.com")
-    );
     assert_eq!(config.snapshot().catalog_version, 1);
 
     let second = catalogs.refresh_ip(false).await.unwrap();

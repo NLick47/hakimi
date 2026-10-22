@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use hakimi_core::strategy::Strategy;
+use anyhow::{bail, Context, Result};
+use hakimi_core::config::{DomainRule, EchSource, RouteAttempt, RoutePolicy};
+use hakimi_core::domain::{host_from_url, normalize_hostname, DomainPattern};
 use serde_json::Value;
 
 use crate::ui_state::{apply_settle, SettlePhase, BAD_COLOR, IDLE_COLOR, OK_COLOR, SLOW_COLOR};
@@ -39,39 +41,143 @@ pub(crate) struct SiteData {
     pub(crate) first: bool,
     pub(crate) last: bool,
     pub(crate) url: String,
-    pub(crate) strategy: i32,
-    pub(crate) sni: String,
     pub(crate) custom: bool,
     pub(crate) domains: Vec<DomainData>,
 }
 
-/// Strategy index used by the UI: 0 auto, 1 direct, 2 ech, 3 fake SNI.
-pub(crate) fn strategy_index(raw: &str) -> i32 {
-    match raw {
-        "direct" => 1,
-        "ech" => 2,
-        "sni" => 3,
-        _ => 0,
+/// UI preset index: 0 auto, 1 direct, 2 ECH, 3 SNI, 4 custom.
+pub(crate) fn route_preset_index(route: &RoutePolicy) -> i32 {
+    if route == &RoutePolicy::auto() {
+        0
+    } else if route == &RoutePolicy::direct() {
+        1
+    } else if route == &RoutePolicy::ech_shared() {
+        2
+    } else if route == &RoutePolicy::sni(Vec::new()) {
+        3
+    } else {
+        4
     }
 }
 
-pub(crate) fn strategy_from_index(index: i32) -> Strategy {
+pub(crate) fn route_from_preset(index: i32) -> Option<RoutePolicy> {
     match index {
-        1 => Strategy::Direct,
-        2 => Strategy::Ech,
-        3 => Strategy::FakeSni,
-        _ => Strategy::Auto,
+        0 => Some(RoutePolicy::auto()),
+        1 => Some(RoutePolicy::direct()),
+        2 => Some(RoutePolicy::ech_shared()),
+        3 => Some(RoutePolicy::sni(Vec::new())),
+        _ => None,
     }
 }
 
-/// Direct is not offered in the editor: `auto` already tries direct first, so a
-/// group pinned to direct is shown as auto and widened on the next save.
-pub(crate) fn editor_strategy_index(strategy: Strategy) -> i32 {
-    match strategy {
-        Strategy::Ech => 2,
-        Strategy::FakeSni => 3,
-        Strategy::Auto | Strategy::Direct => 0,
+/// Compact, round-trippable route syntax used by the site editor.
+///
+/// Examples: `auto`, `direct`, `ech+direct`, `ech:own`, `sni:www.baidu.com+direct`.
+pub(crate) fn format_route(route: &RoutePolicy) -> String {
+    if route == &RoutePolicy::auto() {
+        return "auto".into();
     }
+    route
+        .attempts
+        .iter()
+        .map(|attempt| match attempt {
+            RouteAttempt::Direct => "direct".to_string(),
+            RouteAttempt::Ech {
+                ech: EchSource::Own,
+            } => "ech:own".to_string(),
+            RouteAttempt::Ech {
+                ech: EchSource::Shared,
+            } => "ech".to_string(),
+            RouteAttempt::Sni { sni } if sni.is_empty() => "sni".to_string(),
+            RouteAttempt::Sni { sni } => format!("sni:{}", sni.join(",")),
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+pub(crate) fn parse_route(spec: &str) -> Result<RoutePolicy> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        bail!("线路不能为空");
+    }
+    if spec.eq_ignore_ascii_case("auto") {
+        return Ok(RoutePolicy::auto());
+    }
+    let mut attempts = Vec::new();
+    for part in spec.split('+') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let attempt = if part.eq_ignore_ascii_case("direct") {
+            RouteAttempt::Direct
+        } else if part.eq_ignore_ascii_case("ech") || part.eq_ignore_ascii_case("ech:shared") {
+            RouteAttempt::Ech {
+                ech: EchSource::Shared,
+            }
+        } else if part.eq_ignore_ascii_case("ech:own") {
+            RouteAttempt::Ech {
+                ech: EchSource::Own,
+            }
+        } else if part.eq_ignore_ascii_case("sni") {
+            RouteAttempt::Sni { sni: Vec::new() }
+        } else if let Some(hosts) = part.strip_prefix("sni:") {
+            let hosts = hosts
+                .split(',')
+                .map(str::trim)
+                .filter(|host| !host.is_empty())
+                .map(|host| {
+                    normalize_hostname(host)
+                        .with_context(|| format!("SNI 主机 {host} 格式不正确"))
+                        .map(|host| host.to_ascii_lowercase())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            RouteAttempt::Sni { sni: hosts }
+        } else {
+            bail!("无法识别的线路 `{part}`");
+        };
+        attempts.push(attempt);
+    }
+    if attempts.is_empty() {
+        bail!("线路不能为空");
+    }
+    Ok(RoutePolicy::new(attempts))
+}
+
+/// Normalize one host from a manual entry or pasted URL.
+pub(crate) fn normalize_domain_host(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("域名不能为空");
+    }
+    let mut host = match host_from_url(raw) {
+        Some(host) => host.to_string(),
+        None if raw.contains("://") => bail!("网址 {raw} 无效，请填写域名或 http(s) 网址"),
+        None => raw.to_string(),
+    }
+    .to_ascii_lowercase();
+    if !raw.contains("://") {
+        host = host
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .split('?')
+            .next()
+            .unwrap_or("")
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if host.matches(':').count() == 1 {
+            host = host.split(':').next().unwrap_or("").to_string();
+        }
+    }
+    let host = host.trim_end_matches('.').to_string();
+    if host.is_empty() {
+        bail!("域名不能为空");
+    }
+    DomainPattern::parse(&host).with_context(|| format!("域名 {host} 无效"))?;
+    Ok(host)
 }
 
 /// Built-in group ids. Anything else was added by the user and may be removed
@@ -148,21 +254,29 @@ pub(crate) fn build_sites(
                 selected += 1;
             }
 
-            let raw_domains: Vec<String> = group
+            let rules: Vec<DomainRule> = group
                 .get("domains")
                 .and_then(Value::as_array)
                 .map(|list| {
                     list.iter()
-                        .filter_map(Value::as_str)
-                        .map(ToOwned::to_owned)
+                        .filter_map(|value| {
+                            let pattern = text(value, "pattern");
+                            if pattern.is_empty() {
+                                return None;
+                            }
+                            let route = value.get("route").and_then(|route| {
+                                serde_json::from_value::<RoutePolicy>(route.clone()).ok()
+                            });
+                            Some(DomainRule { pattern, route })
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
-            let domains_config: Vec<String> = raw_domains
+            let domains_config: Vec<String> = rules
                 .iter()
-                .filter(|host| !host.starts_with("*."))
+                .filter(|rule| !rule.pattern.starts_with("*."))
                 .take(12)
-                .cloned()
+                .map(|rule| rule.pattern.clone())
                 .collect();
 
             let mut rows: Vec<DomainData> = Vec::new();
@@ -232,9 +346,9 @@ pub(crate) fn build_sites(
                 .first()
                 .cloned()
                 .or_else(|| {
-                    raw_domains
+                    rules
                         .iter()
-                        .find_map(|host| host.strip_prefix("*.").map(ToOwned::to_owned))
+                        .find_map(|rule| rule.pattern.strip_prefix("*.").map(ToOwned::to_owned))
                 })
                 .unwrap_or_else(|| "example.com".into());
 
@@ -242,8 +356,6 @@ pub(crate) fn build_sites(
             let id_key = id.clone();
             let tile_hex = tile_color(&id);
             let icon_key = icon_key_for(&id);
-            let strategy = strategy_index(&text(group, "strategy"));
-            let sni = text(group, "sni");
             let custom = !builtins.contains(&id);
             // The preset/catalog owns the canonical landing page; custom groups
             // fall back to their first exact routed domain.
@@ -271,8 +383,6 @@ pub(crate) fn build_sites(
                 first: false,
                 last: false,
                 url: homepage,
-                strategy,
-                sni,
                 custom,
                 domains: rows,
             });

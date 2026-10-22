@@ -3,14 +3,19 @@ package com.hakimi.probe.ui
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
+import android.graphics.Rect
+import android.graphics.drawable.ColorDrawable
 import android.provider.Settings
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.PopupWindow
 import android.widget.TextView
 import com.hakimi.probe.R
 import org.json.JSONArray
@@ -35,7 +40,9 @@ private fun inputField(
     setHintTextColor(Palette.MUTED)
     setTextColor(Palette.TEXT)
     textSize = 13.5f
-    setPadding(context.dp(4f), context.dp(10f), context.dp(4f), context.dp(10f))
+    setPadding(context.dp(12f), context.dp(10f), context.dp(12f), context.dp(10f))
+    background = context.rounded(Palette.SURFACE_HI, 10f, Palette.BORDER, 1f)
+    minHeight = context.dp(44f)
     inputType = when {
         numeric -> InputType.TYPE_CLASS_NUMBER
         multiline -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
@@ -47,6 +54,7 @@ private fun inputField(
         setSingleLine(false)
     } else {
         setSingleLine(true)
+        gravity = Gravity.CENTER_VERTICAL or Gravity.START
     }
     setSelection(text.length)
 }
@@ -81,39 +89,180 @@ private fun infoRow(context: Context, label: String, value: String, onClick: (()
     return row
 }
 
+private val ROW_ROUTE_PRESETS = listOf("继承默认", "直连", "ECH", "SNI 伪装", "自定义")
+
+private fun EditText.watchText(action: (String) -> Unit) {
+    addTextChangedListener(object : TextWatcher {
+        override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+        override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+        override fun afterTextChanged(s: Editable?) {
+            action(s?.toString().orEmpty())
+        }
+    })
+}
+
+private fun subFieldLabel(context: Context, label: String): TextView =
+    context.text(label, 10.5f, Palette.MUTED, medium = true).apply {
+        setPadding(context.dp(2f), context.dp(8f), 0, context.dp(4f))
+    }
+
 class SiteEditorSheet(
     private val context: Context,
     private val host: Host,
     private val site: SiteInfo?,
 ) {
-    private var selectedStrategy = site?.strategy?.lowercase() ?: "auto"
+    private data class RowDraft(
+        var pattern: String = "",
+        var preset: Int = 0,
+        var sni: String = "",
+        var custom: String = "",
+    )
+
+    private var selectedPreset = routePresetIndex(site?.defaultRoute ?: "auto")
+    private var routePopup: PopupWindow? = null
 
     fun show() {
         val sheet = Sheet(
             context,
             if (site == null) "添加站点" else "编辑站点",
-            if (site == null) "填写名称和域名" else site.name
+            site?.name
         )
         val name = inputField(context, site?.name.orEmpty(), "例如 Pixiv")
-        val domains = inputField(
-            context,
-            site?.exactDomains?.joinToString("\n").orEmpty(),
-            "每行一个，可粘贴网址\n例如 www.example.com",
-            multiline = true
-        )
         val homepage = inputField(
             context,
             site?.homepage.orEmpty(),
-            "https://example.com/（可选）"
+            "https://example.com"
         )
+
+        val drafts = site?.domainRules
+            ?.map(::draftFromRule)
+            ?.toMutableList()
+            ?: mutableListOf(RowDraft())
+        val rowsContainer = context.column()
+
+        fun renderRows() {
+            rowsContainer.removeAllViews()
+            drafts.forEachIndexed { index, draft ->
+                val block = context.column()
+                if (index > 0) block.setPadding(0, context.dp(10f), 0, 0)
+
+                val line = context.row()
+                val pattern = inputField(context, draft.pattern, "例如 www.pixiv.net")
+                pattern.watchText { draft.pattern = it }
+                line.addView(pattern, LinearLayout.LayoutParams(
+                    0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    1f
+                ))
+
+                val route = context.text(
+                    "${ROW_ROUTE_PRESETS[draft.preset]}  ▾",
+                    12f,
+                    Palette.TEXT,
+                    medium = true
+                ).apply {
+                    gravity = Gravity.CENTER
+                    setPadding(context.dp(6f), context.dp(10f), context.dp(6f), context.dp(10f))
+                    background = context.ripple(
+                        Palette.SURFACE,
+                        10f,
+                        0x150E9FD8,
+                        Palette.BORDER,
+                        1f
+                    )
+                    isClickable = true
+                    isFocusable = true
+                    contentDescription = "线路：${ROW_ROUTE_PRESETS[draft.preset]}"
+                }
+                route.clickOnce {
+                    openRouteMenu(route, draft.preset) { preset ->
+                        draft.preset = preset
+                        renderRows()
+                    }
+                }
+                line.addView(route, LinearLayout.LayoutParams(
+                    context.dp(92f),
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = context.dp(6f) })
+
+                if (drafts.size > 1) {
+                    val remove = context.text("移除", 12f, Palette.TEXT_2, medium = true).apply {
+                        gravity = Gravity.CENTER
+                        setPadding(context.dp(6f), context.dp(10f), context.dp(6f), context.dp(10f))
+                        background = context.selectableBorderless()
+                        isClickable = true
+                        isFocusable = true
+                    }
+                    remove.clickOnce {
+                        drafts.removeAt(index)
+                        renderRows()
+                    }
+                    line.addView(remove, LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply { marginStart = context.dp(2f) })
+                }
+                block.addView(line)
+
+                if (draft.preset == 3) {
+                    block.addView(subFieldLabel(context, "伪装主机"))
+                    val sni = inputField(
+                        context,
+                        draft.sni,
+                        "多个用逗号分隔"
+                    )
+                    sni.watchText { draft.sni = it }
+                    block.addView(sni, LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ))
+                }
+                if (draft.preset == 4) {
+                    block.addView(subFieldLabel(context, "自定义线路"))
+                    val custom = inputField(context, draft.custom, "例如 ech+direct")
+                    custom.watchText { draft.custom = it }
+                    block.addView(custom, LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ))
+                }
+
+                rowsContainer.addView(block)
+            }
+        }
+
+        renderRows()
+
+        val addDomain = context.text("+ 添加域名", 12.5f, Palette.ACCENT, medium = true).apply {
+            setPadding(context.dp(2f), context.dp(10f), context.dp(8f), context.dp(2f))
+            background = context.selectableBorderless()
+            isClickable = true
+            isFocusable = true
+        }
+        addDomain.clickOnce {
+            drafts.add(RowDraft())
+            renderRows()
+        }
+
+        val domainSection = context.column()
+        domainSection.setPadding(0, context.dp(14f), 0, 0)
+        domainSection.addView(fieldLabel(context, "域名"))
+        domainSection.addView(rowsContainer)
+        domainSection.addView(addDomain)
+
         val chips = ArrayList<TextView>()
         val chipRow = context.row()
-        val strategyNames = listOf("自动" to "auto", "ECH" to "ech", "SNI 修改" to "sni")
-        lateinit var sniBlock: LinearLayout
+        val presetNames = listOf("自动", "直连", "ECH", "SNI 伪装", "自定义")
+        val custom = inputField(
+            context,
+            if (selectedPreset == 4) site?.defaultRoute.orEmpty() else "",
+            "例如 ech+direct"
+        )
+        val customBlock = fieldBlock(context, "自定义线路", custom)
 
         fun updateChips() {
             chips.forEachIndexed { index, chip ->
-                val active = strategyNames[index].second == selectedStrategy
+                val active = index == selectedPreset
                 chip.setTextColor(if (active) Palette.DARK_TEXT else Palette.TEXT_2)
                 chip.background = if (active) {
                     context.rounded(Palette.ACCENT, 12f)
@@ -121,28 +270,24 @@ class SiteEditorSheet(
                     context.ripple(Palette.SURFACE, 12f, 0x150EA5E9, Palette.BORDER, 1f)
                 }
             }
+            customBlock.visibility = if (selectedPreset == 4) View.VISIBLE else View.GONE
         }
 
-        strategyNames.forEachIndexed { index, pair ->
-            val chip = context.text(pair.first, 11.5f, Palette.TEXT_2, medium = true).apply {
+        presetNames.forEachIndexed { index, label ->
+            val chip = context.text(label, 11f, Palette.TEXT_2, medium = true).apply {
                 gravity = Gravity.CENTER
-                setPadding(context.dp(10f), context.dp(10f), context.dp(10f), context.dp(10f))
+                setPadding(context.dp(6f), context.dp(10f), context.dp(6f), context.dp(10f))
                 clickOnce {
-                    selectedStrategy = pair.second
+                    selectedPreset = index
                     updateChips()
-                    sniBlock.visibility = if (selectedStrategy == "sni") View.VISIBLE else View.GONE
                 }
             }
             chips += chip
             chipRow.addView(chip, LinearLayout.LayoutParams(0, context.dp(40f), 1f).apply {
-                if (index > 0) marginStart = context.dp(8f)
+                if (index > 0) marginStart = context.dp(6f)
             })
         }
         updateChips()
-
-        val sni = inputField(context, site?.sni.orEmpty(), "留空则不发送 SNI")
-        sniBlock = fieldBlock(context, "SNI 主机（可选）", sni)
-        sniBlock.visibility = if (selectedStrategy == "sni") View.VISIBLE else View.GONE
 
         val error = context.text("", 11f, Palette.RED).apply {
             visibility = View.GONE
@@ -150,25 +295,30 @@ class SiteEditorSheet(
         }
 
         sheet.add(fieldBlock(context, "名称", name, 4f))
-        sheet.add(fieldBlock(context, "域名", domains, 14f))
-        sheet.add(fieldBlock(context, "访问地址（可选）", homepage, 14f))
+        sheet.add(fieldBlock(context, "主页（可选）", homepage, 12f))
+        sheet.add(domainSection)
         sheet.add(context.column().apply {
-            setPadding(0, context.dp(14f), 0, 0)
-            addView(fieldLabel(context, "策略"))
+            setPadding(0, context.dp(16f), 0, 0)
+            addView(fieldLabel(context, "默认线路"))
             addView(chipRow)
         })
-        sheet.add(sniBlock)
+        sheet.add(customBlock)
         sheet.add(error)
 
         sheet.buttons("保存", {
             val nameText = name.text.toString().trim()
-            val domainList = parseDomains(domains.text.toString())
-            if (domainList.isEmpty()) {
-                error.text = "至少填写一个有效域名"
-                error.visibility = View.VISIBLE
-            } else {
-                val strategy = selectedStrategy
-                val sniText = sni.text.toString().trim()
+            runCatching {
+                val rules = buildRules(drafts)
+                val defaultSpec = if (selectedPreset == 4) {
+                    val text = custom.text.toString().trim()
+                    if (text.isEmpty()) {
+                        throw IllegalArgumentException("请填写自定义默认线路")
+                    }
+                    text
+                } else {
+                    routePresetSpec(selectedPreset)
+                }
+                val defaultRoute = parseRouteSpec(defaultSpec)
                 var homepageText = homepage.text.toString().trim()
                 if (homepageText.isNotEmpty() &&
                     !homepageText.startsWith("http://") &&
@@ -176,23 +326,19 @@ class SiteEditorSheet(
                 ) {
                     homepageText = "https://$homepageText"
                 }
+                val primary = rules.first().pattern.removePrefix("*.")
                 if (homepageText.isEmpty()) {
-                    homepageText = "https://${domainList.first().removePrefix("*.")}/"
+                    homepageText = "https://$primary/"
                 }
-                val group = JSONObject().apply {
-                    put("id", site?.id ?: uniqueId(domainList.first()))
-                    put("name", nameText.ifEmpty { domainList.first().removePrefix("*.") })
-                    put("domains", JSONArray(domainList))
-                    put("strategy", strategy)
+                JSONObject().apply {
+                    put("id", site?.id ?: uniqueId(rules.first().pattern))
+                    put("name", nameText.ifEmpty { primary })
+                    put("domains", domainRulesJson(rules))
+                    put("defaultRoute", defaultRoute)
                     put("enabled", site?.enabled ?: true)
-                    put(
-                        "sni",
-                        if (strategy == "sni" && sniText.isNotEmpty()) sniText else JSONObject.NULL
-                    )
-                    put("experimental", site?.experimental ?: false)
                     put("homepage", homepageText)
-                    put("echShared", site?.echShared ?: false)
                 }
+            }.onSuccess { group ->
                 host.saveGroup(group, site == null) { ok, message ->
                     if (ok) {
                         sheet.dismiss()
@@ -201,6 +347,9 @@ class SiteEditorSheet(
                         error.visibility = View.VISIBLE
                     }
                 }
+            }.onFailure { throwable ->
+                error.text = throwable.message ?: "保存失败"
+                error.visibility = View.VISIBLE
             }
         }, "取消", { sheet.dismiss() })
 
@@ -220,34 +369,189 @@ class SiteEditorSheet(
                 }
             }
         }
+        sheet.setOnDismissListener { routePopup?.dismiss() }
         sheet.show()
     }
 
-    private fun parseDomains(raw: String): List<String> {
-        val result = LinkedHashSet<String>()
-        raw.lineSequence().forEach { line ->
-            var value = line.trim()
-            if (value.isEmpty() || value.startsWith("#")) return@forEach
-            value = value.substringBefore('#').trim()
-            if (value.contains("://")) {
-                val host = runCatching { URI(value).host }.getOrNull()
-                if (host != null) value = host
-            } else {
-                value = value.substringBefore('/').substringBefore('?').substringBefore('#')
-                if (value.count { it == ':' } == 1) value = value.substringBefore(':')
+    private fun openRouteMenu(anchor: View, current: Int, onSelected: (Int) -> Unit) {
+        routePopup?.dismiss()
+        val width = context.dp(144f)
+        val itemHeight = context.dp(42f)
+        val itemGap = context.dp(2f)
+        val popupPadding = context.dp(6f)
+        val height = ROW_ROUTE_PRESETS.size * itemHeight +
+            (ROW_ROUTE_PRESETS.size - 1) * itemGap + popupPadding * 2
+        val content = context.column().apply {
+            background = context.rounded(Palette.SURFACE, 14f, Palette.BORDER, 1f)
+            setPadding(popupPadding, popupPadding, popupPadding, popupPadding)
+            elevation = context.dp(8f).toFloat()
+        }
+        ROW_ROUTE_PRESETS.forEachIndexed { index, label ->
+            val active = index == current
+            val item = context.row().apply {
+                background = if (active) {
+                    context.rounded(Palette.ACCENT_SOFT, 9f)
+                } else {
+                    context.ripple(Color.TRANSPARENT, 9f, 0x160E9FD8)
+                }
+                setPadding(context.dp(12f), 0, context.dp(12f), 0)
+                isClickable = true
+                isFocusable = true
             }
-            var wildcard = false
-            if (value.startsWith("*.")) {
-                wildcard = true
-                value = value.removePrefix("*.")
+            item.addView(
+                context.text(
+                    label,
+                    13f,
+                    if (active) Palette.ACCENT_DIM else Palette.TEXT,
+                    medium = active
+                ).apply { gravity = Gravity.CENTER_VERTICAL },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+            )
+            if (active) {
+                item.addView(
+                    context.text("✓", 13f, Palette.ACCENT, medium = true).apply {
+                        gravity = Gravity.CENTER
+                    },
+                    LinearLayout.LayoutParams(context.dp(20f), LinearLayout.LayoutParams.MATCH_PARENT)
+                )
             }
-            value = value.trim('.').lowercase()
-            val ascii = runCatching { IDN.toASCII(value) }.getOrDefault(value)
-            if (ascii.contains('.') && !ascii.startsWith('.') && !ascii.endsWith('.')) {
-                result += if (wildcard) "*.$ascii" else ascii
+            item.clickOnce {
+                routePopup?.dismiss()
+                onSelected(index)
+            }
+            content.addView(item, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                itemHeight
+            ).apply { if (index > 0) topMargin = itemGap })
+        }
+        val popup = PopupWindow(content, width, height, true).apply {
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            isOutsideTouchable = true
+            inputMethodMode = PopupWindow.INPUT_METHOD_NOT_NEEDED
+            elevation = context.dp(10f).toFloat()
+            setOnDismissListener {
+                if (routePopup === this) routePopup = null
             }
         }
-        return result.toList()
+        routePopup = popup
+
+        // Show above the trigger when there is no room below, so the last
+        // options stay reachable inside the sheet.
+        val location = IntArray(2)
+        anchor.getLocationOnScreen(location)
+        val frame = Rect()
+        anchor.getWindowVisibleDisplayFrame(frame)
+        val gap = context.dp(6f)
+        val margin = context.dp(8f)
+        var y = location[1] + anchor.height + gap
+        if (y + height > frame.bottom - margin) {
+            y = (location[1] - height - gap).coerceAtLeast(frame.top + margin)
+        }
+        val maxX = (frame.right - width - margin).coerceAtLeast(frame.left + margin)
+        val x = (location[0] + anchor.width - width).coerceIn(frame.left + margin, maxX)
+        popup.showAtLocation(anchor, Gravity.TOP or Gravity.START, x, y)
+    }
+
+    private fun draftFromRule(rule: DomainRuleInfo): RowDraft {
+        val preset = rowPreset(rule.route)
+        return RowDraft(
+            pattern = rule.pattern,
+            preset = preset,
+            sni = if (preset == 3) sniHosts(rule.route).joinToString(", ") else "",
+            custom = if (preset == 4) rule.route else "",
+        )
+    }
+
+    /** The per-domain preset index; unlike [routePresetIndex], an SNI spec with hosts is still SNI. */
+    private fun rowPreset(spec: String): Int = when {
+        spec.isEmpty() -> 0
+        spec == "direct" -> 1
+        spec == "ech+direct" -> 2
+        isSniSpec(spec) -> 3
+        else -> 4
+    }
+
+    private fun isSniSpec(spec: String): Boolean {
+        val parts = spec.split('+').map { it.trim() }.filter { it.isNotEmpty() }
+        if (parts.isEmpty() || parts.size > 2) return false
+        val head = parts.first()
+        if (head != "sni" && !head.startsWith("sni:")) return false
+        return parts.drop(1).all { it == "direct" }
+    }
+
+    private fun sniHosts(spec: String): List<String> =
+        spec.split('+')
+            .map { it.trim() }
+            .firstOrNull { it.startsWith("sni:") }
+            ?.substringAfter(':')
+            ?.split(',')
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            .orEmpty()
+
+    private fun rowRouteSpec(draft: RowDraft): String = when (draft.preset) {
+        1 -> "direct"
+        2 -> "ech+direct"
+        3 -> {
+            val hosts = draft.sni
+                .split(',', '，', ';', '；', ' ', '\n', '\t')
+                .map { it.trim().lowercase() }
+                .filter { it.isNotEmpty() }
+                .distinct()
+            if (hosts.isEmpty()) "sni+direct" else "sni:${hosts.joinToString(",")}+direct"
+        }
+        4 -> {
+            val text = draft.custom.trim()
+            if (text.isEmpty()) throw IllegalArgumentException("请填写自定义线路")
+            parseRouteSpec(text)
+            text
+        }
+        else -> ""
+    }
+
+    private fun buildRules(drafts: List<RowDraft>): List<DomainRuleInfo> {
+        val seen = HashSet<String>()
+        val rules = ArrayList<DomainRuleInfo>()
+        drafts.forEach { draft ->
+            val normalized = normalizePattern(draft.pattern)
+            if (normalized == null) {
+                if (draft.pattern.isNotBlank()) {
+                    throw IllegalArgumentException("域名写法无效：${draft.pattern.trim()}")
+                }
+            } else {
+                if (!seen.add(normalized)) {
+                    throw IllegalArgumentException("域名重复：$normalized")
+                }
+                rules += DomainRuleInfo(normalized, rowRouteSpec(draft))
+            }
+        }
+        if (rules.isEmpty()) {
+            throw IllegalArgumentException("至少填写一个有效域名")
+        }
+        if (rules.none { !it.pattern.startsWith("*.") }) {
+            throw IllegalArgumentException("至少需要一个精确域名（不能只有 *. 通配）")
+        }
+        return rules
+    }
+
+    private fun normalizePattern(raw: String): String? {
+        var value = raw.trim()
+        if (value.isEmpty()) return null
+        if (value.contains("://")) {
+            value = runCatching { URI(value).host }.getOrNull() ?: return null
+        } else {
+            value = value.substringBefore('/').substringBefore('?').substringBefore('#')
+            if (value.count { it == ':' } == 1) value = value.substringBefore(':')
+        }
+        var wildcard = false
+        if (value.startsWith("*.")) {
+            wildcard = true
+            value = value.removePrefix("*.")
+        }
+        value = value.trim('.').lowercase()
+        val ascii = runCatching { IDN.toASCII(value) }.getOrDefault(value)
+        if (!ascii.contains('.') || ascii.startsWith('.') || ascii.endsWith('.')) return null
+        return if (wildcard) "*.$ascii" else ascii
     }
 
     private fun uniqueId(domain: String): String {
@@ -278,13 +582,7 @@ class SiteDetailSheet(
         texts.gravity = Gravity.CENTER_VERTICAL
         texts.setPadding(context.dp(12f), 0, context.dp(8f), 0)
         val meta = context.row()
-        meta.addView(context.pill(context.strategyLabel(site.strategy), Palette.TEXT_2, Palette.SURFACE_2, 9f))
-        meta.addView(View(context), LinearLayout.LayoutParams(context.dp(6f), 1))
         meta.addView(context.pill("${site.exactDomains.size} 个域名", Palette.TEXT_2, Palette.SURFACE_2, 9f))
-        if (site.experimental) {
-            meta.addView(View(context), LinearLayout.LayoutParams(context.dp(6f), 1))
-            meta.addView(context.pill("实验性", Palette.AMBER, 0x1FFFC66D, 9f))
-        }
         texts.addView(meta)
         header.addView(texts, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         val toggle = android.widget.Switch(context).apply {
@@ -339,13 +637,19 @@ class SiteDetailSheet(
 
         val info = context.card(radius = 20f, padding = 0f)
         info.addView(infoRow(context, "访问地址", site.homepage) { host.openUrl(site.homepage) })
-        if (site.sni.isNotEmpty()) {
-            info.addView(context.divider(14f), LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                context.dp(1f)
-            ))
-            info.addView(infoRow(context, "SNI", site.sni))
-        }
+        info.addView(context.divider(14f), LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            context.dp(1f)
+        ))
+        info.addView(infoRow(
+            context,
+            "默认线路",
+            if (site.routeDetail.isEmpty()) {
+                routeLabel(site.defaultRoute)
+            } else {
+                "${routeLabel(site.defaultRoute)} · ${site.routeDetail}"
+            }
+        ))
         info.addView(context.divider(14f), LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             context.dp(1f)
@@ -380,7 +684,12 @@ class SiteDetailSheet(
             domain.detail.isNotEmpty() -> domain.detail
             else -> "等待首次连接"
         }
-        left.addView(context.text(detail, 9.5f, Palette.MUTED).apply {
+        val route = site.domainRules.firstOrNull { it.pattern == domain.host }?.route.orEmpty()
+        left.addView(context.text(
+            if (route.isEmpty()) detail else "$route · $detail",
+            9.5f,
+            Palette.MUTED
+        ).apply {
             setPadding(0, context.dp(3f), 0, 0)
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END

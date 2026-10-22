@@ -1,16 +1,17 @@
 //! Site management round-trips: what the editor writes must survive a reload,
 //! and edits must replace rather than duplicate.
 
-use hakimi_core::config::{ConfigManager, GroupConfig};
+use hakimi_core::config::{ConfigManager, DomainRule, GroupConfig, RoutePolicy};
 use hakimi_core::paths::Paths;
-use hakimi_core::strategy::Strategy;
 
 fn group(id: &str, name: &str, domains: &[&str]) -> GroupConfig {
     GroupConfig {
         id: id.into(),
         name: name.into(),
-        domains: domains.iter().map(|domain| (*domain).to_string()).collect(),
-        strategy: Strategy::Auto,
+        domains: domains
+            .iter()
+            .map(|domain| DomainRule::new(*domain))
+            .collect(),
         enabled: true,
         ..Default::default()
     }
@@ -24,17 +25,24 @@ fn added_sites_survive_a_reload() {
     {
         let config = ConfigManager::load_or_create(&paths).unwrap();
         let mut site = group("custom", "Custom", &["custom.example", "*.custom.example"]);
-        site.strategy = Strategy::FakeSni;
-        site.sni = Some("www.baidu.com".into());
+        site.default_route = RoutePolicy::sni(vec!["www.baidu.com".into()]);
         config.upsert_group(site).unwrap();
     }
 
     let reloaded = ConfigManager::load_or_create(&paths).unwrap();
     let site = reloaded.snapshot().group("custom").cloned().unwrap();
     assert_eq!(site.name, "Custom");
-    assert_eq!(site.domains, vec!["custom.example", "*.custom.example"]);
-    assert_eq!(site.strategy, Strategy::FakeSni);
-    assert_eq!(site.sni.as_deref(), Some("www.baidu.com"));
+    assert_eq!(
+        site.domains
+            .iter()
+            .map(|rule| rule.pattern.as_str())
+            .collect::<Vec<_>>(),
+        vec!["custom.example", "*.custom.example"]
+    );
+    assert_eq!(
+        site.default_route,
+        RoutePolicy::sni(vec!["www.baidu.com".into()])
+    );
 }
 
 #[test]
@@ -46,7 +54,10 @@ fn editing_a_site_replaces_it_instead_of_duplicating() {
     let mut site = group("custom", "Custom", &["custom.example"]);
     config.upsert_group(site.clone()).unwrap();
 
-    site.domains = vec!["custom.example".into(), "cdn.custom.example".into()];
+    site.domains = vec![
+        DomainRule::new("custom.example"),
+        DomainRule::new("cdn.custom.example"),
+    ];
     site.name = "Renamed".into();
     config.upsert_group(site).unwrap();
 

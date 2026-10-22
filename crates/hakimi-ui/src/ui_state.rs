@@ -348,8 +348,6 @@ mod tests {
             first: false,
             last: false,
             url: String::new(),
-            strategy: 0,
-            sni: String::new(),
             custom: false,
             domains: vec![],
         }

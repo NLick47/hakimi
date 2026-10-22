@@ -373,7 +373,7 @@ class SiteRowView(
         nameView.text = site.name
         nameView.setTextColor(if (site.enabled) Palette.TEXT else Palette.MUTED)
 
-        val meta = "${context.strategyLabel(site.strategy)} · ${site.exactDomains.size} 个域名"
+        val meta = "${site.exactDomains.size} 个域名"
         val status = site.summary.substringAfter(" · ", "")
         val display = if (status.isEmpty() || status == site.summary) {
             meta

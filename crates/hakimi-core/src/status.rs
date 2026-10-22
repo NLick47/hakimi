@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
-use crate::strategy::{CacheStatus, DohSource, FailureReason, IpSource, Strategy, TlsMode};
+use crate::strategy::{CacheStatus, DohSource, FailureReason, IpSource, TlsMode};
 use crate::util::now;
 
 /// Wildcard groups can observe an unbounded set of concrete hosts. Keep the
@@ -56,8 +56,9 @@ pub struct DomainDiagnostics {
     pub state: State,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strategy: Option<TlsMode>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub configured_strategy: Option<Strategy>,
+    /// Ordered modes of the matched domain rule, for diagnostics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configured_modes: Vec<TlsMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip: Option<IpAddr>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,7 +84,7 @@ impl DomainDiagnostics {
     pub fn checking(
         group: Option<String>,
         domain: impl Into<String>,
-        strategy: Option<Strategy>,
+        configured_modes: Vec<TlsMode>,
         catalog_version: u64,
     ) -> Self {
         Self {
@@ -91,7 +92,7 @@ impl DomainDiagnostics {
             domain: domain.into(),
             state: State::Checking,
             strategy: None,
-            configured_strategy: strategy,
+            configured_modes,
             ip: None,
             ip_source: None,
             doh_source: None,
@@ -113,9 +114,7 @@ pub struct GroupStatus {
     pub id: String,
     pub name: String,
     pub enabled: bool,
-    pub experimental: bool,
     pub state: State,
-    pub strategy: Strategy,
     pub primary_domain: Option<String>,
     pub primary_state: Option<State>,
     pub tested_domains: usize,
@@ -288,7 +287,7 @@ impl StatusStore {
         &self,
         group: Option<&str>,
         domain: &str,
-        strategy: Option<Strategy>,
+        configured_modes: Vec<TlsMode>,
         catalog_version: u64,
     ) {
         // A connection that succeeds and is followed immediately by another
@@ -314,7 +313,7 @@ impl StatusStore {
         self.record(DomainDiagnostics::checking(
             group.map(str::to_owned),
             domain,
-            strategy,
+            configured_modes,
             catalog_version,
         ));
     }
@@ -423,9 +422,7 @@ impl StatusStore {
                     id: group.id.clone(),
                     name: group.name.clone(),
                     enabled: group.enabled,
-                    experimental: group.experimental,
                     state,
-                    strategy: group.strategy,
                     primary_domain: primary,
                     primary_state,
                     tested_domains: tested,
@@ -485,7 +482,7 @@ mod tests {
             domain: domain.into(),
             state,
             strategy: Some(TlsMode::Direct),
-            configured_strategy: Some(Strategy::Auto),
+            configured_modes: vec![TlsMode::Direct],
             ip: None,
             ip_source: None,
             doh_source: None,
@@ -504,9 +501,9 @@ mod tests {
     fn repeated_checking_does_not_bump_revision() {
         let store = StatusStore::new();
         store.record(report("example.com", State::Normal));
-        store.mark_checking(Some("github"), "example.com", Some(Strategy::Auto), 1);
+        store.mark_checking(Some("github"), "example.com", vec![TlsMode::Direct], 1);
         let revision = store.revision();
-        store.mark_checking(Some("github"), "example.com", Some(Strategy::Auto), 1);
+        store.mark_checking(Some("github"), "example.com", vec![TlsMode::Direct], 1);
         assert_eq!(
             store.revision(),
             revision,
@@ -517,10 +514,10 @@ mod tests {
     #[test]
     fn a_cold_burst_reuses_one_checking_record() {
         let store = StatusStore::new();
-        store.mark_checking(Some("github"), "example.com", Some(Strategy::Auto), 1);
+        store.mark_checking(Some("github"), "example.com", vec![TlsMode::Direct], 1);
         let first = store.get("example.com").unwrap().last_check;
         std::thread::sleep(std::time::Duration::from_millis(10));
-        store.mark_checking(Some("github"), "example.com", Some(Strategy::Auto), 1);
+        store.mark_checking(Some("github"), "example.com", vec![TlsMode::Direct], 1);
         assert_eq!(
             store.get("example.com").unwrap().last_check,
             first,
@@ -533,14 +530,14 @@ mod tests {
         let store = StatusStore::new();
         store.record(report("example.com", State::Normal));
 
-        store.mark_checking(Some("github"), "example.com", Some(Strategy::Auto), 1);
+        store.mark_checking(Some("github"), "example.com", vec![TlsMode::Direct], 1);
         assert_eq!(store.get("example.com").unwrap().state, State::Normal);
 
         // A stale result is re-marked so the UI still shows progress.
         let mut stale = report("stale.example", State::Normal);
         stale.last_check = now() - chrono::Duration::seconds(2);
         store.record(stale);
-        store.mark_checking(Some("github"), "stale.example", Some(Strategy::Auto), 1);
+        store.mark_checking(Some("github"), "stale.example", vec![TlsMode::Direct], 1);
         assert_eq!(store.get("stale.example").unwrap().state, State::Checking);
     }
 
@@ -581,7 +578,13 @@ mod tests {
     #[test]
     fn disabled_and_paused_win() {
         let store = StatusStore::new();
-        let config = AppConfig::default();
+        let mut config = AppConfig::default();
+        config
+            .groups
+            .iter_mut()
+            .find(|group| group.id == "eh")
+            .unwrap()
+            .enabled = false;
         let eh = store
             .groups_snapshot(&config)
             .into_iter()

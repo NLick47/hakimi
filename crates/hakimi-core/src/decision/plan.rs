@@ -7,7 +7,7 @@ use tokio::net::TcpStream;
 
 use crate::ip_tester::{ConnectError, ProbeSuccess, TlsContext};
 use crate::status::DomainDiagnostics;
-use crate::strategy::{IpSource, Strategy, TlsMode};
+use crate::strategy::{IpSource, TlsMode};
 
 #[derive(Debug, Clone)]
 pub struct ConnectPlan {
@@ -104,14 +104,5 @@ impl Prober for TlsContext {
             .map_err(|_| ConnectError::Timeout)??;
         drop(stream);
         Ok(started.elapsed().as_millis() as u64)
-    }
-}
-
-pub(super) fn mode_for_strategy(strategy: Strategy) -> TlsMode {
-    match strategy {
-        Strategy::Direct => TlsMode::Direct,
-        Strategy::Ech => TlsMode::Ech,
-        Strategy::FakeSni => TlsMode::FakeSni,
-        Strategy::Auto => TlsMode::Direct,
     }
 }

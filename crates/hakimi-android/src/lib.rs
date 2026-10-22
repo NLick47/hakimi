@@ -9,9 +9,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use hakimi_core::config::{AppConfig, DohEndpoint, GroupConfig, ProxyMode};
+use hakimi_core::config::{
+    AppConfig, DohEndpoint, DomainRule, GroupConfig, ProxyMode, RoutePolicy,
+};
 use hakimi_core::runtime::HakimiRuntime;
-use hakimi_core::strategy::Strategy;
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
@@ -48,8 +49,8 @@ fn initialize(data_dir: &str) -> Result<()> {
         return Ok(());
     }
 
-    let runtime = HakimiRuntime::new(Some(PathBuf::from(data_dir)))
-        .context("creating the hakimi runtime")?;
+    let runtime =
+        HakimiRuntime::new(Some(PathBuf::from(data_dir))).context("creating the hakimi runtime")?;
 
     // The probe exposes a plain HTTP proxy; the Android shell points its
     // global proxy at it. Never touch the (nonexistent) Android system proxy
@@ -95,13 +96,10 @@ fn initialize(data_dir: &str) -> Result<()> {
         config.groups.push(GroupConfig {
             id: "echtest".to_string(),
             name: "ECH Test".to_string(),
-            domains: vec!["crypto.cloudflare.com".to_string()],
-            strategy: Strategy::Ech,
+            domains: vec![DomainRule::new("crypto.cloudflare.com")],
             enabled: true,
-            sni: None,
-            experimental: false,
             homepage: Some("https://crypto.cloudflare.com/cdn-cgi/trace".to_string()),
-            ech_shared: true,
+            default_route: RoutePolicy::ech_shared(),
         });
     }
     runtime
@@ -195,8 +193,9 @@ fn remove_group(id: &str) -> Result<()> {
 
 fn ca_pem() -> String {
     match host() {
-        Ok(host) => std::fs::read_to_string(host.runtime.paths().ca_cert_file())
-            .unwrap_or_default(),
+        Ok(host) => {
+            std::fs::read_to_string(host.runtime.paths().ca_cert_file()).unwrap_or_default()
+        }
         Err(_) => String::new(),
     }
 }
@@ -310,10 +309,7 @@ pub extern "system" fn Java_com_hakimi_probe_Native_startProxy(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_hakimi_probe_Native_stopProxy(
-    _env: JNIEnv,
-    _class: JClass,
-) {
+pub extern "system" fn Java_com_hakimi_probe_Native_stopProxy(_env: JNIEnv, _class: JClass) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(stop_proxy));
 }
 
@@ -330,10 +326,7 @@ pub extern "system" fn Java_com_hakimi_probe_Native_isProxyRunning(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_hakimi_probe_Native_shutdown(
-    _env: JNIEnv,
-    _class: JClass,
-) {
+pub extern "system" fn Java_com_hakimi_probe_Native_shutdown(_env: JNIEnv, _class: JClass) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(shutdown));
 }
 
@@ -352,8 +345,7 @@ pub extern "system" fn Java_com_hakimi_probe_Native_caPem(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(ca_pem))
-        .unwrap_or_default();
+    let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(ca_pem)).unwrap_or_default();
     new_string(&mut env, value)
 }
 
@@ -362,8 +354,8 @@ pub extern "system" fn Java_com_hakimi_probe_Native_logPath(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(log_path))
-        .unwrap_or_default();
+    let value =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(log_path)).unwrap_or_default();
     new_string(&mut env, value)
 }
 

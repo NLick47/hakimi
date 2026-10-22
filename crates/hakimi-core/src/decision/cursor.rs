@@ -2,14 +2,14 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use crate::config::{AppConfig, GroupConfig};
+use crate::config::{AppConfig, EchSource, GroupConfig, RouteAttempt, RoutePolicy};
 use crate::resolver::EchOutcome;
 use crate::status::AttemptRecord;
-use crate::strategy::{FailureReason, IpSource, Strategy, TlsMode};
+use crate::strategy::{FailureReason, IpSource, TlsMode};
 use crate::util::{network_id, now};
 
 use super::engine::DecisionEngine;
-use super::plan::{mode_for_strategy, ConnectPlan, DecisionOutcome};
+use super::plan::{ConnectPlan, DecisionOutcome};
 use super::types::{Candidate, DohExpansion, EARLY_DOH_AFTER};
 
 /// Result of matching a host against the configured groups.
@@ -44,6 +44,8 @@ pub struct RouteCursor {
     /// Index into the immutable `config` snapshot. Keeping only the index avoids
     /// cloning the group (including all of its domain strings) per connection.
     group_index: usize,
+    /// Index of the matched `DomainRule` inside the group.
+    rule_index: usize,
     config: Arc<AppConfig>,
     max: usize,
     candidates: Vec<Candidate>,
@@ -52,14 +54,19 @@ pub struct RouteCursor {
     doh: DohExpansion,
     skip_once: bool,
     remote_available: bool,
-    modes: Vec<TlsMode>,
-    mode_index: usize,
+    /// Ordered attempts of the matched domain rule.
+    route_attempts: Vec<RouteAttempt>,
+    attempt_index: usize,
     current: Option<Candidate>,
-    ech_config: Option<Vec<u8>>,
-    ech_checked: bool,
-    ech_error: Option<String>,
+    /// ECHConfigList cache per source (own / shared).
+    ech_configs: [Option<Vec<u8>>; 2],
+    ech_checked: [bool; 2],
+    ech_errors: [Option<String>; 2],
+    /// Fake SNI candidates for the current SNI attempt.
     sni_candidates: Vec<Option<String>>,
+    sni_attempt: Option<usize>,
     sni_index: usize,
+    network: String,
     attempts: Vec<AttemptRecord>,
     last_reason: Option<FailureReason>,
     last_detail: Option<String>,
@@ -75,14 +82,14 @@ impl RouteCursor {
         port: u16,
         tls: bool,
         group_index: usize,
+        rule_index: usize,
         config: Arc<AppConfig>,
     ) -> Self {
         let group = &config.groups[group_index];
         let max = config.advanced.max_candidates_per_domain;
-        let (skip_hint, last_good) =
-            engine
-                .cache
-                .route_hints(&domain, config.advanced.last_good_days);
+        let (skip_hint, last_good) = engine
+            .cache
+            .route_hints(&domain, config.advanced.last_good_days);
         // The common case is an empty set. Only take the write lock (and
         // re-check) when the read-only hint saw a marker.
         let skip_once = skip_hint && engine.cache.take_skip_once(&domain);
@@ -111,7 +118,7 @@ impl RouteCursor {
             }
         };
         let add_cache = |candidates: &mut Vec<Candidate>| {
-            if let Some((ip, _)) = last_good {
+            if let Some(ip) = last_good {
                 if candidates.len() < max && !contains_ip(candidates, ip) {
                     candidates.push(Candidate {
                         ip,
@@ -152,30 +159,15 @@ impl RouteCursor {
         let candidates: Vec<Candidate> =
             ranked.into_iter().map(|(_, candidate)| candidate).collect();
 
-        let mut modes = if tls {
-            group.strategy.attempts().to_vec()
+        let route = group
+            .domains
+            .get(rule_index)
+            .and_then(|rule| rule.route.as_ref())
+            .unwrap_or(&group.default_route);
+        let route_attempts = if tls {
+            route.attempts.clone()
         } else {
-            vec![TlsMode::Direct]
-        };
-        // Use the last-known-good strategy as the first attempt. Without this, a site that
-        // only works with fake SNI pays a failed direct/ECH pass on every process start
-        // (and every catalog-triggered re-plan), which is especially visible for image
-        // hosts. `auto` still falls back to the normal order on failure.
-        if tls && group.strategy == Strategy::Auto {
-            if let Some(preferred) = last_good.map(|(_, strategy)| mode_for_strategy(strategy)) {
-                if modes.contains(&preferred) && modes.first() != Some(&preferred) {
-                    modes.retain(|mode| *mode != preferred);
-                    modes.insert(0, preferred);
-                }
-            }
-        }
-        let sni_candidates = if tls && modes.contains(&TlsMode::FakeSni) {
-            // Only fake-SNI routes need the current network identity. Most
-            // connections never touch the OS network cache.
-            let network = network_id();
-            engine.sni_candidates(&config, group, &domain, &network)
-        } else {
-            Vec::new()
+            vec![RouteAttempt::Direct]
         };
 
         Self {
@@ -184,6 +176,7 @@ impl RouteCursor {
             port,
             tls,
             group_index,
+            rule_index,
             config,
             max,
             candidates,
@@ -192,14 +185,16 @@ impl RouteCursor {
             doh: DohExpansion::default(),
             skip_once,
             remote_available,
-            modes,
-            mode_index: 0,
+            route_attempts,
+            attempt_index: 0,
             current: None,
-            ech_config: None,
-            ech_checked: false,
-            ech_error: None,
-            sni_candidates,
+            ech_configs: [None, None],
+            ech_checked: [false, false],
+            ech_errors: [None, None],
+            sni_candidates: Vec::new(),
+            sni_attempt: None,
             sni_index: 0,
+            network: network_id(),
             attempts: Vec::new(),
             last_reason: None,
             last_detail: None,
@@ -243,16 +238,75 @@ impl RouteCursor {
     /// Locked ECH/fake-SNI groups have no direct mode; their cursor is left untouched so
     /// the usual failure diagnostics still apply. Must be called before the first plan.
     pub fn restrict_to_direct(&mut self) -> bool {
-        if !self.modes.contains(&TlsMode::Direct) {
+        if !self
+            .route_attempts
+            .iter()
+            .any(|attempt| attempt.mode() == TlsMode::Direct)
+        {
             return false;
         }
-        self.modes.retain(|mode| *mode == TlsMode::Direct);
-        self.mode_index = 0;
+        self.route_attempts
+            .retain(|attempt| matches!(attempt, RouteAttempt::Direct));
+        self.attempt_index = 0;
         self.sni_candidates.clear();
+        self.sni_attempt = None;
         self.sni_index = 0;
-        // Nothing can request ECH after the mode was removed.
-        self.ech_checked = true;
         true
+    }
+
+    fn configured_route(&self) -> &RoutePolicy {
+        let group = self.group();
+        group
+            .domains
+            .get(self.rule_index)
+            .and_then(|rule| rule.route.as_ref())
+            .unwrap_or(&group.default_route)
+    }
+
+    /// Ordered modes of the matched route, used by status diagnostics.
+    pub fn configured_modes(&self) -> Vec<TlsMode> {
+        self.configured_route()
+            .attempts
+            .iter()
+            .map(RouteAttempt::mode)
+            .collect()
+    }
+
+    fn sni_candidates_for(&self, hosts: &[String]) -> Vec<Option<String>> {
+        let mut out: Vec<Option<String>> = Vec::new();
+        let mut push = |candidate: Option<String>| {
+            if !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        };
+        if let Some(cached) = self
+            .engine
+            .cache
+            .sni(&self.group().id, &self.domain, &self.network)
+        {
+            let allowed = hosts.is_empty()
+                || cached.sni.as_deref().is_some_and(|cached| {
+                    hosts.iter().any(|host| host.eq_ignore_ascii_case(cached))
+                });
+            if allowed {
+                push(cached.sni);
+            }
+        }
+        if hosts.is_empty() {
+            for candidate in &self.config.advanced.fake_sni_candidates {
+                push(normalize_sni(candidate));
+            }
+        } else {
+            for candidate in hosts {
+                push(normalize_sni(candidate));
+            }
+        }
+        if out.is_empty() {
+            out.push(None);
+        }
+        // A `None` entry sends no SNI and is effectively a duplicate of Direct.
+        out.sort_by_key(|entry| entry.is_none());
+        out
     }
 
     /// Skip an already-attempted plan (for example one taken from the plan cache).
@@ -265,8 +319,8 @@ impl RouteCursor {
     }
 
     /// Produce the next plan in round-robin order. Each round pairs one candidate IP
-    /// with every configured TLS route, so the connection race compares routes instead
-    /// of stopping at the first route that merely works. `None` means every strategy
+    /// with every configured attempt, so the connection race compares attempts instead
+    /// of stopping at the first one that merely connects. `None` means every attempt
     /// and candidate was exhausted; a failure diagnostic has been recorded in that case.
     pub async fn next_plan(&mut self) -> Option<ConnectPlan> {
         if self.finished {
@@ -276,19 +330,17 @@ impl RouteCursor {
             if self.finished {
                 return None;
             }
-            if self.modes.is_empty() {
+            if self.route_attempts.is_empty() {
                 self.finish_failure();
                 return None;
             }
             // Advance to the next candidate when the round is done (or not started).
-            if self.current.is_none() || self.mode_index >= self.modes.len() {
+            if self.current.is_none() || self.attempt_index >= self.route_attempts.len() {
                 match self.next_candidate().await {
                     Some(candidate) => {
                         self.current = Some(candidate);
-                        self.mode_index = 0;
-                        // The SNI list is swept per candidate. Without this reset the
-                        // second IP starts at the end of the list and never gets a
-                        // fake-SNI attempt at all.
+                        self.attempt_index = 0;
+                        self.sni_attempt = None;
                         self.sni_index = 0;
                     }
                     None => {
@@ -297,88 +349,97 @@ impl RouteCursor {
                     }
                 }
             }
-            let mode = self.modes[self.mode_index];
-
-            if mode == TlsMode::Ech && !self.ech_checked {
-                match self
-                    .engine
-                    .resolver
-                    .doh_ech_config(&self.domain, self.group().ech_shared)
-                    .await
-                {
-                    Ok(EchOutcome {
-                        config,
-                        source,
-                        stale,
-                        ..
-                    }) => {
-                        self.ech_config = Some(config);
-                        if self.doh.source.is_none() {
-                            self.doh.source = Some(source);
-                        }
-                        self.doh.stale |= stale;
-                    }
-                    Err(error) => {
-                        self.ech_error = Some(format!("{error:#}"));
-                    }
-                }
-                // Mark the attempt only after the await: if the race that
-                // requested this plan is cancelled mid-query, the next plan
-                // request retries instead of silently dropping the ECH route.
-                self.ech_checked = true;
-                if self.ech_config.is_none() {
-                    if self.group().strategy == Strategy::Ech {
-                        self.last_reason = Some(FailureReason::EchUnavailable);
-                        self.last_detail = self
-                            .ech_error
-                            .clone()
-                            .or_else(|| Some("no ECHConfig available".into()));
-                        self.finish_failure();
-                        return None;
-                    }
-                    // Drop the ECH route for every round; the mode index now points
-                    // at the next mode, so do not advance again.
-                    self.modes.retain(|m| *m != TlsMode::Ech);
-                    continue;
-                }
+            let attempt = self.route_attempts[self.attempt_index].clone();
+            if self.engine.route_rejected(&self.domain, attempt.mode()) {
+                self.attempt_index += 1;
+                continue;
             }
-
             let Some(candidate) = self.current.clone() else {
                 self.finish_failure();
                 return None;
             };
 
-            if mode == TlsMode::FakeSni {
-                if self.sni_index >= self.sni_candidates.len() {
-                    // The SNI list is exhausted for this candidate, but another
-                    // candidate may still work with the same hosts. Move past the
-                    // fake-SNI route for this round; the mode stays in the list so
-                    // the next candidate sweeps the full SNI list again.
-                    self.mode_index += 1;
-                    continue;
+            match attempt {
+                RouteAttempt::Direct => {
+                    self.attempt_index += 1;
+                    let plan = self.build_plan(candidate, TlsMode::Direct, None, None);
+                    if self.take_skipped(&plan) {
+                        continue;
+                    }
+                    return Some(plan);
                 }
-                // Stay on this mode until the whole SNI list has been paired with
-                // the current candidate, mirroring the old SNI-major sweep.
-                let sni = self.sni_candidates[self.sni_index].clone();
-                self.sni_index += 1;
-                let plan = self.build_plan(candidate, mode, sni, None);
-                if self.take_skipped(&plan) {
-                    continue;
+                RouteAttempt::Ech { ech } => {
+                    let slot = ech_slot(ech);
+                    if !self.ech_checked[slot] {
+                        match self
+                            .engine
+                            .resolver
+                            .doh_ech_config(&self.domain, ech == EchSource::Shared)
+                            .await
+                        {
+                            Ok(EchOutcome {
+                                config,
+                                source,
+                                stale,
+                                ..
+                            }) => {
+                                self.ech_configs[slot] = Some(config);
+                                if self.doh.source.is_none() {
+                                    self.doh.source = Some(source);
+                                }
+                                self.doh.stale |= stale;
+                            }
+                            Err(error) => {
+                                self.ech_errors[slot] = Some(format!("{error:#}"));
+                            }
+                        }
+                        // Mark the attempt only after the await: if the race that
+                        // requested this plan is cancelled mid-query, the next plan
+                        // request retries instead of permanently dropping ECH.
+                        self.ech_checked[slot] = true;
+                    }
+                    self.attempt_index += 1;
+                    let Some(config) = self.ech_configs[slot].clone() else {
+                        self.last_reason = Some(FailureReason::EchUnavailable);
+                        self.last_detail = self.ech_errors[slot].clone().or_else(|| {
+                            Some(format!(
+                                "no ECHConfig available ({})",
+                                if ech == EchSource::Shared {
+                                    "own + shared"
+                                } else {
+                                    "own"
+                                }
+                            ))
+                        });
+                        continue;
+                    };
+                    let plan = self.build_plan(candidate, TlsMode::Ech, None, Some(config));
+                    if self.take_skipped(&plan) {
+                        continue;
+                    }
+                    return Some(plan);
                 }
-                return Some(plan);
+                RouteAttempt::Sni { sni: hosts } => {
+                    if self.sni_attempt != Some(self.attempt_index) {
+                        self.sni_candidates = self.sni_candidates_for(&hosts);
+                        self.sni_attempt = Some(self.attempt_index);
+                        self.sni_index = 0;
+                    }
+                    if self.sni_index >= self.sni_candidates.len() {
+                        // The SNI list is exhausted for this candidate; the next
+                        // candidate sweeps the same list again.
+                        self.attempt_index += 1;
+                        continue;
+                    }
+                    let sni = self.sni_candidates[self.sni_index].clone();
+                    self.sni_index += 1;
+                    let plan = self.build_plan(candidate, TlsMode::FakeSni, sni, None);
+                    if self.take_skipped(&plan) {
+                        continue;
+                    }
+                    return Some(plan);
+                }
             }
-
-            self.mode_index += 1;
-            let ech = if mode == TlsMode::Ech {
-                self.ech_config.clone()
-            } else {
-                None
-            };
-            let plan = self.build_plan(candidate, mode, None, ech);
-            if self.take_skipped(&plan) {
-                continue;
-            }
-            return Some(plan);
         }
     }
 
@@ -483,7 +544,7 @@ impl RouteCursor {
             self.engine.cache.put_sni(crate::cache::CachedSni {
                 group: self.group().id.clone(),
                 domain: self.domain.clone(),
-                network_id: network_id(),
+                network_id: self.network.clone(),
                 sni: plan.sni.clone(),
                 saved_at: now(),
             });
@@ -502,7 +563,9 @@ impl RouteCursor {
         self.finished = true;
         let reason = if let Some(reason) = self.last_reason {
             reason
-        } else if self.group().strategy == Strategy::Ech && self.ech_config.is_none() {
+        } else if self.configured_route().contains_mode(TlsMode::Ech)
+            && self.ech_configs.iter().all(Option::is_none)
+        {
             FailureReason::EchUnavailable
         } else if self.doh.error.is_some() {
             FailureReason::DohFailed
@@ -515,7 +578,7 @@ impl RouteCursor {
         if let Some(error) = &self.doh.error {
             detail.push(format!("DoH: {error}"));
         }
-        if let Some(error) = &self.ech_error {
+        for error in self.ech_errors.iter().flatten() {
             detail.push(format!("ECH: {error}"));
         }
         if let Some(error) = &self.last_detail {
@@ -545,6 +608,22 @@ impl RouteCursor {
             plan: None,
             diagnostics,
         });
+    }
+}
+
+fn normalize_sni(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_ascii_lowercase())
+    }
+}
+
+fn ech_slot(source: EchSource) -> usize {
+    match source {
+        EchSource::Own => 0,
+        EchSource::Shared => 1,
     }
 }
 

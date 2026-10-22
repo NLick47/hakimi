@@ -1,4 +1,4 @@
-import { ScrollView, LineEdit, TextEdit } from "std-widgets.slint";
+import { ScrollView } from "std-widgets.slint";
 
 // Desktop-native palette: neutral window, solid surfaces, hairline borders.
 // No gradients, no translucency, small radii.
@@ -8,6 +8,14 @@ export struct DomainEntry {
     status: string,
     status-color: color,
     latency: string,
+}
+
+export struct EditorDomain {
+    pattern: string,
+    route: int,
+    route-label: string,
+    sni: string,
+    custom: string,
 }
 
 export struct SiteEntry {
@@ -23,8 +31,6 @@ export struct SiteEntry {
     first: bool,
     last: bool,
     url: string,
-    strategy: int,
-    sni: string,
     custom: bool,
     domains: [DomainEntry],
 }
@@ -86,6 +92,159 @@ component InlineField inherits Rectangle {
         if !self.focused && root.dirty {
             root.dirty = false;
             root.commit(root.text);
+        }
+    }
+}
+
+/// Light themed text input. The std-widgets LineEdit follows the OS theme and
+/// rendered as a dark block on a light window; every editor field uses this
+/// component instead so contrast and sizing stay predictable.
+component FormInput inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder: "";
+    in property <bool> invalid: false;
+    callback edited(string);
+
+    height: 40px;
+    border-radius: 8px;
+    background: #FFFFFF;
+    border-width: 1px;
+    border-color: input.has-focus ? #0067C0 : (root.invalid ? #C05B5B : #D8DDE3);
+    animate border-color { duration: 120ms; }
+
+    if root.text == "": Text {
+        x: 11px;
+        width: parent.width - 22px;
+        height: parent.height;
+        text: root.placeholder;
+        font-size: 13px;
+        color: #98A1AB;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    input := TextInput {
+        x: 10px;
+        width: parent.width - 20px;
+        height: parent.height - 1px;
+        text <=> root.text;
+        single-line: true;
+        font-size: 14px;
+        color: #1B1F24;
+        vertical-alignment: center;
+        edited => { root.edited(root.text); }
+    }
+}
+
+/// Route dropdown trigger. Shows the current choice plus a chevron so the row
+/// reads as a menu instead of a mysterious click-to-cycle label.
+component RouteSelect inherits Rectangle {
+    in property <string> label;
+    in property <int> current: 0;
+    in property <[string]> model;
+    callback selected(int);
+
+    width: 126px;
+    height: 40px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: popup.is-open ? #0067C0 : (touch.has-hover ? #BFC7CF : #D6DBE0);
+    background: popup.is-open ? #F2F7FC : (touch.has-hover ? #F2F4F6 : #FFFFFF);
+    animate background { duration: 100ms; }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 8px;
+        spacing: 3px;
+
+        Text {
+            text: "线路";
+            font-size: 11px;
+            color: #98A1AB;
+            vertical-alignment: center;
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.label;
+            font-size: 12.5px;
+            color: #1B1F24;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        VerticalLayout {
+            alignment: center;
+            Path {
+                width: 10px;
+                height: 10px;
+                commands: popup.is-open ? "M 2.2 3.8 L 5.4 6.8 L 8.6 3.8" : "M 2.4 4 L 5 6.6 L 7.6 4";
+                stroke: #5C6670;
+                stroke-width: 1.4px;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { popup.show(); }
+    }
+
+    popup := PopupWindow {
+        x: root.width - 172px;
+        y: root.height + 6px;
+        width: 172px;
+        height: root.model.length * 32px + 8px;
+        close-policy: close-on-click-outside;
+
+        Rectangle {
+            border-radius: 8px;
+            background: #FFFFFF;
+            border-width: 1px;
+            border-color: #D6DBE0;
+            drop-shadow-blur: 18px;
+            drop-shadow-color: rgba(15, 18, 22, 0.18);
+            drop-shadow-offset-y: 6px;
+
+            VerticalLayout {
+                padding: 4px;
+                spacing: 0px;
+
+                for option[k] in root.model: Rectangle {
+                    height: 32px;
+                    border-radius: 5px;
+                    background: k == root.current ? #EDF3FA : (option-touch.has-hover ? #F2F4F6 : transparent);
+                    animate background { duration: 100ms; }
+
+                    Text {
+                        x: 10px;
+                        width: parent.width - 36px;
+                        text: option;
+                        font-size: 12.5px;
+                        color: k == root.current ? #0067C0 : #1B1F24;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    if k == root.current: Path {
+                        width: 10px;
+                        height: 10px;
+                        x: parent.width - 22px;
+                        y: (parent.height - self.height) / 2;
+                        commands: "M 1.5 5.2 L 4 7.6 L 8.6 2.4";
+                        stroke: #0067C0;
+                        stroke-width: 1.6px;
+                        stroke-line-cap: round;
+                        stroke-line-join: round;
+                    }
+
+                    option-touch := TouchArea {
+                        clicked => {
+                            root.selected(k);
+                            popup.close();
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -518,24 +677,6 @@ component InfoRow inherits Rectangle {
 
 // -- site editor -------------------------------------------------------------
 
-component StrategyChip inherits Rectangle {
-    in property <int> kind: 0;
-
-    width: label.preferred-width + 12px;
-    height: 17px;
-    border-radius: 4px;
-    background: kind == 2 ? #E8F1FA : (kind == 3 ? #F3EFFA : #F0F2F4);
-
-    label := Text {
-        text: kind == 2 ? "ECH" : (kind == 3 ? "SNI" : "直连");
-        font-size: 10px;
-        font-weight: 600;
-        color: kind == 2 ? #0067C0 : (kind == 3 ? #6E56A8 : #6B7480);
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-    }
-}
-
 component ChoicePill inherits Rectangle {
     in property <string> label;
     in property <bool> active: false;
@@ -613,15 +754,23 @@ export component AppWindow inherits Window {
     in-out property <bool> editor-open: false;
     in-out property <string> editor-id;
     in-out property <string> editor-name;
-    in-out property <string> editor-domains;
+    in-out property <[EditorDomain]> editor-domain-rows;
     in-out property <string> editor-homepage;
-    in-out property <int> editor-strategy: 0;
-    in-out property <string> editor-sni;
+    in-out property <int> editor-default-preset: 0;
+    in-out property <string> editor-default-custom;
+    in property <[string]> domain-route-presets: ["继承默认", "直连", "ECH", "SNI 伪装", "自定义"];
     in property <string> editor-error;
     in property <string> sites-summary;
     in-out property <bool> sites-expanded: false;
     in property <bool> editor-is-new: true;
     in property <bool> editor-deletable: false;
+
+    callback editor-add-domain();
+    callback editor-remove-domain(int);
+    callback editor-domain-pattern(int, string);
+    callback editor-set-domain-route(int, int);
+    callback editor-domain-sni(int, string);
+    callback editor-domain-custom(int, string);
 
     callback toggle-master();
     callback open-fix();
@@ -1285,21 +1434,32 @@ export component AppWindow inherits Window {
                                 HorizontalLayout {
                                     padding-left: 16px;
                                     padding-right: 14px;
-                                    spacing: 10px;
+                                    spacing: 8px;
 
-                                    Text {
-                                        text: "站点管理";
-                                        font-size: 13px;
-                                        color: #1B1F24;
-                                        vertical-alignment: center;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Text {
+                                            text: "站点管理";
+                                            font-size: 13.5px;
+                                            color: #3B434C;
+                                        }
                                     }
-                                    Text {
-                                        horizontal-stretch: 1;
-                                        text: root.sites-summary;
-                                        font-size: 11.5px;
-                                        color: #6B7480;
-                                        horizontal-alignment: right;
-                                        vertical-alignment: center;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Text {
+                                            text: root.sites-summary;
+                                            font-size: 12px;
+                                            color: #6B7480;
+                                        }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        PillButton {
+                                            label: "+ 添加站点";
+                                            min-width: 86px;
+                                            clicked => { root.open-editor(""); }
+                                        }
                                     }
                                     VerticalLayout {
                                         alignment: center;
@@ -1339,73 +1499,50 @@ export component AppWindow inherits Window {
                                     }
 
                                     Rectangle {
-                                        height: 44px;
+                                        height: 48px;
+                                        background: site-touch.has-hover ? #F7F8F9 : transparent;
+                                        animate background { duration: 100ms; }
+
+                                        site-touch := TouchArea {
+                                            clicked => { root.open-editor(site.id); }
+                                        }
 
                                         HorizontalLayout {
                                             padding-left: 16px;
-                                            padding-right: 8px;
-                                            spacing: 8px;
+                                            padding-right: 14px;
+                                            spacing: 10px;
 
                                             VerticalLayout {
                                                 alignment: center;
                                                 SiteBadge {
+                                                    badge: 24px;
                                                     icon: site.icon;
                                                     initial: site.initial;
                                                     tile-color: site.tile-color;
                                                 }
                                             }
-                                            Text {
-                                                text: site.name;
-                                                font-size: 13px;
-                                                color: site.enabled ? #1B1F24 : #6B7480;
-                                                vertical-alignment: center;
+                                            VerticalLayout {
+                                                horizontal-stretch: 1;
+                                                alignment: center;
+                                                spacing: 1px;
+
+                                                Text {
+                                                    text: site.name;
+                                                    font-size: 13.5px;
+                                                    font-weight: 500;
+                                                    color: site.enabled ? #1B1F24 : #6B7480;
+                                                }
+                                                Text {
+                                                    text: site.summary;
+                                                    font-size: 11.5px;
+                                                    color: site.summary-color;
+                                                    overflow: elide;
+                                                }
                                             }
                                             VerticalLayout {
                                                 alignment: center;
-                                                if site.strategy == 2 || site.strategy == 3: StrategyChip { kind: site.strategy; }
+                                                Chevron { open: false; }
                                             }
-                                            Rectangle { horizontal-stretch: 1; }
-                                            Text {
-                                                text: site.sni;
-                                                font-size: 11px;
-                                                font-family: "Menlo";
-                                                color: #98A1AB;
-                                                vertical-alignment: center;
-                                                overflow: elide;
-                                            }
-                                            TextButton {
-                                                label: "编辑";
-                                                min-width: 44px;
-                                                clicked => { root.open-editor(site.id); }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                Rectangle {
-                                    height: 1px;
-                                    background: transparent;
-
-                                    Rectangle {
-                                        x: 16px;
-                                        width: parent.width - 32px;
-                                        height: 1px;
-                                        background: #ECEEF0;
-                                    }
-                                }
-
-                                Rectangle {
-                                    height: 44px;
-
-                                    HorizontalLayout {
-                                        padding-left: 8px;
-                                        padding-right: 8px;
-
-                                        TextButton {
-                                            label: "+ 添加站点";
-                                            accent: true;
-                                            min-width: 92px;
-                                            clicked => { root.open-editor(""); }
                                         }
                                     }
                                 }
@@ -1702,144 +1839,246 @@ export component AppWindow inherits Window {
         TouchArea { }
 
         card := Rectangle {
-            width: 428px;
-            height: body.preferred-height;
+            width: 560px;
+            height: parent.height - 40px > 620px ? 620px : parent.height - 40px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             background: #FFFFFF;
-            border-radius: 10px;
+            border-radius: 12px;
             border-width: 1px;
             border-color: #DDE2E7;
             drop-shadow-blur: 28px;
             drop-shadow-color: rgba(15, 18, 22, 0.22);
             drop-shadow-offset-y: 10px;
 
-            body := VerticalLayout {
-                padding: 20px;
-                spacing: 12px;
+            VerticalLayout {
+                body := ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        padding: 24px;
+                        spacing: 14px;
+
+                        Text {
+                            text: root.editor-is-new ? "添加站点" : "编辑站点";
+                            font-size: 19px;
+                            font-weight: 600;
+                            color: #1B1F24;
+                        }
 
                 Text {
-                    text: root.editor-is-new ? "添加站点" : "编辑站点";
-                    font-size: 15px;
+                    text: "名称与访问地址";
+                    font-size: 12.5px;
                     font-weight: 600;
-                    color: #1B1F24;
+                    color: #4B5563;
                 }
 
                 VerticalLayout {
-                    spacing: 5px;
+                    spacing: 6px;
                     Text {
                         text: "名称";
-                        font-size: 11px;
-                        color: #6B7480;
-                    }
-                    LineEdit {
-                        text <=> root.editor-name;
-                        placeholder-text: "例如 Pixiv";
-                    }
-                }
-
-                VerticalLayout {
-                    spacing: 5px;
-                    Text {
-                        text: "域名";
-                        font-size: 11px;
-                        color: #6B7480;
-                    }
-                    TextEdit {
-                        text <=> root.editor-domains;
-                        height: 72px;
-                        wrap: word-wrap;
                         font-size: 12px;
-                        placeholder-text: "每行一个，可粘贴网址，例如 www.example.com";
+                        color: #4B5563;
                     }
-                }
-
-                VerticalLayout {
-                    spacing: 5px;
-                    Text {
-                        text: "访问地址（可选）";
-                        font-size: 11px;
-                        color: #6B7480;
-                    }
-                    LineEdit {
-                        text <=> root.editor-homepage;
-                        placeholder-text: "例如 https://www.example.com/，留空使用第一个域名";
+                    FormInput {
+                        text <=> root.editor-name;
+                        placeholder: "例如 Pixiv";
                     }
                 }
 
                 VerticalLayout {
                     spacing: 6px;
                     Text {
-                        text: "策略";
-                        font-size: 11px;
-                        color: #6B7480;
+                        text: "访问地址（可选）";
+                        font-size: 12px;
+                        color: #4B5563;
                     }
-                    HorizontalLayout {
-                        spacing: 6px;
-                        ChoicePill {
-                            label: "自动";
-                            horizontal-stretch: 1;
-                            active: root.editor-strategy == 0;
-                            clicked => { root.editor-strategy = 0; }
-                        }
-                        ChoicePill {
-                            label: "ECH";
-                            horizontal-stretch: 1;
-                            active: root.editor-strategy == 2;
-                            clicked => { root.editor-strategy = 2; }
-                        }
-                        ChoicePill {
-                            label: "SNI 修改";
-                            horizontal-stretch: 1;
-                            active: root.editor-strategy == 3;
-                            clicked => { root.editor-strategy = 3; }
-                        }
+                    FormInput {
+                        text <=> root.editor-homepage;
+                        placeholder: "例如 https://www.example.com/，留空使用第一个域名";
                     }
                 }
 
-                if root.editor-strategy == 3: VerticalLayout {
-                    spacing: 5px;
-                    Text {
-                        text: "SNI 主机（可选）";
-                        font-size: 11px;
-                        color: #6B7480;
-                    }
-                    LineEdit {
-                        text <=> root.editor-sni;
-                        placeholder-text: "留空则不发送 SNI";
-                    }
+                Text {
+                    text: "域名与线路";
+                    font-size: 12.5px;
+                    font-weight: 600;
+                    color: #4B5563;
                 }
-
-                if root.editor-error != "": Text {
-                    text: root.editor-error;
-                    font-size: 11px;
-                    color: #C0392B;
+                Text {
+                    text: "每个域名单独选择线路。点击右侧的线路选择器即可切换，不需要手写线路语法。";
+                    font-size: 11.5px;
+                    color: #6B7480;
                     wrap: word-wrap;
                 }
 
-                HorizontalLayout {
-                    spacing: 8px;
+                VerticalLayout {
+                    spacing: 10px;
+                    for row[i] in root.editor-domain-rows: VerticalLayout {
+                        spacing: 6px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            FormInput {
+                                horizontal-stretch: 1;
+                                text: row.pattern;
+                                placeholder: "example.com 或 *.example.com";
+                                edited(text) => { root.editor-domain-pattern(i, text); }
+                            }
+                            RouteSelect {
+                                label: row.route-label;
+                                current: row.route;
+                                model: root.domain-route-presets;
+                                selected(index) => {
+                                    root.editor-set-domain-route(i, index);
+                                }
+                            }
+                            if root.editor-domain-rows.length > 1: VerticalLayout {
+                                alignment: center;
+                                TextButton {
+                                    label: "移除";
+                                    min-width: 44px;
+                                    clicked => {
+                                        root.editor-remove-domain(i);
+                                    }
+                                }
+                            }
+                        }
+                        if row.route == 3: VerticalLayout {
+                            spacing: 4px;
+                            Text {
+                                text: "伪装 SNI 主机";
+                                font-size: 11.5px;
+                                color: #6B7480;
+                            }
+                            FormInput {
+                                text: row.sni;
+                                placeholder: "多个用逗号分隔；留空使用默认候选";
+                                edited(text) => { root.editor-domain-sni(i, text); }
+                            }
+                        }
+                        if row.route == 4: VerticalLayout {
+                            spacing: 4px;
+                            Text {
+                                text: "自定义线路";
+                                font-size: 11.5px;
+                                color: #6B7480;
+                            }
+                            FormInput {
+                                text: row.custom;
+                                placeholder: "例如 ech+direct";
+                                edited(text) => { root.editor-domain-custom(i, text); }
+                            }
+                        }
+                    }
+                }
 
-                    if root.editor-deletable: PillButton {
-                        label: "删除站点";
-                        tone: 1;
-                        clicked => { root.delete-site(root.editor-id); }
+                TextButton {
+                    label: "+ 添加域名";
+                    accent: true;
+                    min-width: 100px;
+                    clicked => {
+                        root.editor-add-domain();
                     }
-                    Rectangle { horizontal-stretch: 1; }
-                    TextButton {
-                        label: "取消";
-                        min-width: 52px;
-                        clicked => { root.close-editor(); }
+                }
+
+                Text {
+                    text: "站点默认线路";
+                    font-size: 12.5px;
+                    font-weight: 600;
+                    color: #4B5563;
+                }
+                Text {
+                    text: "没有单独设置线路的域名会使用它。";
+                    font-size: 11.5px;
+                    color: #6B7480;
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    ChoicePill {
+                        label: "自动";
+                        horizontal-stretch: 1;
+                        active: root.editor-default-preset == 0;
+                        clicked => { root.editor-default-preset = 0; }
                     }
-                    ActionButton {
-                        label: "保存";
-                        clicked => { root.save-editor(); }
+                    ChoicePill {
+                        label: "直连";
+                        horizontal-stretch: 1;
+                        active: root.editor-default-preset == 1;
+                        clicked => { root.editor-default-preset = 1; }
+                    }
+                    ChoicePill {
+                        label: "ECH";
+                        horizontal-stretch: 1;
+                        active: root.editor-default-preset == 2;
+                        clicked => { root.editor-default-preset = 2; }
+                    }
+                    ChoicePill {
+                        label: "SNI 伪装";
+                        horizontal-stretch: 1;
+                        active: root.editor-default-preset == 3;
+                        clicked => { root.editor-default-preset = 3; }
+                    }
+                    ChoicePill {
+                        label: "自定义";
+                        horizontal-stretch: 1;
+                        active: root.editor-default-preset == 4;
+                        clicked => { root.editor-default-preset = 4; }
+                    }
+                }
+
+                if root.editor-default-preset == 4: VerticalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: "自定义默认线路（高级）";
+                        font-size: 12px;
+                        color: #4B5563;
+                    }
+                    FormInput {
+                        text <=> root.editor-default-custom;
+                        placeholder: "例如 ech+direct 或 sni:www.baidu.com+direct";
+                    }
+                }
+                    }
+                }
+
+                Rectangle { height: 1px; background: #ECEEF0; }
+
+                VerticalLayout {
+                    padding-left: 24px;
+                    padding-right: 24px;
+                    padding-top: 12px;
+                    padding-bottom: 16px;
+                    spacing: 10px;
+
+                    if root.editor-error != "": Text {
+                        text: root.editor-error;
+                        font-size: 12px;
+                        color: #C0392B;
+                        wrap: word-wrap;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+
+                        if root.editor-deletable: PillButton {
+                            label: "删除站点";
+                            tone: 1;
+                            clicked => { root.delete-site(root.editor-id); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        TextButton {
+                            label: "取消";
+                            min-width: 52px;
+                            clicked => { root.close-editor(); }
+                        }
+                        ActionButton {
+                            label: "保存";
+                            clicked => { root.save-editor(); }
+                        }
                     }
                 }
             }
         }
     }
-
 }
 
 // System tray: Slint requires the tray to be the root of an exported component

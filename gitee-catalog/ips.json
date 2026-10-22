@@ -12,7 +12,9 @@
       "raw.githubusercontent.com",
       "*.githubusercontent.com",
       "githubassets.com",
-      "*.githubassets.com"
+      "*.githubassets.com",
+      "codeload.github.com",
+      "gist.github.com"
     ],
     "pixiv": [
       "pixiv.net",
@@ -30,7 +32,8 @@
       "steamcommunity.com",
       "*.steamcommunity.com",
       "*.steampowered.com",
-      "*.steamstatic.com"
+      "*.steamstatic.com",
+      "steamcdn-a.akamaihd.net"
     ],
     "eh": [
       "e-hentai.org",
@@ -302,12 +305,5 @@
       "188.114.96.3",
       "188.114.97.3"
     ]
-  },
-  "sni": {
-    "ao3": "",
-    "github": "",
-    "pixiv": "",
-    "poipiku": "",
-    "steam": ""
   }
 }

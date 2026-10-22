@@ -4,8 +4,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use hakimi_core::cache::CacheStats;
+use hakimi_core::config::RoutePolicy;
 use hakimi_core::runtime::HakimiRuntime;
-use hakimi_core::strategy::Strategy;
 use serde_json::Value;
 
 #[derive(Parser)]
@@ -113,26 +113,27 @@ enum GroupCommand {
         id: String,
         #[arg(long)]
         enabled: Option<bool>,
+        /// Replace the group's default route preset.
         #[arg(long, value_enum)]
-        strategy: Option<StrategyArg>,
+        route: Option<RoutePresetArg>,
     },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
-enum StrategyArg {
+enum RoutePresetArg {
     Auto,
     Direct,
     Ech,
     Sni,
 }
 
-impl From<StrategyArg> for Strategy {
-    fn from(value: StrategyArg) -> Self {
+impl From<RoutePresetArg> for RoutePolicy {
+    fn from(value: RoutePresetArg) -> Self {
         match value {
-            StrategyArg::Auto => Strategy::Auto,
-            StrategyArg::Direct => Strategy::Direct,
-            StrategyArg::Ech => Strategy::Ech,
-            StrategyArg::Sni => Strategy::FakeSni,
+            RoutePresetArg::Auto => RoutePolicy::auto(),
+            RoutePresetArg::Direct => RoutePolicy::direct(),
+            RoutePresetArg::Ech => RoutePolicy::ech_shared(),
+            RoutePresetArg::Sni => RoutePolicy::sni(Vec::new()),
         }
     }
 }
@@ -286,29 +287,30 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&config.groups)?);
             } else {
                 for group in &config.groups {
+                    let modes: Vec<&str> = group
+                        .default_route
+                        .attempts
+                        .iter()
+                        .map(|attempt| attempt.mode().as_str())
+                        .collect();
                     println!(
-                        "{:<10} {:<20} strategy={:<6} enabled={:<5} experimental={} domains={}",
+                        "{:<10} {:<20} default={:<20} enabled={:<5} domains={}",
                         group.id,
                         group.name,
-                        group.strategy.as_str(),
+                        modes.join(">"),
                         group.enabled,
-                        group.experimental,
                         group.domains.len()
                     );
                 }
             }
         }
         Command::Group { command } => match command {
-            GroupCommand::Set {
-                id,
-                enabled,
-                strategy,
-            } => {
+            GroupCommand::Set { id, enabled, route } => {
                 if let Some(enabled) = enabled {
                     runtime.set_group_enabled(&id, enabled)?;
                 }
-                if let Some(strategy) = strategy {
-                    runtime.set_group_strategy(&id, strategy.into())?;
+                if let Some(route) = route {
+                    runtime.set_group_default_route(&id, route.into())?;
                 }
                 let group = runtime
                     .config()

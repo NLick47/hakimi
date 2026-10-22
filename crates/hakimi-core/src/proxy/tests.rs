@@ -7,13 +7,13 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::cache::{CacheManager, LastGoodEntry};
 use crate::catalog::RemoteIpProvider;
-use crate::config::{ConfigManager, GroupConfig};
+use crate::config::{ConfigManager, DomainRule, GroupConfig, RoutePolicy};
 use crate::decision::{DecisionEngine, Route};
 use crate::ip_tester::TlsContext;
 use crate::paths::Paths;
 use crate::resolver::{DohResolution, EchOutcome, IpResolver};
 use crate::status::StatusStore;
-use crate::strategy::{IpSource, Strategy, TlsMode};
+use crate::strategy::{IpSource, TlsMode};
 use crate::util::now;
 
 use super::connect::{
@@ -110,10 +110,6 @@ impl RemoteIpProvider for FakeRemote {
         Some(self.ips.clone())
     }
 
-    fn remote_sni(&self, _group_id: &str) -> Option<String> {
-        None
-    }
-
     fn has_ip_catalog(&self) -> bool {
         true
     }
@@ -161,9 +157,8 @@ impl IpResolver for SlowEchResolver {
 
 fn engine_for_test(
     dir: &std::path::Path,
-    strategy: Strategy,
+    route: RoutePolicy,
     cached_ip: IpAddr,
-    last_good_strategy: Strategy,
     remote_ips: Vec<IpAddr>,
     resolver: Arc<dyn IpResolver>,
 ) -> Arc<DecisionEngine> {
@@ -174,20 +169,16 @@ fn engine_for_test(
         .upsert_group(GroupConfig {
             id: "test".into(),
             name: "Test".into(),
-            domains: vec!["upstream.test".into()],
-            strategy,
+            domains: vec![DomainRule::new("upstream.test")],
             enabled: true,
-            sni: None,
-            experimental: false,
             homepage: None,
-            ech_shared: false,
+            default_route: route,
         })
         .unwrap();
     let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
     cache.put_last_good(LastGoodEntry {
         domain: "upstream.test".into(),
         ip: cached_ip,
-        strategy: last_good_strategy,
         source: IpSource::Cache,
         network_id: "test".into(),
         saved_at: now(),
@@ -212,9 +203,8 @@ fn engine_for_direct_test(
 ) -> Arc<DecisionEngine> {
     engine_for_test(
         dir,
-        Strategy::Direct,
+        RoutePolicy::direct(),
         cached_ip,
-        Strategy::Direct,
         remote_ips,
         Arc::new(FakeResolver),
     )
@@ -325,9 +315,8 @@ async fn raw_tunnel_never_waits_for_ech() {
     let resolver = Arc::new(SlowEchResolver::default());
     let engine = engine_for_test(
         dir.path(),
-        Strategy::Auto,
+        RoutePolicy::auto(),
         "192.0.2.1".parse().unwrap(),
-        Strategy::Ech,
         vec!["198.51.100.1".parse().unwrap()],
         resolver.clone(),
     );
@@ -421,10 +410,24 @@ async fn tunnel_address_race_honors_the_deadline() {
 /// certificate instead of the local one.
 #[test]
 fn only_direct_groups_may_use_the_cached_direct_tunnel() {
-    assert!(may_tunnel_directly(Strategy::Direct, TlsMode::Direct));
-    assert!(!may_tunnel_directly(Strategy::Auto, TlsMode::Direct));
-    assert!(!may_tunnel_directly(Strategy::Ech, TlsMode::Direct));
-    assert!(!may_tunnel_directly(Strategy::FakeSni, TlsMode::Direct));
-    assert!(!may_tunnel_directly(Strategy::Direct, TlsMode::FakeSni));
-    assert!(!may_tunnel_directly(Strategy::Direct, TlsMode::Ech));
+    assert!(may_tunnel_directly(
+        RoutePolicy::direct().is_direct_only(),
+        TlsMode::Direct
+    ));
+    assert!(!may_tunnel_directly(
+        RoutePolicy::auto().is_direct_only(),
+        TlsMode::Direct
+    ));
+    assert!(!may_tunnel_directly(
+        RoutePolicy::sni(Vec::new()).is_direct_only(),
+        TlsMode::Direct
+    ));
+    assert!(!may_tunnel_directly(
+        RoutePolicy::direct().is_direct_only(),
+        TlsMode::FakeSni
+    ));
+    assert!(!may_tunnel_directly(
+        RoutePolicy::direct().is_direct_only(),
+        TlsMode::Ech
+    ));
 }

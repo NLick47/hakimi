@@ -1,59 +1,118 @@
 use super::*;
 use crate::ui_state::{BAD_COLOR, IDLE_COLOR, OK_COLOR, SLOW_COLOR};
+use hakimi_core::config::{DomainRule, RouteAttempt, RoutePolicy};
 
-fn draft(domains: &str, strategy: Strategy, sni: &str) -> SiteDraft {
+fn domains(patterns: &[&str]) -> serde_json::Value {
+    serde_json::Value::Array(
+        patterns
+            .iter()
+            .map(|pattern| serde_json::json!({ "pattern": pattern }))
+            .collect(),
+    )
+}
+
+fn row(pattern: &str, preset: i32) -> DomainDraft {
+    DomainDraft {
+        pattern: pattern.into(),
+        preset,
+        sni: String::new(),
+        custom: String::new(),
+    }
+}
+
+fn row_with_sni(pattern: &str, sni: &str) -> DomainDraft {
+    DomainDraft {
+        pattern: pattern.into(),
+        preset: 3,
+        sni: sni.into(),
+        custom: String::new(),
+    }
+}
+
+fn draft(rows: Vec<DomainDraft>, preset: i32) -> SiteDraft {
     SiteDraft {
         id: String::new(),
         is_new: true,
         name: String::new(),
-        domains: domains.into(),
+        domains: rows,
         homepage: String::new(),
-        strategy,
-        sni: sni.into(),
+        default_preset: preset,
+        default_custom: String::new(),
     }
 }
 
 #[test]
 fn new_site_gets_a_config_safe_id() {
     let config = AppConfig::default();
-    let group = build_group(&config, &draft("www.example.com", Strategy::Auto, "")).unwrap();
+    let group = build_group(&config, &draft(vec![row("www.example.com", 0)], 0)).unwrap();
     assert_eq!(group.id, "www-example-com");
     assert_eq!(group.name, "www.example.com");
     assert!(group.enabled);
-    assert_eq!(group.sni, None);
+    assert_eq!(group.default_route, RoutePolicy::auto());
+    assert_eq!(group.domains.len(), 1);
+    assert_eq!(group.domains[0].pattern, "www.example.com");
+    assert!(group.domains[0].route.is_none());
 }
 
 #[test]
-fn empty_sni_is_preserved_for_fake_sni() {
+fn domain_rows_can_override_ech_and_sni() {
     let config = AppConfig::default();
-    let group = build_group(&config, &draft("example.com", Strategy::FakeSni, " ")).unwrap();
-    assert_eq!(group.sni.as_deref(), Some(""));
+    let group = build_group(
+        &config,
+        &draft(
+            vec![
+                row("www.example.com", 2),
+                row_with_sni("*.cdn.example.com", "www.baidu.com"),
+                row("example.com", 0),
+            ],
+            0,
+        ),
+    )
+    .unwrap();
+    assert_eq!(group.domains[0].pattern, "www.example.com");
+    assert_eq!(
+        group.domains[0].route.as_ref().unwrap().attempts[0].mode(),
+        hakimi_core::strategy::TlsMode::Ech
+    );
+    assert_eq!(
+        group.domains[1].route.as_ref().unwrap().attempts[0].mode(),
+        hakimi_core::strategy::TlsMode::FakeSni
+    );
+    assert!(group.domains[2].route.is_none());
 }
 
 #[test]
-fn sni_is_dropped_for_other_strategies() {
+fn default_route_presets_and_custom_specs_round_trip() {
     let config = AppConfig::default();
-    let group = build_group(&config, &draft("example.com", Strategy::Ech, "")).unwrap();
-    assert_eq!(group.sni, None);
+    let group = build_group(&config, &draft(vec![row("example.com", 0)], 2)).unwrap();
+    assert_eq!(group.default_route, RoutePolicy::ech_shared());
+
+    let mut custom = draft(vec![row("example.com", 0)], 4);
+    custom.default_custom = "sni:WWW.Baidu.COM+direct".into();
+    let group = build_group(&config, &custom).unwrap();
+    assert_eq!(
+        group.default_route,
+        RoutePolicy::sni(vec!["www.baidu.com".into()])
+    );
 }
 
 #[test]
 fn rejects_domains_without_an_exact_entry() {
     let config = AppConfig::default();
-    assert!(build_group(&config, &draft("*.example.com", Strategy::Auto, "")).is_err());
+    assert!(build_group(&config, &draft(vec![row("*.example.com", 0)], 0)).is_err());
 }
 
 #[test]
 fn rejects_domains_owned_by_another_group() {
     let config = AppConfig::default();
-    let error = build_group(&config, &draft("github.com", Strategy::Auto, "")).unwrap_err();
+    let error = build_group(&config, &draft(vec![row("github.com", 0)], 0)).unwrap_err();
     assert!(format!("{error:#}").contains("GitHub"));
 }
 
 #[test]
 fn rejects_malformed_domains() {
     let config = AppConfig::default();
-    assert!(build_group(&config, &draft("example..com", Strategy::Auto, "")).is_err());
+    assert!(build_group(&config, &draft(vec![row("example..com", 0)], 0)).is_err());
 }
 
 #[test]
@@ -80,7 +139,7 @@ fn ca_actions_are_judged_by_the_resulting_trust_state() {
 fn probe_sweep_phases_drive_the_display() {
     let config = serde_json::json!({
         "groups": [
-            { "id": "flip", "name": "Flip", "enabled": true, "domains": ["flip.example"] }
+            { "id": "flip", "name": "Flip", "enabled": true, "domains": domains(&["flip.example"]) }
         ]
     });
 
@@ -137,22 +196,22 @@ fn icon_keys_match_whole_ids_and_slugs_only() {
     assert_eq!(icon_key_for("hanime"), "hanime");
 }
 
-fn draft_with(id: &str, is_new: bool, domains: &str, strategy: Strategy, sni: &str) -> SiteDraft {
+fn draft_with(id: &str, is_new: bool, rows: Vec<DomainDraft>, preset: i32) -> SiteDraft {
     SiteDraft {
         id: id.into(),
         is_new,
         name: String::new(),
-        domains: domains.into(),
+        domains: rows,
         homepage: String::new(),
-        strategy,
-        sni: sni.into(),
+        default_preset: preset,
+        default_custom: String::new(),
     }
 }
 
 #[test]
 fn new_site_homepage_is_normalized_and_optional() {
     let config = AppConfig::default();
-    let mut site = draft("www.example.com", Strategy::Auto, "");
+    let mut site = draft(vec![row("www.example.com", 0)], 0);
 
     // Blank means "use the first exact domain" at render time.
     assert_eq!(build_group(&config, &site).unwrap().homepage, None);
@@ -174,29 +233,31 @@ fn new_site_homepage_is_normalized_and_optional() {
 }
 
 #[test]
-fn editing_a_site_keeps_its_id_and_shared_flags() {
-    let mut config = AppConfig::default();
-    let mut existing = config.group("pixiv").unwrap().clone();
-    existing.ech_shared = true;
-    existing.experimental = true;
-    config.groups = vec![existing];
+fn editing_a_site_keeps_its_id_and_per_domain_routes() {
+    let config = AppConfig::default();
 
     let group = build_group(
         &config,
         &draft_with(
             "pixiv",
             false,
-            "pixiv.net\nwww.pixiv.net",
-            Strategy::FakeSni,
-            "",
+            vec![
+                row("pixiv.net", 2),
+                row("www.pixiv.net", 2),
+                row_with_sni("*.pximg.net", "www.baidu.com"),
+            ],
+            0,
         ),
     )
     .unwrap();
 
     assert_eq!(group.id, "pixiv");
-    assert!(group.ech_shared, "editing must not drop echShared");
-    assert!(group.experimental, "editing must not drop experimental");
-    assert_eq!(group.domains, vec!["pixiv.net", "www.pixiv.net"]);
+    assert_eq!(group.default_route, RoutePolicy::auto());
+    assert_eq!(group.domains.len(), 3);
+    assert_eq!(
+        group.domains[2].route.as_ref().unwrap().attempts[0].mode(),
+        hakimi_core::strategy::TlsMode::FakeSni
+    );
 }
 
 #[test]
@@ -204,40 +265,23 @@ fn generated_ids_avoid_existing_groups() {
     let mut config = AppConfig::default();
     let mut taken = config.group("pixiv").unwrap().clone();
     taken.id = "example-com".into();
-    taken.domains = vec!["other.example".into()];
+    taken.domains = vec![DomainRule::new("other.example")];
     config.groups.push(taken);
 
-    let group = build_group(&config, &draft("example.com", Strategy::Auto, "")).unwrap();
+    let group = build_group(&config, &draft(vec![row("example.com", 0)], 0)).unwrap();
     assert_eq!(group.id, "example-com-2");
 }
 
 #[test]
-fn domains_accept_commas_and_whitespace() {
+fn domain_rows_are_lowercased_and_deduped() {
     let config = AppConfig::default();
     let group = build_group(
         &config,
-        &draft(
-            "a.example, b.example，c.example\nd.example",
-            Strategy::Auto,
-            "",
-        ),
+        &draft(vec![row("Example.COM", 0), row("example.com", 0)], 0),
     )
     .unwrap();
-    assert_eq!(
-        group.domains,
-        vec!["a.example", "b.example", "c.example", "d.example"]
-    );
-}
-
-#[test]
-fn domains_are_lowercased_and_deduped() {
-    let config = AppConfig::default();
-    let group = build_group(
-        &config,
-        &draft("Example.COM example.com", Strategy::Auto, ""),
-    )
-    .unwrap();
-    assert_eq!(group.domains, vec!["example.com"]);
+    assert_eq!(group.domains.len(), 1);
+    assert_eq!(group.domains[0].pattern, "example.com");
     assert_eq!(
         group.name, "example.com",
         "name falls back to the first domain"
@@ -249,10 +293,16 @@ fn sni_hostnames_are_normalized() {
     let config = AppConfig::default();
     let group = build_group(
         &config,
-        &draft("example.com", Strategy::FakeSni, "  WWW.Baidu.COM "),
+        &draft(vec![row_with_sni("example.com", "WWW.Baidu.COM")], 0),
     )
     .unwrap();
-    assert_eq!(group.sni.as_deref(), Some("www.baidu.com"));
+    let route = group.domains[0].route.as_ref().unwrap();
+    assert_eq!(
+        route.attempts[0],
+        RouteAttempt::Sni {
+            sni: vec!["www.baidu.com".into()]
+        }
+    );
 }
 
 #[test]
@@ -260,7 +310,7 @@ fn rejects_malformed_sni() {
     let config = AppConfig::default();
     assert!(build_group(
         &config,
-        &draft("example.com", Strategy::FakeSni, "not a host")
+        &draft(vec![row_with_sni("example.com", "not a host")], 0)
     )
     .is_err());
 }
@@ -271,13 +321,22 @@ fn pasted_urls_contribute_their_host() {
     let group = build_group(
         &config,
         &draft(
-            "https://www.example.com/en/\nHTTPS://cdn.example.net:8443/x?q=1",
-            Strategy::Auto,
-            "",
+            vec![
+                row("https://www.example.com/en/", 0),
+                row("HTTPS://cdn.example.net:8443/x?q=1", 0),
+            ],
+            0,
         ),
     )
     .unwrap();
-    assert_eq!(group.domains, vec!["www.example.com", "cdn.example.net"]);
+    assert_eq!(
+        group
+            .domains
+            .iter()
+            .map(|rule| rule.pattern.as_str())
+            .collect::<Vec<_>>(),
+        vec!["www.example.com", "cdn.example.net"]
+    );
     assert_eq!(group.name, "www.example.com");
 }
 
@@ -285,7 +344,7 @@ fn pasted_urls_contribute_their_host() {
 fn urls_without_a_usable_host_are_rejected() {
     let config = AppConfig::default();
     for input in ["https://", "https:///path", "://example.com"] {
-        let error = build_group(&config, &draft(input, Strategy::Auto, "")).unwrap_err();
+        let error = build_group(&config, &draft(vec![row(input, 0)], 0)).unwrap_err();
         assert!(
             format!("{error:#}").contains("网址"),
             "{input} should read as a URL problem: {error:#}"
@@ -296,38 +355,33 @@ fn urls_without_a_usable_host_are_rejected() {
 #[test]
 fn rejects_an_empty_domain_list() {
     let config = AppConfig::default();
-    assert!(build_group(&config, &draft(" ,  , ", Strategy::Auto, "")).is_err());
+    assert!(build_group(&config, &draft(Vec::new(), 0)).is_err());
+    assert!(build_group(&config, &draft(vec![row("  ", 0)], 0)).is_err());
 }
 
 #[test]
-fn strategies_round_trip_through_the_editor() {
-    assert_eq!(
-        strategy_from_index(editor_strategy_index(Strategy::Auto)),
-        Strategy::Auto
-    );
-    assert_eq!(
-        strategy_from_index(editor_strategy_index(Strategy::Ech)),
-        Strategy::Ech
-    );
-    assert_eq!(
-        strategy_from_index(editor_strategy_index(Strategy::FakeSni)),
-        Strategy::FakeSni
-    );
-    // Direct is intentionally shown as Auto: auto already tries direct first.
-    assert_eq!(editor_strategy_index(Strategy::Direct), 0);
+fn route_presets_round_trip_through_the_editor() {
+    for preset in 0..=3 {
+        let route = route_from_preset(preset).unwrap();
+        assert_eq!(route_preset_index(&route), preset);
+        assert_eq!(parse_route(&format_route(&route)).unwrap(), route);
+    }
+    let custom = parse_route("ech:own+sni:www.baidu.com+direct").unwrap();
+    assert_eq!(route_preset_index(&custom), 4);
+    assert_eq!(parse_route(&format_route(&custom)).unwrap(), custom);
 }
 
 fn snapshot() -> (Vec<SiteData>, String) {
     let config = serde_json::json!({
         "groups": [
             { "id": "ok", "name": "OK", "enabled": true,
-              "domains": ["a.example", "b.example"] },
+              "domains": domains(&["a.example", "b.example"]) },
             { "id": "slow", "name": "Slow", "enabled": true,
-              "domains": ["c.example"] },
+              "domains": domains(&["c.example"]) },
             { "id": "bad", "name": "Bad", "enabled": true,
-              "domains": ["d.example"] },
+              "domains": domains(&["d.example"]) },
             { "id": "off", "name": "Off", "enabled": false,
-              "domains": ["e.example"] }
+              "domains": domains(&["e.example"]) }
         ]
     });
     let status = serde_json::json!({
@@ -346,18 +400,18 @@ fn snapshot() -> (Vec<SiteData>, String) {
 fn visit_urls_use_canonical_homepages() {
     let config = serde_json::json!({
         "groups": [
-            { "id": "github", "name": "GitHub", "enabled": true, "domains": ["github.com"] },
-            { "id": "pixiv", "name": "Pixiv", "enabled": true, "domains": ["pixiv.net", "www.pixiv.net"], "homepage": "https://www.pixiv.net/" },
-            { "id": "ao3", "name": "AO3", "enabled": true, "domains": ["archiveofourown.org"] },
-            { "id": "eh", "name": "E-Hentai", "enabled": true, "domains": ["e-hentai.org"] },
-            { "id": "hitomi", "name": "Hitomi", "enabled": true, "domains": ["hitomi.la"] },
-            { "id": "nhentai", "name": "nhentai", "enabled": true, "domains": ["nhentai.net"] },
-            { "id": "hanime", "name": "Hanime", "enabled": true, "domains": ["hanime.tv"] },
-            { "id": "steam", "name": "Steam", "enabled": true, "domains": ["store.steampowered.com"] },
-            { "id": "poipiku", "name": "Poipiku", "enabled": true, "domains": ["poipiku.com"] },
-            { "id": "custom", "name": "Custom", "enabled": true, "domains": ["custom.example", "*.custom.example"], "homepage": "https://custom-home.example/" },
-            { "id": "fallback", "name": "Fallback", "enabled": true, "domains": ["fallback.example"] },
-            { "id": "wild", "name": "Wild", "enabled": true, "domains": ["*.wild.example"] }
+            { "id": "github", "name": "GitHub", "enabled": true, "domains": domains(&["github.com"]) },
+            { "id": "pixiv", "name": "Pixiv", "enabled": true, "domains": domains(&["pixiv.net", "www.pixiv.net"]), "homepage": "https://www.pixiv.net/" },
+            { "id": "ao3", "name": "AO3", "enabled": true, "domains": domains(&["archiveofourown.org"]) },
+            { "id": "eh", "name": "E-Hentai", "enabled": true, "domains": domains(&["e-hentai.org"]) },
+            { "id": "hitomi", "name": "Hitomi", "enabled": true, "domains": domains(&["hitomi.la"]) },
+            { "id": "nhentai", "name": "nhentai", "enabled": true, "domains": domains(&["nhentai.net"]) },
+            { "id": "hanime", "name": "Hanime", "enabled": true, "domains": domains(&["hanime.tv"]) },
+            { "id": "steam", "name": "Steam", "enabled": true, "domains": domains(&["store.steampowered.com"]) },
+            { "id": "poipiku", "name": "Poipiku", "enabled": true, "domains": domains(&["poipiku.com"]) },
+            { "id": "custom", "name": "Custom", "enabled": true, "domains": domains(&["custom.example", "*.custom.example"]), "homepage": "https://custom-home.example/" },
+            { "id": "fallback", "name": "Fallback", "enabled": true, "domains": domains(&["fallback.example"]) },
+            { "id": "wild", "name": "Wild", "enabled": true, "domains": domains(&["*.wild.example"]) }
         ]
     });
     let status = serde_json::json!({ "domains": [] });
@@ -407,7 +461,7 @@ fn site_summaries_reflect_state_with_matching_colours() {
 fn paused_snapshot_still_reports_health() {
     let config = serde_json::json!({
         "groups": [
-            { "id": "ok", "name": "OK", "enabled": true, "domains": ["a.example"] }
+            { "id": "ok", "name": "OK", "enabled": true, "domains": domains(&["a.example"]) }
         ]
     });
     let status = serde_json::json!({ "domains": [
@@ -426,7 +480,7 @@ fn paused_snapshot_still_reports_health() {
 fn selected_but_untested_sites_point_to_the_explicit_action() {
     let config = serde_json::json!({
         "groups": [
-            { "id": "ok", "name": "OK", "enabled": true, "domains": ["a.example"] }
+            { "id": "ok", "name": "OK", "enabled": true, "domains": domains(&["a.example"]) }
         ]
     });
     let status = serde_json::json!({ "domains": [] });
@@ -442,7 +496,7 @@ fn selected_but_untested_sites_point_to_the_explicit_action() {
 fn a_sweep_is_visible_while_paused() {
     let config = serde_json::json!({
         "groups": [
-            { "id": "ok", "name": "OK", "enabled": true, "domains": ["a.example"] }
+            { "id": "ok", "name": "OK", "enabled": true, "domains": domains(&["a.example"]) }
         ]
     });
     let status = serde_json::json!({ "domains": [] });
@@ -462,8 +516,8 @@ fn a_sweep_is_visible_while_paused() {
 fn custom_groups_are_marked_for_deletion() {
     let config = serde_json::json!({
         "groups": [
-            { "id": "pixiv", "name": "Pixiv", "enabled": true, "domains": ["pixiv.net"] },
-            { "id": "mine", "name": "Mine", "enabled": true, "domains": ["mine.example"] }
+            { "id": "pixiv", "name": "Pixiv", "enabled": true, "domains": domains(&["pixiv.net"]) },
+            { "id": "mine", "name": "Mine", "enabled": true, "domains": domains(&["mine.example"]) }
         ]
     });
     let (sites, _) = build_snapshot(

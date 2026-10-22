@@ -2,50 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// Configured strategy for a group.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Strategy {
-    #[default]
-    Auto,
-    Direct,
-    Ech,
-    #[serde(rename = "sni", alias = "fake_sni", alias = "fake-sni")]
-    FakeSni,
-}
-
-impl Strategy {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Direct => "direct",
-            Self::Ech => "ech",
-            Self::FakeSni => "sni",
-        }
-    }
-
-    /// Ordered attempts for `auto`; a locked strategy yields just itself.
-    pub fn attempts(self) -> &'static [TlsMode] {
-        const AUTO: &[TlsMode] = &[TlsMode::Direct, TlsMode::Ech, TlsMode::FakeSni];
-        const DIRECT: &[TlsMode] = &[TlsMode::Direct];
-        const ECH: &[TlsMode] = &[TlsMode::Ech];
-        const SNI: &[TlsMode] = &[TlsMode::FakeSni];
-        match self {
-            Self::Auto => AUTO,
-            Self::Direct => DIRECT,
-            Self::Ech => ECH,
-            Self::FakeSni => SNI,
-        }
-    }
-}
-
-impl fmt::Display for Strategy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// A concrete TLS strategy chosen for one connection (never `auto`).
+/// A concrete TLS mode chosen for one connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TlsMode {
@@ -61,14 +18,6 @@ impl TlsMode {
             Self::Direct => "direct",
             Self::Ech => "ech",
             Self::FakeSni => "sni",
-        }
-    }
-
-    pub fn cache_strategy(self) -> Strategy {
-        match self {
-            Self::Direct => Strategy::Direct,
-            Self::Ech => Strategy::Ech,
-            Self::FakeSni => Strategy::FakeSni,
         }
     }
 }
@@ -267,20 +216,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_order_matches_document() {
-        assert_eq!(
-            Strategy::Auto.attempts(),
-            &[TlsMode::Direct, TlsMode::Ech, TlsMode::FakeSni]
-        );
-        assert_eq!(Strategy::Direct.attempts(), &[TlsMode::Direct]);
-    }
-
-    #[test]
     fn serialized_names() {
-        assert_eq!(
-            serde_json::to_string(&Strategy::FakeSni).unwrap(),
-            "\"sni\""
-        );
+        assert_eq!(serde_json::to_string(&TlsMode::FakeSni).unwrap(), "\"sni\"");
         assert_eq!(
             serde_json::to_string(&IpSource::DohCache).unwrap(),
             "\"doh-cache\""
@@ -288,14 +225,6 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&FailureReason::CertInvalid).unwrap(),
             "\"cert_invalid\""
-        );
-    }
-
-    #[test]
-    fn deserialize_aliases() {
-        assert_eq!(
-            serde_json::from_str::<Strategy>("\"fake_sni\"").unwrap(),
-            Strategy::FakeSni
         );
     }
 }

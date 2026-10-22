@@ -249,20 +249,6 @@ fun View.clickOnce(intervalMs: Long = 600L, action: () -> Unit) {
     })
 }
 
-fun Context.strategyLabel(strategy: String): String = when (strategy.lowercase()) {
-    "ech" -> "ECH"
-    "sni" -> "SNI"
-    "direct" -> "直连"
-    else -> "自动"
-}
-
-fun Context.strategyColor(strategy: String): Pair<Int, Int> = when (strategy.lowercase()) {
-    "ech" -> Palette.ACCENT to Palette.ACCENT_SOFT
-    "sni" -> Palette.PURPLE to 0xFFF0EAFA.toInt()
-    "direct" -> Palette.TEXT_2 to Palette.SURFACE_2
-    else -> Palette.MUTED to Palette.SURFACE_2
-}
-
 private val SITE_ICONS = mapOf(
     "pixiv" to R.drawable.site_pixiv,
     "hitomi" to R.drawable.site_hitomi,

@@ -118,7 +118,6 @@ pub trait RemoteIpProvider: Send + Sync {
     /// result: the route cursor only needs the addresses, so the pattern
     /// string is not copied for every new connection.
     fn remote_ips(&self, domain: &str) -> Option<Vec<std::net::IpAddr>>;
-    fn remote_sni(&self, group_id: &str) -> Option<String>;
     fn has_ip_catalog(&self) -> bool;
 
     /// Remote IPs for a domain plus the "an IP catalog is loaded" flag.
@@ -126,10 +125,7 @@ pub trait RemoteIpProvider: Send + Sync {
     /// The decision cursor needs both for every new connection. The default
     /// keeps existing providers working; implementations that can answer both
     /// from one snapshot should override it.
-    fn remote_ips_with_catalog(
-        &self,
-        domain: &str,
-    ) -> (Option<Vec<std::net::IpAddr>>, bool) {
+    fn remote_ips_with_catalog(&self, domain: &str) -> (Option<Vec<std::net::IpAddr>>, bool) {
         (self.remote_ips(domain), self.has_ip_catalog())
     }
 }
@@ -139,18 +135,11 @@ impl RemoteIpProvider for CatalogManager {
         CatalogManager::remote_ips(self, domain)
     }
 
-    fn remote_sni(&self, group_id: &str) -> Option<String> {
-        CatalogManager::remote_sni(self, group_id)
-    }
-
     fn has_ip_catalog(&self) -> bool {
         CatalogManager::has_ip_catalog(self)
     }
 
-    fn remote_ips_with_catalog(
-        &self,
-        domain: &str,
-    ) -> (Option<Vec<std::net::IpAddr>>, bool) {
+    fn remote_ips_with_catalog(&self, domain: &str) -> (Option<Vec<std::net::IpAddr>>, bool) {
         CatalogManager::remote_ips_with_catalog(self, domain)
     }
 }
@@ -240,10 +229,7 @@ impl CatalogManager {
 
     /// One read-lock acquisition for the domain's IPs and the catalog flag.
     /// The decision cursor asks for both on every new connection.
-    pub fn remote_ips_with_catalog(
-        &self,
-        domain: &str,
-    ) -> (Option<Vec<std::net::IpAddr>>, bool) {
+    pub fn remote_ips_with_catalog(&self, domain: &str) -> (Option<Vec<std::net::IpAddr>>, bool) {
         let catalog = self.ip_catalog.read();
         let available = catalog.is_some();
         let ips = catalog
@@ -251,13 +237,6 @@ impl CatalogManager {
             .and_then(|catalog| catalog.lookup_ips_normalized(domain))
             .map(|(_, ips)| ips.clone());
         (ips, available)
-    }
-
-    pub fn remote_sni(&self, group_id: &str) -> Option<String> {
-        self.ip_catalog
-            .read()
-            .as_ref()
-            .and_then(|catalog| catalog.sni.get(group_id).cloned())
     }
 
     pub fn remote_doh_endpoints(&self) -> Vec<DohEndpoint> {

@@ -19,7 +19,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::decision::{ConnectPlan, Route, RouteCursor};
 use crate::domain::{is_ip_literal, normalize_hostname_cow};
-use crate::strategy::{FailureReason, Strategy, TlsMode};
+use crate::strategy::{FailureReason, TlsMode};
 use crate::util::parse_authority;
 
 use super::response::{empty_response, error_response};
@@ -51,12 +51,12 @@ impl TunnelInfo {
 
 /// Whether a cached direct plan may be turned into a raw TCP tunnel.
 ///
-/// Only groups that never use MITM may do this.  A group that can use ECH or
+/// Only routes that never use MITM may do this. A route that can use ECH or
 /// fake SNI has to terminate the browser's TLS locally, and the browser must
 /// not see a different certificate on the next connection to the same host:
 /// the first CONNECT was intercepted, the next one has to be too.
-pub(super) fn may_tunnel_directly(group_strategy: Strategy, plan_mode: TlsMode) -> bool {
-    group_strategy == Strategy::Direct && plan_mode == TlsMode::Direct
+pub(super) fn may_tunnel_directly(direct_only: bool, plan_mode: TlsMode) -> bool {
+    direct_only && plan_mode == TlsMode::Direct
 }
 
 pub(super) async fn handle_connect(
@@ -127,7 +127,7 @@ pub(super) async fn handle_connect(
     let candidate_timeout = Duration::from_millis(config.advanced.ip_timeout_ms.clamp(500, 10_000));
     let mut stale_plan = None;
     if let Some(plan) = ctx.engine.cached_plan(&host, port, true) {
-        if may_tunnel_directly(group.strategy, plan.mode) {
+        if may_tunnel_directly(group.route_for(&host).is_direct_only(), plan.mode) {
             let started = std::time::Instant::now();
             match connect_tcp_upstream(plan.ip, plan.port, candidate_timeout).await {
                 Ok(stream) => {
@@ -158,7 +158,7 @@ pub(super) async fn handle_connect(
     // Explicitly direct groups never need MITM. When the CA is not trusted we also keep
     // Auto groups on the raw path: a direct origin still works, while an ECH/fake-SNI
     // origin would only produce a browser certificate error anyway.
-    if group.strategy == Strategy::Direct || !ctx.ca.installed() {
+    if group.route_for(&host).is_direct_only() || !ctx.ca.installed() {
         return tunnel_direct_group(req, &ctx, host, port, stale_plan.as_deref()).await;
     }
 
@@ -515,7 +515,11 @@ pub(super) async fn race_tcp_addresses(
     Err((timed_out, last_error))
 }
 
-async fn tunnel_to_host(req: &mut Request<Incoming>, host: String, port: u16) -> Response<ProxyBody> {
+async fn tunnel_to_host(
+    req: &mut Request<Incoming>,
+    host: String,
+    port: u16,
+) -> Response<ProxyBody> {
     let upstream = match connect_host_staggered(&host, port, CONNECT_TIMEOUT).await {
         Ok(stream) => stream,
         Err((timed_out, detail)) => {
@@ -625,7 +629,7 @@ pub(crate) fn upstream_failure(
         domain: plan.domain.clone(),
         state: crate::status::State::Failed,
         strategy: Some(plan.mode),
-        configured_strategy: None,
+        configured_modes: Vec::new(),
         ip: Some(plan.ip),
         ip_source: None,
         doh_source: None,

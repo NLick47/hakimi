@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use http::StatusCode;
+
 use crate::cache::{CacheManager, IpScoreUpdate, LastGoodEntry};
 use crate::catalog::RemoteIpProvider;
 use crate::config::{AppConfig, ConfigManager, GroupConfig};
@@ -43,12 +45,17 @@ pub struct DecisionEngine {
     /// a full-map sum there would put an O(cache size) scan under an exclusive
     /// lock on the success path.
     plan_cache_count: AtomicUsize,
+    /// Routes that produced an HTTP rejection (403/421/451). Keyed by
+    /// `domain|mode`; entries expire after [`ROUTE_REJECTION_TTL`].
+    route_rejections: parking_lot::RwLock<HashMap<String, Instant>>,
 }
 
 pub(super) const PLAN_CACHE_MAX: usize = 2048;
 /// Leave headroom after a prune so a burst of new hosts does not sort the map
 /// on every success.
 pub(super) const PLAN_CACHE_PRUNE_TO: usize = PLAN_CACHE_MAX * 3 / 4;
+/// How long an HTTP-rejected route stays out of the candidate set.
+const ROUTE_REJECTION_TTL: Duration = Duration::from_secs(300);
 
 /// The key a plan is stored under.  Hot-path callers already pass a
 /// normalized host, so the common case borrows.
@@ -95,6 +102,7 @@ impl DecisionEngine {
             ip_scores: parking_lot::RwLock::new(seeded_scores),
             ip_score_count: AtomicUsize::new(ip_score_count),
             plan_cache_count: AtomicUsize::new(0),
+            route_rejections: parking_lot::RwLock::new(HashMap::new()),
         })
     }
 
@@ -195,7 +203,7 @@ impl DecisionEngine {
         probing: bool,
     ) -> Route {
         let (config, matcher) = self.config.snapshot_and_matcher();
-        let Some(group_id) = matcher.match_normalized(&normalized) else {
+        let Some((group_id, rule_index)) = matcher.match_entry_normalized(&normalized) else {
             return Route::Bypass(DecisionOutcome {
                 plan: None,
                 diagnostics: Arc::new(DomainDiagnostics {
@@ -203,7 +211,7 @@ impl DecisionEngine {
                     domain: normalized.into_owned(),
                     state: State::Direct,
                     strategy: None,
-                    configured_strategy: None,
+                    configured_modes: Vec::new(),
                     ip: None,
                     ip_source: None,
                     doh_source: None,
@@ -250,7 +258,7 @@ impl DecisionEngine {
         self.status.mark_checking(
             Some(group.id.as_str()),
             &normalized,
-            Some(group.strategy),
+            group.route_modes(&normalized),
             config.catalog_version,
         );
         // The cursor keeps an index into this immutable config snapshot, so a
@@ -266,6 +274,7 @@ impl DecisionEngine {
             port,
             tls,
             group_index,
+            rule_index,
             config,
         )))
     }
@@ -305,30 +314,93 @@ impl DecisionEngine {
             return None;
         }
         if tls {
-            if !group.strategy.attempts().contains(&plan.mode) {
+            let route = group.route_for(&plan.domain);
+            if !route.contains_mode(plan.mode) {
                 return None;
             }
-            // A group-level fake SNI is authoritative. Editing it must not keep
-            // using the old name for the rest of the plan-cache lifetime.
+            // A route-level fake-SNI list is authoritative. Editing it must not
+            // keep using an old name for the rest of the plan-cache lifetime.
             if plan.mode == TlsMode::FakeSni {
-                if let Some(configured) = group.sni.as_deref() {
-                    let configured = configured.trim();
-                    let matches = if configured.is_empty() {
-                        plan.sni.is_none()
-                    } else {
-                        plan.sni
-                            .as_deref()
-                            .is_some_and(|sni| sni.eq_ignore_ascii_case(configured))
-                    };
-                    if !matches {
-                        return None;
-                    }
+                let allowed = route.attempts.iter().any(|attempt| {
+                    attempt
+                        .sni_hosts()
+                        .is_some_and(|hosts| match plan.sni.as_deref() {
+                            Some(sni) if hosts.is_empty() => config
+                                .advanced
+                                .fake_sni_candidates
+                                .iter()
+                                .any(|host| host.eq_ignore_ascii_case(sni)),
+                            Some(sni) => hosts.iter().any(|host| host.eq_ignore_ascii_case(sni)),
+                            None => {
+                                hosts.is_empty() || hosts.iter().any(|host| host.trim().is_empty())
+                            }
+                        })
+                });
+                if !allowed {
+                    return None;
                 }
             }
         } else if plan.mode != TlsMode::Direct {
             return None;
         }
+        if self.route_rejected(&plan.domain, plan.mode) {
+            return None;
+        }
         Some(plan)
+    }
+
+    /// True while an HTTP rejection (403/421/451) keeps this mode out of the
+    /// candidate set for the domain.
+    pub(super) fn route_rejected(&self, domain: &str, mode: TlsMode) -> bool {
+        let key = format!("{domain}|{}", mode.as_str());
+        let mut rejections = self.route_rejections.write();
+        match rejections.get(&key) {
+            Some(at) if at.elapsed() < ROUTE_REJECTION_TTL => true,
+            Some(_) => {
+                rejections.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Called after an upstream response with a status that indicates the route
+    /// itself was rejected. A TLS handshake is not enough: Pixiv's fake-SNI
+    /// route completes TLS and then returns 403 from nginx. Drop that route and
+    /// let the next connection try the next configured attempt.
+    pub fn note_http_rejection(&self, domain: &str, port: u16, tls: bool, status: StatusCode) {
+        if !matches!(status.as_u16(), 403 | 421 | 451) {
+            return;
+        }
+        let Some(plan) = self.cached_plan(domain, port, tls) else {
+            return;
+        };
+        if plan.mode == TlsMode::Direct {
+            return;
+        }
+        tracing::warn!(
+            domain = %plan.domain,
+            mode = %plan.mode,
+            sni = plan.sni.as_deref().unwrap_or(""),
+            status = status.as_u16(),
+            "upstream rejected the selected route; re-planning"
+        );
+        self.forget_plan(&plan.domain, plan.port, plan.tls);
+        self.cache.mark_skip_once([plan.domain.clone()]);
+        self.record_ip(&plan.domain, plan.ip, None, true);
+        let mut rejections = self.route_rejections.write();
+        if rejections.len() > 1024 {
+            rejections.retain(|_, at| at.elapsed() < ROUTE_REJECTION_TTL);
+        }
+        rejections.insert(
+            format!("{}|{}", plan.domain, plan.mode.as_str()),
+            Instant::now(),
+        );
+    }
+
+    /// Configuration edits can change the route a rejection belonged to.
+    pub fn clear_route_rejections(&self) {
+        self.route_rejections.write().clear();
     }
 
     pub fn forget_plan(&self, domain: &str, port: u16, tls: bool) {
@@ -672,7 +744,10 @@ impl DecisionEngine {
                 State::Normal
             },
             strategy: Some(plan.mode),
-            configured_strategy: config.group(&plan.group_id).map(|group| group.strategy),
+            configured_modes: config
+                .group(&plan.group_id)
+                .map(|group| group.route_modes(&plan.domain))
+                .unwrap_or_default(),
             ip: Some(plan.ip),
             ip_source: Some(plan.source),
             doh_source,
@@ -695,7 +770,6 @@ impl DecisionEngine {
             Some(LastGoodEntry {
                 domain: plan.domain.clone(),
                 ip: plan.ip,
-                strategy: plan.mode.cache_strategy(),
                 source: plan.source,
                 network_id: network_id(),
                 saved_at: now(),
@@ -754,7 +828,7 @@ impl DecisionEngine {
             domain: domain.to_string(),
             state: State::Failed,
             strategy: None,
-            configured_strategy: Some(group.strategy),
+            configured_modes: group.route_modes(domain),
             ip: None,
             ip_source: None,
             doh_source: doh.source,
@@ -870,51 +944,6 @@ impl DecisionEngine {
         }
     }
 
-    pub(super) fn sni_candidates(
-        &self,
-        config: &AppConfig,
-        group: &GroupConfig,
-        domain: &str,
-        network: &str,
-    ) -> Vec<Option<String>> {
-        // A group that names its own SNI is authoritative: `Some("")` means
-        // "send no SNI", not "fall back to the shared candidates".
-        if let Some(configured) = &group.sni {
-            let value = configured.trim().to_ascii_lowercase();
-            return vec![if value.is_empty() { None } else { Some(value) }];
-        }
-
-        let mut out: Vec<Option<String>> = Vec::new();
-        let mut push = |candidate: Option<String>| {
-            let normalized = candidate.and_then(|value| {
-                if value.trim().is_empty() {
-                    None
-                } else {
-                    Some(value.to_ascii_lowercase())
-                }
-            });
-            if !out.contains(&normalized) {
-                out.push(normalized);
-            }
-        };
-        if let Some(cached) = self.cache.sni(&group.id, domain, network) {
-            push(cached.sni);
-        }
-        if let Some(remote) = self.remote.remote_sni(&group.id) {
-            push(Some(remote));
-        }
-        for candidate in &config.advanced.fake_sni_candidates {
-            push(Some(candidate.clone()));
-        }
-        if out.is_empty() {
-            out.push(None);
-        }
-        // Real fake-SNI hosts race first; a `None` entry (no SNI replacement) is
-        // effectively a duplicate of the direct route on the same IP, so it goes last.
-        out.sort_by_key(|entry| entry.is_none());
-        out
-    }
-
     fn config_failure(
         &self,
         group: Option<String>,
@@ -928,7 +957,7 @@ impl DecisionEngine {
             domain: domain.to_string(),
             state: State::Failed,
             strategy: None,
-            configured_strategy: None,
+            configured_modes: Vec::new(),
             ip: None,
             ip_source: None,
             doh_source: None,
@@ -961,7 +990,7 @@ impl DecisionEngine {
             domain: domain.to_string(),
             state,
             strategy: None,
-            configured_strategy: Some(group.strategy),
+            configured_modes: group.route_modes(domain),
             ip: None,
             ip_source: None,
             doh_source: None,

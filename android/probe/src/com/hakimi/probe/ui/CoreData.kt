@@ -18,23 +18,139 @@ data class DomainInfo(
     val detail: String,
 )
 
+data class DomainRuleInfo(
+    val pattern: String,
+    /** Compact route spec, empty means "inherit the site default route". */
+    val route: String,
+)
+
 data class SiteInfo(
     val id: String,
     val name: String,
     val enabled: Boolean,
-    val strategy: String,
-    val sni: String,
     val homepage: String,
     val domains: List<DomainInfo>,
     val exactDomains: List<String>,
     val rawDomainCount: Int,
+    val domainRules: List<DomainRuleInfo>,
+    val defaultRoute: String,
+    val routeDetail: String,
     val summary: String,
     val summaryColor: Int,
     val state: String,
     val custom: Boolean,
-    val experimental: Boolean,
-    val echShared: Boolean,
 )
+
+/** Compact route syntax shared with the desktop editor. */
+fun routeLabel(spec: String): String = when (spec) {
+    "", "auto" -> "自动"
+    "direct" -> "直连"
+    "ech+direct" -> "ECH"
+    "sni+direct" -> "SNI 伪装"
+    else -> "自定义"
+}
+
+fun routePresetIndex(spec: String): Int = when (spec) {
+    "", "auto" -> 0
+    "direct" -> 1
+    "ech+direct" -> 2
+    "sni+direct" -> 3
+    else -> 4
+}
+
+fun routePresetSpec(preset: Int): String = when (preset) {
+    0 -> "auto"
+    1 -> "direct"
+    2 -> "ech+direct"
+    3 -> "sni+direct"
+    else -> "auto"
+}
+
+fun groupRouteSummary(defaultSpec: String, rules: List<DomainRuleInfo>): Pair<String, String> {
+    val overrides = rules.count { it.route.isNotEmpty() && it.route != defaultSpec }
+    return if (overrides == 0) {
+        routeLabel(defaultSpec) to ""
+    } else {
+        "混合" to "$overrides 个域名覆盖"
+    }
+}
+
+fun routeSpec(route: JSONObject?): String {
+    val attempts = route?.optJSONArray("attempts") ?: return ""
+    if (attempts.length() == 0) return ""
+    val tokens = ArrayList<String>()
+    for (index in 0 until attempts.length()) {
+        val attempt = attempts.optJSONObject(index) ?: continue
+        when (attempt.optString("mode")) {
+            "direct" -> tokens += "direct"
+            "ech" -> tokens += if (attempt.optString("ech", "shared").lowercase() == "own") {
+                "ech:own"
+            } else {
+                "ech"
+            }
+            "sni" -> {
+                val hosts = ArrayList<String>()
+                val list = attempt.optJSONArray("sni")
+                if (list != null) {
+                    for (index in 0 until list.length()) {
+                        val host = list.optString(index).trim()
+                        if (host.isNotEmpty()) hosts += host
+                    }
+                }
+                tokens += if (hosts.isEmpty()) "sni" else "sni:" + hosts.joinToString(",")
+            }
+        }
+    }
+    if (tokens == listOf("direct", "ech:own", "sni")) return "auto"
+    return tokens.joinToString("+")
+}
+
+private fun autoRouteJson(): JSONObject = JSONObject().put(
+    "attempts",
+    JSONArray().apply {
+        put(JSONObject().put("mode", "direct"))
+        put(JSONObject().put("mode", "ech").put("ech", "own"))
+        put(JSONObject().put("mode", "sni"))
+    }
+)
+
+fun parseRouteSpec(spec: String): JSONObject {
+    val text = spec.trim()
+    if (text.isEmpty() || text.equals("auto", ignoreCase = true)) return autoRouteJson()
+    val attempts = JSONArray()
+    text.split('+').map { it.trim() }.filter { it.isNotEmpty() }.forEach { part ->
+        val attempt = JSONObject()
+        when {
+            part.equals("direct", ignoreCase = true) ->
+                attempt.put("mode", "direct")
+            part.equals("ech", ignoreCase = true) || part.equals("ech:shared", ignoreCase = true) ->
+                attempt.put("mode", "ech").put("ech", "shared")
+            part.equals("ech:own", ignoreCase = true) ->
+                attempt.put("mode", "ech").put("ech", "own")
+            part.equals("sni", ignoreCase = true) ->
+                attempt.put("mode", "sni")
+            part.startsWith("sni:", ignoreCase = true) -> {
+                val hosts = part.substringAfter(':').split(',')
+                    .map { it.trim().lowercase() }
+                    .filter { it.isNotEmpty() }
+                attempt.put("mode", "sni")
+                if (hosts.isNotEmpty()) attempt.put("sni", JSONArray(hosts))
+            }
+            else -> throw IllegalArgumentException("无法识别的线路：$part")
+        }
+        attempts.put(attempt)
+    }
+    if (attempts.length() == 0) throw IllegalArgumentException("线路不能为空")
+    return JSONObject().put("attempts", attempts)
+}
+
+fun domainRulesJson(rules: List<DomainRuleInfo>): JSONArray = JSONArray().apply {
+    rules.forEach { rule ->
+        val value = JSONObject().put("pattern", rule.pattern)
+        if (rule.route.isNotEmpty()) value.put("route", parseRouteSpec(rule.route))
+        put(value)
+    }
+}
 
 data class CoreData(
     val running: Boolean,
@@ -124,9 +240,17 @@ object CoreParser {
             if (id.isEmpty() || id == "echtest") return@forEach
             val name = group.str("name").ifEmpty { id }
             val enabled = group.optBoolean("enabled", true)
-            val strategy = group.str("strategy").ifEmpty { "auto" }
-            val rawDomains = group.optJSONArray("domains")?.strings().orEmpty()
+            val rules = ArrayList<DomainRuleInfo>()
+            group.optJSONArray("domains")?.objects()?.forEach { rule ->
+                val pattern = rule.str("pattern")
+                if (pattern.isNotEmpty()) {
+                    rules += DomainRuleInfo(pattern, routeSpec(rule.optJSONObject("route")))
+                }
+            }
+            val rawDomains = rules.map { it.pattern }
             val exactDomains = rawDomains.filter { !it.startsWith("*.") }
+            val defaultRoute = routeSpec(group.optJSONObject("defaultRoute"))
+            val (_, routeDetail) = groupRouteSummary(defaultRoute, rules)
             val displayDomains = exactDomains.take(24).map { host ->
                 domainInfo(host, diagnostics[host], enabled)
             }
@@ -199,18 +323,17 @@ object CoreParser {
                 id = id,
                 name = name,
                 enabled = enabled,
-                strategy = strategy,
-                sni = group.str("sni"),
                 homepage = homepage,
                 domains = displayDomains,
                 exactDomains = exactDomains,
                 rawDomainCount = rawDomains.size,
+                domainRules = rules,
+                defaultRoute = defaultRoute,
+                routeDetail = routeDetail,
                 summary = summary,
                 summaryColor = summaryColor,
                 state = state,
                 custom = id !in BUILTIN_IDS,
-                experimental = group.optBoolean("experimental", false),
-                echShared = group.optBoolean("echShared", false),
             )
         }
 

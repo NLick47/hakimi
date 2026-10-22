@@ -5,15 +5,15 @@ use http_body_util::BodyExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::cache::{CacheManager, LastGoodEntry};
 use crate::ca::CertificateAuthority;
+use crate::cache::{CacheManager, LastGoodEntry};
 use crate::catalog::CatalogManager;
-use crate::config::{ConfigManager, GroupConfig};
+use crate::config::{ConfigManager, DomainRule, GroupConfig, RoutePolicy};
 use crate::decision::DecisionEngine;
 use crate::paths::Paths;
 use crate::resolver::{DohResolution, EchOutcome, IpResolver, Resolver};
 use crate::status::StatusStore;
-use crate::strategy::{IpSource, Strategy};
+use crate::strategy::IpSource;
 use crate::util::now;
 
 /// A remote catalog with one working address.
@@ -23,10 +23,6 @@ struct StubRemote;
 impl crate::catalog::RemoteIpProvider for StubRemote {
     fn remote_ips(&self, _domain: &str) -> Option<Vec<std::net::IpAddr>> {
         Some(vec!["127.0.0.1".parse().unwrap()])
-    }
-
-    fn remote_sni(&self, _group_id: &str) -> Option<String> {
-        None
     }
 
     fn has_ip_catalog(&self) -> bool {
@@ -74,13 +70,10 @@ fn engine_for_with_resolver(
             config.groups.push(GroupConfig {
                 id: "test".into(),
                 name: "Test".into(),
-                domains: vec!["upstream.test".into()],
-                strategy: Strategy::Direct,
+                domains: vec![DomainRule::new("upstream.test")],
                 enabled: true,
-                sni: None,
-                experimental: false,
                 homepage: None,
-                ech_shared: false,
+                default_route: RoutePolicy::direct(),
             });
             Ok(())
         })
@@ -89,7 +82,6 @@ fn engine_for_with_resolver(
     cache.put_last_good(LastGoodEntry {
         domain: "upstream.test".into(),
         ip: "127.0.0.1".parse().unwrap(),
-        strategy: Strategy::Direct,
         source: IpSource::Cache,
         network_id: "test".into(),
         saved_at: now(),
@@ -119,7 +111,6 @@ async fn cancelled_discovery_does_not_poison_the_domain() {
     cache.put_last_good(LastGoodEntry {
         domain: "upstream.test".into(),
         ip: "192.0.2.1".parse().unwrap(),
-        strategy: Strategy::Direct,
         source: IpSource::Cache,
         network_id: "test".into(),
         saved_at: now(),
@@ -304,7 +295,10 @@ async fn image_bursts_keep_the_http1_connections_idle() {
     // Give hyper a moment to check the connections back into the pool.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let after_first = accepts.load(Ordering::SeqCst);
-    assert_eq!(after_first, 4, "the first burst should use four h1 connections");
+    assert_eq!(
+        after_first, 4,
+        "the first burst should use four h1 connections"
+    );
 
     burst(pool, uri, 4).await;
     assert_eq!(
@@ -346,7 +340,6 @@ async fn refused_candidate_releases_the_hedge_window() {
     engine.cache.put_last_good(LastGoodEntry {
         domain: "upstream.test".into(),
         ip: "::1".parse().unwrap(),
-        strategy: Strategy::Direct,
         source: IpSource::Cache,
         network_id: "test".into(),
         saved_at: now(),
@@ -456,11 +449,13 @@ async fn concurrent_cold_connections_share_one_discovery() {
                 let Ok(tls) = acceptor.accept(stream).await else {
                     return;
                 };
-                let service = hyper::service::service_fn(|_req: hyper::Request<hyper::body::Incoming>| async {
-                    Ok::<_, std::convert::Infallible>(
-                        hyper::Response::new(http_body_util::Full::new(Bytes::from_static(b"ok"))),
-                    )
-                });
+                let service = hyper::service::service_fn(
+                    |_req: hyper::Request<hyper::body::Incoming>| async {
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                            http_body_util::Full::new(Bytes::from_static(b"ok")),
+                        ))
+                    },
+                );
                 let _ = hyper_util::server::conn::auto::Builder::new(
                     hyper_util::rt::TokioExecutor::new(),
                 )
@@ -488,7 +483,6 @@ async fn concurrent_cold_connections_share_one_discovery() {
     engine.cache.put_last_good(LastGoodEntry {
         domain: "upstream.test".into(),
         ip: "::1".parse().unwrap(),
-        strategy: Strategy::Direct,
         source: IpSource::Cache,
         network_id: "test".into(),
         saved_at: now(),

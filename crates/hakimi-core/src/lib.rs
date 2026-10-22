@@ -15,6 +15,8 @@
 //! - [`status`] group/domain state and diagnostics
 //! - [`logging`] local logging and redaction
 
+#[cfg(test)]
+mod bench;
 pub mod ca;
 pub mod cache;
 pub mod catalog;
@@ -22,22 +24,19 @@ pub mod config;
 pub mod decision;
 pub mod dns;
 pub mod domain;
+pub mod hooks;
+pub mod instance;
 pub mod ip_tester;
 pub mod logging;
 pub mod pac;
-pub mod instance;
 pub mod paths;
 pub mod proxy;
 pub mod resolver;
 pub mod runtime;
 pub mod status;
-#[cfg(test)]
-mod bench;
 pub mod strategy;
 pub mod system_proxy;
-pub mod hooks;
 pub mod util;
 
-pub use config::{AppConfig, GroupConfig};
+pub use config::{AppConfig, DomainRule, GroupConfig, RouteAttempt, RoutePolicy};
 pub use runtime::HakimiRuntime;
-pub use strategy::Strategy;

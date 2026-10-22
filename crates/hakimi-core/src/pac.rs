@@ -22,13 +22,14 @@ pub fn generate(config: &AppConfig, proxy: SocketAddr, paused: bool) -> String {
     let mut seen_wild = HashSet::new();
     if !paused {
         for group in config.enabled_groups() {
-            for domain in &group.domains {
+            for rule in &group.domains {
+                let domain = rule.pattern.as_str();
                 if let Some(suffix) = domain.strip_prefix("*.") {
                     if seen_wild.insert(suffix) {
                         wild.push(suffix);
                     }
-                } else if seen_exact.insert(domain.as_str()) {
-                    exact.push(domain.as_str());
+                } else if seen_exact.insert(domain) {
+                    exact.push(domain);
                 }
             }
         }
@@ -97,8 +98,8 @@ mod tests {
         assert!(script.contains("exact[host] === 1"));
         assert!(script.contains("shExpMatch(host, \"*.\" + wild[i])"));
         assert!(script.contains("PROXY 127.0.0.1:8443; DIRECT"));
-        // E-Hentai is disabled by default.
-        assert!(!script.contains("e-hentai.org"));
+        // All groups ship enabled, so E-Hentai is intercepted as well.
+        assert!(script.contains("e-hentai.org"));
         assert!(script.contains("return \"DIRECT\""));
     }
 

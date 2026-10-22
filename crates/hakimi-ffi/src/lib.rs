@@ -10,9 +10,8 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
 
-use hakimi_core::config::{AppConfig, GroupConfig};
+use hakimi_core::config::{AppConfig, GroupConfig, RoutePolicy};
 use hakimi_core::runtime::HakimiRuntime;
-use hakimi_core::strategy::Strategy;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
@@ -113,18 +112,20 @@ impl HakimiHandle {
                     Err(error) => self.error_json(format!("{error:#}")),
                 }
             }
-            "setGroupStrategy" => {
+            "setGroupDefaultRoute" => {
                 let Some(id) = value.get("id").and_then(Value::as_str) else {
-                    return self.error_json("setGroupStrategy needs `id`");
+                    return self.error_json("setGroupDefaultRoute needs `id`");
                 };
-                let Some(strategy) = value
-                    .get("strategy")
-                    .and_then(Value::as_str)
-                    .and_then(parse_strategy)
+                let Some(route) = value
+                    .get("route")
+                    .cloned()
+                    .and_then(|route| serde_json::from_value::<RoutePolicy>(route).ok())
                 else {
-                    return self.error_json("setGroupStrategy needs strategy auto/direct/ech/sni");
+                    return self.error_json(
+                        "setGroupDefaultRoute needs a `route` with a non-empty attempts array",
+                    );
                 };
-                match self.runtime.set_group_strategy(id, strategy) {
+                match self.runtime.set_group_default_route(id, route) {
                     Ok(config) => json!({"ok": true, "result": config}).to_string(),
                     Err(error) => self.error_json(format!("{error:#}")),
                 }
@@ -225,16 +226,6 @@ impl HakimiHandle {
             Ok(status) => json!({"ok": true, "result": status}).to_string(),
             Err(error) => self.error_json(format!("{error:#}")),
         }
-    }
-}
-
-fn parse_strategy(value: &str) -> Option<Strategy> {
-    match value.to_ascii_lowercase().as_str() {
-        "auto" => Some(Strategy::Auto),
-        "direct" => Some(Strategy::Direct),
-        "ech" => Some(Strategy::Ech),
-        "sni" | "fake_sni" | "fake-sni" => Some(Strategy::FakeSni),
-        _ => None,
     }
 }
 

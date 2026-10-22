@@ -25,80 +25,89 @@
       "id": "ao3",
       "name": "AO3",
       "domains": [
-        "archiveofourown.org",
-        "www.archiveofourown.org",
-        "*.archiveofourown.org"
+        { "pattern": "archiveofourown.org" },
+        { "pattern": "www.archiveofourown.org" },
+        { "pattern": "*.archiveofourown.org" }
       ],
-      "strategy": "sni",
       "enabled": true,
-      "sni": "",
-      "experimental": false,
-      "echShared": false
+      "defaultRoute": {
+        "attempts": [
+          { "mode": "sni" },
+          { "mode": "direct" }
+        ]
+      }
     },
     {
       "id": "github",
       "name": "GitHub",
       "domains": [
-        "github.com",
-        "api.github.com",
-        "raw.githubusercontent.com",
-        "*.githubusercontent.com",
-        "*.githubassets.com"
+        { "pattern": "github.com" },
+        { "pattern": "api.github.com" },
+        { "pattern": "codeload.github.com" },
+        { "pattern": "gist.github.com", "route": { "attempts": [{ "mode": "sni", "sni": ["api.github.com"] }, { "mode": "direct" }] } },
+        { "pattern": "raw.githubusercontent.com" },
+        { "pattern": "*.githubusercontent.com" },
+        { "pattern": "*.githubassets.com" }
       ],
-      "strategy": "auto",
       "enabled": true,
-      "sni": "",
-      "experimental": false,
-      "echShared": false
+      "defaultRoute": {
+        "attempts": [
+          { "mode": "sni" },
+          { "mode": "direct" }
+        ]
+      }
     },
     {
       "id": "pixiv",
       "name": "Pixiv",
       "domains": [
-        "pixiv.net",
-        "www.pixiv.net",
-        "*.pixiv.net",
-        "i.pximg.net",
-        "s.pximg.net",
-        "booth.pximg.net",
-        "*.pximg.net"
+        { "pattern": "pixiv.net", "route": { "attempts": [{ "mode": "ech", "ech": "shared" }, { "mode": "direct" }] } },
+        { "pattern": "www.pixiv.net", "route": { "attempts": [{ "mode": "ech", "ech": "shared" }, { "mode": "direct" }] } },
+        { "pattern": "*.pixiv.net", "route": { "attempts": [{ "mode": "ech", "ech": "shared" }, { "mode": "direct" }] } },
+        { "pattern": "i.pximg.net" },
+        { "pattern": "s.pximg.net" },
+        { "pattern": "booth.pximg.net" },
+        { "pattern": "*.pximg.net" }
       ],
-      "strategy": "auto",
       "enabled": true,
-      "sni": "",
-      "experimental": false,
-      "echShared": true
+      "defaultRoute": { "attempts": [{ "mode": "sni" }, { "mode": "direct" }] }
     },
     {
       "id": "poipiku",
       "name": "Poipiku",
       "domains": [
-        "poipiku.com",
-        "img.poipiku.com",
-        "cdn.poipiku.com",
-        "*.poipiku.com"
+        { "pattern": "poipiku.com" },
+        { "pattern": "img.poipiku.com" },
+        { "pattern": "cdn.poipiku.com" },
+        { "pattern": "*.poipiku.com" }
       ],
-      "strategy": "direct",
       "enabled": true,
-      "sni": "",
-      "experimental": false,
-      "echShared": false
+      "defaultRoute": {
+        "attempts": [
+          { "mode": "direct" },
+          { "mode": "ech", "ech": "own" },
+          { "mode": "sni" }
+        ]
+      }
     },
     {
       "id": "steam",
       "name": "Steam",
       "domains": [
-        "store.steampowered.com",
-        "steamcommunity.com",
-        "*.steamcommunity.com",
-        "*.steampowered.com",
-        "*.steamstatic.com"
+        { "pattern": "store.steampowered.com" },
+        { "pattern": "steamcommunity.com" },
+        { "pattern": "*.steamcommunity.com" },
+        { "pattern": "*.steampowered.com" },
+        { "pattern": "*.steamstatic.com" },
+        { "pattern": "steamcdn-a.akamaihd.net" }
       ],
-      "strategy": "auto",
       "enabled": true,
-      "sni": "",
-      "experimental": false,
-      "echShared": false
+      "defaultRoute": {
+        "attempts": [
+          { "mode": "sni" },
+          { "mode": "direct" }
+        ]
+      }
     }
   ],
   "catalogVersion": 0,

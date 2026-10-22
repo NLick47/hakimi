@@ -22,8 +22,6 @@ pub struct IpCatalogRaw {
     pub groups: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub ips: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
-    pub sni: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -33,8 +31,6 @@ pub struct IpCatalog {
     pub groups: BTreeMap<String, Vec<String>>,
     /// Normalized domain or wildcard -> ordered candidate IPs.
     pub ips: HashMap<String, Vec<IpAddr>>,
-    /// Group id -> fake SNI. An empty string means the empty-SNI candidate.
-    pub sni: HashMap<String, String>,
     pub warnings: Vec<String>,
     /// Sum of every domain's IP list. Status polling reads this while holding
     /// the catalog lock; recomputing it there scanned the whole catalog.
@@ -80,7 +76,7 @@ impl IpCatalog {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ips.is_empty() && self.groups.is_empty() && self.sni.is_empty()
+        self.ips.is_empty() && self.groups.is_empty()
     }
 
     pub fn domain_count(&self) -> usize {
@@ -103,13 +99,18 @@ impl IpCatalog {
         }
         let mut out = Vec::new();
         for group in &config.groups {
-            for domain in group.domains.iter().filter(|d| !d.starts_with("*.")) {
+            for rule in group
+                .domains
+                .iter()
+                .filter(|rule| !rule.pattern.starts_with("*."))
+            {
+                let domain = rule.pattern.as_str();
                 if wildcard_suffixes.iter().any(|suffix| {
                     domain.len() > suffix.len()
                         && domain.ends_with(suffix)
                         && domain.as_bytes()[domain.len() - suffix.len() - 1] == b'.'
                 }) {
-                    out.push(domain.clone());
+                    out.push(domain.to_string());
                 }
             }
         }
@@ -172,8 +173,8 @@ pub fn validate(raw: IpCatalogRaw, config: &AppConfig) -> Result<IpCatalog> {
     // Coverage may come from the catalog's own group list or from user-configured groups.
     let mut coverage_entries = catalog_group_patterns.clone();
     for group in &config.groups {
-        for domain in &group.domains {
-            coverage_entries.push((group.id.clone(), domain.clone()));
+        for rule in &group.domains {
+            coverage_entries.push((group.id.clone(), rule.pattern.clone()));
         }
     }
     let coverage = DomainMatcher::from_patterns(coverage_entries)?;
@@ -224,28 +225,6 @@ pub fn validate(raw: IpCatalogRaw, config: &AppConfig) -> Result<IpCatalog> {
         }
     }
 
-    let mut sni = HashMap::new();
-    for (group_id, value) in raw.sni {
-        if !groups.contains_key(&group_id) {
-            warnings.push(format!(
-                "IP catalog sni entry for unknown group `{group_id}`; ignored"
-            ));
-            continue;
-        }
-        if !value.is_empty() {
-            match normalize_hostname(&value) {
-                Ok(host) => {
-                    sni.insert(group_id, host);
-                }
-                Err(error) => warnings.push(format!(
-                    "IP catalog sni entry for group `{group_id}` is invalid ({error}); ignored"
-                )),
-            }
-        } else {
-            sni.insert(group_id, String::new());
-        }
-    }
-
     let matcher = DomainMatcher::from_patterns(groups.iter().flat_map(|(id, domains)| {
         domains
             .iter()
@@ -265,7 +244,6 @@ pub fn validate(raw: IpCatalogRaw, config: &AppConfig) -> Result<IpCatalog> {
         schema_version: raw.v,
         groups,
         ips,
-        sni,
         warnings,
         ip_count,
         matcher,
@@ -303,9 +281,13 @@ pub fn affected_domains(
 
     if !changed_wildcards.is_empty() {
         for group in &config.groups {
-            for domain in group.domains.iter().filter(|d| !d.starts_with("*.")) {
-                if matches_any_suffix(domain, &changed_wildcards) {
-                    affected.insert(domain.clone());
+            for rule in group
+                .domains
+                .iter()
+                .filter(|rule| !rule.pattern.starts_with("*."))
+            {
+                if matches_any_suffix(&rule.pattern, &changed_wildcards) {
+                    affected.insert(rule.pattern.clone());
                 }
             }
         }
@@ -355,8 +337,7 @@ mod tests {
                         "raw.githubusercontent.com": ["185.199.108.133"],
                         "pixiv.net": ["210.140.139.155", "210.140.139.161"],
                         "uncovered.example": ["1.1.1.1"]
-                    },
-                    "sni": {"pixiv": "www.cloudflare.com"}
+                    }
                 }"#),
             &AppConfig::default(),
         )
@@ -372,7 +353,6 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(catalog.sni.get("pixiv").unwrap(), "www.cloudflare.com");
         assert!(catalog
             .warnings
             .iter()
@@ -468,7 +448,10 @@ mod tests {
         )
         .unwrap();
         let found = catalog.lookup_ips("a.mitm.test");
-        assert!(found.is_some(), "the wildcard entry must serve the subdomain");
+        assert!(
+            found.is_some(),
+            "the wildcard entry must serve the subdomain"
+        );
         assert_eq!(found.unwrap().1.len(), 1);
     }
 

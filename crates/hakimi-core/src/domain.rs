@@ -154,7 +154,9 @@ pub fn host_from_url(input: &str) -> Option<&str> {
     }
     // The authority ends at the first path, query or fragment delimiter.
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
     let host = match host.strip_prefix('[') {
         Some(rest) => rest.split_once(']').map_or(rest, |(host, _)| host),
         None => host.split_once(':').map_or(host, |(host, _)| host),
@@ -172,7 +174,10 @@ pub fn is_ip_literal(host: &str) -> bool {
 /// The brackets belong to the authority, not to the host: keeping them makes
 /// the host look like a name, so it matches no group and cannot be resolved.
 pub fn bare_host(host: &str) -> &str {
-    match host.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+    match host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
         Some(inner) => inner,
         None => host,
     }
@@ -182,8 +187,14 @@ pub fn bare_host(host: &str) -> &str {
 /// exact match first, then the longest wildcard suffix.
 #[derive(Clone, Debug, Default)]
 pub struct DomainMatcher {
-    exact: HashMap<String, String>,
-    wildcards: HashMap<String, String>,
+    exact: HashMap<String, MatchEntry>,
+    wildcards: HashMap<String, MatchEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct MatchEntry {
+    group: String,
+    rule: usize,
 }
 
 impl DomainMatcher {
@@ -200,27 +211,43 @@ impl DomainMatcher {
                 bail!("empty group id");
             }
             let pattern = DomainPattern::parse(pattern.as_ref())?;
+            let entry = MatchEntry {
+                group: group_id,
+                rule: 0,
+            };
             if pattern.wildcard {
                 // `or_insert` keeps the first declaration for a shared wildcard, matching
                 // exact-match precedence.
                 wildcards
                     .entry(pattern.pattern[2..].to_string())
-                    .or_insert(group_id);
+                    .or_insert(entry);
             } else {
-                exact.entry(pattern.pattern).or_insert(group_id);
+                exact.entry(pattern.pattern).or_insert(entry);
             }
         }
         Ok(Self { exact, wildcards })
     }
 
     pub fn from_groups(groups: &[crate::config::GroupConfig]) -> Result<Self> {
-        let entries = groups.iter().flat_map(|group| {
-            group
-                .domains
-                .iter()
-                .map(move |domain| (group.id.as_str(), domain.as_str()))
-        });
-        Self::from_patterns(entries)
+        let mut exact = HashMap::new();
+        let mut wildcards = HashMap::new();
+        for group in groups {
+            for (rule_index, rule) in group.domains.iter().enumerate() {
+                let pattern = DomainPattern::parse(&rule.pattern)?;
+                let entry = MatchEntry {
+                    group: group.id.clone(),
+                    rule: rule_index,
+                };
+                if pattern.wildcard {
+                    wildcards
+                        .entry(pattern.pattern[2..].to_string())
+                        .or_insert(entry);
+                } else {
+                    exact.entry(pattern.pattern).or_insert(entry);
+                }
+            }
+        }
+        Ok(Self { exact, wildcards })
     }
 
     pub fn match_host(&self, host: &str) -> Option<&str> {
@@ -229,27 +256,39 @@ impl DomainMatcher {
     }
 
     pub fn match_normalized(&self, host: &str) -> Option<&str> {
-        if let Some(group) = self.exact.get(host) {
-            return Some(group);
+        self.match_entry_normalized(host).map(|entry| entry.0)
+    }
+
+    /// Group id plus the matched domain-rule index. Callers that resolve a
+    /// per-domain route need the rule index; other callers keep using
+    /// [`Self::match_normalized`].
+    pub fn match_entry_normalized(&self, host: &str) -> Option<(&str, usize)> {
+        if let Some(entry) = self.exact.get(host) {
+            return Some((entry.group.as_str(), entry.rule));
         }
-        self.wildcard_match(host)
+        self.wildcard_entry(host)
+            .map(|entry| (entry.group.as_str(), entry.rule))
     }
 
     /// Longest wildcard suffix wins. Scanning label boundaries from left to right
     /// visits the longest suffix first and costs O(labels) map lookups instead of
     /// an O(number of wildcards) scan per request.
-    fn wildcard_match(&self, host: &str) -> Option<&str> {
+    fn wildcard_entry(&self, host: &str) -> Option<&MatchEntry> {
         if self.wildcards.is_empty() {
             return None;
         }
         for (index, byte) in host.bytes().enumerate() {
             if byte == b'.' {
-                if let Some(group) = self.wildcards.get(&host[index + 1..]) {
-                    return Some(group.as_str());
+                if let Some(entry) = self.wildcards.get(&host[index + 1..]) {
+                    return Some(entry);
                 }
             }
         }
         None
+    }
+
+    fn wildcard_match(&self, host: &str) -> Option<&str> {
+        self.wildcard_entry(host).map(|entry| entry.group.as_str())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -306,20 +345,19 @@ pub fn lookup_domain_map<'a, V>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::GroupConfig;
-    use crate::strategy::Strategy;
+    use crate::config::{DomainRule, GroupConfig};
 
     fn group(id: &str, domains: &[&str]) -> GroupConfig {
         GroupConfig {
             id: id.into(),
             name: id.into(),
-            domains: domains.iter().map(|d| d.to_string()).collect(),
-            strategy: Strategy::Auto,
+            domains: domains
+                .iter()
+                .map(|domain| DomainRule::new(*domain))
+                .collect(),
             enabled: true,
-            sni: None,
-            experimental: false,
             homepage: None,
-            ech_shared: false,
+            default_route: crate::config::RoutePolicy::direct(),
         }
     }
 
@@ -390,8 +428,9 @@ mod tests {
         let ascii = if host.is_ascii() {
             host
         } else {
-            idna::domain_to_ascii(&host)
-                .map_err(|err| anyhow::anyhow!("invalid internationalized domain `{input}`: {err:?}"))?
+            idna::domain_to_ascii(&host).map_err(|err| {
+                anyhow::anyhow!("invalid internationalized domain `{input}`: {err:?}")
+            })?
         };
         if ascii.len() > 253 {
             bail!("domain name is longer than 253 characters");
@@ -461,9 +500,9 @@ mod tests {
                     "different result for {input:?}"
                 ),
                 (Err(_), Err(_)) => {}
-                (expected, actual) => panic!(
-                    "different outcome for {input:?}: old={expected:?} new={actual:?}"
-                ),
+                (expected, actual) => {
+                    panic!("different outcome for {input:?}: old={expected:?} new={actual:?}")
+                }
             }
         }
     }
@@ -495,13 +534,19 @@ mod tests {
 
     #[test]
     fn urls_reduce_to_their_host() {
-        assert_eq!(host_from_url("https://www.example.com").unwrap(), "www.example.com");
+        assert_eq!(
+            host_from_url("https://www.example.com").unwrap(),
+            "www.example.com"
+        );
         assert_eq!(
             host_from_url("HTTPS://user:pw@www.example.com:8443/en/?q=1#top").unwrap(),
             "www.example.com"
         );
         assert_eq!(host_from_url("http://example.com/").unwrap(), "example.com");
-        assert_eq!(host_from_url("ftp://*.example.com").unwrap(), "*.example.com");
+        assert_eq!(
+            host_from_url("ftp://*.example.com").unwrap(),
+            "*.example.com"
+        );
         assert!(host_from_url("www.example.com").is_none());
         assert!(host_from_url("https://").is_none());
         assert!(host_from_url("https:// ").is_none());

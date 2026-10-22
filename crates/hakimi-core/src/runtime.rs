@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use crate::ca::{CaStatus, CertificateAuthority};
 use crate::cache::CacheManager;
 use crate::catalog::{CatalogManager, RefreshReport};
-use crate::config::{AppConfig, ConfigManager, GroupConfig, ProxyMode};
+use crate::config::{AppConfig, ConfigManager, GroupConfig, ProxyMode, RoutePolicy};
 use crate::decision::DecisionEngine;
 use crate::ip_tester::TlsContext;
 use crate::logging;
@@ -23,7 +23,6 @@ use crate::paths::Paths;
 use crate::proxy::{self, ProxyContext, ProxyHandle, UpstreamPool};
 use crate::resolver::Resolver;
 use crate::status::{DomainDiagnostics, StatusStore};
-use crate::strategy::Strategy;
 use crate::system_proxy::{SystemProxyManager, SystemProxyStatus};
 use crate::util::{network_id, now};
 
@@ -652,8 +651,8 @@ impl HakimiRuntime {
         self.config.set_group_enabled(id, enabled)
     }
 
-    pub fn set_group_strategy(&self, id: &str, strategy: Strategy) -> Result<AppConfig> {
-        self.config.set_group_strategy(id, strategy)
+    pub fn set_group_default_route(&self, id: &str, route: RoutePolicy) -> Result<AppConfig> {
+        self.config.set_group_default_route(id, route)
     }
 
     pub fn upsert_group(&self, group: GroupConfig) -> Result<AppConfig> {
@@ -698,7 +697,11 @@ impl HakimiRuntime {
         if !sections.is_empty() {
             tracing::info!(sections = ?sections, "configuration updated");
         }
-        self.config.update(config)
+        let result = self.config.update(config);
+        if result.is_ok() {
+            self.engine.clear_route_rejections();
+        }
+        result
     }
 
     pub fn export_diagnostics(&self) -> Result<PathBuf> {
@@ -941,7 +944,7 @@ impl HakimiRuntime {
         // Prefetch shared ECH configs so the first browser request does not pay the
         // HTTPS-RR DoH query inside the CONNECT path.
         for group in config.enabled_groups() {
-            if group.ech_shared {
+            if group.uses_shared_ech() {
                 if let Some(domain) = group.primary_domain().map(ToOwned::to_owned) {
                     let resolver = self.resolver.clone();
                     tokio::spawn(async move {
@@ -1011,9 +1014,8 @@ impl HakimiRuntime {
 #[cfg(test)]
 mod status_snapshot_tests {
     use super::*;
-    use crate::config::GroupConfig;
+    use crate::config::{DomainRule, GroupConfig, RoutePolicy};
     use crate::status::DomainDiagnostics;
-    use crate::strategy::Strategy;
 
     fn record(status: &StatusStore, domain: &str) {
         status.record(DomainDiagnostics {
@@ -1021,7 +1023,7 @@ mod status_snapshot_tests {
             domain: domain.into(),
             state: crate::status::State::Normal,
             strategy: None,
-            configured_strategy: None,
+            configured_modes: Vec::new(),
             ip: Some("93.184.216.34".parse().unwrap()),
             ip_source: None,
             doh_source: None,
@@ -1050,13 +1052,10 @@ mod status_snapshot_tests {
                 config.groups.push(GroupConfig {
                     id: "test".into(),
                     name: "Test".into(),
-                    domains: vec!["a.test".into(), "*.wild.test".into()],
-                    strategy: Strategy::Auto,
+                    domains: vec![DomainRule::new("a.test"), DomainRule::new("*.wild.test")],
                     enabled: true,
-                    sni: None,
-                    experimental: false,
                     homepage: None,
-                    ech_shared: false,
+                    default_route: RoutePolicy::auto(),
                 });
                 Ok(())
             })
@@ -1088,7 +1087,7 @@ mod status_snapshot_tests {
         runtime
             .config()
             .mutate(|config| {
-                config.groups[0].domains.push("c.test".into());
+                config.groups[0].domains.push(DomainRule::new("c.test"));
                 Ok(())
             })
             .unwrap();

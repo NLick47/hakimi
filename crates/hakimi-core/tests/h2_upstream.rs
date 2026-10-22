@@ -22,14 +22,13 @@ use tokio::net::{TcpListener, TcpStream};
 use hakimi_core::ca::CertificateAuthority;
 use hakimi_core::cache::CacheManager;
 use hakimi_core::catalog::CatalogManager;
-use hakimi_core::config::{ConfigManager, GroupConfig};
+use hakimi_core::config::{ConfigManager, DomainRule, GroupConfig, RoutePolicy};
 use hakimi_core::decision::DecisionEngine;
 use hakimi_core::ip_tester::TlsContext;
 use hakimi_core::paths::Paths;
 use hakimi_core::proxy::{self, ProxyContext};
 use hakimi_core::resolver::Resolver;
 use hakimi_core::status::StatusStore;
-use hakimi_core::strategy::Strategy;
 
 /// The trust hook lives in the environment, which is process wide: the tests
 /// must not run at the same time.
@@ -77,12 +76,19 @@ async fn spawn_h2_origin(tls: Arc<rustls::ServerConfig>) -> (SocketAddr, Arc<Ori
                         }
                         state.versions.lock().unwrap().push(req.version());
                         let path = req.uri().path().to_string();
-                        let received = req.into_body().collect().await.map(|b| b.to_bytes().len()).unwrap_or(0);
+                        let received = req
+                            .into_body()
+                            .collect()
+                            .await
+                            .map(|b| b.to_bytes().len())
+                            .unwrap_or(0);
                         let body = path
                             .strip_prefix("/bytes/")
                             .and_then(|count| count.parse::<usize>().ok())
                             .map(|count| Bytes::from(vec![7u8; count]))
-                            .unwrap_or_else(|| Bytes::from(format!("origin-ok len={received}").into_bytes()));
+                            .unwrap_or_else(|| {
+                                Bytes::from(format!("origin-ok len={received}").into_bytes())
+                            });
                         Ok::<_, Infallible>(hyper::Response::new(Full::new(body)))
                     }
                 });
@@ -135,13 +141,10 @@ async fn spawn_proxy(
             config.groups.push(GroupConfig {
                 id: "test".into(),
                 name: "Test".into(),
-                domains: vec!["origin.test".into()],
-                strategy: Strategy::Auto,
+                domains: vec![DomainRule::new("origin.test")],
                 enabled: true,
-                sni: None,
-                experimental: false,
                 homepage: None,
-                ech_shared: false,
+                default_route: RoutePolicy::auto(),
             });
             // The DoH endpoints point at a closed port: the cursor always
             // asks for a DoH expansion once the catalog candidates run out,
@@ -244,7 +247,9 @@ async fn request(proxy: SocketAddr, port: u16, path: &str) -> (u16, Vec<u8>) {
 }
 
 /// An origin plus a proxy that reaches it.
-async fn setup_with(http1_hosts: Vec<String>) -> (
+async fn setup_with(
+    http1_hosts: Vec<String>,
+) -> (
     SocketAddr,
     SocketAddr,
     Arc<OriginState>,
@@ -262,7 +267,6 @@ async fn setup_with(http1_hosts: Vec<String>) -> (
     let (proxy_addr, handle, dir) = spawn_proxy(ca.clone(), origin_addr, http1_hosts).await;
     (proxy_addr, origin_addr, state, handle, dir, ca_dir)
 }
-
 
 /// Open a CONNECT tunnel to the proxy and speak HTTP/2 inside it, trusting
 /// the local CA.  The connection task runs in the background.
@@ -310,7 +314,10 @@ async fn tunnel_h2(
     client_config.alpn_protocols = vec![b"h2".to_vec()];
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
     let tls = connector
-        .connect(rustls_pki_types::ServerName::try_from("origin.test").unwrap(), stream)
+        .connect(
+            rustls_pki_types::ServerName::try_from("origin.test").unwrap(),
+            stream,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -374,12 +381,7 @@ async fn a_large_body_survives_the_http2_flow_control() {
     let (proxy_addr, origin_addr, state, _handle, _dir, _ca_dir) = setup_with(Vec::new()).await;
 
     let size = 1024 * 1024;
-    let (status, body) = request(
-        proxy_addr,
-        origin_addr.port(),
-        &format!("/bytes/{size}"),
-    )
-    .await;
+    let (status, body) = request(proxy_addr, origin_addr.port(), &format!("/bytes/{size}")).await;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     assert_eq!(body.len(), size, "the body must arrive complete");
     assert!(body.iter().all(|byte| *byte == 7));

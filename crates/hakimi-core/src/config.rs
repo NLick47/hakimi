@@ -9,24 +9,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{normalize_hostname, DomainMatcher, DomainPattern};
 use crate::paths::Paths;
-use crate::strategy::Strategy;
-use crate::util::{atomic_write_json, decode_key_material, read_json};
+use crate::strategy::TlsMode;
+use crate::util::{atomic_write_json, decode_key_material, now, read_json};
 
 pub const MAX_GROUPS: usize = 128;
 pub const MAX_DOMAINS_PER_GROUP: usize = 512;
 pub const MAX_TOTAL_DOMAINS: usize = 5000;
 pub const MAX_CUSTOM_DOH: usize = 32;
-/// Bumped when `default_groups()` gains a domain that existing configs must
-/// also receive. Each bump needs a matching step in `migrate_defaults`.
-pub const CURRENT_DEFAULTS_VERSION: u32 = 1;
+pub const MAX_ROUTE_ATTEMPTS: usize = 8;
+pub const MAX_SNI_HOSTS_PER_ATTEMPT: usize = 16;
 
 /// Default remote IP catalog, shared by the desktop and Android builds.
-pub const DEFAULT_CATALOG_IP: &str =
-    "https://gitee.com/mom09/hakimi/raw/master/ips.json";
+pub const DEFAULT_CATALOG_IP: &str = "https://gitee.com/mom09/hakimi/raw/master/ips.json";
 
 /// Default remote DoH catalog, shared by the desktop and Android builds.
-pub const DEFAULT_CATALOG_DOH: &str =
-    "https://gitee.com/mom09/hakimi/raw/master/doh.json";
+pub const DEFAULT_CATALOG_DOH: &str = "https://gitee.com/mom09/hakimi/raw/master/doh.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -38,8 +35,6 @@ pub struct AppConfig {
     /// Monotonic local catalog revision. Incremented when accepted remote IP catalog content
     /// changes; cached IPs remember the revision that produced them.
     pub catalog_version: u64,
-    /// Built-in defaults revision this config has been migrated to.
-    pub defaults_version: u32,
     pub advanced: AdvancedConfig,
     pub log: LogConfig,
 }
@@ -52,7 +47,6 @@ impl Default for AppConfig {
             proxy: ProxyConfig::default(),
             groups: default_groups(),
             catalog_version: 0,
-            defaults_version: CURRENT_DEFAULTS_VERSION,
             advanced: AdvancedConfig::default(),
             log: LogConfig::default(),
         }
@@ -255,25 +249,155 @@ impl Default for LogConfig {
     }
 }
 
+/// Where the ECHConfigList for an ECH attempt may come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EchSource {
+    /// Only the domain's own HTTPS RR.
+    Own,
+    /// The domain's own HTTPS RR, then Cloudflare's shared `cloudflare-ech.com` config.
+    #[default]
+    Shared,
+}
+
+/// One ordered TLS attempt for a domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum RouteAttempt {
+    Direct,
+    Ech {
+        #[serde(default)]
+        ech: EchSource,
+    },
+    Sni {
+        /// Fake SNI hosts. Empty means the global `advanced.fakeSniCandidates` list.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sni: Vec<String>,
+    },
+}
+
+impl RouteAttempt {
+    pub fn mode(&self) -> TlsMode {
+        match self {
+            Self::Direct => TlsMode::Direct,
+            Self::Ech { .. } => TlsMode::Ech,
+            Self::Sni { .. } => TlsMode::FakeSni,
+        }
+    }
+
+    pub fn ech_source(&self) -> Option<EchSource> {
+        match self {
+            Self::Ech { ech } => Some(*ech),
+            _ => None,
+        }
+    }
+
+    pub fn sni_hosts(&self) -> Option<&[String]> {
+        match self {
+            Self::Sni { sni } => Some(sni),
+            _ => None,
+        }
+    }
+}
+
+/// Ordered attempts for one domain. The engine never appends an implicit
+/// fallback: what is listed here is exactly what will be tried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutePolicy {
+    pub attempts: Vec<RouteAttempt>,
+}
+
+impl RoutePolicy {
+    pub fn new(attempts: Vec<RouteAttempt>) -> Self {
+        Self { attempts }
+    }
+
+    pub fn auto() -> Self {
+        Self::new(vec![
+            RouteAttempt::Direct,
+            RouteAttempt::Ech {
+                ech: EchSource::Own,
+            },
+            RouteAttempt::Sni { sni: Vec::new() },
+        ])
+    }
+
+    pub fn direct() -> Self {
+        Self::new(vec![RouteAttempt::Direct])
+    }
+
+    pub fn ech_shared() -> Self {
+        Self::new(vec![
+            RouteAttempt::Ech {
+                ech: EchSource::Shared,
+            },
+            RouteAttempt::Direct,
+        ])
+    }
+
+    pub fn sni(hosts: Vec<String>) -> Self {
+        Self::new(vec![RouteAttempt::Sni { sni: hosts }, RouteAttempt::Direct])
+    }
+
+    pub fn contains_mode(&self, mode: TlsMode) -> bool {
+        self.attempts.iter().any(|attempt| attempt.mode() == mode)
+    }
+
+    pub fn is_direct_only(&self) -> bool {
+        self.attempts
+            .iter()
+            .all(|attempt| matches!(attempt, RouteAttempt::Direct))
+    }
+}
+
+impl Default for RoutePolicy {
+    fn default() -> Self {
+        Self::auto()
+    }
+}
+
+/// A domain pattern plus an optional override of the site's default route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DomainRule {
+    pub pattern: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<RoutePolicy>,
+}
+
+impl DomainRule {
+    pub fn new(pattern: impl Into<String>) -> Self {
+        Self {
+            pattern: pattern.into(),
+            route: None,
+        }
+    }
+
+    pub fn routed(pattern: impl Into<String>, route: RoutePolicy) -> Self {
+        Self {
+            pattern: pattern.into(),
+            route: Some(route),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GroupConfig {
     pub id: String,
     pub name: String,
-    pub domains: Vec<String>,
-    pub strategy: Strategy,
+    pub domains: Vec<DomainRule>,
     pub enabled: bool,
-    pub sni: Option<String>,
-    pub experimental: bool,
     /// Canonical page opened by the UI's "visit" button. `None` falls back to
     /// the first exact routed domain, which is the right default for custom
     /// groups but not for presets such as Pixiv (bare `pixiv.net` is not the
     /// canonical `www.pixiv.net` host).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub homepage: Option<String>,
-    /// Use Cloudflare's shared ECH config (cloudflare-ech.com) when the domain itself
-    /// publishes no ECHConfig. Needed for Cloudflare-fronted sites such as www.pixiv.net.
-    pub ech_shared: bool,
+    /// Route used by domain rules without an explicit route.
+    #[serde(default = "RoutePolicy::auto")]
+    pub default_route: RoutePolicy,
 }
 
 impl Default for GroupConfig {
@@ -282,12 +406,9 @@ impl Default for GroupConfig {
             id: String::new(),
             name: String::new(),
             domains: Vec::new(),
-            strategy: Strategy::Auto,
             enabled: true,
-            sni: None,
-            experimental: false,
             homepage: None,
-            ech_shared: false,
+            default_route: RoutePolicy::auto(),
         }
     }
 }
@@ -297,26 +418,93 @@ impl GroupConfig {
     pub fn primary_domain(&self) -> Option<&str> {
         self.domains
             .iter()
-            .find(|domain| !domain.starts_with("*."))
-            .map(String::as_str)
+            .find(|rule| !rule.pattern.starts_with("*."))
+            .map(|rule| rule.pattern.as_str())
     }
 
     /// First `limit` exact domains, skipping wildcards.
     pub fn probe_domains(&self, limit: usize) -> Vec<&str> {
         self.domains
             .iter()
-            .filter(|domain| !domain.starts_with("*."))
+            .filter(|rule| !rule.pattern.starts_with("*."))
             .take(limit)
-            .map(String::as_str)
+            .map(|rule| rule.pattern.as_str())
             .collect()
     }
 
     pub fn exact_domains(&self) -> impl Iterator<Item = &str> {
         self.domains
             .iter()
-            .filter(|domain| !domain.starts_with("*."))
-            .map(String::as_str)
+            .filter(|rule| !rule.pattern.starts_with("*."))
+            .map(|rule| rule.pattern.as_str())
     }
+
+    pub fn patterns(&self) -> impl Iterator<Item = &str> {
+        self.domains.iter().map(|rule| rule.pattern.as_str())
+    }
+
+    /// Resolve the route for an already-normalized host (lowercase, no root dot).
+    ///
+    /// Exact patterns win over wildcards; among wildcards the longest suffix
+    /// wins. A rule without a route inherits `default_route`.
+    pub fn route_for(&self, host: &str) -> &RoutePolicy {
+        let host = host.trim_end_matches('.');
+        let mut wildcard: Option<(usize, &DomainRule)> = None;
+        for rule in &self.domains {
+            if let Some(suffix) = rule.pattern.strip_prefix("*.") {
+                if host_matches_suffix(host, suffix) {
+                    let labels = suffix.bytes().filter(|byte| *byte == b'.').count() + 1;
+                    if wildcard.is_none_or(|(best, _)| labels > best) {
+                        wildcard = Some((labels, rule));
+                    }
+                }
+            } else if host.eq_ignore_ascii_case(rule.pattern.as_str()) {
+                return rule.route.as_ref().unwrap_or(&self.default_route);
+            }
+        }
+        wildcard
+            .map(|(_, rule)| rule.route.as_ref().unwrap_or(&self.default_route))
+            .unwrap_or(&self.default_route)
+    }
+
+    pub fn domain(&self, pattern: &str) -> Option<&DomainRule> {
+        self.domains
+            .iter()
+            .find(|rule| rule.pattern.eq_ignore_ascii_case(pattern))
+    }
+
+    pub fn route_modes(&self, host: &str) -> Vec<TlsMode> {
+        self.route_for(host)
+            .attempts
+            .iter()
+            .map(RouteAttempt::mode)
+            .collect()
+    }
+
+    /// True when any route in this group may fall back to Cloudflare's shared
+    /// ECH config. Startup uses this to prefetch it once per group.
+    pub fn uses_shared_ech(&self) -> bool {
+        let uses_shared = |route: &RoutePolicy| {
+            route
+                .attempts
+                .iter()
+                .any(|attempt| attempt.ech_source() == Some(EchSource::Shared))
+        };
+        uses_shared(&self.default_route)
+            || self
+                .domains
+                .iter()
+                .filter_map(|rule| rule.route.as_ref())
+                .any(uses_shared)
+    }
+}
+
+fn host_matches_suffix(host: &str, suffix: &str) -> bool {
+    let host = host.as_bytes();
+    let suffix = suffix.as_bytes();
+    host.len() > suffix.len()
+        && host[host.len() - suffix.len() - 1] == b'.'
+        && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
 fn default_true() -> bool {
@@ -327,145 +515,151 @@ pub fn default_groups() -> Vec<GroupConfig> {
     fn group(
         id: &str,
         name: &str,
-        domains: &[&str],
-        strategy: Strategy,
+        domains: Vec<DomainRule>,
+        default_route: RoutePolicy,
         enabled: bool,
-        experimental: bool,
         homepage: &str,
     ) -> GroupConfig {
         GroupConfig {
             id: id.to_string(),
             name: name.to_string(),
-            domains: domains.iter().map(|d| d.to_string()).collect(),
-            strategy,
+            domains,
             enabled,
-            sni: None,
-            experimental,
             homepage: Some(homepage.to_string()),
-            ech_shared: false,
+            default_route,
         }
     }
+
+    let plain = |pattern: &str| DomainRule::new(pattern);
+    let ech = |pattern: &str| DomainRule::routed(pattern, RoutePolicy::ech_shared());
+
     vec![
         group(
             "github",
             "GitHub",
-            &[
-                "github.com",
-                "api.github.com",
-                "raw.githubusercontent.com",
-                "*.githubusercontent.com",
-                "*.githubassets.com",
+            vec![
+                plain("github.com"),
+                plain("api.github.com"),
+                // The default certificate on the shared GitHub edge does not
+                // cover gist; api.github.com makes it serve the *.github.com
+                // wildcard, which does.
+                DomainRule::routed(
+                    "gist.github.com",
+                    RoutePolicy::sni(vec!["api.github.com".to_string()]),
+                ),
+                plain("codeload.github.com"),
+                plain("raw.githubusercontent.com"),
+                plain("*.githubusercontent.com"),
+                plain("*.githubassets.com"),
             ],
-            Strategy::Auto,
+            RoutePolicy::sni(Vec::new()),
             true,
-            false,
             "https://github.com/",
         ),
-        {
-            let mut group = group(
-                "pixiv",
-                "Pixiv",
-                &[
-                    "pixiv.net",
-                    "www.pixiv.net",
-                    "*.pixiv.net",
-                    "i.pximg.net",
-                    "s.pximg.net",
-                    "booth.pximg.net",
-                    "*.pximg.net",
-                ],
-                Strategy::Auto,
-                true,
-                false,
-                "https://www.pixiv.net/",
-            );
-            group.ech_shared = true;
-            group
-        },
+        group(
+            "pixiv",
+            "Pixiv",
+            vec![
+                ech("pixiv.net"),
+                ech("www.pixiv.net"),
+                ech("*.pixiv.net"),
+                plain("i.pximg.net"),
+                plain("s.pximg.net"),
+                plain("booth.pximg.net"),
+                plain("*.pximg.net"),
+            ],
+            RoutePolicy::sni(Vec::new()),
+            true,
+            "https://www.pixiv.net/",
+        ),
         group(
             "ao3",
             "AO3",
-            &["archiveofourown.org", "*.archiveofourown.org"],
-            Strategy::Auto,
+            vec![
+                plain("archiveofourown.org"),
+                plain("www.archiveofourown.org"),
+                plain("*.archiveofourown.org"),
+            ],
+            RoutePolicy::sni(Vec::new()),
             true,
-            false,
             "https://archiveofourown.org/",
         ),
         group(
             "eh",
             "E-Hentai",
-            &[
-                "e-hentai.org",
-                "exhentai.org",
-                "*.e-hentai.org",
-                "*.exhentai.org",
-                "ehgt.org",
-                "*.ehgt.org",
+            vec![
+                plain("e-hentai.org"),
+                // ExHentai only answers with a valid certificate through ECH;
+                // plain direct or fake SNI fails certificate validation.
+                ech("exhentai.org"),
+                plain("*.e-hentai.org"),
+                ech("*.exhentai.org"),
+                plain("ehgt.org"),
+                plain("*.ehgt.org"),
             ],
-            Strategy::Auto,
-            false,
+            RoutePolicy::sni(Vec::new()),
             true,
             "https://e-hentai.org/",
         ),
         group(
             "hitomi",
             "Hitomi",
-            &[
-                "hitomi.la",
-                "*.hitomi.la",
-                "ltn.gold-usergeneratedcontent.net",
-                "*.gold-usergeneratedcontent.net",
+            vec![
+                plain("hitomi.la"),
+                plain("*.hitomi.la"),
+                plain("ltn.gold-usergeneratedcontent.net"),
+                plain("*.gold-usergeneratedcontent.net"),
             ],
-            Strategy::Auto,
+            RoutePolicy::auto(),
             true,
-            false,
             "https://hitomi.la/",
         ),
         group(
             "nhentai",
             "nhentai",
-            &["nhentai.net", "*.nhentai.net"],
-            Strategy::Auto,
+            vec![plain("nhentai.net"), plain("*.nhentai.net")],
+            RoutePolicy::auto(),
             true,
-            false,
             "https://nhentai.net/",
         ),
         group(
             "hanime",
             "Hanime",
-            &["hanime.tv", "www.hanime.tv", "*.hanime.tv"],
-            Strategy::Auto,
+            vec![
+                plain("hanime.tv"),
+                plain("www.hanime.tv"),
+                plain("*.hanime.tv"),
+            ],
+            RoutePolicy::auto(),
             true,
-            false,
             "https://hanime.tv/",
         ),
         group(
             "steam",
             "Steam",
-            &[
-                "store.steampowered.com",
-                "steamcommunity.com",
-                "*.steamcommunity.com",
-                "*.steampowered.com",
-                "*.steamstatic.com",
+            vec![
+                plain("store.steampowered.com"),
+                plain("steamcommunity.com"),
+                plain("*.steamcommunity.com"),
+                plain("*.steampowered.com"),
+                plain("*.steamstatic.com"),
+                plain("steamcdn-a.akamaihd.net"),
             ],
-            Strategy::Auto,
+            RoutePolicy::sni(Vec::new()),
             true,
-            false,
             "https://store.steampowered.com/",
         ),
         group(
             "poipiku",
             "Poipiku",
-            &[
-                "poipiku.com",
-                "img.poipiku.com",
-                "cdn.poipiku.com",
-                "*.poipiku.com",
+            vec![
+                plain("poipiku.com"),
+                plain("img.poipiku.com"),
+                plain("cdn.poipiku.com"),
+                plain("*.poipiku.com"),
             ],
-            Strategy::Direct,
+            RoutePolicy::auto(),
             true,
-            false,
             "https://poipiku.com/",
         ),
     ]
@@ -590,12 +784,9 @@ impl AppConfig {
             if let Some(homepage) = &group.homepage {
                 let raw = homepage.trim();
                 if !raw.is_empty() {
-                    let parsed = url::Url::parse(raw).with_context(|| {
-                        format!("group `{}` homepage is not a URL", group.id)
-                    })?;
-                    if !matches!(parsed.scheme(), "http" | "https")
-                        || parsed.host_str().is_none()
-                    {
+                    let parsed = url::Url::parse(raw)
+                        .with_context(|| format!("group `{}` homepage is not a URL", group.id))?;
+                    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
                         bail!(
                             "group `{}` homepage must be an absolute http(s) URL",
                             group.id
@@ -612,25 +803,36 @@ impl AppConfig {
                     group.id
                 );
             }
-            if !group.domains.iter().any(|domain| !domain.starts_with("*.")) {
+            if !group
+                .domains
+                .iter()
+                .any(|rule| !rule.pattern.starts_with("*."))
+            {
                 bail!(
                     "group `{}` needs at least one exact domain to act as its primary domain",
                     group.id
                 );
             }
+            validate_route(
+                &group.default_route,
+                &format!("group `{}` defaultRoute", group.id),
+            )?;
             let mut patterns = std::collections::HashSet::new();
-            for raw in &group.domains {
-                let pattern =
-                    DomainPattern::parse(raw).with_context(|| format!("group `{}`", group.id))?;
+            for rule in &group.domains {
+                let pattern = DomainPattern::parse(&rule.pattern)
+                    .with_context(|| format!("group `{}`", group.id))?;
                 if !patterns.insert(pattern.as_str().to_string()) {
-                    bail!("group `{}` contains duplicate domain `{raw}`", group.id);
+                    bail!(
+                        "group `{}` contains duplicate domain `{}`",
+                        group.id,
+                        rule.pattern
+                    );
                 }
-            }
-            if let Some(sni) = &group.sni {
-                if !sni.is_empty() {
-                    normalize_hostname(sni).with_context(|| {
-                        format!("group `{}` has an invalid SNI override", group.id)
-                    })?;
+                if let Some(route) = &rule.route {
+                    validate_route(
+                        route,
+                        &format!("group `{}` domain `{}`", group.id, rule.pattern),
+                    )?;
                 }
             }
             total_domains += group.domains.len();
@@ -663,6 +865,36 @@ impl AppConfig {
     pub fn enabled_groups(&self) -> impl Iterator<Item = &GroupConfig> {
         self.groups.iter().filter(|group| group.enabled)
     }
+}
+
+fn validate_route(route: &RoutePolicy, label: &str) -> Result<()> {
+    if route.attempts.is_empty() {
+        bail!("{label} needs at least one attempt");
+    }
+    if route.attempts.len() > MAX_ROUTE_ATTEMPTS {
+        bail!("{label} supports at most {MAX_ROUTE_ATTEMPTS} attempts");
+    }
+    for (index, attempt) in route.attempts.iter().enumerate() {
+        if let RouteAttempt::Sni { sni } = attempt {
+            if sni.len() > MAX_SNI_HOSTS_PER_ATTEMPT {
+                bail!(
+                    "{label} attempt {} supports at most {MAX_SNI_HOSTS_PER_ATTEMPT} SNI hosts",
+                    index + 1
+                );
+            }
+            for host in sni {
+                if !host.trim().is_empty() {
+                    normalize_hostname(host).with_context(|| {
+                        format!(
+                            "{label} attempt {} has an invalid SNI host `{host}`",
+                            index + 1
+                        )
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_group_id(id: &str) -> Result<()> {
@@ -703,60 +935,6 @@ pub fn validate_catalog_url(raw: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// Append built-in groups a config predates and fill in newly introduced
-/// built-in metadata (currently the homepage URL), keeping custom groups and
-/// explicit user values untouched. Returns how many entries changed.
-fn merge_missing_defaults(config: &mut AppConfig) -> usize {
-    let mut changed = 0;
-    for mut default_group in default_groups() {
-        match config
-            .groups
-            .iter_mut()
-            .find(|group| group.id == default_group.id)
-        {
-            Some(existing) => {
-                let has_homepage = existing
-                    .homepage
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|url| !url.is_empty());
-                if !has_homepage {
-                    if let Some(homepage) = default_group.homepage.take() {
-                        existing.homepage = Some(homepage);
-                        changed += 1;
-                    }
-                }
-            }
-            None => {
-                config.groups.push(default_group);
-                changed += 1;
-            }
-        }
-    }
-    changed
-}
-
-/// Apply domain additions that built-in groups gained after this config was
-/// written. `merge_missing_defaults` only handles whole groups; domains need a
-/// version marker because a user may have edited a built-in group's domain
-/// list on purpose.
-fn migrate_defaults(config: &mut AppConfig) -> usize {
-    let mut changed = 0;
-    if config.defaults_version < 1 {
-        // The pixiv login/OAuth flow runs on subdomains that the old preset
-        // did not intercept (it listed only the bare and www hosts).
-        if let Some(group) = config.groups.iter_mut().find(|group| group.id == "pixiv") {
-            if !group.domains.iter().any(|domain| domain == "*.pixiv.net") {
-                group.domains.push("*.pixiv.net".to_string());
-                changed += 1;
-            }
-        }
-        config.defaults_version = CURRENT_DEFAULTS_VERSION;
-        changed += 1;
-    }
-    changed
-}
-
 /// Thread-safe configuration holder that keeps the derived domain matcher in sync.
 pub struct ConfigManager {
     path: PathBuf,
@@ -775,34 +953,32 @@ impl ConfigManager {
     pub fn load_or_create(paths: &Paths) -> Result<Self> {
         paths.ensure()?;
         let path = paths.config_file();
-        let mut config = if path.exists() {
-            read_json::<AppConfig>(&path).with_context(|| {
-                format!(
-                    "failed to parse {}; fix or remove the file to regenerate defaults",
-                    path.display()
-                )
-            })?
+        let config = if path.exists() {
+            match read_json::<AppConfig>(&path) {
+                Ok(config) => config,
+                Err(error) => {
+                    // The schema changed while the app is still unreleased. Keep
+                    // the old file for inspection instead of refusing to start.
+                    let backup = path.with_file_name(format!(
+                        "config.invalid-{}.json",
+                        now().format("%Y%m%d-%H%M%S")
+                    ));
+                    let _ = std::fs::rename(&path, &backup);
+                    tracing::warn!(
+                        error = %error,
+                        backup = %backup.display(),
+                        "config.json does not match this build; regenerating defaults"
+                    );
+                    let config = AppConfig::default();
+                    atomic_write_json(&path, &config)?;
+                    config
+                }
+            }
         } else {
             let config = AppConfig::default();
             atomic_write_json(&path, &config)?;
             config
         };
-        // A config written by an older build lacks sites that have since been
-        // added to the defaults. Built-in groups cannot be deleted from the UI,
-        // so a missing id means "predates this site", not "user removed it".
-        let restored = merge_missing_defaults(&mut config);
-        // Domain additions cannot use the same "missing id" test: users may
-        // edit a built-in group's domain list, so a version marker decides
-        // which migrations have already run.
-        let migrated = migrate_defaults(&mut config);
-        if restored + migrated > 0 {
-            tracing::info!(
-                restored,
-                migrated,
-                "updated built-in site defaults in the config"
-            );
-            atomic_write_json(&path, &config)?;
-        }
         Self::new(path, config)
     }
 
@@ -817,7 +993,10 @@ impl ConfigManager {
         let matcher = Arc::new(config.matcher()?);
         Ok(Self {
             path,
-            inner: RwLock::new(Inner { config: Arc::new(config), matcher }),
+            inner: RwLock::new(Inner {
+                config: Arc::new(config),
+                matcher,
+            }),
             revision: AtomicU64::new(1),
         })
     }
@@ -893,12 +1072,12 @@ impl ConfigManager {
         })
     }
 
-    pub fn set_group_strategy(&self, id: &str, strategy: Strategy) -> Result<AppConfig> {
+    pub fn set_group_default_route(&self, id: &str, route: RoutePolicy) -> Result<AppConfig> {
         self.mutate(|config| {
             let group = config
                 .group_mut(id)
                 .with_context(|| format!("unknown group `{id}`"))?;
-            group.strategy = strategy;
+            group.default_route = route;
             Ok(())
         })
     }
@@ -961,46 +1140,45 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.groups.len(), 9);
         let eh = config.group("eh").unwrap();
-        assert!(!eh.enabled);
-        assert!(eh.experimental);
-        assert_eq!(config.group("poipiku").unwrap().strategy, Strategy::Direct);
+        assert!(eh.enabled);
+        assert!(config.groups.iter().all(|group| group.enabled));
+        assert_eq!(
+            config.group("poipiku").unwrap().default_route.attempts[0].mode(),
+            TlsMode::Direct
+        );
         // The three adult sites ship enabled with their own CDN domains.
         let hitomi = config.group("hitomi").unwrap();
         assert!(hitomi.enabled);
         assert!(hitomi
             .domains
             .iter()
-            .any(|domain| domain == "*.gold-usergeneratedcontent.net"));
+            .any(|rule| rule.pattern == "*.gold-usergeneratedcontent.net"));
         assert!(config
             .group("nhentai")
             .unwrap()
             .domains
             .iter()
-            .any(|domain| domain == "*.nhentai.net"));
+            .any(|rule| rule.pattern == "*.nhentai.net"));
         assert!(config
             .group("hanime")
             .unwrap()
             .domains
             .iter()
-            .any(|domain| domain == "*.hanime.tv"));
-        assert!(config.group("pixiv").unwrap().ech_shared);
+            .any(|rule| rule.pattern == "*.hanime.tv"));
         assert_eq!(
             config.group("pixiv").unwrap().homepage.as_deref(),
             Some("https://www.pixiv.net/")
         );
-        assert!(config
-            .groups
-            .iter()
-            .all(|group| group
-                .homepage
-                .as_deref()
-                .is_some_and(|url| url.starts_with("https://"))));
+        assert!(config.groups.iter().all(|group| group
+            .homepage
+            .as_deref()
+            .is_some_and(|url| url.starts_with("https://"))));
         assert!(config
             .group("pixiv")
             .unwrap()
             .domains
             .iter()
-            .any(|domain| domain == "s.pximg.net"));
+            .any(|rule| rule.pattern == "s.pximg.net"));
         assert!(config
             .advanced
             .http1_hosts
@@ -1023,14 +1201,129 @@ mod tests {
     }
 
     #[test]
-    fn group_ech_shared_roundtrip() {
-        let group: GroupConfig = serde_json::from_str(
-            r#"{"id":"p","name":"P","domains":["pixiv.net"],"echShared":true}"#,
+    fn per_domain_routes_select_ech_fake_sni_or_direct() {
+        let config = AppConfig::default();
+        let pixiv = config.group("pixiv").unwrap();
+        assert_eq!(
+            pixiv.route_for("www.pixiv.net").attempts[0].mode(),
+            TlsMode::Ech
+        );
+        assert_eq!(
+            pixiv.route_for("pixiv.net").attempts[0].mode(),
+            TlsMode::Ech
+        );
+        // pximg hosts inherit the site's fake-SNI default.
+        assert_eq!(
+            pixiv.route_for("i.pximg.net").attempts[0].mode(),
+            TlsMode::FakeSni
+        );
+        assert_eq!(
+            pixiv.route_for("s.pximg.net").attempts[0].mode(),
+            TlsMode::FakeSni
+        );
+        // Exact rules beat the broader wildcard.
+        assert_eq!(
+            pixiv.route_for("accounts.pixiv.net").attempts[0].mode(),
+            TlsMode::Ech
+        );
+        let ao3 = config.group("ao3").unwrap();
+        assert_eq!(
+            ao3.route_for("archiveofourown.org").attempts[0].mode(),
+            TlsMode::FakeSni
+        );
+        let eh = config.group("eh").unwrap();
+        assert_eq!(
+            eh.route_for("e-hentai.org").attempts[0].mode(),
+            TlsMode::FakeSni
+        );
+        assert_eq!(
+            eh.route_for("exhentai.org").attempts[0].mode(),
+            TlsMode::Ech
+        );
+        assert_eq!(
+            eh.route_for("www.exhentai.org").attempts[0].mode(),
+            TlsMode::Ech
+        );
+        let github = config.group("github").unwrap();
+        assert_eq!(
+            github.route_for("raw.githubusercontent.com").attempts[0].mode(),
+            TlsMode::FakeSni
+        );
+        // gist needs the api.github.com SNI to receive a certificate that
+        // covers gist.github.com.
+        assert_eq!(
+            github.route_for("gist.github.com").attempts[0],
+            RouteAttempt::Sni {
+                sni: vec!["api.github.com".to_string()]
+            }
+        );
+        // Hosts that answer directly start with a direct attempt so the
+        // common case does not pay for a failed fake-SNI handshake.
+        for id in ["hitomi", "nhentai", "hanime", "poipiku"] {
+            assert_eq!(
+                config.group(id).unwrap().default_route.attempts[0].mode(),
+                TlsMode::Direct,
+                "{id} should prefer direct"
+            );
+        }
+        let steam = config.group("steam").unwrap();
+        assert_eq!(
+            steam.route_for("store.steampowered.com").attempts[0].mode(),
+            TlsMode::FakeSni
+        );
+        assert_eq!(
+            steam.route_for("steamcommunity.com").attempts[0].mode(),
+            TlsMode::FakeSni
+        );
+    }
+
+    #[test]
+    fn route_policy_roundtrips_as_attempts() {
+        let route = RoutePolicy::new(vec![
+            RouteAttempt::Ech {
+                ech: EchSource::Shared,
+            },
+            RouteAttempt::Sni {
+                sni: vec!["www.baidu.com".into()],
+            },
+            RouteAttempt::Direct,
+        ]);
+        let text = serde_json::to_string(&route).unwrap();
+        assert!(text.contains(r#""mode":"ech""#));
+        assert!(text.contains(r#""ech":"shared""#));
+        let decoded: RoutePolicy = serde_json::from_str(&text).unwrap();
+        assert_eq!(decoded, route);
+    }
+
+    #[test]
+    fn incompatible_config_is_backed_up_and_regenerated() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            br#"{"groups":[{"id":"old","domains":["old.example"],"strategy":"auto"}]}"#,
         )
         .unwrap();
-        assert!(group.ech_shared);
-        let text = serde_json::to_string(&group).unwrap();
-        assert!(text.contains("\"echShared\":true"));
+
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        assert!(manager.snapshot().group("old").is_none());
+        assert!(manager.snapshot().group("pixiv").is_some());
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config.invalid-")
+            })
+            .collect();
+        assert_eq!(
+            backups.len(),
+            1,
+            "the old config must be kept for inspection"
+        );
     }
 
     #[test]
@@ -1044,7 +1337,7 @@ mod tests {
     fn rejects_duplicate_groups() {
         let mut config = AppConfig::default();
         let mut duplicate = config.groups[0].clone();
-        duplicate.domains = vec!["example.com".into()];
+        duplicate.domains = vec![DomainRule::new("example.com")];
         config.groups.push(duplicate);
         assert!(config.validate().is_err());
     }
@@ -1053,64 +1346,6 @@ mod tests {
     /// so adding a site does not break unrelated tests.
     fn config_defaults() -> usize {
         AppConfig::default().groups.len()
-    }
-
-    #[test]
-    fn merge_adds_only_missing_builtin_sites() {
-        let mut config = AppConfig::default();
-        config.groups.retain(|group| group.id != "nhentai");
-        let mut custom = GroupConfig::default();
-        custom.id = "custom".into();
-        custom.name = "Custom".into();
-        custom.domains = vec!["custom.example".into()];
-        config.groups.push(custom);
-        // Older configs predate the homepage field: fill it from defaults too.
-        config.group_mut("github").unwrap().homepage = None;
-
-        assert_eq!(merge_missing_defaults(&mut config), 2);
-        assert!(config.group("nhentai").is_some());
-        assert_eq!(
-            config.group("github").unwrap().homepage.as_deref(),
-            Some("https://github.com/")
-        );
-        assert_eq!(
-            config
-                .groups
-                .iter()
-                .filter(|group| group.id == "custom")
-                .count(),
-            1,
-            "custom groups must keep working"
-        );
-
-        // Idempotent: a second pass adds nothing.
-        assert_eq!(merge_missing_defaults(&mut config), 0);
-    }
-
-    #[test]
-    fn an_old_config_gains_new_sites_on_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::new(dir.path());
-        let mut old = AppConfig::default();
-        old.groups
-            .retain(|group| !matches!(group.id.as_str(), "hitomi" | "nhentai" | "hanime"));
-        old.group_mut("github").unwrap().homepage = None;
-        atomic_write_json(&paths.config_file(), &old).unwrap();
-
-        let manager = ConfigManager::load_or_create(&paths).unwrap();
-        let snapshot = manager.snapshot();
-        for id in ["hitomi", "nhentai", "hanime"] {
-            assert!(snapshot.group(id).is_some(), "{id} should be restored");
-        }
-        assert_eq!(
-            snapshot.group("github").unwrap().homepage.as_deref(),
-            Some("https://github.com/"),
-            "existing built-ins gain newly introduced homepage defaults"
-        );
-
-        // The merge is persisted, so the next load starts from the new list.
-        let reloaded = ConfigManager::load_or_create(&paths).unwrap();
-        assert_eq!(reloaded.snapshot().groups.len(), AppConfig::default().groups.len());
     }
 
     #[test]
@@ -1123,16 +1358,18 @@ mod tests {
         assert!(text.contains("\"maxCandidatesPerDomain\""));
         let manager2 = ConfigManager::load(paths.config_file()).unwrap();
         assert_eq!(manager2.snapshot().groups.len(), config_defaults());
-        manager.set_group_enabled("eh", true).unwrap();
-        assert!(!manager2.snapshot().group("eh").unwrap().enabled); // other holders are not auto-reloaded
+        manager.set_group_enabled("eh", false).unwrap();
+        assert!(manager2.snapshot().group("eh").unwrap().enabled); // other holders are not auto-reloaded
         let manager3 = ConfigManager::load(paths.config_file()).unwrap();
-        assert!(manager3.snapshot().group("eh").unwrap().enabled);
+        assert!(!manager3.snapshot().group("eh").unwrap().enabled);
     }
 
     #[test]
     fn rejects_invalid_domains() {
         let mut config = AppConfig::default();
-        config.groups[0].domains.push("bad domain.com".into());
+        config.groups[0]
+            .domains
+            .push(DomainRule::new("bad domain.com"));
         assert!(config.validate().is_err());
     }
 
@@ -1150,37 +1387,7 @@ mod tests {
         let config = AppConfig::default();
         let matcher = config.matcher().unwrap();
         assert_eq!(matcher.match_host("accounts.pixiv.net"), Some("pixiv"));
-        assert_eq!(
-            matcher.match_host("oauth.secure.pixiv.net"),
-            Some("pixiv")
-        );
+        assert_eq!(matcher.match_host("oauth.secure.pixiv.net"), Some("pixiv"));
         assert_eq!(matcher.match_host("app-api.pixiv.net"), Some("pixiv"));
-    }
-
-    #[test]
-    fn older_configs_gain_pixiv_login_domains() {
-        let mut config = AppConfig::default();
-        config.defaults_version = 0;
-        let pixiv = config
-            .groups
-            .iter_mut()
-            .find(|group| group.id == "pixiv")
-            .unwrap();
-        pixiv.domains.retain(|domain| domain != "*.pixiv.net");
-
-        assert_eq!(migrate_defaults(&mut config), 2);
-        assert_eq!(config.defaults_version, CURRENT_DEFAULTS_VERSION);
-        assert!(config
-            .group("pixiv")
-            .unwrap()
-            .domains
-            .iter()
-            .any(|domain| domain == "*.pixiv.net"));
-    }
-
-    #[test]
-    fn defaults_migration_is_idempotent() {
-        let mut config = AppConfig::default();
-        assert_eq!(migrate_defaults(&mut config), 0);
     }
 }

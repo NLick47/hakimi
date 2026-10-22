@@ -8,12 +8,12 @@ use parking_lot::Mutex;
 
 use crate::cache::{CacheManager, LastGoodEntry};
 use crate::catalog::RemoteIpProvider;
-use crate::config::{ConfigManager, GroupConfig};
+use crate::config::{ConfigManager, DomainRule, GroupConfig, RouteAttempt, RoutePolicy};
 use crate::ip_tester::{ConnectError, ProbeSuccess};
 use crate::paths::Paths;
 use crate::resolver::{DohResolution, EchOutcome, IpResolver};
 use crate::status::{State, StatusStore};
-use crate::strategy::{DohSource, FailureReason, IpSource, Strategy, TlsMode};
+use crate::strategy::{DohSource, FailureReason, IpSource, TlsMode};
 use crate::util::{network_id, now};
 use anyhow::Result;
 
@@ -23,16 +23,12 @@ use super::*;
 #[derive(Default)]
 struct FakeRemote {
     ips: Mutex<Option<Vec<IpAddr>>>,
-    sni: Mutex<Option<String>>,
     catalog: Mutex<bool>,
 }
 
 impl RemoteIpProvider for FakeRemote {
     fn remote_ips(&self, _domain: &str) -> Option<Vec<IpAddr>> {
         self.ips.lock().clone()
-    }
-    fn remote_sni(&self, _group_id: &str) -> Option<String> {
-        self.sni.lock().clone()
     }
     fn has_ip_catalog(&self) -> bool {
         *self.catalog.lock()
@@ -114,7 +110,7 @@ impl Prober for FakeProber {
 
 #[tokio::test]
 async fn reprobe_restores_ips_that_answer_again() {
-    let h = harness(&["example.com"], Strategy::Auto);
+    let h = harness(&["example.com"], RoutePolicy::auto());
     let ip: std::net::IpAddr = "203.0.113.10".parse().unwrap();
     h.engine.record_ip("example.com", ip, None, true);
     let before = h.engine.score_ip("example.com", ip);
@@ -145,7 +141,7 @@ async fn reprobe_restores_ips_that_answer_again() {
 
 #[tokio::test]
 async fn a_successful_reprobe_pays_down_the_failure_history() {
-    let h = harness(&["example.com"], Strategy::Auto);
+    let h = harness(&["example.com"], RoutePolicy::auto());
     let ip: IpAddr = "203.0.113.40".parse().unwrap();
     h.engine.record_ip("example.com", ip, None, true);
     h.prober.working.lock().insert(ip);
@@ -169,7 +165,7 @@ async fn a_successful_reprobe_pays_down_the_failure_history() {
 
 #[tokio::test]
 async fn persisted_scores_keep_a_blocked_ip_demoted_after_restart() {
-    let h = harness(&["example.com"], Strategy::Auto);
+    let h = harness(&["example.com"], RoutePolicy::auto());
     let ip: std::net::IpAddr = "203.0.113.30".parse().unwrap();
     h.engine.record_ip("example.com", ip, None, true);
     let demoted = h.engine.score_ip("example.com", ip);
@@ -192,7 +188,7 @@ async fn persisted_scores_keep_a_blocked_ip_demoted_after_restart() {
 
 #[test]
 fn ip_score_overflow_keeps_known_good_ips() {
-    let h = harness(&["example.com"], Strategy::Auto);
+    let h = harness(&["example.com"], RoutePolicy::auto());
     let good: std::net::IpAddr = "203.0.113.10".parse().unwrap();
     h.engine.record_ip("example.com", good, Some(80), false);
 
@@ -223,7 +219,7 @@ struct Harness {
     resolver: Arc<FakeResolver>,
 }
 
-fn harness(group_domains: &[&str], strategy: Strategy) -> Harness {
+fn harness(group_domains: &[&str], default_route: RoutePolicy) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::new(dir.path());
     paths.ensure().unwrap();
@@ -232,13 +228,13 @@ fn harness(group_domains: &[&str], strategy: Strategy) -> Harness {
         .upsert_group(GroupConfig {
             id: "test".into(),
             name: "Test".into(),
-            domains: group_domains.iter().map(|d| d.to_string()).collect(),
-            strategy,
+            domains: group_domains
+                .iter()
+                .map(|domain| DomainRule::new(*domain))
+                .collect(),
             enabled: true,
-            sni: None,
-            experimental: false,
             homepage: None,
-            ech_shared: false,
+            default_route,
         })
         .unwrap();
     let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
@@ -264,35 +260,21 @@ fn harness(group_domains: &[&str], strategy: Strategy) -> Harness {
     }
 }
 
-#[test]
-fn explicit_group_sni_replaces_the_shared_candidates() {
-    let harness = harness(&["example.com"], Strategy::FakeSni);
-    let config = harness.engine.config.snapshot();
-    let mut group = config.group("test").unwrap().clone();
-
-    // An explicit empty value means "send no SNI", not "use the defaults".
-    group.sni = Some(String::new());
-    assert_eq!(
-        harness
-            .engine
-            .sni_candidates(&config, &group, "example.com", "net"),
-        vec![None]
-    );
-
-    group.sni = Some("WWW.Baidu.com".into());
-    assert_eq!(
-        harness
-            .engine
-            .sni_candidates(&config, &group, "example.com", "net"),
-        vec![Some("www.baidu.com".to_string())]
-    );
-
-    // Without an explicit value the shared candidates still apply.
-    group.sni = None;
-    let candidates = harness
-        .engine
-        .sni_candidates(&config, &group, "example.com", "net");
-    assert!(candidates.iter().any(|candidate| candidate.is_some()));
+#[tokio::test]
+async fn route_sni_hosts_drive_fake_sni_plans() {
+    let route = RoutePolicy::new(vec![RouteAttempt::Sni {
+        sni: vec!["WWW.Baidu.com".into()],
+    }]);
+    let harness = harness(&["example.com"], route);
+    *harness.remote.catalog.lock() = true;
+    *harness.remote.ips.lock() = Some(vec!["203.0.113.10".parse().unwrap()]);
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let plan = cursor.next_plan().await.expect("a fake-SNI plan");
+    assert_eq!(plan.mode, TlsMode::FakeSni);
+    assert_eq!(plan.sni.as_deref(), Some("www.baidu.com"));
 }
 
 /// The fake-SNI sweep is candidate-major: every candidate IP must get the
@@ -300,7 +282,7 @@ fn explicit_group_sni_replaces_the_shared_candidates() {
 /// advanced to the next candidate, so only the first IP was ever tried.
 #[tokio::test]
 async fn fake_sni_sweep_restarts_for_each_candidate() {
-    let harness = harness(&["example.com"], Strategy::FakeSni);
+    let harness = harness(&["example.com"], RoutePolicy::sni(Vec::new()));
     *harness.remote.catalog.lock() = true;
     let first: IpAddr = "203.0.113.10".parse().unwrap();
     let second: IpAddr = "203.0.113.11".parse().unwrap();
@@ -329,7 +311,7 @@ async fn fake_sni_sweep_restarts_for_each_candidate() {
 
 #[tokio::test]
 async fn direct_tries_remote_before_doh() {
-    let harness = harness(&["example.com"], Strategy::Auto);
+    let harness = harness(&["example.com"], RoutePolicy::auto());
     *harness.remote.catalog.lock() = true;
     *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
     harness
@@ -347,7 +329,7 @@ async fn direct_tries_remote_before_doh() {
 
 #[tokio::test]
 async fn a_manual_probe_runs_while_routing_is_paused() {
-    let harness = harness(&["example.com"], Strategy::Auto);
+    let harness = harness(&["example.com"], RoutePolicy::auto());
     *harness.remote.catalog.lock() = true;
     *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
     harness
@@ -371,7 +353,7 @@ async fn a_manual_probe_runs_while_routing_is_paused() {
 
 #[tokio::test]
 async fn route_cursor_needs_no_probe_and_caches_the_plan() {
-    let harness = harness(&["example.com"], Strategy::Direct);
+    let harness = harness(&["example.com"], RoutePolicy::direct());
     *harness.remote.catalog.lock() = true;
     *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
     let mut cursor = match harness.engine.route("example.com", 443, true) {
@@ -396,8 +378,8 @@ async fn route_cursor_needs_no_probe_and_caches_the_plan() {
 }
 
 #[tokio::test]
-async fn cached_plan_is_invalidated_when_strategy_changes() {
-    let harness = harness(&["example.com"], Strategy::Auto);
+async fn cached_plan_is_invalidated_when_route_changes() {
+    let harness = harness(&["example.com"], RoutePolicy::auto());
     *harness.remote.catalog.lock() = true;
     *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
     harness
@@ -415,7 +397,10 @@ async fn cached_plan_is_invalidated_when_strategy_changes() {
     harness
         .engine
         .config
-        .set_group_strategy("test", Strategy::FakeSni)
+        .set_group_default_route(
+            "test",
+            RoutePolicy::new(vec![RouteAttempt::Sni { sni: Vec::new() }]),
+        )
         .unwrap();
     assert!(harness
         .engine
@@ -439,7 +424,7 @@ fn test_plan(mode: TlsMode, sni: Option<&str>) -> ConnectPlan {
 
 #[tokio::test]
 async fn duplicate_addresses_from_catalog_and_doh_are_merged() {
-    let h = harness(&["example.com"], Strategy::Direct);
+    let h = harness(&["example.com"], RoutePolicy::direct());
     *h.remote.catalog.lock() = true;
     *h.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
     h.resolver.answers.lock().push_back(Ok(DohResolution {
@@ -471,7 +456,7 @@ async fn duplicate_addresses_from_catalog_and_doh_are_merged() {
 
 #[test]
 fn plan_cache_stays_bounded_when_every_entry_is_fresh() {
-    let h = harness(&["example.com"], Strategy::Direct);
+    let h = harness(&["example.com"], RoutePolicy::direct());
     for i in 0..(PLAN_CACHE_MAX + 100) {
         let mut plan = test_plan(TlsMode::Direct, None);
         plan.domain = format!("h{i}.example.com");
@@ -495,11 +480,13 @@ fn plan_cache_stays_bounded_when_every_entry_is_fresh() {
 
 #[test]
 fn plan_cache_count_tracks_inserts_replacements_and_removals() {
-    let h = harness(&["example.com"], Strategy::Direct);
+    let h = harness(&["example.com"], RoutePolicy::direct());
     assert_eq!(h.engine.plan_cache_len(), 0);
 
-    h.engine.remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
-    h.engine.remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
     assert_eq!(
         h.engine.plan_cache_len(),
         1,
@@ -527,8 +514,9 @@ fn plan_cache_count_tracks_inserts_replacements_and_removals() {
 
 #[test]
 fn network_change_drops_remembered_plans() {
-    let h = harness(&["example.com"], Strategy::Direct);
-    h.engine.remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
     assert!(h.engine.cached_plan("example.com", 443, true).is_some());
 
     h.engine.forget_all_plans();
@@ -541,9 +529,15 @@ fn network_change_drops_remembered_plans() {
 
 #[test]
 fn plan_cache_finds_entries_under_any_spelling_of_the_domain() {
-    let h = harness(&["example.com"], Strategy::Direct);
-    h.engine.remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
-    for spelling in ["example.com", "EXAMPLE.com", "example.com.", " example.com. "] {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
+    for spelling in [
+        "example.com",
+        "EXAMPLE.com",
+        "example.com.",
+        " example.com. ",
+    ] {
         assert!(
             h.engine.cached_plan(spelling, 443, true).is_some(),
             "`{spelling}` must find the stored plan"
@@ -556,8 +550,9 @@ fn plan_cache_finds_entries_under_any_spelling_of_the_domain() {
 
 #[test]
 fn an_expired_plan_is_dropped() {
-    let h = harness(&["example.com"], Strategy::Direct);
-    h.engine.remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
     assert!(h.engine.cached_plan("example.com", 443, true).is_some());
 
     // Age the entry past the TTL (the default is ten minutes).
@@ -583,12 +578,13 @@ fn an_expired_plan_is_dropped() {
 
 #[test]
 fn plan_cache_separates_ports_and_tls_flags() {
-    let h = harness(&["example.com"], Strategy::Direct);
+    let h = harness(&["example.com"], RoutePolicy::direct());
     let mut plain = test_plan(TlsMode::Direct, None);
     plain.port = 80;
     plain.tls = false;
     h.engine.remember_plan_arc(Arc::new(plain));
-    h.engine.remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
 
     assert!(h.engine.cached_plan("example.com", 443, true).is_some());
     assert!(h.engine.cached_plan("example.com", 80, false).is_some());
@@ -604,14 +600,19 @@ fn plan_cache_separates_ports_and_tls_flags() {
 }
 
 #[test]
-fn cached_fake_sni_plan_follows_the_configured_sni() {
-    let h = harness(&["example.com"], Strategy::FakeSni);
+fn cached_fake_sni_plan_follows_the_configured_route_sni() {
+    let h = harness(
+        &["example.com"],
+        RoutePolicy::sni(vec!["old.example".into()]),
+    );
     h.engine
         .remember_plan_arc(Arc::new(test_plan(TlsMode::FakeSni, Some("old.example"))));
     assert!(h.engine.cached_plan("example.com", 443, true).is_some());
 
     let mut group = h.engine.config.snapshot().group("test").unwrap().clone();
-    group.sni = Some("new.example".into());
+    group.default_route = RoutePolicy::new(vec![RouteAttempt::Sni {
+        sni: vec!["new.example".into()],
+    }]);
     h.engine.config.upsert_group(group).unwrap();
     assert!(
         h.engine.cached_plan("example.com", 443, true).is_none(),
@@ -619,31 +620,26 @@ fn cached_fake_sni_plan_follows_the_configured_sni() {
     );
 }
 
-#[tokio::test]
-async fn last_good_strategy_is_tried_first() {
-    let harness = harness(&["example.com"], Strategy::Auto);
-    *harness.remote.catalog.lock() = true;
-    *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
-    harness.cache.put_last_good(LastGoodEntry {
-        domain: "example.com".into(),
-        ip: "1.1.1.1".parse().unwrap(),
-        strategy: Strategy::FakeSni,
-        source: IpSource::Cache,
-        network_id: network_id(),
-        saved_at: now(),
-        catalog_version: 1,
-    });
-    let mut cursor = match harness.engine.route("example.com", 443, true) {
-        Route::Group(cursor) => cursor,
-        _ => panic!("expected a group route"),
-    };
-    let plan = cursor.next_plan().await.expect("a plan");
-    assert_eq!(plan.mode, TlsMode::FakeSni);
+#[test]
+fn http_rejection_drops_the_cached_route() {
+    let h = harness(
+        &["example.com"],
+        RoutePolicy::sni(vec!["www.baidu.com".into()]),
+    );
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::FakeSni, Some("www.baidu.com"))));
+    assert!(h.engine.cached_plan("example.com", 443, true).is_some());
+
+    h.engine
+        .note_http_rejection("example.com", 443, true, http::StatusCode::FORBIDDEN);
+
+    assert!(h.engine.cached_plan("example.com", 443, true).is_none());
+    assert!(h.engine.route_rejected("example.com", TlsMode::FakeSni));
 }
 
 #[tokio::test]
 async fn catalog_update_bypasses_cached_plan_once() {
-    let harness = harness(&["example.com"], Strategy::Auto);
+    let harness = harness(&["example.com"], RoutePolicy::auto());
     *harness.remote.catalog.lock() = true;
     *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
     harness
@@ -678,7 +674,7 @@ async fn catalog_update_bypasses_cached_plan_once() {
 
 #[tokio::test]
 async fn falls_back_to_second_remote_ip_in_order() {
-    let harness = harness(&["example.com"], Strategy::Direct);
+    let harness = harness(&["example.com"], RoutePolicy::direct());
     *harness.remote.catalog.lock() = true;
     *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap(), "8.8.8.8".parse().unwrap()]);
     harness
@@ -695,7 +691,7 @@ async fn falls_back_to_second_remote_ip_in_order() {
 
 #[tokio::test]
 async fn doh_is_used_after_initial_candidates_fail() {
-    let harness = harness(&["example.com"], Strategy::Direct);
+    let harness = harness(&["example.com"], RoutePolicy::direct());
     *harness.remote.catalog.lock() = true;
     *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
     harness
@@ -721,13 +717,12 @@ async fn doh_is_used_after_initial_candidates_fail() {
 
 #[tokio::test]
 async fn skip_once_prefers_new_remote_ip() {
-    let harness = harness(&["example.com"], Strategy::Direct);
+    let harness = harness(&["example.com"], RoutePolicy::direct());
     *harness.remote.catalog.lock() = true;
     *harness.remote.ips.lock() = Some(vec!["8.8.8.8".parse().unwrap()]);
     harness.cache.put_last_good(LastGoodEntry {
         domain: "example.com".into(),
         ip: "1.1.1.1".parse().unwrap(),
-        strategy: Strategy::Direct,
         source: IpSource::Remote,
         network_id: network_id(),
         saved_at: now(),
@@ -753,7 +748,7 @@ async fn skip_once_prefers_new_remote_ip() {
 async fn auto_interleaves_the_accelerated_route_after_direct() {
     // Even when direct works, the accelerated route must be the very next
     // plan so the connection race can pick the faster one.
-    let harness = harness(&["example.com"], Strategy::Auto);
+    let harness = harness(&["example.com"], RoutePolicy::auto());
     *harness.remote.catalog.lock() = true;
     *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
     let ip: IpAddr = "1.1.1.1".parse().unwrap();
@@ -777,7 +772,7 @@ async fn auto_interleaves_the_accelerated_route_after_direct() {
 
 #[tokio::test]
 async fn auto_falls_back_to_fake_sni_and_caches_it() {
-    let harness = harness(&["example.com"], Strategy::Auto);
+    let harness = harness(&["example.com"], RoutePolicy::auto());
     *harness.remote.catalog.lock() = true;
     *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
     let ip: IpAddr = "1.1.1.1".parse().unwrap();
@@ -799,7 +794,7 @@ async fn auto_falls_back_to_fake_sni_and_caches_it() {
 
 #[tokio::test]
 async fn failure_returns_reasons_and_attempts() {
-    let harness = harness(&["example.com"], Strategy::Direct);
+    let harness = harness(&["example.com"], RoutePolicy::direct());
     *harness.remote.catalog.lock() = true;
     *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
     let outcome = harness.engine.decide_https("example.com").await;
@@ -817,7 +812,7 @@ async fn failure_returns_reasons_and_attempts() {
 #[test]
 #[ignore = "micro benchmark"]
 fn bench_route_decision() {
-    let h = harness(&["example.com"], Strategy::Direct);
+    let h = harness(&["example.com"], RoutePolicy::direct());
     *h.remote.catalog.lock() = true;
     *h.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
     crate::bench::measure("decision.route", 20_000, || {
@@ -829,8 +824,9 @@ fn bench_route_decision() {
 #[test]
 #[ignore = "micro benchmark"]
 fn bench_plan_cache_lookup() {
-    let h = harness(&["example.com"], Strategy::Direct);
-    h.engine.remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
     crate::bench::measure("decision.cached_plan", 100_000, || {
         let _ = h.engine.cached_plan("example.com", 443, true);
     });

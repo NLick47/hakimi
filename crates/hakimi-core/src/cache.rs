@@ -10,7 +10,7 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use crate::strategy::{IpSource, Strategy};
+use crate::strategy::IpSource;
 use crate::util::{atomic_write, atomic_write_json, now, read_json};
 
 const MAX_STALE_AGE_DAYS: i64 = 7;
@@ -21,7 +21,6 @@ const MAX_SNI_AGE_DAYS: i64 = 30;
 pub struct LastGoodEntry {
     pub domain: String,
     pub ip: IpAddr,
-    pub strategy: Strategy,
     pub source: IpSource,
     pub network_id: String,
     pub saved_at: DateTime<Utc>,
@@ -319,28 +318,24 @@ impl CacheManager {
 
     /// Route-relevant fields of a remembered entry. The decision cursor only
     /// needs the IP and strategy; avoid cloning the domain/network strings.
-    pub fn last_good_route(&self, domain: &str, max_age_days: i64) -> Option<(IpAddr, Strategy)> {
+    pub fn last_good_route(&self, domain: &str, max_age_days: i64) -> Option<IpAddr> {
         let now = now();
         let data = self.data.read();
         let entry = data.last_good.get(domain)?;
         (now.signed_duration_since(entry.saved_at) <= Duration::days(max_age_days))
-            .then_some((entry.ip, entry.strategy))
+            .then_some(entry.ip)
     }
 
     /// One read-lock acquisition for the two pieces of route state a new cursor
     /// needs. `skip_once` is only consumed by the caller when it is present, so
     /// the common empty-set path never takes the write lock.
-    pub fn route_hints(
-        &self,
-        domain: &str,
-        max_age_days: i64,
-    ) -> (bool, Option<(IpAddr, Strategy)>) {
+    pub fn route_hints(&self, domain: &str, max_age_days: i64) -> (bool, Option<IpAddr>) {
         let now = now();
         let data = self.data.read();
         let skip_once = data.skip_once.contains(domain);
         let last_good = data.last_good.get(domain).and_then(|entry| {
             (now.signed_duration_since(entry.saved_at) <= Duration::days(max_age_days))
-                .then_some((entry.ip, entry.strategy))
+                .then_some(entry.ip)
         });
         (skip_once, last_good)
     }
@@ -353,7 +348,8 @@ impl CacheManager {
         data.ip_scores
             .iter()
             .filter_map(|(key, entry)| {
-                if now.signed_duration_since(entry.updated_at) > Duration::days(MAX_IP_SCORE_AGE_DAYS)
+                if now.signed_duration_since(entry.updated_at)
+                    > Duration::days(MAX_IP_SCORE_AGE_DAYS)
                 {
                     return None;
                 }
@@ -377,7 +373,6 @@ impl CacheManager {
         if let Some(entry) = last_good {
             let fresh = data.last_good.get(&entry.domain).is_some_and(|existing| {
                 existing.ip == entry.ip
-                    && existing.strategy == entry.strategy
                     && existing.source == entry.source
                     && timestamp.signed_duration_since(existing.saved_at) < Duration::seconds(60)
             });
@@ -424,7 +419,14 @@ impl CacheManager {
 
     /// Upsert one quality entry. Keeps the map bounded: entries past the widest
     /// freshness window are dropped, then the oldest beyond the cap.
-    pub fn put_ip_score(&self, domain: &str, ip: IpAddr, ewma_ms: f64, successes: u32, failures: u32) {
+    pub fn put_ip_score(
+        &self,
+        domain: &str,
+        ip: IpAddr,
+        ewma_ms: f64,
+        successes: u32,
+        failures: u32,
+    ) {
         self.record_outcome(
             None,
             Some(IpScoreUpdate {
@@ -611,7 +613,9 @@ impl CacheManager {
             }
         }
         data.sni.insert(key, entry);
-        Self::prune_by_age(&mut data.sni, MAX_FAKE_SNI, SNI_PRUNE_TO, |entry| entry.saved_at);
+        Self::prune_by_age(&mut data.sni, MAX_FAKE_SNI, SNI_PRUNE_TO, |entry| {
+            entry.saved_at
+        });
         self.mark_dirty(&data);
     }
 
@@ -670,7 +674,6 @@ mod tests {
         cache.put_last_good(LastGoodEntry {
             domain: "github.com".into(),
             ip: "20.205.243.166".parse().unwrap(),
-            strategy: Strategy::Direct,
             source: IpSource::Remote,
             network_id: network_id(),
             saved_at: now() - Duration::days(8),
@@ -680,7 +683,6 @@ mod tests {
         cache.put_last_good(LastGoodEntry {
             domain: "github.com".into(),
             ip: "20.205.243.166".parse().unwrap(),
-            strategy: Strategy::Direct,
             source: IpSource::Remote,
             network_id: network_id(),
             saved_at: now() - Duration::days(2),
@@ -772,7 +774,9 @@ mod tests {
         }
         cache.mark_skip_once((0..5000u32).map(|index| format!("host{index}.example.com")));
         cache.flush_if_dirty();
-        let size = std::fs::metadata(cache.path()).map(|meta| meta.len()).unwrap_or(0);
+        let size = std::fs::metadata(cache.path())
+            .map(|meta| meta.len())
+            .unwrap_or(0);
         assert!(
             size < 900_000,
             "the cache file must stay small, got {size} bytes"
@@ -804,8 +808,7 @@ mod tests {
     #[tokio::test]
     async fn record_outcome_without_changes_does_not_schedule_a_flush() {
         let dir = tempfile::tempdir().unwrap();
-        let cache =
-            std::sync::Arc::new(CacheManager::load(dir.path().join("state.json")).unwrap());
+        let cache = std::sync::Arc::new(CacheManager::load(dir.path().join("state.json")).unwrap());
         // The background flusher has to be running, otherwise every write is
         // persisted eagerly and the dirty flag never shows up.
         cache.start_auto_flush(StdDuration::from_secs(3600));
@@ -832,7 +835,8 @@ mod tests {
     }
 
     #[test]
-    fn skip_once_is_consumed() {        let (_dir, cache) = manager();
+    fn skip_once_is_consumed() {
+        let (_dir, cache) = manager();
         cache.mark_skip_once(["github.com", "api.github.com"]);
         assert!(cache.has_skip_once("github.com"));
         assert!(cache.take_skip_once("github.com"));
@@ -928,14 +932,16 @@ mod tests {
             cache.put_last_good(sample_entry(&domain, &ip));
         }
         assert!(cache.last_good_hosts().len() <= 512, "count cap must hold");
-        assert!(cache.last_good("old.example.com", 30).is_none(), "ancient entry pruned");
+        assert!(
+            cache.last_good("old.example.com", 30).is_none(),
+            "ancient entry pruned"
+        );
     }
 
     fn sample_entry(domain: &str, ip: &str) -> LastGoodEntry {
         LastGoodEntry {
             domain: domain.into(),
             ip: ip.parse().unwrap(),
-            strategy: Strategy::Auto,
             source: IpSource::Remote,
             network_id: "ip:test".into(),
             saved_at: now(),
@@ -968,48 +974,48 @@ mod tests {
         );
     }
 
-/// The two writes a successful connection does to the cache.
-#[tokio::test]
-#[ignore = "micro benchmark"]
-async fn bench_cache_writes() {
-    let (_dir, cache) = manager();
-    let cache = Arc::new(cache);
-    // The runtime writes the cache in the background; without the flusher
-    // every write would serialize and fsync the whole file.
-    cache.start_auto_flush(std::time::Duration::from_secs(5));
-    let ip: IpAddr = "203.0.113.7".parse().unwrap();
-    crate::bench::measure("cache.record_outcome", 20_000, || {
-        cache.record_outcome(
-            Some(sample_entry("example.com", "203.0.113.7")),
-            Some(IpScoreUpdate {
-                domain: "example.com",
-                ip,
-                ewma_ms: 100.0,
-                successes: 1,
-                failures: 0,
-            }),
-        );
-    });
-}
+    /// The two writes a successful connection does to the cache.
+    #[tokio::test]
+    #[ignore = "micro benchmark"]
+    async fn bench_cache_writes() {
+        let (_dir, cache) = manager();
+        let cache = Arc::new(cache);
+        // The runtime writes the cache in the background; without the flusher
+        // every write would serialize and fsync the whole file.
+        cache.start_auto_flush(std::time::Duration::from_secs(5));
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        crate::bench::measure("cache.record_outcome", 20_000, || {
+            cache.record_outcome(
+                Some(sample_entry("example.com", "203.0.113.7")),
+                Some(IpScoreUpdate {
+                    domain: "example.com",
+                    ip,
+                    ewma_ms: 100.0,
+                    successes: 1,
+                    failures: 0,
+                }),
+            );
+        });
+    }
 
-/// The same writes without a background flusher, which is how the one-shot
-/// commands run.  The write must still not touch the disk.
-#[test]
-#[ignore = "micro benchmark"]
-fn bench_cache_writes_without_flusher() {
-    let (_dir, cache) = manager();
-    let ip: IpAddr = "203.0.113.7".parse().unwrap();
-    crate::bench::measure("cache.write (no flusher)", 20_000, || {
-        cache.record_outcome(
-            Some(sample_entry("example.com", "203.0.113.7")),
-            Some(IpScoreUpdate {
-                domain: "example.com",
-                ip,
-                ewma_ms: 100.0,
-                successes: 1,
-                failures: 0,
-            }),
-        );
-    });
-}
+    /// The same writes without a background flusher, which is how the one-shot
+    /// commands run.  The write must still not touch the disk.
+    #[test]
+    #[ignore = "micro benchmark"]
+    fn bench_cache_writes_without_flusher() {
+        let (_dir, cache) = manager();
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        crate::bench::measure("cache.write (no flusher)", 20_000, || {
+            cache.record_outcome(
+                Some(sample_entry("example.com", "203.0.113.7")),
+                Some(IpScoreUpdate {
+                    domain: "example.com",
+                    ip,
+                    ewma_ms: 100.0,
+                    successes: 1,
+                    failures: 0,
+                }),
+            );
+        });
+    }
 }

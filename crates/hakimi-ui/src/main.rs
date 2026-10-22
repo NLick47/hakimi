@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -8,10 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use hakimi_core::config::{AppConfig, GroupConfig};
+use hakimi_core::config::{AppConfig, DomainRule, GroupConfig, RouteAttempt, RoutePolicy};
 use hakimi_core::instance::{InstanceLock, InstanceLockError};
 use hakimi_core::runtime::HakimiRuntime;
-use hakimi_core::strategy::Strategy;
 use serde_json::Value;
 use slint::{Color, Model, ModelRc, SharedString, VecModel};
 use ui_state::SettlePhase;
@@ -24,8 +23,9 @@ mod ui_state;
 #[cfg(test)]
 pub(crate) use model::icon_key_for;
 pub(crate) use model::{
-    build_sites, build_snapshot, builtin_group_ids, editor_strategy_index, finish_snapshot,
-    strategy_from_index, text, SiteData, SweepState, SITE_ICONS,
+    build_sites, build_snapshot, builtin_group_ids, finish_snapshot, format_route,
+    normalize_domain_host, parse_route, route_from_preset, route_preset_index, text, SiteData,
+    SweepState, SITE_ICONS,
 };
 
 pub(crate) fn data_dir() -> Option<PathBuf> {
@@ -112,8 +112,6 @@ fn build_site_entry(site: &SiteData) -> SiteEntry {
         first: site.first,
         last: site.last,
         url: SharedString::from(site.url.clone()),
-        strategy: site.strategy,
-        sni: SharedString::from(site.sni.clone()),
         custom: site.custom,
         domains: ModelRc::new(VecModel::from(domains)),
     }
@@ -137,6 +135,10 @@ thread_local! {
     static WINDOW: std::cell::RefCell<Option<WindowShell>> =
         const { std::cell::RefCell::new(None) };
     static NEXT_WINDOW_ID: Cell<u64> = const { Cell::new(0) };
+    // Rows of the currently open site editor. Slint models are not mutable from
+    // the UI, so callbacks mutate this VecModel and the view re-renders.
+    static EDITOR_ROWS: RefCell<Option<Rc<VecModel<EditorDomain>>>> =
+        const { RefCell::new(None) };
     // UI state that must survive a window rebuild.
     static PAGE_STATE: Cell<i32> = const { Cell::new(0) };
     static SITES_EXPANDED_STATE: Cell<bool> = const { Cell::new(false) };
@@ -411,22 +413,39 @@ fn wire_window(app: &AppWindow, ctx: &UiContext) {
                     app.set_editor_is_new(false);
                     app.set_editor_id(SharedString::from(group.id.clone()));
                     app.set_editor_name(SharedString::from(group.name.clone()));
-                    app.set_editor_domains(SharedString::from(group.domains.join("\n")));
+                    set_editor_rows(
+                        &app,
+                        group.domains.iter().map(editor_domain_from_rule).collect(),
+                    );
                     app.set_editor_homepage(SharedString::from(
                         group.homepage.clone().unwrap_or_default(),
                     ));
-                    app.set_editor_strategy(editor_strategy_index(group.strategy));
-                    app.set_editor_sni(SharedString::from(group.sni.clone().unwrap_or_default()));
+                    let preset = route_preset_index(&group.default_route);
+                    app.set_editor_default_preset(preset);
+                    app.set_editor_default_custom(SharedString::from(if preset == 4 {
+                        format_route(&group.default_route)
+                    } else {
+                        String::new()
+                    }));
                     app.set_editor_deletable(!builtins.contains(&group.id));
                 }
                 None => {
                     app.set_editor_is_new(true);
                     app.set_editor_id(SharedString::new());
                     app.set_editor_name(SharedString::new());
-                    app.set_editor_domains(SharedString::new());
+                    set_editor_rows(
+                        &app,
+                        vec![EditorDomain {
+                            pattern: SharedString::new(),
+                            route: 0,
+                            route_label: SharedString::from(domain_route_label(0)),
+                            sni: SharedString::new(),
+                            custom: SharedString::new(),
+                        }],
+                    );
                     app.set_editor_homepage(SharedString::new());
-                    app.set_editor_strategy(0);
-                    app.set_editor_sni(SharedString::new());
+                    app.set_editor_default_preset(0);
+                    app.set_editor_default_custom(SharedString::new());
                     app.set_editor_deletable(false);
                 }
             }
@@ -443,6 +462,39 @@ fn wire_window(app: &AppWindow, ctx: &UiContext) {
             }
         });
     }
+    app.on_editor_add_domain(|| {
+        with_editor_rows(|model| {
+            model.push(EditorDomain {
+                pattern: SharedString::new(),
+                route: 0,
+                route_label: SharedString::from(domain_route_label(0)),
+                sni: SharedString::new(),
+                custom: SharedString::new(),
+            });
+        });
+    });
+    app.on_editor_remove_domain(|index| {
+        with_editor_rows(|model| {
+            if model.row_count() > 1 {
+                model.remove(index.max(0) as usize);
+            }
+        });
+    });
+    app.on_editor_domain_pattern(|index, text| {
+        update_editor_row(index.max(0) as usize, |row| row.pattern = text);
+    });
+    app.on_editor_set_domain_route(|index, route| {
+        update_editor_row(index.max(0) as usize, |row| {
+            row.route = route.clamp(0, 4);
+            row.route_label = SharedString::from(domain_route_label(row.route));
+        });
+    });
+    app.on_editor_domain_sni(|index, text| {
+        update_editor_row(index.max(0) as usize, |row| row.sni = text);
+    });
+    app.on_editor_domain_custom(|index, text| {
+        update_editor_row(index.max(0) as usize, |row| row.custom = text);
+    });
     {
         let runtime = runtime.clone();
         let expanded = expanded.clone();
@@ -849,65 +901,162 @@ fn ca_outcome(result: Result<bool>, want_installed: bool) -> CaOutcome {
 // -- site editor ----------------------------------------------------------------
 
 /// Site editor input, kept independent of Slint so it can be unit tested.
+#[derive(Clone)]
+struct DomainDraft {
+    pattern: String,
+    /// 0 inherit, 1 direct, 2 ECH, 3 SNI, 4 custom.
+    preset: i32,
+    sni: String,
+    custom: String,
+}
+
 struct SiteDraft {
     id: String,
     is_new: bool,
     name: String,
-    domains: String,
+    domains: Vec<DomainDraft>,
     homepage: String,
-    strategy: Strategy,
-    sni: String,
+    /// 0 auto, 1 direct, 2 ECH, 3 SNI, 4 custom.
+    default_preset: i32,
+    default_custom: String,
 }
 
-/// Build the group a draft describes. Existing groups keep `echShared` and
-/// `experimental` so editing a site never silently drops them.
+fn domain_route_label(preset: i32) -> &'static str {
+    match preset {
+        1 => "直连",
+        2 => "ECH",
+        3 => "SNI 伪装",
+        4 => "自定义",
+        _ => "继承默认",
+    }
+}
+
+/// Recognize the preset-shaped fake-SNI routes; anything else stays custom so
+/// the editor never silently rewrites a hand-written attempt list.
+fn domain_sni_hosts(route: &RoutePolicy) -> Option<Vec<String>> {
+    match route.attempts.as_slice() {
+        [RouteAttempt::Sni { sni }] => Some(sni.clone()),
+        [RouteAttempt::Sni { sni }, RouteAttempt::Direct] => Some(sni.clone()),
+        _ => None,
+    }
+}
+
+fn editor_domain_from_rule(rule: &DomainRule) -> EditorDomain {
+    let (preset, sni, custom) = match &rule.route {
+        None => (0, String::new(), String::new()),
+        Some(route) if route == &RoutePolicy::direct() => (1, String::new(), String::new()),
+        Some(route) if route == &RoutePolicy::ech_shared() => (2, String::new(), String::new()),
+        Some(route) => match domain_sni_hosts(route) {
+            Some(hosts) => (3, hosts.join(", "), String::new()),
+            None => (4, String::new(), format_route(route)),
+        },
+    };
+    EditorDomain {
+        pattern: rule.pattern.clone().into(),
+        route: preset,
+        route_label: domain_route_label(preset).into(),
+        sni: sni.into(),
+        custom: custom.into(),
+    }
+}
+
+fn set_editor_rows(app: &AppWindow, rows: Vec<EditorDomain>) {
+    let model = Rc::new(VecModel::from(rows));
+    app.set_editor_domain_rows(ModelRc::from(model.clone()));
+    EDITOR_ROWS.with(|cell| *cell.borrow_mut() = Some(model));
+}
+
+fn with_editor_rows(f: impl FnOnce(&VecModel<EditorDomain>)) {
+    EDITOR_ROWS.with(|cell| {
+        if let Some(model) = cell.borrow().as_ref() {
+            f(model);
+        }
+    });
+}
+
+fn update_editor_row(index: usize, update: impl FnOnce(&mut EditorDomain)) {
+    with_editor_rows(|model| {
+        if let Some(mut row) = model.row_data(index) {
+            update(&mut row);
+            model.set_row_data(index, row);
+        }
+    });
+}
+
+fn editor_rows_snapshot() -> Vec<DomainDraft> {
+    EDITOR_ROWS.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|model| {
+                (0..model.row_count())
+                    .filter_map(|index| model.row_data(index))
+                    .map(|row| DomainDraft {
+                        pattern: row.pattern.to_string(),
+                        preset: row.route,
+                        sni: row.sni.to_string(),
+                        custom: row.custom.to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn parse_sni_hosts(raw: &str) -> Result<Vec<String>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(|host| {
+            hakimi_core::domain::normalize_hostname(host)
+                .map(|host| host.to_ascii_lowercase())
+                .with_context(|| format!("SNI 主机 {host} 格式不正确"))
+        })
+        .collect()
+}
+
 fn build_group(config: &AppConfig, draft: &SiteDraft) -> Result<GroupConfig> {
-    let mut domains: Vec<String> = Vec::new();
-    for part in draft
-        .domains
-        .split(|c: char| c.is_whitespace() || c == ',' || c == '，')
-    {
-        // Hostnames are case-insensitive; storing them as typed used to make
-        // `Example.COM` a different site from `example.com`.
-        let raw = part.trim();
-        if raw.is_empty() {
+    let mut domains: Vec<DomainRule> = Vec::new();
+    for row in &draft.domains {
+        let pattern = normalize_domain_host(&row.pattern)?;
+        if domains.iter().any(|rule| rule.pattern == pattern) {
             continue;
         }
-        // A pasted URL carries the host in its authority; strip the scheme,
-        // credentials, port and path before validating it as a domain.
-        let host = match hakimi_core::domain::host_from_url(raw) {
-            Some(host) => host.to_string(),
-            None if raw.contains("://") => bail!("网址 {raw} 无效，请填写域名或 http(s) 网址"),
-            None => raw.to_string(),
-        }
-        .to_ascii_lowercase();
-        hakimi_core::domain::DomainPattern::parse(&host)
-            .with_context(|| format!("域名 {host} 无效"))?;
-        if !domains.iter().any(|existing| existing == &host) {
-            domains.push(host);
-        }
+        let route = match row.preset {
+            0 => None,
+            1 => Some(RoutePolicy::direct()),
+            2 => Some(RoutePolicy::ech_shared()),
+            3 => Some(RoutePolicy::sni(parse_sni_hosts(&row.sni)?)),
+            4 => Some(parse_route(&row.custom)?),
+            _ => None,
+        };
+        domains.push(DomainRule { pattern, route });
     }
     if domains.is_empty() {
         bail!("请至少填写一个域名");
     }
-    if !domains.iter().any(|host| !host.starts_with("*.")) {
+    if !domains.iter().any(|rule| !rule.pattern.starts_with("*.")) {
         bail!("至少需要一个精确域名（不能只有 *. 通配）");
     }
     for other in &config.groups {
         if !draft.is_new && other.id == draft.id {
             continue;
         }
-        if let Some(conflict) = domains.iter().find(|domain| {
+        if let Some(conflict) = domains.iter().find(|rule| {
             other
                 .domains
                 .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(domain))
+                .any(|existing| existing.pattern.eq_ignore_ascii_case(&rule.pattern))
         }) {
-            bail!("域名 {conflict} 已属于站点「{}」", other.name);
+            bail!("域名 {} 已属于站点「{}」", conflict.pattern, other.name);
         }
     }
+    let default_route = if draft.default_preset == 4 {
+        parse_route(&draft.default_custom)?
+    } else {
+        route_from_preset(draft.default_preset).unwrap_or_default()
+    };
     let name = if draft.name.trim().is_empty() {
-        domains[0].clone()
+        domains[0].pattern.clone()
     } else {
         draft.name.trim().to_string()
     };
@@ -924,10 +1073,6 @@ fn build_group(config: &AppConfig, draft: &SiteDraft) -> Result<GroupConfig> {
             Some(candidate)
         }
     };
-    let sni = draft.sni.trim().to_ascii_lowercase();
-    if !sni.is_empty() {
-        hakimi_core::domain::normalize_hostname(&sni).context("SNI 主机格式不正确")?;
-    }
 
     let existing = if draft.is_new {
         None
@@ -936,24 +1081,16 @@ fn build_group(config: &AppConfig, draft: &SiteDraft) -> Result<GroupConfig> {
     };
     let mut group = existing.unwrap_or_default();
     group.id = if draft.is_new {
-        unique_group_id(config, &domains[0])
+        unique_group_id(config, &domains[0].pattern)
     } else {
         draft.id.clone()
     };
     group.name = name;
     group.domains = domains;
     group.homepage = homepage;
-    group.strategy = draft.strategy;
-    // An empty preset is meaningful for fake SNI: it means "send no SNI".
-    group.sni = if draft.strategy == Strategy::FakeSni || !sni.is_empty() {
-        Some(sni)
-    } else {
-        None
-    };
+    group.default_route = default_route;
     if draft.is_new {
         group.enabled = true;
-        group.experimental = false;
-        group.ech_shared = false;
     }
     Ok(group)
 }
@@ -964,10 +1101,10 @@ fn save_site(runtime: &HakimiRuntime, app: &AppWindow) -> Result<()> {
         id: app.get_editor_id().to_string(),
         is_new: app.get_editor_is_new(),
         name: app.get_editor_name().to_string(),
-        domains: app.get_editor_domains().to_string(),
+        domains: editor_rows_snapshot(),
         homepage: app.get_editor_homepage().to_string(),
-        strategy: strategy_from_index(app.get_editor_strategy()),
-        sni: app.get_editor_sni().to_string(),
+        default_preset: app.get_editor_default_preset(),
+        default_custom: app.get_editor_default_custom().to_string(),
     };
     let config = runtime.config().snapshot();
     let group = build_group(&config, &draft)?;
@@ -975,8 +1112,7 @@ fn save_site(runtime: &HakimiRuntime, app: &AppWindow) -> Result<()> {
         id = %group.id,
         name = %group.name,
         domains = group.domains.len(),
-        strategy = ?group.strategy,
-        sni = group.sni.as_deref().unwrap_or(""),
+        default_route = ?group.default_route,
         is_new = draft.is_new,
         "site saved"
     );
@@ -1056,26 +1192,31 @@ fn sample_config() -> Value {
             "doh": "https://gitee.com/hakimi/catalogs/doh.json"
         },
         "groups": [
-            { "id": "pixiv", "name": "Pixiv", "enabled": true, "strategy": "ech",
-              "domains": ["www.pixiv.net", "i.pximg.net", "s.pximg.net", "booth.pximg.net", "novel.pixiv.net"] },
+            { "id": "pixiv", "name": "Pixiv", "enabled": true,
+              "defaultRoute": { "attempts": [{ "mode": "direct" }] },
+              "domains": [
+                { "pattern": "www.pixiv.net", "route": { "attempts": [{ "mode": "ech", "ech": "shared" }, { "mode": "direct" }] } },
+                { "pattern": "i.pximg.net", "route": { "attempts": [{ "mode": "sni", "sni": ["www.baidu.com"] }, { "mode": "direct" }] } },
+                { "pattern": "s.pximg.net", "route": { "attempts": [{ "mode": "sni", "sni": ["www.baidu.com"] }, { "mode": "direct" }] } }
+              ] },
             { "id": "eh", "name": "E-Hentai", "enabled": true,
-              "domains": ["e-hentai.org", "forums.e-hentai.org", "exhentai.org"] },
+              "defaultRoute": { "attempts": [{ "mode": "direct" }, { "mode": "ech", "ech": "own" }, { "mode": "sni" }] },
+              "domains": [{ "pattern": "e-hentai.org" }, { "pattern": "exhentai.org" }] },
             { "id": "hitomi", "name": "Hitomi", "enabled": true,
-              "domains": ["hitomi.la", "ltn.gold-usergeneratedcontent.net"] },
-            { "id": "github", "name": "GitHub", "enabled": true, "strategy": "sni", "sni": "www.baidu.com",
-              "domains": ["github.com", "raw.githubusercontent.com", "api.github.com"] },
+              "defaultRoute": { "attempts": [{ "mode": "direct" }, { "mode": "ech", "ech": "own" }, { "mode": "sni" }] },
+              "domains": [{ "pattern": "hitomi.la" }] },
+            { "id": "github", "name": "GitHub", "enabled": true,
+              "defaultRoute": { "attempts": [{ "mode": "direct" }, { "mode": "ech", "ech": "own" }, { "mode": "sni" }] },
+              "domains": [{ "pattern": "github.com" }, { "pattern": "raw.githubusercontent.com" }] },
             { "id": "ao3", "name": "AO3", "enabled": true,
-              "domains": ["ao3.org", "archiveofourown.org"] },
+              "defaultRoute": { "attempts": [{ "mode": "ech", "ech": "shared" }, { "mode": "direct" }] },
+              "domains": [{ "pattern": "archiveofourown.org" }] },
             { "id": "steam", "name": "Steam", "enabled": true,
-              "domains": ["steamcommunity.com", "store.steampowered.com"] },
-            { "id": "poipiku", "name": "Poipiku", "enabled": true, "strategy": "direct",
-              "domains": ["poipiku.me", "poipiku.art"] },
-            { "id": "hitomi", "name": "Hitomi", "enabled": true,
-              "domains": ["hitomi.la", "ltn.gold-usergeneratedcontent.net"] },
-            { "id": "nhentai", "name": "nhentai", "enabled": true,
-              "domains": ["nhentai.net", "i.nhentai.net"] },
-            { "id": "hanime", "name": "Hanime", "enabled": true,
-              "domains": ["hanime.tv", "www.hanime.tv"] }
+              "defaultRoute": { "attempts": [{ "mode": "direct" }, { "mode": "ech", "ech": "own" }, { "mode": "sni" }] },
+              "domains": [{ "pattern": "steamcommunity.com" }, { "pattern": "store.steampowered.com" }] },
+            { "id": "poipiku", "name": "Poipiku", "enabled": true,
+              "defaultRoute": { "attempts": [{ "mode": "direct" }] },
+              "domains": [{ "pattern": "poipiku.com" }] }
         ]
     })
 }
@@ -1144,8 +1285,18 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     match std::env::var("HAKIMI_UI_EDITOR").as_deref() {
         Ok("new") => {
             app.set_editor_is_new(true);
-            app.set_editor_strategy(3);
-            app.set_editor_sni(SharedString::from(""));
+            set_editor_rows(
+                &app,
+                vec![EditorDomain {
+                    pattern: SharedString::new(),
+                    route: 0,
+                    route_label: SharedString::from(domain_route_label(0)),
+                    sni: SharedString::new(),
+                    custom: SharedString::new(),
+                }],
+            );
+            app.set_editor_default_preset(0);
+            app.set_editor_default_custom(SharedString::new());
             app.set_editor_homepage(SharedString::new());
             app.set_editor_open(true);
         }
@@ -1153,11 +1304,33 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
             app.set_editor_is_new(false);
             app.set_editor_id(SharedString::from("pixiv"));
             app.set_editor_name(SharedString::from("Pixiv"));
-            app.set_editor_domains(SharedString::from(
-                "pixiv.net\nwww.pixiv.net\ni.pximg.net\ns.pximg.net",
-            ));
-            app.set_editor_strategy(3);
-            app.set_editor_sni(SharedString::from(""));
+            set_editor_rows(
+                &app,
+                vec![
+                    editor_domain_from_rule(&DomainRule::routed(
+                        "pixiv.net",
+                        RoutePolicy::ech_shared(),
+                    )),
+                    editor_domain_from_rule(&DomainRule::routed(
+                        "www.pixiv.net",
+                        RoutePolicy::ech_shared(),
+                    )),
+                    editor_domain_from_rule(&DomainRule::routed(
+                        "*.pixiv.net",
+                        RoutePolicy::ech_shared(),
+                    )),
+                    editor_domain_from_rule(&DomainRule::routed(
+                        "i.pximg.net",
+                        RoutePolicy::sni(vec!["www.baidu.com".into()]),
+                    )),
+                    editor_domain_from_rule(&DomainRule::routed(
+                        "s.pximg.net",
+                        RoutePolicy::sni(vec!["www.baidu.com".into()]),
+                    )),
+                ],
+            );
+            app.set_editor_default_preset(0);
+            app.set_editor_default_custom(SharedString::new());
             app.set_editor_homepage(SharedString::from("https://www.pixiv.net/"));
             app.set_editor_deletable(false);
             app.set_editor_open(true);
@@ -1165,7 +1338,6 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
         Err(_) => {}
     }
     app.show()?;
-
     // let the first render pass settle
     for _ in 0..8 {
         std::thread::sleep(Duration::from_millis(60));

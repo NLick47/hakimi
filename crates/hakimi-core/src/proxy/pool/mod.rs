@@ -359,6 +359,13 @@ impl UpstreamPool {
         let started = std::time::Instant::now();
         match client.request(request).await {
             Ok(response) => {
+                // A completed TLS handshake does not prove the route is usable:
+                // a fake-SNI request can reach nginx and get a 403. Feed the
+                // status back so the next connection drops that route.
+                if let Some(host) = debug_host {
+                    self.engine
+                        .note_http_rejection(host, port, tls, response.status());
+                }
                 if response.version() == http::Version::HTTP_2 {
                     self.stats.responses_h2.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -852,11 +859,9 @@ impl RouteConnector {
                         }
                         let started = Instant::now();
                         match this.connect_plan(&plan, force_http1, timeout).await {
-                            Ok(io) => Ok((
-                                Arc::new(plan),
-                                io,
-                                started.elapsed().as_millis() as u64,
-                            )),
+                            Ok(io) => {
+                                Ok((Arc::new(plan), io, started.elapsed().as_millis() as u64))
+                            }
                             Err((reason, detail)) => Err((plan, reason, detail)),
                         }
                     }));

@@ -25,14 +25,17 @@
       "id": "ao3",
       "name": "AO3",
       "domains": [
-        "archiveofourown.org",
-        "www.archiveofourown.org",
-        "*.archiveofourown.org"
+        { "pattern": "archiveofourown.org" },
+        { "pattern": "www.archiveofourown.org" },
+        { "pattern": "*.archiveofourown.org" }
       ],
-      "strategy": "sni",
       "enabled": true,
-      "sni": "",
-      "experimental": false
+      "defaultRoute": {
+        "attempts": [
+          { "mode": "sni" },
+          { "mode": "direct" }
+        ]
+      }
     }
   ],
   "catalogVersion": 0,
