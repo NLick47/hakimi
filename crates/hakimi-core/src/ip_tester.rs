@@ -25,7 +25,9 @@ pub const ALPN_HTTP11: &[u8] = b"http/1.1";
 /// Building a `ClientConfig` rebuilds the ECH setup and the WebPKI verifier. More
 /// importantly, a fresh config starts with an empty TLS session cache, which defeats
 /// TLS 1.3 resumption for every new upstream connection. Configs are therefore cached by
-/// (mode, ALPN, ECH config, fake SNI/real domain) and share one resumption store.
+/// (mode, ALPN, ECH config, fake SNI/real domain). Direct/ECH share a store; fake SNI keeps
+/// a private store because its per-domain certificate verifier must not accept another
+/// domain's resumed session.
 pub struct TlsContext {
     provider: Arc<CryptoProvider>,
     roots: Arc<RootCertStore>,
@@ -205,9 +207,13 @@ impl TlsContext {
         // Sessions are keyed by the ServerName passed to the connector, so Direct/ECH
         // configs can share one store safely across domains. Fake SNI configs must not:
         // two real domains may present the same fake name, and a resumed session would
-        // bypass the per-domain certificate check. Those keep a private store.
+        // bypass the per-domain certificate check. Those keep a private store. Without
+        // it, every new fake-SNI connection paid a full handshake even though the
+        // public server offered TLS tickets.
         if mode != TlsMode::FakeSni {
             config.resumption = Resumption::store(self.sessions.clone());
+        } else {
+            config.resumption = Resumption::store(Arc::new(ClientSessionMemoryCache::new(64)));
         }
         let config = Arc::new(config);
         let mut configs = self.configs.write();
