@@ -257,8 +257,12 @@ impl StatusStore {
             let now = now();
             let domains = self.domains.read();
             if let Some(existing) = domains.get(domain) {
-                if matches!(existing.state, State::Normal | State::Direct)
-                    && now.signed_duration_since(existing.last_check) < chrono::Duration::seconds(1)
+                let age = now.signed_duration_since(existing.last_check);
+                if age < chrono::Duration::seconds(1)
+                    && matches!(
+                        existing.state,
+                        State::Normal | State::Direct | State::Checking
+                    )
                 {
                     return;
                 }
@@ -320,7 +324,8 @@ impl StatusStore {
         values
     }
 
-    pub fn counts(&self) -> StatusCounts {        let map = self.domains.read();
+    pub fn counts(&self) -> StatusCounts {
+        let map = self.domains.read();
         let mut counts = StatusCounts {
             normal: 0,
             direct: 0,
@@ -456,19 +461,9 @@ mod tests {
     fn repeated_checking_does_not_bump_revision() {
         let store = StatusStore::new();
         store.record(report("example.com", State::Normal));
-        store.mark_checking(
-            Some("github"),
-            "example.com",
-            Some(Strategy::Auto),
-            1,
-        );
+        store.mark_checking(Some("github"), "example.com", Some(Strategy::Auto), 1);
         let revision = store.revision();
-        store.mark_checking(
-            Some("github"),
-            "example.com",
-            Some(Strategy::Auto),
-            1,
-        );
+        store.mark_checking(Some("github"), "example.com", Some(Strategy::Auto), 1);
         assert_eq!(
             store.revision(),
             revision,
@@ -477,28 +472,32 @@ mod tests {
     }
 
     #[test]
+    fn a_cold_burst_reuses_one_checking_record() {
+        let store = StatusStore::new();
+        store.mark_checking(Some("github"), "example.com", Some(Strategy::Auto), 1);
+        let first = store.get("example.com").unwrap().last_check;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.mark_checking(Some("github"), "example.com", Some(Strategy::Auto), 1);
+        assert_eq!(
+            store.get("example.com").unwrap().last_check,
+            first,
+            "concurrent cold connections must not replace the shared Checking record"
+        );
+    }
+
+    #[test]
     fn fresh_success_absorbs_the_next_checking_marker() {
         let store = StatusStore::new();
         store.record(report("example.com", State::Normal));
 
-        store.mark_checking(
-            Some("github"),
-            "example.com",
-            Some(Strategy::Auto),
-            1,
-        );
+        store.mark_checking(Some("github"), "example.com", Some(Strategy::Auto), 1);
         assert_eq!(store.get("example.com").unwrap().state, State::Normal);
 
         // A stale result is re-marked so the UI still shows progress.
         let mut stale = report("stale.example", State::Normal);
         stale.last_check = now() - chrono::Duration::seconds(2);
         store.record(stale);
-        store.mark_checking(
-            Some("github"),
-            "stale.example",
-            Some(Strategy::Auto),
-            1,
-        );
+        store.mark_checking(Some("github"), "stale.example", Some(Strategy::Auto), 1);
         assert_eq!(store.get("stale.example").unwrap().state, State::Checking);
     }
 
@@ -589,17 +588,16 @@ mod tests {
         );
     }
 
-
-/// The snapshot the UI polls: a clone of every domain record plus the counts.
-#[test]
-#[ignore = "micro benchmark"]
-fn bench_status_snapshot() {
-    let store = StatusStore::new();
-    for index in 0..256 {
-        store.record(report(&format!("host{index}.example.com"), State::Normal));
+    /// The snapshot the UI polls: a clone of every domain record plus the counts.
+    #[test]
+    #[ignore = "micro benchmark"]
+    fn bench_status_snapshot() {
+        let store = StatusStore::new();
+        for index in 0..256 {
+            store.record(report(&format!("host{index}.example.com"), State::Normal));
+        }
+        crate::bench::measure("status.snapshot", 2_000, || {
+            let _ = store.domains_snapshot_with_counts();
+        });
     }
-    crate::bench::measure("status.snapshot", 2_000, || {
-        let _ = store.domains_snapshot_with_counts();
-    });
-}
 }

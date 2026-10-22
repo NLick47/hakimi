@@ -259,6 +259,62 @@ async fn raw_tunnel_races_past_a_blackholed_candidate() {
     );
 }
 
+/// A refused first raw candidate must release the hedge window immediately.
+/// The black-hole test above only proves that a slow first candidate is
+/// eventually bypassed; this one measures the fast-failure path that a stale
+/// last-good IP usually takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_tunnel_releases_hedge_after_refusal() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _listener = listener;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_for_direct_test(
+        dir.path(),
+        "::1".parse().unwrap(),
+        vec!["127.0.0.1".parse().unwrap()],
+    );
+    let mut cursor = match engine.route("upstream.test", port, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+
+    let started = Instant::now();
+    let result = race_tcp_plans(&mut cursor, Duration::from_secs(1)).await;
+    let elapsed = started.elapsed();
+    let (plan, _stream, _) = result.expect("the reachable candidate must win");
+    assert_eq!(plan.ip.to_string(), "127.0.0.1");
+    assert!(
+        elapsed < Duration::from_millis(120),
+        "a refused candidate made the raw tunnel wait for the hedge window: {elapsed:?}"
+    );
+}
+
+/// Same fast-failure rule for the address race used by bypass tunnels and
+/// plain-HTTP upstreams.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn address_race_releases_hedge_after_refusal() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _listener = listener;
+    let addresses = vec![
+        format!("[::1]:{port}").parse().unwrap(),
+        format!("127.0.0.1:{port}").parse().unwrap(),
+    ];
+
+    let started = Instant::now();
+    let stream = race_tcp_addresses(addresses, Duration::from_secs(1))
+        .await
+        .expect("the reachable address must win");
+    let elapsed = started.elapsed();
+    drop(stream);
+    assert!(
+        elapsed < Duration::from_millis(120),
+        "a refused address made the fallback wait for the hedge window: {elapsed:?}"
+    );
+}
+
 /// The raw CONNECT path can only use direct plans, but an auto group whose
 /// last-good strategy is ECH used to put that route first and await an HTTPS-RR
 /// DoH query before every direct candidate. With a fast-failing first address that

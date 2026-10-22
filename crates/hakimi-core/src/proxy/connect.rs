@@ -301,6 +301,9 @@ pub(super) async fn race_tcp_plans(
         FuturesUnordered::new();
     let mut exhausted = false;
     let mut first_start: Option<Instant> = None;
+    // As in the pooled race, a failed candidate releases the remaining
+    // hedge delay immediately instead of making the fallback wait it out.
+    let (failure_tx, failure_rx) = tokio::sync::watch::channel(false);
 
     loop {
         let event = if !exhausted && pending.len() < RAW_RACE_SIZE {
@@ -330,9 +333,15 @@ pub(super) async fn race_tcp_plans(
                         (now < deadline).then(|| deadline - now)
                     }
                 };
+                let mut failure_rx = failure_rx.clone();
                 pending.push(Box::pin(async move {
                     if let Some(delay) = delay {
-                        tokio::time::sleep(delay).await;
+                        if !*failure_rx.borrow() {
+                            tokio::select! {
+                                _ = tokio::time::sleep(delay) => {}
+                                _ = failure_rx.changed() => {}
+                            }
+                        }
                     }
                     let address = SocketAddr::new(plan.ip, plan.port);
                     let started = Instant::now();
@@ -358,7 +367,14 @@ pub(super) async fn race_tcp_plans(
             Event::Plan(None) => exhausted = true,
             Event::Result(result) => match result {
                 Ok((plan, stream, latency)) => return Some((Arc::new(plan), stream, latency)),
-                Err((plan, reason, detail)) => cursor.note_failure(&plan, reason, detail),
+                Err((plan, reason, detail)) => {
+                    cursor.note_failure(&plan, reason, detail);
+                    // Same rule as the pooled race: once a candidate has
+                    // failed, the fallback is no longer speculative and should
+                    // not wait for the rest of the initial hedge window.
+                    first_start = None;
+                    let _ = failure_tx.send(true);
+                }
             },
         }
     }
@@ -443,12 +459,19 @@ pub(super) async fn race_tcp_addresses(
         let end = (index + RAW_RACE_SIZE).min(addresses.len());
         let mut pending: FuturesUnordered<Pin<Box<dyn Future<Output = ConnectResult> + Send>>> =
             FuturesUnordered::new();
+        // Release the hedge sleep as soon as one address fails, so a refused
+        // first address does not add 150 ms to a healthy fallback.
+        let (failure_tx, failure_rx) = tokio::sync::watch::channel(false);
         for (offset, address) in addresses[index..end].iter().copied().enumerate() {
+            let mut failure_rx = failure_rx.clone();
             pending.push(Box::pin(async move {
                 // Give the preferred address a head start; the rest follow together
                 // after one stagger instead of a linear ramp.
-                if offset > 0 {
-                    tokio::time::sleep(RAW_RACE_STAGGER).await;
+                if offset > 0 && !*failure_rx.borrow() {
+                    tokio::select! {
+                        _ = tokio::time::sleep(RAW_RACE_STAGGER) => {}
+                        _ = failure_rx.changed() => {}
+                    }
                 }
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
@@ -476,6 +499,7 @@ pub(super) async fn race_tcp_addresses(
                 Err((hit_timeout, detail)) => {
                     timed_out |= hit_timeout;
                     last_error = detail;
+                    let _ = failure_tx.send(true);
                 }
             }
         }

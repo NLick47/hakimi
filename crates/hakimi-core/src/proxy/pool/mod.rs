@@ -783,6 +783,11 @@ impl RouteConnector {
         // Plans generated together form one initial hedge wave. Plans that arrive
         // after a failed handshake start immediately instead of sleeping again.
         let mut first_start: Option<Instant> = None;
+        // A watch channel lets already-sleeping hedge futures abandon the rest
+        // of their stagger as soon as any candidate fails. Without it, a
+        // refused first candidate still costs the full 150 ms before the
+        // healthy fallback is allowed to start.
+        let (failure_tx, failure_rx) = tokio::sync::watch::channel(false);
 
         loop {
             let event = if !exhausted && pending.len() < RACE_SIZE {
@@ -810,9 +815,15 @@ impl RouteConnector {
                         }
                     };
                     let this = self.clone();
+                    let mut failure_rx = failure_rx.clone();
                     pending.push(Box::pin(async move {
                         if let Some(delay) = delay {
-                            tokio::time::sleep(delay).await;
+                            if !*failure_rx.borrow() {
+                                tokio::select! {
+                                    _ = tokio::time::sleep(delay) => {}
+                                    _ = failure_rx.changed() => {}
+                                }
+                            }
                         }
                         let started = Instant::now();
                         match this.connect_plan(&plan, force_http1, timeout).await {
@@ -835,6 +846,13 @@ impl RouteConnector {
                     Err((plan, reason, detail)) => {
                         self.engine.forget_plan(&plan.domain, plan.port, plan.tls);
                         cursor.note_failure(&plan, reason, detail);
+                        // A fast failure means the hedge window has done its
+                        // job: start the next candidate immediately instead of
+                        // making the user wait out the rest of the stagger.
+                        // The next plan opens a fresh 150 ms window for the
+                        // candidates after it.
+                        first_start = None;
+                        let _ = failure_tx.send(true);
                     }
                 },
             }
@@ -944,21 +962,27 @@ impl RouteConnector {
             type BypassResult = Result<PooledIo, String>;
             let mut pending =
                 FuturesUnordered::<Pin<Box<dyn Future<Output = BypassResult> + Send>>>::new();
+            let (failure_tx, failure_rx) = tokio::sync::watch::channel(false);
             for (i, address) in batch.iter().enumerate() {
                 let this = self.clone();
                 let address = *address;
                 let host = host.to_string();
                 let force = force_http1;
+                let mut failure_rx = failure_rx.clone();
                 pending.push(Box::pin(async move {
                     // One shared head-start for the preferred address (matching
                     // the group race): a linear ramp would make the 8th address
                     // of a blackholed host wait over a second before trying.
-                    if i > 0 {
+                    // A fast failure releases the head-start immediately.
+                    if i > 0 && !*failure_rx.borrow() {
                         let head_start = deadline
                             .saturating_duration_since(tokio::time::Instant::now())
                             .min(RACE_STAGGER);
                         if !head_start.is_zero() {
-                            tokio::time::sleep(head_start).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(head_start) => {}
+                                _ = failure_rx.changed() => {}
+                            }
                         }
                     }
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -993,7 +1017,10 @@ impl RouteConnector {
             while let Some(result) = pending.next().await {
                 match result {
                     Ok(io) => return Ok(io),
-                    Err(detail) => last_error = Some(detail),
+                    Err(detail) => {
+                        last_error = Some(detail);
+                        let _ = failure_tx.send(true);
+                    }
                 }
             }
             // The whole batch failed; try the next one.

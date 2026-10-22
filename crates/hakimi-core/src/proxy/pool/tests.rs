@@ -228,6 +228,71 @@ async fn http1_connections_are_reused() {
     assert_eq!(stats["responsesH1"], 3);
 }
 
+/// A refused first candidate must not make the healthy fallback wait out the
+/// 150 ms hedge window.  This is the latency a browser sees when a stale
+/// last-good address is still cached but the origin has moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_candidate_releases_the_hedge_window() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 4096];
+                let _ = socket.read(&mut buffer).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, config) = engine_for(dir.path());
+    // The cached route points at an IPv6 address with no listener on this
+    // port, so the first TCP connect is refused immediately.  The remote
+    // catalog then offers 127.0.0.1, where the test origin is listening.
+    engine.cache.put_last_good(LastGoodEntry {
+        domain: "upstream.test".into(),
+        ip: "::1".parse().unwrap(),
+        strategy: Strategy::Direct,
+        source: IpSource::Cache,
+        network_id: "test".into(),
+        saved_at: now(),
+        catalog_version: 0,
+    });
+    let engine = DecisionEngine::new(
+        config.clone(),
+        engine.cache.clone(),
+        Arc::new(StubRemote),
+        engine.resolver.clone(),
+        engine.prober.clone(),
+        engine.status.clone(),
+    );
+    let tls = TlsContext::new().unwrap();
+    let pool = UpstreamPool::new(engine, tls, &config.snapshot());
+    let uri = format!("http://upstream.test:{port}/");
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(&uri)
+        .body(Either::Right(Full::new(Bytes::new())))
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let response = pool.send(request, false).await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert!(
+        elapsed < std::time::Duration::from_millis(120),
+        "the refused candidate made the fallback wait for the hedge window: {elapsed:?}"
+    );
+}
+
 /// Regression probe for cold-connection latency: a single cached candidate is
 /// available, but `race_plans` pre-buffers plans and `next_plan` waits for DoH
 /// expansion before the race can start. The first connection should not wait
