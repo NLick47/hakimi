@@ -162,6 +162,7 @@ impl UpstreamStats {
 
 pub struct UpstreamPool {
     auto: Client<RouteConnector, UpstreamBody>,
+    http1: Client<RouteConnector, UpstreamBody>,
     upgrade: Client<RouteConnector, UpstreamBody>,
     recovery: Client<RouteConnector, UpstreamBody>,
     engine: Arc<DecisionEngine>,
@@ -247,6 +248,7 @@ impl UpstreamPool {
     pub fn new(engine: Arc<DecisionEngine>, tls: Arc<TlsContext>, config: &AppConfig) -> Arc<Self> {
         let stats = Arc::new(UpstreamStats::default());
         let max_idle = config.advanced.upstream_max_idle_per_host.max(1);
+        let http1_limit = config.advanced.http1_max_concurrent.max(1);
 
         let http1_hosts = DomainMatcher::from_patterns(
             config
@@ -270,6 +272,14 @@ impl UpstreamPool {
         };
         let upgrade_connector = RouteConnector {
             engine: engine.clone(),
+            tls: tls.clone(),
+            http1_only: true,
+            http1_hosts: http1_hosts.clone(),
+            discovery: discovery.clone(),
+            stats: stats.clone(),
+        };
+        let http1_connector = RouteConnector {
+            engine: engine.clone(),
             tls,
             http1_only: true,
             http1_hosts: http1_hosts.clone(),
@@ -278,6 +288,14 @@ impl UpstreamPool {
         };
         Arc::new(Self {
             auto: build_client(config, auto_connector.clone(), max_idle),
+            // Image hosts are HTTP/1.1-only because a burst should spread over
+            // independent TCP connections. Their idle budget therefore has to
+            // track the burst concurrency, not the global small-idle profile:
+            // keeping only `max_idle` connections would make the next image
+            // burst reopen most of them (and pay the TLS handshakes again).
+            // This pool is only selected for `http1_hosts`, so the extra idle
+            // sockets do not apply to ordinary h2 origins.
+            http1: build_client(config, http1_connector, max_idle.max(http1_limit)),
             upgrade: build_client(config, upgrade_connector, max_idle),
             // The recovery pool starts empty, so the first request after a
             // slow response opens a fresh connection instead of reusing the
@@ -288,7 +306,7 @@ impl UpstreamPool {
             engine,
             slow_hosts: RwLock::new(HashMap::new()),
             http1_hosts,
-            http1_limit: config.advanced.http1_max_concurrent.max(1),
+            http1_limit,
             http1_slots: RwLock::new(HashMap::new()),
             stats,
         })
@@ -331,6 +349,8 @@ impl UpstreamPool {
             &self.upgrade
         } else if recovery {
             &self.recovery
+        } else if is_http1_host {
+            &self.http1
         } else {
             &self.auto
         };
@@ -497,7 +517,12 @@ impl UpstreamPool {
                 return false;
             }
         };
-        match tokio::time::timeout(WARM_TIMEOUT, self.auto.request(request)).await {
+        let client = if self.http1_hosts.match_host(host).is_some() {
+            &self.http1
+        } else {
+            &self.auto
+        };
+        match tokio::time::timeout(WARM_TIMEOUT, client.request(request)).await {
             Ok(Ok(response)) => {
                 self.stats.warm_success.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(

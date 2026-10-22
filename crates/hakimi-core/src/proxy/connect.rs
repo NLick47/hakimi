@@ -13,7 +13,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper::upgrade;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
@@ -213,11 +213,15 @@ pub(super) async fn handle_connect(
                 if alpn.as_deref() == Some(b"h2") {
                     http2::Builder::new(TokioExecutor::new())
                         .adaptive_window(true)
+                        .timer(TokioTimer::new())
                         .serve_connection(io, service)
                         .await
                         .context("serving MITM HTTP/2 connection")
                 } else {
                     http1::Builder::new()
+                        // The timer arms hyper's header-read timeout for the
+                        // browser side of the MITM tunnel as well.
+                        .timer(TokioTimer::new())
                         .serve_connection(io, service)
                         .with_upgrades()
                         .await

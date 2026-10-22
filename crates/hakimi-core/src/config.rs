@@ -179,7 +179,9 @@ pub struct AdvancedConfig {
     pub plan_cache_secs: u64,
     /// Idle timeout for pooled upstream HTTP/1.1 and HTTP/2 connections.
     pub upstream_idle_secs: u64,
-    /// Maximum idle HTTP/1.1 connections kept per authority.
+    /// Maximum idle HTTP/1.1 connections kept per authority. Image hosts in
+    /// `http1Hosts` use at least `http1MaxConcurrent` instead, so a following
+    /// image burst can reuse the connections it just opened.
     pub upstream_max_idle_per_host: usize,
     /// Host patterns forced to HTTP/1.1 upstream. Image CDNs often throttle a single TCP
     /// connection; independent HTTP/1.1 connections let concurrent images aggregate

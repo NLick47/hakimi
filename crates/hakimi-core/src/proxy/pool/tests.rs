@@ -228,6 +228,92 @@ async fn http1_connections_are_reused() {
     assert_eq!(stats["responsesH1"], 3);
 }
 
+/// Image hosts are deliberately forced onto HTTP/1.1 so a burst can use
+/// several TCP connections. The pool must keep enough of those connections
+/// idle for the next burst; otherwise every image page pays for fresh TLS
+/// handshakes even though the origin just served the previous one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn image_bursts_keep_the_http1_connections_idle() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepted = accepts.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            accepted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 8192];
+                while let Ok(read) = socket.read(&mut buffer).await {
+                    if read == 0 {
+                        break;
+                    }
+                    if socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                        )
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    async fn burst(pool: Arc<UpstreamPool>, uri: String, count: usize) {
+        let mut tasks = Vec::with_capacity(count);
+        for _ in 0..count {
+            let pool = pool.clone();
+            let uri = uri.clone();
+            tasks.push(tokio::spawn(async move {
+                let request = Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Either::Right(Full::new(Bytes::new())))
+                    .unwrap();
+                let response = pool.send(request, false).await.unwrap();
+                assert_eq!(response.status(), http::StatusCode::OK);
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(&body[..], b"ok");
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, config) = engine_for(dir.path());
+    config
+        .mutate(|config| {
+            config.advanced.http1_hosts = vec!["upstream.test".into()];
+            config.advanced.http1_max_concurrent = 4;
+            config.advanced.upstream_max_idle_per_host = 1;
+            Ok(())
+        })
+        .unwrap();
+    let tls = TlsContext::new().unwrap();
+    let pool = UpstreamPool::new(engine, tls, &config.snapshot());
+    let uri = format!("http://upstream.test:{port}/");
+
+    burst(pool.clone(), uri.clone(), 4).await;
+    // Give hyper a moment to check the connections back into the pool.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let after_first = accepts.load(Ordering::SeqCst);
+    assert_eq!(after_first, 4, "the first burst should use four h1 connections");
+
+    burst(pool, uri, 4).await;
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        after_first,
+        "the second image burst should reuse the idle h1 connections instead of reconnecting"
+    );
+}
+
 /// A refused first candidate must not make the healthy fallback wait out the
 /// 150 ms hedge window.  This is the latency a browser sees when a stale
 /// last-good address is still cached but the origin has moved.

@@ -22,7 +22,7 @@ use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -152,6 +152,11 @@ pub async fn start(ctx: Arc<ProxyContext>, bind: SocketAddr) -> Result<ProxyHand
                     match accepted {
                         Ok((stream, _peer)) => {
                             let _ = stream.set_nodelay(true);
+                            // A browser or tunnel client can disappear without a
+                            // FIN (Wi-Fi drop, killed app). TCP keepalive lets the
+                            // tunnel task release the upstream socket instead of
+                            // waiting for the OS default, which can be hours.
+                            crate::util::apply_tcp_keepalive(&stream);
                             let ctx = ctx.clone();
                             tokio::spawn(async move {
                                 if let Err(error) = serve_connection(stream, ctx).await {
@@ -182,6 +187,10 @@ async fn serve_connection(stream: TcpStream, ctx: Arc<ProxyContext>) -> Result<(
         async move { Ok::<_, Infallible>(handle_request(req, ctx).await) }
     });
     http1::Builder::new()
+        // Hyper's default 30 s header-read timeout is only armed when a timer
+        // is installed. Without it a local slowloris client can pin a task and
+        // an accepted socket forever before ever sending a complete request.
+        .timer(TokioTimer::new())
         .serve_connection(TokioIo::new(stream), service)
         .with_upgrades()
         .await
