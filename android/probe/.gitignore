@@ -5,3 +5,9 @@ hakimi-probe.apk
 debug.keystore
 assets/ca/
 res/raw/hakimi_ca.bin
+
+# Android Studio / Gradle
+.gradle/
+local.properties
+.idea/
+*.iml

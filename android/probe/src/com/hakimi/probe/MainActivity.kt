@@ -828,13 +828,18 @@ class MainActivity : Activity(), Host {
                         true
                     }
                 }
-                "catalogs.ip" -> {
-                    next.getJSONObject("catalogs").put("ip", raw)
-                    true
-                }
-                "catalogs.doh" -> {
-                    next.getJSONObject("catalogs").put("doh", raw)
-                    true
+                "catalogs.ip", "catalogs.doh" -> {
+                    val value = raw.trim()
+                    if (value.isNotEmpty() &&
+                        !value.startsWith("http://") &&
+                        !value.startsWith("https://")
+                    ) {
+                        showSnack("目录地址必须以 http:// 或 https:// 开头", error = true)
+                        false
+                    } else {
+                        next.getJSONObject("catalogs").put(key.substringAfter('.'), value)
+                        true
+                    }
                 }
                 else -> false
             }
@@ -844,6 +849,39 @@ class MainActivity : Activity(), Host {
                         if (ok) "设置已保存" else (error ?: "保存失败"),
                         error = !ok
                     )
+                }
+            }
+        }
+    }
+
+    override fun resetCatalogs() {
+        Sheets.confirm(
+            this,
+            "恢复默认目录",
+            "IP 目录和 DoH 目录将恢复为内置的 Gitee 地址。",
+            "恢复"
+        ) {
+            val defaults = runCatching { JSONObject(Native.defaultCatalogUrls()) }.getOrNull()
+            val next = runCatching { JSONObject(data.configJson.toString()) }.getOrNull()
+            if (defaults == null || next == null) {
+                showSnack("配置尚未就绪", error = true)
+                return@confirm
+            }
+            val ip = defaults.optString("ip")
+            val doh = defaults.optString("doh")
+            if (ip.isEmpty() || doh.isEmpty()) {
+                showSnack("默认目录不可用", error = true)
+                return@confirm
+            }
+            val catalogs = next.getJSONObject("catalogs")
+            catalogs.put("ip", ip)
+            catalogs.put("doh", doh)
+            applyConfig(next) { ok, error ->
+                if (ok) {
+                    showSnack("目录已恢复默认")
+                    refreshCatalogs()
+                } else {
+                    showSnack(error ?: "恢复失败", error = true)
                 }
             }
         }

@@ -28,7 +28,6 @@ class SettingsScreen(private val context: Context, private val host: Host) {
 
     private lateinit var envRow: SettingRow
     private lateinit var serviceRow: SettingRow
-    private lateinit var proxyRow: SettingRow
     private lateinit var modeRow: SettingRow
     private lateinit var excludedRow: SettingRow
     private lateinit var certRow: SettingRow
@@ -37,6 +36,7 @@ class SettingsScreen(private val context: Context, private val host: Host) {
     private lateinit var portRow: SettingRow
     private lateinit var ipCatalogRow: SettingRow
     private lateinit var dohCatalogRow: SettingRow
+    private lateinit var resetCatalogRow: SettingRow
     private lateinit var alwaysOnRow: SettingRow
     private lateinit var batteryRow: SettingRow
 
@@ -53,12 +53,10 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         excludedRow = SettingRow(context, "排除应用", "这些应用不经过 hakimi，直接连接网络")
         excludedRow.clickOnce { host.chooseExcludedApps() }
         envRow = SettingRow(context, "环境状态", "证书安装状态")
-        envRow.clickOnce { if (!host.core.userCaTrusted) host.openCaSetup() else host.setTab(0) }
+        envRow.hideChevron()
         serviceRow = SettingRow(context, "核心服务", "本地加速核心的运行状态")
-        serviceRow.clickOnce { host.setTab(0) }
-        proxyRow = SettingRow(context, "本地代理", "代理模式下浏览器流量进入核心的入口")
-        proxyRow.clickOnce { host.copy(host.core.endpoint, "代理地址") }
-        content.addView(rowsCard(modeRow, excludedRow, envRow, serviceRow, proxyRow))
+        serviceRow.hideChevron()
+        content.addView(rowsCard(modeRow, excludedRow, envRow, serviceRow))
         content.addView(space(8f))
 
         content.addView(section("证书"))
@@ -112,7 +110,9 @@ class SettingsScreen(private val context: Context, private val host: Host) {
                 configString("catalogs", "doh")
             )
         }
-        content.addView(rowsCard(portRow, ipCatalogRow, dohCatalogRow))
+        resetCatalogRow = SettingRow(context, "恢复默认目录", "把 IP/DoH 目录恢复为内置地址")
+        resetCatalogRow.clickOnce { host.resetCatalogs() }
+        content.addView(rowsCard(portRow, ipCatalogRow, dohCatalogRow, resetCatalogRow))
         content.addView(space(8f))
 
         content.addView(section("后台"))
@@ -124,8 +124,6 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         content.addView(space(8f))
 
         content.addView(section("工具"))
-        val probe = SettingRow(context, "检测全部站点", "逐域名探测可用线路与延迟")
-        probe.clickOnce { host.runProbeSweep() }
         val catalogs = SettingRow(context, "刷新远程目录", "重新拉取 IP 与 DoH 目录")
         catalogs.clickOnce { host.refreshCatalogs() }
         val diagnose = SettingRow(context, "域名诊断", "查看单域名的完整路由尝试过程")
@@ -134,7 +132,7 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         log.clickOnce { host.showLog() }
         val export = SettingRow(context, "导出诊断包", "包含脱敏配置与运行状态")
         export.clickOnce { host.exportDiagnostics() }
-        content.addView(rowsCard(probe, catalogs, diagnose, log, export))
+        content.addView(rowsCard(catalogs, diagnose, log, export))
         content.addView(space(8f))
 
         content.addView(section("关于"))
@@ -181,10 +179,6 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         serviceRow.setValue(
             if (data.running) "运行中" else "已停止",
             if (data.running) Palette.GREEN else Palette.MUTED
-        )
-        proxyRow.setValue(
-            if (vpn) "VPN 接管" else data.endpoint,
-            if (vpn) Palette.MUTED else Palette.ACCENT
         )
         certRow.setValue(if (trusted) "已信任" else "未信任", if (trusted) Palette.GREEN else Palette.AMBER)
 

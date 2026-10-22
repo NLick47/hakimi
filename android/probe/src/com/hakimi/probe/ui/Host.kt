@@ -27,6 +27,7 @@ interface Host {
     fun diagnosePrompt()
     fun runDiagnose(domain: String, done: (DiagnoseOutcome) -> Unit)
     fun applyConfig(next: JSONObject, done: (Boolean, String?) -> Unit)
+    fun resetCatalogs()
     fun editSetting(key: String, title: String, subtitle: String, value: String)
     fun chooseMode()
     fun chooseExcludedApps()

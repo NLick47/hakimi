@@ -161,6 +161,15 @@ fn config_json() -> String {
     }
 }
 
+/// Built-in catalog endpoints, exposed so the UI can offer a one-tap reset.
+fn default_catalog_urls() -> String {
+    serde_json::json!({
+        "ip": hakimi_core::config::DEFAULT_CATALOG_IP,
+        "doh": hakimi_core::config::DEFAULT_CATALOG_DOH,
+    })
+    .to_string()
+}
+
 fn apply_config(raw: &str) -> Result<()> {
     let host = host()?;
     let config: AppConfig = serde_json::from_str(raw).context("parsing config JSON")?;
@@ -394,6 +403,16 @@ pub extern "system" fn Java_com_hakimi_probe_Native_config(
 ) -> jstring {
     let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(config_json))
         .unwrap_or_else(|_| "{\"error\":\"native panic\"}".to_string());
+    new_string(&mut env, value)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_hakimi_probe_Native_defaultCatalogUrls(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(default_catalog_urls))
+        .unwrap_or_else(|_| "{}".to_string());
     new_string(&mut env, value)
 }
 

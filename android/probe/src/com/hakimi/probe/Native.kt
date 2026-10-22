@@ -25,6 +25,8 @@ object Native {
 
     @JvmStatic external fun config(): String
 
+    @JvmStatic external fun defaultCatalogUrls(): String
+
     @JvmStatic external fun applyConfig(json: String): Boolean
 
     @JvmStatic external fun setGroupEnabled(id: String, enabled: Boolean): Boolean

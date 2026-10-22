@@ -20,6 +20,14 @@ pub const MAX_CUSTOM_DOH: usize = 32;
 /// also receive. Each bump needs a matching step in `migrate_defaults`.
 pub const CURRENT_DEFAULTS_VERSION: u32 = 1;
 
+/// Default remote IP catalog, shared by the desktop and Android builds.
+pub const DEFAULT_CATALOG_IP: &str =
+    "https://gitee.com/mom09/hakimi/raw/master/ips.json";
+
+/// Default remote DoH catalog, shared by the desktop and Android builds.
+pub const DEFAULT_CATALOG_DOH: &str =
+    "https://gitee.com/mom09/hakimi/raw/master/doh.json";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppConfig {
@@ -122,8 +130,8 @@ pub struct CatalogSources {
 impl Default for CatalogSources {
     fn default() -> Self {
         Self {
-            ip: String::new(),
-            doh: String::new(),
+            ip: DEFAULT_CATALOG_IP.to_string(),
+            doh: DEFAULT_CATALOG_DOH.to_string(),
             ip_mirrors: Vec::new(),
             doh_mirrors: Vec::new(),
             signature_public_key: None,
