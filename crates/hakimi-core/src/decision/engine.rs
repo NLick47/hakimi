@@ -352,7 +352,25 @@ impl DecisionEngine {
     /// True while an HTTP rejection (403/421/451) keeps this mode out of the
     /// candidate set for the domain.
     pub(super) fn route_rejected(&self, domain: &str, mode: TlsMode) -> bool {
+        // The overwhelmingly common case is an empty rejection map. Check it
+        // under a shared lock before formatting a key or taking the exclusive
+        // lock that `note_http_rejection` needs. This runs for every route
+        // attempt of every cold connection.
+        if self.route_rejections.read().is_empty() {
+            return false;
+        }
         let key = format!("{domain}|{}", mode.as_str());
+        let expired = {
+            let rejections = self.route_rejections.read();
+            match rejections.get(&key) {
+                Some(at) if at.elapsed() < ROUTE_REJECTION_TTL => return true,
+                Some(_) => true,
+                None => false,
+            }
+        };
+        if !expired {
+            return false;
+        }
         let mut rejections = self.route_rejections.write();
         match rejections.get(&key) {
             Some(at) if at.elapsed() < ROUTE_REJECTION_TTL => true,
