@@ -19,6 +19,10 @@ use crate::util::{now, redact_url};
 
 const SHARED_ECH_DOMAIN: &str = "cloudflare-ech.com";
 const SHARED_ECH_TTL_SECS: u32 = 30 * 60;
+/// After a DoH TTL expires, serve the still-usable answer for this short grace
+/// period while a background query refreshes it. Without the grace, every
+/// expired entry paid the full DoH timeout before the page could connect.
+const STALE_WHILE_REVALIDATE_SECS: i64 = 60;
 
 #[derive(Debug, Clone)]
 pub struct EffectiveEndpoint {
@@ -95,21 +99,23 @@ impl IpResolver for Resolver {
 }
 
 /// Global DoH resolver. Endpoint order is primary -> fallback -> user custom -> remote catalog,
-/// deduplicated by URL. A live query is attempted before stale cache; fresh cache entries are
-/// used directly according to their TTL.
+/// deduplicated by URL. Fresh cache entries are used directly; a just-expired answer is served
+/// while a background query refreshes it, and an older usable answer is used only after a live
+/// failure.
 type EndpointCache = Option<(u64, u64, Arc<Vec<EffectiveEndpoint>>)>;
 
+#[derive(Clone)]
 pub struct Resolver {
     cache: Arc<CacheManager>,
     config: Arc<ConfigManager>,
     catalogs: Arc<CatalogManager>,
-    clients: RwLock<HashMap<String, reqwest::Client>>,
-    health: RwLock<HashMap<String, DohHealth>>,
-    shared_ech_lock: tokio::sync::Mutex<()>,
-    query_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    clients: Arc<RwLock<HashMap<String, reqwest::Client>>>,
+    health: Arc<RwLock<HashMap<String, DohHealth>>>,
+    shared_ech_lock: Arc<tokio::sync::Mutex<()>>,
+    query_locks: Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Config/catalog revisions plus the derived endpoint list. A DoH query
     /// used to rebuild and re-clone this list on every cache miss.
-    endpoint_cache: RwLock<EndpointCache>,
+    endpoint_cache: Arc<RwLock<EndpointCache>>,
 }
 
 impl Resolver {
@@ -122,11 +128,11 @@ impl Resolver {
             cache,
             config,
             catalogs,
-            clients: RwLock::new(HashMap::new()),
-            health: RwLock::new(HashMap::new()),
-            shared_ech_lock: tokio::sync::Mutex::new(()),
-            query_locks: parking_lot::Mutex::new(HashMap::new()),
-            endpoint_cache: RwLock::new(None),
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            health: Arc::new(RwLock::new(HashMap::new())),
+            shared_ech_lock: Arc::new(tokio::sync::Mutex::new(())),
+            query_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            endpoint_cache: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -239,6 +245,44 @@ impl Resolver {
         None
     }
 
+    /// Select a cached IP answer without waiting for DoH. `extra_secs` bounds
+    /// how far past the DNS TTL the answer may be served in the background
+    /// refresh path; `None` is the last-resort fallback used after a live
+    /// failure.
+    fn stale_ip_resolution(
+        &self,
+        domain: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        extra_secs: Option<i64>,
+    ) -> Option<DohResolution> {
+        for qtype in [TYPE_A, TYPE_AAAA] {
+            if let Some(answer) = self.cache.doh_answer(domain, qtype) {
+                if answer.ips.is_empty() || answer.is_fresh(at) {
+                    continue;
+                }
+                if let Some(extra) = extra_secs {
+                    if answer.ttl_secs == 0 {
+                        continue;
+                    }
+                    let age = at.signed_duration_since(answer.fetched_at).num_seconds();
+                    if age > answer.ttl_secs as i64 + extra {
+                        continue;
+                    }
+                }
+                return Some(DohResolution {
+                    ips: answer.ips,
+                    hints: answer.hints,
+                    source: DohSource::Cache,
+                    endpoint: "stale-cache".to_string(),
+                    stale: true,
+                    ttl: 0,
+                    fallback_used: false,
+                });
+            }
+        }
+        None
+    }
+
     fn fresh_ech(&self, domain: &str) -> Result<Option<EchOutcome>> {
         if let Some(cached) = self.cache.ech(domain, true) {
             let config = base64::engine::general_purpose::STANDARD
@@ -268,6 +312,46 @@ impl Resolver {
         lock.lock_owned().await
     }
 
+    fn try_query_lock(&self, key: String) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = {
+            let mut locks = self.query_locks.lock();
+            if locks.len() > 1024 {
+                locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            }
+            locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        lock.try_lock_owned().ok()
+    }
+
+    /// Refresh an expired answer without making the request wait for DoH.
+    /// `try_query_lock` deliberately skips spawning another refresh when a
+    /// foreground resolve already owns this domain's single-flight lock.
+    fn spawn_ip_refresh(&self, domain: String) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let resolver = self.clone();
+        handle.spawn(async move {
+            let domain = normalize_query_name(&domain);
+            let Some(_guard) = resolver.try_query_lock(format!("ip|{domain}")) else {
+                return;
+            };
+            if resolver.fresh_ip_resolution(&domain, now()).is_some() {
+                return;
+            }
+            if let Err(error) = resolver.resolve_live_ips(&domain).await {
+                tracing::debug!(
+                    domain = %domain,
+                    error = %error,
+                    "background DoH refresh failed; keeping the stale answer"
+                );
+            }
+        });
+    }
+
     /// Resolve A/AAAA candidates. IPv4 answers come first; AAAA is queried when A yields no
     /// addresses (the design keeps IPv6 as a later-phase feature).
     pub async fn resolve_ips(&self, domain: &str) -> Result<DohResolution> {
@@ -275,6 +359,17 @@ impl Resolver {
         let at = now();
 
         if let Some(resolution) = self.fresh_ip_resolution(&domain, at) {
+            return Ok(resolution);
+        }
+
+        // A just-expired answer is still a useful route. Return it immediately
+        // and let a background query renew the cache, instead of putting the
+        // first request after the TTL behind a potentially multi-second DoH
+        // timeout. The grace window is intentionally short.
+        if let Some(resolution) =
+            self.stale_ip_resolution(&domain, at, Some(STALE_WHILE_REVALIDATE_SECS))
+        {
+            self.spawn_ip_refresh(domain.clone());
             return Ok(resolution);
         }
 
@@ -286,6 +381,10 @@ impl Resolver {
             return Ok(resolution);
         }
 
+        self.resolve_live_ips(&domain).await
+    }
+
+    async fn resolve_live_ips(&self, domain: &str) -> Result<DohResolution> {
         let mut attempts = Vec::new();
         let mut fallback_used = false;
         let mut last_error: Option<anyhow::Error> = None;
@@ -295,7 +394,7 @@ impl Resolver {
         let mut source = DohSource::Primary;
         let mut endpoint = String::new();
 
-        match self.query_one_type(&domain, TYPE_A).await {
+        match self.query_one_type(domain, TYPE_A).await {
             Ok(query) => {
                 source = query.source;
                 endpoint = query.endpoint;
@@ -323,7 +422,7 @@ impl Resolver {
         }
 
         if ips.is_empty() && last_error.is_none() {
-            match self.query_one_type(&domain, TYPE_AAAA).await {
+            match self.query_one_type(domain, TYPE_AAAA).await {
                 Ok(query) => {
                     source = query.source;
                     endpoint = query.endpoint;
@@ -363,21 +462,16 @@ impl Resolver {
             });
         }
 
-        // Last resort: stale cache, A first then AAAA.
-        for qtype in [TYPE_A, TYPE_AAAA] {
-            if let Some(answer) = self.cache.doh_answer(&domain, qtype) {
-                if !answer.ips.is_empty() {
-                    return Ok(DohResolution {
-                        ips: answer.ips,
-                        hints: answer.hints,
-                        source: DohSource::Cache,
-                        endpoint: "stale-cache".to_string(),
-                        stale: true,
-                        ttl: 0,
-                        fallback_used,
-                    });
-                }
-            }
+        // Another request may have completed a refresh while this query was
+        // running; prefer that answer over the last-resort stale entry.
+        if let Some(mut resolution) = self.fresh_ip_resolution(domain, now()) {
+            resolution.fallback_used = fallback_used;
+            return Ok(resolution);
+        }
+
+        if let Some(mut resolution) = self.stale_ip_resolution(domain, now(), None) {
+            resolution.fallback_used = fallback_used;
+            return Ok(resolution);
         }
 
         if let Some(error) = last_error {
@@ -1013,5 +1107,77 @@ mod tests {
         let resolution = resolver.resolve_ips("github.com").await.unwrap();
         assert_eq!(resolution.source, DohSource::Cache);
         assert_eq!(resolution.ips.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_answers_are_served_without_waiting_for_doh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, cache, resolver) = resolver(dir.path());
+        config
+            .mutate(|config| {
+                // Keep the background refresh offline and deterministic.
+                config.doh.primary = "https://127.0.0.1:1/dns-query".into();
+                config.doh.fallback = "https://127.0.0.1:1/dns-query".into();
+                config.doh.custom.clear();
+                Ok(())
+            })
+            .unwrap();
+        cache.put_doh_answer(CachedAnswer {
+            domain: "github.com".into(),
+            qtype: TYPE_A,
+            ips: vec!["20.205.243.166".parse().unwrap()],
+            hints: Vec::new(),
+            ech_config: None,
+            ttl_secs: 60,
+            fetched_at: now() - chrono::Duration::seconds(90),
+        });
+
+        let started = Instant::now();
+        let resolution = resolver.resolve_ips("github.com").await.unwrap();
+        assert!(resolution.stale);
+        assert_eq!(resolution.source, DohSource::Cache);
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "an expired-but-usable answer should not wait for DoH: {:?}",
+            started.elapsed()
+        );
+        // Let the background refresh observe the empty endpoint list and exit.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    #[test]
+    fn expired_answers_are_available_for_the_revalidate_grace_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, cache, resolver) = resolver(dir.path());
+        cache.put_doh_answer(CachedAnswer {
+            domain: "github.com".into(),
+            qtype: TYPE_A,
+            ips: vec!["20.205.243.166".parse().unwrap()],
+            hints: Vec::new(),
+            ech_config: None,
+            ttl_secs: 60,
+            fetched_at: now() - chrono::Duration::seconds(90),
+        });
+
+        let at = now();
+        let stale = resolver
+            .stale_ip_resolution("github.com", at, Some(STALE_WHILE_REVALIDATE_SECS))
+            .expect("an expired answer within the grace window must be usable");
+        assert!(stale.stale);
+        assert_eq!(stale.ips.len(), 1);
+
+        let beyond_grace = now() + chrono::Duration::seconds(90);
+        assert!(
+            resolver
+                .stale_ip_resolution("github.com", beyond_grace, Some(60))
+                .is_none(),
+            "the stale-while-revalidate path must not serve arbitrarily old answers"
+        );
+        assert!(
+            resolver
+                .stale_ip_resolution("github.com", beyond_grace, None)
+                .is_some(),
+            "the last-resort path may still use the usable answer"
+        );
     }
 }
