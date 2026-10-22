@@ -276,6 +276,7 @@ impl DecisionEngine {
             group_index,
             rule_index,
             config,
+            !probing,
         )))
     }
 

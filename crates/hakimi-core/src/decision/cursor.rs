@@ -84,6 +84,7 @@ impl RouteCursor {
         group_index: usize,
         rule_index: usize,
         config: Arc<AppConfig>,
+        hedge_cold_ech: bool,
     ) -> Self {
         let group = &config.groups[group_index];
         let max = config.advanced.max_candidates_per_domain;
@@ -170,12 +171,13 @@ impl RouteCursor {
             vec![RouteAttempt::Direct]
         };
         // A cold ECH-first route used to block the whole cursor on the HTTPS RR
-        // lookup even when the route explicitly allows Direct fallback. Move
-        // that fallback ahead of the lookup so the race can open its first TCP
-        // connection immediately; the ECH plan is still generated (and raced)
-        // on the next `next_plan` call once the lookup has a value. A fresh
-        // cached config keeps ECH in its configured first position.
-        if tls {
+        // lookup even when the route explicitly allows Direct fallback. In the
+        // connection race, move that fallback ahead of the lookup so the first
+        // TCP connection can open immediately; the ECH plan is still generated
+        // (and raced) on the next `next_plan` call once the lookup has a value.
+        // Diagnostic probes keep the configured priority, and a fresh cached
+        // config keeps ECH in its configured first position.
+        if tls && hedge_cold_ech {
             let cold_ech = route_attempts
                 .iter()
                 .position(|attempt| attempt.ech_source().is_some());
