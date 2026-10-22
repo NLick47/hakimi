@@ -283,6 +283,40 @@ impl StatusStore {
         }
     }
 
+    /// Warmup failures are recorded as Checking so a first attempt that is
+    /// immediately retried does not flash Failed. Once warmup finishes, turn
+    /// any probe still sitting in Checking with a recorded failure into a real
+    /// Failed state exactly once.
+    pub fn settle_provisional(&self, domains: &[String]) {
+        let mut map = self.domains.write();
+        let mut counts = self.counts.write();
+        let mut changed = false;
+        for domain in domains {
+            let Some(entry) = map.get_mut(domain) else {
+                continue;
+            };
+            if entry.state != State::Checking || entry.error.is_none() {
+                continue;
+            }
+            let mut updated = (**entry).clone();
+            updated.state = State::Failed;
+            tracing::info!(
+                domain = %domain,
+                from = ?State::Checking,
+                to = ?State::Failed,
+                error = ?updated.error,
+                "domain state changed"
+            );
+            counts.remove(State::Checking);
+            counts.add(State::Failed);
+            *entry = Arc::new(updated);
+            changed = true;
+        }
+        if changed {
+            self.revision.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     pub fn mark_checking(
         &self,
         group: Option<&str>,
@@ -666,6 +700,32 @@ mod tests {
 
         store.clear();
         assert_eq!(store.counts(), StatusCounts::default());
+    }
+
+    #[test]
+    fn settling_provisional_failures_publishes_one_failure() {
+        let store = StatusStore::new();
+        let mut diagnostic = DomainDiagnostics::checking(
+            Some("test".into()),
+            "a.example",
+            Vec::new(),
+            0,
+        );
+        diagnostic.error = Some(FailureReason::TcpTimeout);
+        store.record(diagnostic);
+        assert_eq!(store.get("a.example").unwrap().state, State::Checking);
+
+        let revision = store.revision();
+        store.settle_provisional(&["a.example".to_string()]);
+        assert_eq!(store.get("a.example").unwrap().state, State::Failed);
+        assert!(store.revision() > revision);
+        assert_eq!(store.counts().failed, 1);
+        assert_eq!(store.counts().checking, 0);
+
+        // Settling again is a no-op.
+        let revision = store.revision();
+        store.settle_provisional(&["a.example".to_string()]);
+        assert_eq!(store.revision(), revision);
     }
 
     #[test]

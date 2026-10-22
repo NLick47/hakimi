@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,10 @@ pub struct DecisionEngine {
     /// Routes that produced an HTTP rejection (403/421/451). Keyed by
     /// `domain|mode`; entries expire after [`ROUTE_REJECTION_TTL`].
     route_rejections: parking_lot::RwLock<HashMap<String, Instant>>,
+    /// True while the initial warmup is probing. Failures are published as
+    /// Checking instead of Failed so the first probe's retry does not flash
+    /// red; the runtime settles the remaining ones after warmup.
+    warming: AtomicBool,
 }
 
 pub(super) const PLAN_CACHE_MAX: usize = 2048;
@@ -103,7 +107,21 @@ impl DecisionEngine {
             ip_score_count: AtomicUsize::new(ip_score_count),
             plan_cache_count: AtomicUsize::new(0),
             route_rejections: parking_lot::RwLock::new(HashMap::new()),
+            warming: AtomicBool::new(false),
         })
+    }
+
+    /// Mark the start of the initial warmup. Probe failures stay in Checking
+    /// until [`Self::finish_warmup`] so a first attempt that is immediately
+    /// retried does not publish Failed and then Normal.
+    pub fn begin_warmup(&self) {
+        self.warming.store(true, Ordering::SeqCst);
+    }
+
+    /// End the warmup window. The runtime also settles any probe that is still
+    /// Checking with a recorded failure into Failed.
+    pub fn finish_warmup(&self) {
+        self.warming.store(false, Ordering::SeqCst);
     }
 
     pub async fn decide_https(self: &Arc<Self>, domain: &str) -> DecisionOutcome {
@@ -842,10 +860,15 @@ impl DecisionEngine {
         if let Some(error) = &doh.error {
             suggestions.push(format!("DoH error: {error}"));
         }
+        let provisional = self.warming.load(Ordering::Relaxed);
         let diagnostics = Arc::new(DomainDiagnostics {
             group: Some(group.id.clone()),
             domain: domain.to_string(),
-            state: State::Failed,
+            state: if provisional {
+                State::Checking
+            } else {
+                State::Failed
+            },
             strategy: None,
             configured_modes: group.route_modes(domain),
             ip: None,

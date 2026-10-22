@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -780,6 +780,24 @@ impl HakimiRuntime {
                 let runtime = runtime.clone();
                 tokio::spawn(async move { runtime.resolver.health_check().await })
             };
+            // A fresh data directory has no cached IP catalog. Warming up
+            // before the initial refresh records false failures for every
+            // catalog-backed domain, and the status then flips Failed -> Normal
+            // seconds later. Wait briefly for that first refresh instead.
+            let catalog_configured = {
+                let config = runtime.config.snapshot();
+                !config.catalogs.ip.trim().is_empty()
+                    || !config.catalogs.ip_mirrors.is_empty()
+            };
+            if catalog_configured && !runtime.catalogs.has_ip_catalog() {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !runtime.catalogs.has_ip_catalog() && Instant::now() < deadline {
+                    tokio::select! {
+                        _ = receiver.changed() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    }
+                }
+            }
             runtime.warm_groups().await;
             tokio::select! {
                 _ = receiver.changed() => {}
@@ -940,6 +958,7 @@ impl HakimiRuntime {
             concurrency = limit,
             "warming upstream routes"
         );
+        self.engine.begin_warmup();
 
         // Prefetch shared ECH configs so the first browser request does not pay the
         // HTTPS-RR DoH query inside the CONNECT path.
@@ -955,6 +974,7 @@ impl HakimiRuntime {
         }
 
         let mut handles = Vec::new();
+        let probed: Vec<String> = primaries.iter().chain(rest.iter()).cloned().collect();
         for domain in primaries {
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(permit) => permit,
@@ -992,6 +1012,8 @@ impl HakimiRuntime {
         }
         // Summarize the warmup: how many routes are hot before the user opens
         // a browser, and how many hosts stayed cold.
+        let engine = self.engine.clone();
+        let status = self.status.clone();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             let (mut ok, mut fail) = (0usize, 0usize);
@@ -1001,6 +1023,10 @@ impl HakimiRuntime {
                     _ => fail += 1,
                 }
             }
+            // Any probe that never recovered is a real failure, but publish it
+            // only after every retry has finished.
+            engine.finish_warmup();
+            status.settle_provisional(&probed);
             tracing::info!(
                 ok,
                 cold = fail,
