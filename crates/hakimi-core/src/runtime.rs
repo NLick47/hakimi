@@ -745,6 +745,14 @@ impl HakimiRuntime {
     /// permit for the duration of its probe, so a sweep never opens dozens of
     /// TLS connections at once.
     async fn probe_hosts(self: &Arc<Self>, hosts: Vec<String>, scope: &str) {
+        // The startup probe sweep is the same kind of background probing as the
+        // warm-up: it fills the DoH and last-good caches before the first real
+        // request. A harness that has to observe a cold connection turns both
+        // off.
+        if crate::hooks::skip_warmup() {
+            tracing::debug!("probe sweep skipped by the test hook");
+            return;
+        }
         let started = std::time::Instant::now();
         let total = hosts.len();
         if total == 0 {
@@ -845,7 +853,10 @@ impl HakimiRuntime {
                 }
                 runtime.engine.reprobe_failed_ips(16).await;
                 let stats = runtime.upstream.stats_json();
-                tracing::info!(
+                // A periodic snapshot, not an event. It repeats every minute
+                // with mostly unchanged numbers and would otherwise be the
+                // second largest block in the log.
+                tracing::debug!(
                     stats = %serde_json::to_string(&stats).unwrap_or_default(),
                     "pool stats"
                 );
@@ -903,6 +914,11 @@ impl HakimiRuntime {
     }
 
     async fn warm_groups(self: &Arc<Self>) {
+        // A harness that needs a cold connection can turn the warm-up off.
+        if crate::hooks::skip_warmup() {
+            tracing::debug!("upstream warm-up skipped by the test hook");
+            return;
+        }
         let config = self.config.snapshot();
         let limit = config.advanced.prewarm_concurrency.clamp(1, 32);
         let semaphore = Arc::new(Semaphore::new(limit));

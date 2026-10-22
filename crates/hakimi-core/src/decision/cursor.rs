@@ -72,6 +72,17 @@ pub struct RouteCursor {
     last_detail: Option<String>,
     skipped: HashSet<String>,
     finished: bool,
+    /// True once the plan list ran out.
+    ///
+    /// The failure is deliberately *not* published at that moment: the racing
+    /// callers still have attempts in flight, and their results are the only
+    /// explanation of why the connection failed. Publishing early turned
+    /// every real timeout into a misleading "no candidate address was
+    /// available", because the aggregate reason was computed before the
+    /// first attempt had reported back.
+    exhausted: bool,
+    /// True once a connection succeeded; a success suppresses the failure.
+    succeeded: bool,
     failure: Option<DecisionOutcome>,
 }
 
@@ -225,6 +236,8 @@ impl RouteCursor {
             last_detail: None,
             skipped: HashSet::new(),
             finished: false,
+            exhausted: false,
+            succeeded: false,
             failure: None,
         }
     }
@@ -345,7 +358,12 @@ impl RouteCursor {
         self.engine.forget_plan(&plan.domain, plan.port, plan.tls);
     }
 
-    pub fn outcome(&self) -> Option<&DecisionOutcome> {
+    pub fn outcome(&mut self) -> Option<&DecisionOutcome> {
+        // Finalize lazily: by the time the caller asks, every in-flight
+        // attempt has reported back and the attempt trace is complete.
+        if self.failure.is_none() && self.exhausted && !self.succeeded {
+            self.finish_failure();
+        }
         self.failure.as_ref()
     }
 
@@ -362,7 +380,7 @@ impl RouteCursor {
                 return None;
             }
             if self.route_attempts.is_empty() {
-                self.finish_failure();
+                self.exhausted = true;
                 return None;
             }
             // Advance to the next candidate when the round is done (or not started).
@@ -375,7 +393,10 @@ impl RouteCursor {
                         self.sni_index = 0;
                     }
                     None => {
-                        self.finish_failure();
+                        // The plan list is exhausted, but the race may still have
+                        // attempts in flight. The failure is published by
+                        // `outcome()` once they reported back.
+                        self.exhausted = true;
                         return None;
                     }
                 }
@@ -536,10 +557,18 @@ impl RouteCursor {
 
     /// Record a failed real connection attempt. The caller then asks for the next plan.
     pub fn note_failure(&mut self, plan: &ConnectPlan, reason: FailureReason, detail: String) {
+        // Per candidate, so it stays at debug level: a race that fails
+        // completely emits one line per candidate, and the trace is already
+        // published twice at a higher level - by "failed candidate before
+        // success" when another candidate wins, and by "all connection
+        // strategies failed" when none does. This line is the raw record for
+        // a deep dive, not the summary.
         tracing::debug!(
             domain = %plan.domain,
             ip = %plan.ip,
             mode = %plan.mode,
+            source = %plan.source,
+            sni = ?plan.sni,
             reason = %reason,
             detail = %detail,
             "upstream candidate failed"
@@ -581,6 +610,7 @@ impl RouteCursor {
             });
         }
         self.finished = true;
+        self.succeeded = true;
         DecisionOutcome {
             plan: Some(plan),
             diagnostics,
@@ -621,6 +651,35 @@ impl RouteCursor {
         if self.skip_once {
             detail.push("last-good cache was skipped once after a catalog update".into());
         }
+        // An empty route policy and an empty candidate list both end the
+        // cursor, but they are different problems. Without this note the
+        // aggregate reason reads like "no address was known" even though the
+        // route itself was never tried.
+        if self.route_attempts.is_empty() {
+            detail.push(format!(
+                "the route policy for `{}` has no connection attempts (configured modes: {:?})",
+                self.domain,
+                self.configured_modes()
+            ));
+        }
+        if self.candidates.is_empty() {
+            detail.push(format!(
+                "no candidate address was available for `{}` (catalog loaded: {}, DoH source: {:?})",
+                self.domain,
+                self.remote_available,
+                self.doh.source
+            ));
+        }
+        // The cursor state is what turns "no route worked" into "why did no
+        // route work": how far the candidate list was walked, how many modes
+        // were configured and how many of them were actually tried.
+        detail.push(format!(
+            "cursor state: candidate_index={} of {} candidates, route_attempts={}, attempt_index={}",
+            self.candidate_index,
+            self.candidates.len(),
+            self.route_attempts.len(),
+            self.attempt_index
+        ));
         let attempts = std::mem::take(&mut self.attempts);
         let diagnostics = self.engine.failure_diagnostics(
             self.group(),
@@ -634,6 +693,7 @@ impl RouteCursor {
             } else {
                 Some(detail.join("; "))
             },
+            &self.candidates,
         );
         self.failure = Some(DecisionOutcome {
             plan: None,

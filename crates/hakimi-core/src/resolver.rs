@@ -885,11 +885,41 @@ impl Resolver {
         domain: &str,
         qtype: u16,
     ) -> Result<ResolvedAnswer> {
+        let started = Instant::now();
+        let result = self.query_endpoint_inner(endpoint, domain, qtype).await;
+        match &result {
+            Ok(_) => {}
+            Err(error) => {
+                // A DoH failure is one of the two classic reasons why a site
+                // becomes unroutable, so it must be visible at the default log
+                // level and must name the endpoint that failed.
+                tracing::warn!(
+                    endpoint = %endpoint.name,
+                    url = %redact_url(&endpoint.url),
+                    source = %endpoint.source,
+                    domain = %domain,
+                    qtype,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    error = %format!("{error:#}"),
+                    "doh query failed"
+                );
+            }
+        }
+        result
+    }
+
+    async fn query_endpoint_inner(
+        &self,
+        endpoint: &EffectiveEndpoint,
+        domain: &str,
+        qtype: u16,
+    ) -> Result<ResolvedAnswer> {
         let config = self.config.snapshot();
         let timeout = Duration::from_secs(config.catalogs.timeout_secs.max(1));
         let client = self.client_for(endpoint, timeout)?;
         let id: u16 = rand::rng().random();
         let query = dns::build_query(domain, qtype, id)?;
+        let started = Instant::now();
         let response = client
             .post(&endpoint.url)
             .header(reqwest::header::CONTENT_TYPE, "application/dns-message")
@@ -933,6 +963,21 @@ impl Resolver {
             bail!("DoH response code {}", parsed.rcode_text());
         }
         let answer = dns::extract_answer(&parsed, domain, qtype);
+        // The answer set is the whole point of a DoH lookup: without it a log
+        // reader cannot tell "DoH is unreachable" apart from "DoH answered but
+        // the answer was empty", and those two need very different fixes.
+        tracing::info!(
+            endpoint = %endpoint.name,
+            url = %redact_url(&endpoint.url),
+            source = %endpoint.source,
+            domain = %domain,
+            qtype,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            ips = %format_ips(&answer.ips),
+            hints = %format_ips(&answer.hints),
+            ttl_secs = answer.ttl,
+            "doh query answered"
+        );
         Ok(answer)
     }
 
@@ -997,19 +1042,47 @@ impl Resolver {
         elapsed: Duration,
         error: Option<String>,
     ) {
-        self.health.write().insert(
-            endpoint.url.clone(),
-            DohHealth {
-                name: endpoint.name.clone(),
-                url: endpoint.url.clone(),
-                source: endpoint.source,
-                healthy,
-                latency_ms: Some(elapsed.as_millis() as u64),
-                last_error: error,
-                checked_at: now(),
-            },
-        );
+        let previous = {
+            let mut health = self.health.write();
+            let previous = health.get(&endpoint.url).map(|entry| entry.healthy);
+            health.insert(
+                endpoint.url.clone(),
+                DohHealth {
+                    name: endpoint.name.clone(),
+                    url: endpoint.url.clone(),
+                    source: endpoint.source,
+                    healthy,
+                    latency_ms: Some(elapsed.as_millis() as u64),
+                    last_error: error.clone(),
+                    checked_at: now(),
+                },
+            );
+            previous
+        };
+        // Only transitions are logged: a healthy endpoint answers every query,
+        // and one line per query would drown the interesting failures.
+        if previous != Some(healthy) {
+            if healthy {
+                tracing::info!(
+                    endpoint = %endpoint.name,
+                    url = %redact_url(&endpoint.url),
+                    source = %endpoint.source,
+                    latency_ms = elapsed.as_millis() as u64,
+                    "doh endpoint is reachable"
+                );
+            } else {
+                tracing::warn!(
+                    endpoint = %endpoint.name,
+                    url = %redact_url(&endpoint.url),
+                    source = %endpoint.source,
+                    latency_ms = elapsed.as_millis() as u64,
+                    error = error.as_deref().unwrap_or("unknown"),
+                    "doh endpoint is unreachable"
+                );
+            }
+        }
     }
+
 }
 
 fn normalize_query_name(domain: &str) -> String {
@@ -1022,6 +1095,20 @@ fn remaining_ttl(answer: &CachedAnswer, now: chrono::DateTime<chrono::Utc>) -> u
         .num_seconds()
         .max(0) as u32;
     answer.ttl_secs.saturating_sub(age)
+}
+
+/// Compact rendering of a list of addresses for the log.
+///
+/// The debug rendering contains spaces, which makes the line impossible to
+/// read field by field - and the answer set is the whole point of the line.
+fn format_ips(ips: &[std::net::IpAddr]) -> String {
+    if ips.is_empty() {
+        return "none".to_string();
+    }
+    ips.iter()
+        .map(|ip| ip.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]

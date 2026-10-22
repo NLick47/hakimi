@@ -191,6 +191,28 @@ async fn persisted_scores_keep_a_blocked_ip_demoted_after_restart() {
     );
 }
 
+#[tokio::test]
+async fn a_timed_out_candidate_sinks_behind_an_untested_one() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    *h.remote.catalog.lock() = true;
+    let failed: IpAddr = "203.0.113.10".parse().unwrap();
+    let untested: IpAddr = "203.0.113.11".parse().unwrap();
+    // Catalog order puts the dead address first; the quality rank must
+    // reverse it.
+    *h.remote.ips.lock() = Some(vec![failed, untested]);
+    h.engine.record_ip("example.com", failed, None, true);
+
+    let mut cursor = match h.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let plan = cursor.next_plan().await.expect("a direct plan");
+    assert_eq!(
+        plan.ip, untested,
+        "an address that timed out must not be tried before an untested one"
+    );
+}
+
 #[test]
 fn ip_score_overflow_keeps_known_good_ips() {
     let h = harness(&["example.com"], RoutePolicy::auto());
@@ -922,3 +944,106 @@ fn bench_plan_cache_lookup() {
         let _ = h.engine.cached_plan("example.com", 443, true);
     });
 }
+
+/// A total failure must be published only after the racing attempts reported
+/// back.
+///
+/// The plan list runs out long before the in-flight connections do. Publishing
+/// the failure at that moment computed the aggregate reason from an empty
+/// attempt history, so every real timeout was reported as "no candidate
+/// address was available" and the attempt trace stayed empty.
+#[tokio::test]
+async fn a_failure_is_published_only_after_the_attempts_reported_back() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    *h.remote.catalog.lock() = true;
+    *h.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+
+    let mut cursor = match h.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let plan = cursor.next_plan().await.expect("a direct plan");
+
+    // The plan list is exhausted while the connection is still in flight.
+    assert!(
+        cursor.next_plan().await.is_none(),
+        "the cursor must run out of plans"
+    );
+    let published = h
+        .engine
+        .status
+        .get("example.com")
+        .expect("the cursor publishes a checking state");
+    assert!(
+        published.error.is_none(),
+        "an exhausted plan list must not publish a failure: the attempts that \
+         explain it have not reported back yet, so the reason would be a guess \
+         (got {:?})",
+        published.error
+    );
+
+    // Now the connection fails.
+    cursor.note_failure(&plan, FailureReason::TcpTimeout, "timed out".into());
+
+    let outcome = cursor.outcome().expect("a failure outcome");
+    assert_eq!(
+        outcome.diagnostics.error,
+        Some(FailureReason::TcpTimeout),
+        "the published reason must be the real one, not a guess made before \
+         the attempts reported back"
+    );
+    assert_eq!(
+        outcome.diagnostics.attempts.len(),
+        1,
+        "the attempt trace must reach the diagnostics: {:?}",
+        outcome.diagnostics.attempts
+    );
+    assert_eq!(outcome.diagnostics.attempts[0].ip, plan.ip);
+    assert_eq!(
+        outcome.diagnostics.attempts[0].error,
+        Some(FailureReason::TcpTimeout)
+    );
+}
+
+/// The same rule applies to the pool and raw races: the reason must be the
+/// error of the attempt that actually failed, never "no candidate".
+#[tokio::test]
+async fn an_exhausted_cursor_reports_the_last_attempt_error() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    *h.remote.catalog.lock() = true;
+    let addresses: Vec<IpAddr> = vec!["1.1.1.1".parse().unwrap(), "2.2.2.2".parse().unwrap()];
+    *h.remote.ips.lock() = Some(addresses.clone());
+
+    let mut cursor = match h.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let mut plans = Vec::new();
+    while let Some(plan) = cursor.next_plan().await {
+        plans.push(plan);
+    }
+    assert_eq!(plans.len(), addresses.len());
+    for plan in &plans {
+        cursor.note_failure(plan, FailureReason::TcpTimeout, "timed out".into());
+    }
+
+    let outcome = cursor.outcome().expect("a failure outcome");
+    assert_eq!(outcome.diagnostics.error, Some(FailureReason::TcpTimeout));
+    assert_eq!(
+        outcome.diagnostics.attempts.len(),
+        addresses.len(),
+        "every candidate that was tried must appear in the trace"
+    );
+    for address in &addresses {
+        assert!(
+            outcome
+                .diagnostics
+                .attempts
+                .iter()
+                .any(|attempt| attempt.ip == *address),
+            "the trace must name {address}: {:?}",
+            outcome.diagnostics.attempts
+        );
+    }
+}
+

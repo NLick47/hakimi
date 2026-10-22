@@ -862,7 +862,7 @@ impl RouteConnector {
             } else if !pending.is_empty() {
                 Event::Result(pending.next().await.expect("pending is not empty"))
             } else {
-                return Err(discovery_failure_detail(&cursor));
+                return Err(discovery_failure_detail(&mut cursor));
             };
 
             match event {
@@ -1090,7 +1090,7 @@ impl RouteConnector {
     }
 }
 
-fn discovery_failure_detail(cursor: &RouteCursor) -> String {
+fn discovery_failure_detail(cursor: &mut RouteCursor) -> String {
     cursor
         .outcome()
         .and_then(|outcome| outcome.diagnostics.detail.clone())

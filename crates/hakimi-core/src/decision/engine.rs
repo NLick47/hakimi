@@ -18,8 +18,8 @@ use crate::util::{network_id, now};
 
 use super::cursor::{Route, RouteCursor};
 use super::plan::{ConnectPlan, DecisionOutcome, Prober};
-use super::score::{IpScore, IP_SCORE_CAP, IP_SCORE_PRUNE_TO};
-use super::types::{Candidate, DohExpansion};
+use super::score::{IpScore, IP_SCORE_CAP, IP_SCORE_PRUNE_TO, UNSEEN_RANK};
+use super::types::{Candidate, DohExpansion, EARLY_DOH_AFTER};
 
 pub struct DecisionEngine {
     pub config: Arc<ConfigManager>,
@@ -52,6 +52,14 @@ pub struct DecisionEngine {
     /// `route_rejections`, only the address is dropped; other IPs on the same
     /// route mode may still work.
     ip_rejections: parking_lot::RwLock<HashMap<String, HashMap<IpAddr, Instant>>>,
+    /// The route that was last logged for a domain.
+    ///
+    /// The resolution line is by far the most frequent line in the log: a
+    /// route that is reused for every connection of a domain says nothing
+    /// new, while a route *change* is exactly what an operator wants to see.
+    /// The map is bounded; when it overflows the stale entries are dropped,
+    /// which costs one extra line per domain and nothing else.
+    logged_routes: parking_lot::RwLock<HashMap<String, (IpAddr, TlsMode, Instant)>>,
     /// True while the initial warmup is probing. Failures are published as
     /// Checking instead of Failed so the first probe's retry does not flash
     /// red; the runtime settles the remaining ones after warmup.
@@ -62,6 +70,11 @@ pub(super) const PLAN_CACHE_MAX: usize = 2048;
 /// Leave headroom after a prune so a burst of new hosts does not sort the map
 /// on every success.
 pub(super) const PLAN_CACHE_PRUNE_TO: usize = PLAN_CACHE_MAX * 3 / 4;
+/// How many domains keep a "last logged route" stamp.
+const LOGGED_ROUTE_MAX: usize = 1024;
+/// How long a route stamp survives. A domain that has not been seen for this
+/// long is treated as new the next time it connects.
+const LOGGED_ROUTE_TTL: Duration = Duration::from_secs(600);
 /// How long an HTTP-rejected route stays out of the candidate set.
 const ROUTE_REJECTION_TTL: Duration = Duration::from_secs(300);
 /// How long a block-page IP stays out of a domain's candidate set.
@@ -114,8 +127,45 @@ impl DecisionEngine {
             plan_cache_count: AtomicUsize::new(0),
             route_rejections: parking_lot::RwLock::new(HashMap::new()),
             ip_rejections: parking_lot::RwLock::new(HashMap::new()),
+            logged_routes: parking_lot::RwLock::new(HashMap::new()),
             warming: AtomicBool::new(false),
         })
+    }
+
+    /// Remember the route that was last logged for `domain` and report whether
+    /// it changed.
+    ///
+    /// The stamp expires so a domain that has not been seen for a while is
+    /// treated as new the next time it connects.
+    fn route_changed(&self, domain: &str, ip: IpAddr, mode: TlsMode) -> bool {
+        let now = Instant::now();
+        // The common case is an unchanged route. A read lock is enough for
+        // it, which keeps the success path off the exclusive lock.
+        {
+            let routes = self.logged_routes.read();
+            if let Some((known_ip, known_mode, at)) = routes.get(domain) {
+                if *known_ip == ip
+                    && *known_mode == mode
+                    && now.duration_since(*at) < LOGGED_ROUTE_TTL
+                {
+                    return false;
+                }
+            }
+        }
+        let mut routes = self.logged_routes.write();
+        if routes.len() >= LOGGED_ROUTE_MAX {
+            routes.retain(|_, (_, _, at)| now.duration_since(*at) < LOGGED_ROUTE_TTL);
+            if routes.len() >= LOGGED_ROUTE_MAX {
+                routes.clear();
+            }
+        }
+        match routes.get(domain) {
+            Some((known_ip, known_mode, _)) if *known_ip == ip && *known_mode == mode => false,
+            _ => {
+                routes.insert(domain.to_string(), (ip, mode, now));
+                true
+            }
+        }
     }
 
     /// Mark the start of the initial warmup. Probe failures stay in Checking
@@ -395,7 +445,14 @@ impl DecisionEngine {
             .cache
             .route_hints(domain, config.advanced.last_good_days);
         let (remote, _) = self.remote.remote_ips_with_catalog(domain);
-        if last_good.is_none() && remote.as_ref().is_none_or(Vec::is_empty) {
+        // A domain with no known address at all and a domain with exactly one
+        // known address need the same thing: a second address to fall back to.
+        // The second case is the dangerous one, because a single remembered
+        // address that is black-holed leaves the connection with nowhere to
+        // go — and the DoH lookup that could have supplied an alternative only
+        // starts once the first attempt has already burned its timeout.
+        let known = last_good.is_some() as usize + remote.as_ref().map_or(0, Vec::len);
+        if known < EARLY_DOH_AFTER {
             let resolver = self.resolver.clone();
             let domain = domain.to_string();
             tokio::spawn(async move {
@@ -597,7 +654,7 @@ impl DecisionEngine {
             .get(domain)
             .and_then(|by_ip| by_ip.get(&ip))
             .map(|score| score.rank())
-            .unwrap_or(f64::MAX)
+            .unwrap_or(UNSEEN_RANK)
     }
 
     /// Score a cursor's candidate list under one read lock. A cold route can
@@ -612,7 +669,7 @@ impl DecisionEngine {
                 by_ip
                     .and_then(|by_ip| by_ip.get(&candidate.ip))
                     .map(IpScore::rank)
-                    .unwrap_or(f64::MAX)
+                    .unwrap_or(UNSEEN_RANK)
             })
             .collect()
     }
@@ -847,7 +904,9 @@ impl DecisionEngine {
             }
         }
         if restored > 0 {
-            tracing::info!(restored, "failed ip scores restored after re-probe");
+            // A periodic health event, not a problem. It repeats every minute
+            // and would otherwise be one of the largest blocks in the log.
+            tracing::debug!(restored, "failed ip scores restored after re-probe");
         }
         restored
     }
@@ -883,14 +942,14 @@ impl DecisionEngine {
             _ => None,
         };
         if attempts.len() > 1 {
+            // The candidates that died before the winner. This is the partial
+            // failure case, so it is published at the default level; the same
+            // compact rendering as the total failure line keeps both greppable.
             for (index, attempt) in attempts.iter().enumerate() {
                 tracing::info!(
                     domain = %plan.domain,
                     attempt = index + 1,
-                    strategy = ?attempt.strategy,
-                    ip = %attempt.ip,
-                    source = ?attempt.source,
-                    error = ?attempt.error,
+                    failed = %format_attempt(attempt),
                     "failed candidate before success"
                 );
             }
@@ -950,16 +1009,22 @@ impl DecisionEngine {
             self.forget_plan(&plan.domain, plan.port, plan.tls);
         }
         self.status.record_arc(diagnostics.clone());
-        tracing::info!(
-            group = %plan.group_id,
-            domain = %plan.domain,
-            ip = %plan.ip,
-            mode = %plan.mode,
-            source = %plan.source,
-            latency_ms,
-            attempts = attempts_total,
-            "resolved connection strategy"
-        );
+        // Only a route change is worth a line. A route that is reused for
+        // every connection of a domain is the normal case and would drown
+        // the log; a change is the interesting event.
+        if self.route_changed(&plan.domain, plan.ip, plan.mode) {
+            tracing::info!(
+                group = %plan.group_id,
+                domain = %plan.domain,
+                ip = %plan.ip,
+                mode = %plan.mode,
+                source = %plan.source,
+                doh_source = ?doh_source,
+                latency_ms,
+                attempts = attempts_total,
+                "resolved connection strategy"
+            );
+        }
         diagnostics
     }
 
@@ -973,6 +1038,7 @@ impl DecisionEngine {
         attempts: Vec<AttemptRecord>,
         doh: &DohExpansion,
         detail: Option<String>,
+        candidates: &[Candidate],
     ) -> Arc<DomainDiagnostics> {
         let mut suggestions = vec![reason.suggestion().to_string()];
         if !self.remote.has_ip_catalog() {
@@ -1012,10 +1078,24 @@ impl DecisionEngine {
             suggestions,
         });
         self.status.record_arc(diagnostics.clone());
+        // The aggregate `reason` alone cannot explain a total failure: it says
+        // that every strategy died, not which address died, in which mode and
+        // with what error. The attempt trace is already in the diagnostics
+        // (the local error page shows it), so log it here too — otherwise a
+        // black-holed address is indistinguishable from a filtered SNI.
         tracing::warn!(
             group = %group.id,
             domain = %domain,
             reason = %reason,
+            modes = %format_modes(&group.route_modes(domain)),
+            candidates = %format_candidates(candidates),
+            doh_source = %format_optional(doh.source.map(|source| source.as_str())),
+            // The error and the detail contain spaces, so they are recorded in
+            // the quoted form: an unquoted value would swallow the fields that
+            // follow it.
+            doh_error = ?doh.error.clone().unwrap_or_default(),
+            attempts = %format_attempts(&diagnostics.attempts),
+            detail = ?diagnostics.detail.clone().unwrap_or_default(),
             "all connection strategies failed"
         );
         diagnostics
@@ -1044,6 +1124,7 @@ impl DecisionEngine {
                 ips,
                 hints,
                 source,
+                endpoint,
                 stale,
                 ..
             }) => {
@@ -1054,7 +1135,7 @@ impl DecisionEngine {
                     IpSource::Doh
                 };
                 let before = candidates.len();
-                for ip in ips.into_iter().chain(hints) {
+                for ip in ips.iter().copied().chain(hints.iter().copied()) {
                     if candidates.len() >= max {
                         break;
                     }
@@ -1070,12 +1151,18 @@ impl DecisionEngine {
                     }
                 }
                 // DoH is the expensive fallback: its cost and yield decide
-                // whether the catalog needs better coverage.
+                // whether the catalog needs better coverage. The answer itself
+                // is logged too: "DoH added nothing" and "DoH answered with
+                // the address that is already black-holed" need different
+                // fixes, and only the raw IPs tell them apart.
                 if elapsed > 1000 {
                     tracing::warn!(
                         domain = %domain,
                         source = ?source,
+                        endpoint = %endpoint,
                         stale,
+                        answered_ips = %format_ips(&ips),
+                        hints = %format_ips(&hints),
                         added = candidates.len() - before,
                         elapsed_ms = elapsed,
                         "doh expansion was slow"
@@ -1084,7 +1171,10 @@ impl DecisionEngine {
                     tracing::info!(
                         domain = %domain,
                         source = ?source,
+                        endpoint = %endpoint,
                         stale,
+                        answered_ips = %format_ips(&ips),
+                        hints = %format_ips(&hints),
                         added = candidates.len() - before,
                         elapsed_ms = elapsed,
                         "doh expansion"
@@ -1176,4 +1266,92 @@ impl DecisionEngine {
             diagnostics,
         }
     }
+}
+
+/// Compact, greppable rendering of the configured TLS modes.
+fn format_modes(modes: &[TlsMode]) -> String {
+    if modes.is_empty() {
+        return "none".to_string();
+    }
+    modes
+        .iter()
+        .map(|mode| mode.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Compact rendering of the candidate set: `address:source` per entry.
+///
+/// The debug rendering of a candidate list is unreadable in a log file and
+/// cannot be grepped, and the whole point of this line is to answer "which
+/// addresses were even tried".
+fn format_candidates(candidates: &[Candidate]) -> String {
+    if candidates.is_empty() {
+        return "none".to_string();
+    }
+    candidates
+        .iter()
+        .map(|candidate| format!("{}:{}", candidate.ip, candidate.source.as_str()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Compact rendering of one attempt: `mode@address#error:source[#sni]`.
+///
+/// The error is the part that decides what to do next (a black hole, a
+/// filtered SNI, a bad certificate), so it has to be visible per attempt.
+fn format_attempt(attempt: &AttemptRecord) -> String {
+    let error = attempt
+        .error
+        .map(|reason| reason.as_str())
+        .unwrap_or("-");
+    let sni = attempt
+        .sni
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("#{value}"))
+        .unwrap_or_default();
+    format!(
+        "{}@{}#{}:{}{}",
+        attempt.strategy.as_str(),
+        attempt.ip,
+        error,
+        attempt.source.as_str(),
+        sni
+    )
+}
+
+/// Compact rendering of the attempt trace: `mode@address:source#error`.
+///
+/// The error is the part that decides what to do next (a black hole, a
+/// filtered SNI, a bad certificate), so it has to be visible per attempt.
+fn format_attempts(attempts: &[AttemptRecord]) -> String {
+    if attempts.is_empty() {
+        return "none".to_string();
+    }
+    attempts
+        .iter()
+        .map(format_attempt)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Render an optional value without the `Some(...)` noise.
+fn format_optional(value: Option<&str>) -> String {
+    value.unwrap_or("none").to_string()
+}
+
+/// Compact rendering of a list of addresses.
+///
+/// The debug rendering of a list contains spaces, which makes the log line
+/// impossible to parse field by field - and the addresses are the one thing
+/// an operator has to be able to read off the line.
+fn format_ips(ips: &[std::net::IpAddr]) -> String {
+    if ips.is_empty() {
+        return "none".to_string();
+    }
+    ips.iter()
+        .map(|ip| ip.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
