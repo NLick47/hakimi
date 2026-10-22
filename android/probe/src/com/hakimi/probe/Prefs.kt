@@ -13,6 +13,7 @@ object Prefs {
     private const val FILE = "hakimi"
     private const val DESIRED = "desired_running"
     private const val MODE = "run_mode"
+    private const val EXCLUDED_APPS = "vpn_excluded_apps"
 
     fun get(context: Context): SharedPreferences =
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
@@ -29,6 +30,14 @@ object Prefs {
 
     fun setMode(context: Context, mode: String) {
         get(context).edit().putString(MODE, if (mode == MODE_VPN) MODE_VPN else MODE_PROXY).commit()
+    }
+
+    /** Packages whose traffic bypasses the VPN entirely. Empty means none. */
+    fun excludedApps(context: Context): Set<String> =
+        get(context).getStringSet(EXCLUDED_APPS, null)?.toSet() ?: emptySet()
+
+    fun setExcludedApps(context: Context, packages: Set<String>) {
+        get(context).edit().putStringSet(EXCLUDED_APPS, packages.toSet()).commit()
     }
 
     fun systemAlwaysOn(context: Context): Boolean = runCatching {

@@ -30,6 +30,7 @@ class SettingsScreen(private val context: Context, private val host: Host) {
     private lateinit var serviceRow: SettingRow
     private lateinit var proxyRow: SettingRow
     private lateinit var modeRow: SettingRow
+    private lateinit var excludedRow: SettingRow
     private lateinit var certRow: SettingRow
     private lateinit var certInfo: TextView
 
@@ -49,13 +50,15 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         content.addView(section("连接"))
         modeRow = SettingRow(context, "运行模式", "本地代理或 VPN 接管全部应用")
         modeRow.clickOnce { host.chooseMode() }
+        excludedRow = SettingRow(context, "排除应用", "这些应用不经过 hakimi，直接连接网络")
+        excludedRow.clickOnce { host.chooseExcludedApps() }
         envRow = SettingRow(context, "环境状态", "证书安装状态")
         envRow.clickOnce { if (!host.core.userCaTrusted) host.openCaSetup() else host.setTab(0) }
         serviceRow = SettingRow(context, "核心服务", "本地加速核心的运行状态")
         serviceRow.clickOnce { host.setTab(0) }
         proxyRow = SettingRow(context, "本地代理", "代理模式下浏览器流量进入核心的入口")
         proxyRow.clickOnce { host.copy(host.core.endpoint, "代理地址") }
-        content.addView(rowsCard(modeRow, envRow, serviceRow, proxyRow))
+        content.addView(rowsCard(modeRow, excludedRow, envRow, serviceRow, proxyRow))
         content.addView(space(8f))
 
         content.addView(section("证书"))
@@ -152,9 +155,14 @@ class SettingsScreen(private val context: Context, private val host: Host) {
     fun refresh(data: CoreData) {
         val trusted = data.userCaTrusted
         val vpn = Prefs.mode(context) == Prefs.MODE_VPN
+        val excluded = Prefs.excludedApps(context)
         modeRow.setValue(
             if (vpn) "VPN · 全部应用" else "本地代理",
             if (vpn) Palette.ACCENT else Palette.TEXT_2
+        )
+        excludedRow.setValue(
+            excludedSummary(excluded),
+            if (excluded.isEmpty()) Palette.TEXT_2 else Palette.ACCENT
         )
         envRow.setValue(
             when {
@@ -203,6 +211,21 @@ class SettingsScreen(private val context: Context, private val host: Host) {
             if (exempt) Palette.GREEN else Palette.AMBER
         )
         versionRow.setValue(appVersion)
+    }
+
+    private fun excludedSummary(packages: Set<String>): String {
+        if (packages.isEmpty()) return "未排除"
+        val labels = packages.mapNotNull { pkg ->
+            runCatching {
+                val info = context.packageManager.getApplicationInfo(pkg, 0)
+                context.packageManager.getApplicationLabel(info).toString()
+            }.getOrNull()
+        }
+        return when {
+            labels.isEmpty() -> "${packages.size} 个"
+            labels.size == 1 -> labels.first()
+            else -> "${labels.first()} 等 ${labels.size} 个"
+        }
     }
 
     private fun rowsCard(vararg rows: View): LinearLayout {

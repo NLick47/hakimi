@@ -29,6 +29,8 @@ interface Host {
     fun applyConfig(next: JSONObject, done: (Boolean, String?) -> Unit)
     fun editSetting(key: String, title: String, subtitle: String, value: String)
     fun chooseMode()
+    fun chooseExcludedApps()
+    fun onExcludedAppsChanged()
     fun openVpnSettings()
     fun requestBatteryExemption()
     fun refreshCatalogs()

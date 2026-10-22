@@ -82,7 +82,7 @@ android/probe/                Kotlin 原生 App（无 Gradle，aapt2 + kotlinc +
 `android/probe` 现在有两种运行模式：
 
 - **本地代理**：core 监听 `127.0.0.1:8443`，浏览器手动配置代理；App 不再写全局 `http_proxy`。
-- **VPN · 全部应用**（默认）：`VpnService` 接管所有应用（含浏览器和 WebView），通过静态 HTTP 代理把请求交给 core；核心只接管启用中的站点，其他站点由核心直接隧道转发。VPN 本身不读取 TUN，也不需要 tun2socks。这里不能用 PAC：WebView 系浏览器（如 Via）不读取 VPN 下发的 PAC，会绕过核心直连。
+- **VPN · 全部应用**（默认）：`VpnService` 接管所有应用（含浏览器和 WebView），通过静态 HTTP 代理把请求交给 core；核心只接管启用中的站点，其他站点由核心直接隧道转发。VPN 本身不读取 TUN，也不需要 tun2socks。这里不能用 PAC：WebView 系浏览器（如 Via）不读取 VPN 下发的 PAC，会绕过核心直连。设置 → 排除应用 可以按应用排除（可多选），被排除的应用从 VPN UID 范围移除，直接连接、不经过核心和 MITM。
 
 VPN 模式已在 Android 16 x86_64 模拟器（Chrome）和一加 Ace 2 真机（Via）上验证通过；always-on 仍待验证。
 

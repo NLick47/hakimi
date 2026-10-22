@@ -19,6 +19,7 @@ class Sheet(
     context: Context,
     title: String? = null,
     subtitle: String? = null,
+    scrollable: Boolean = true,
 ) : Dialog(context, R.style.SheetDialog) {
     val body: LinearLayout = LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL
@@ -70,14 +71,23 @@ class Sheet(
             root.addView(header)
         }
 
-        scroll.addView(body, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
-        root.addView(scroll, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
+        if (scrollable) {
+            scroll.addView(body, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+            root.addView(scroll, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+        } else {
+            // A sheet that hosts its own scrollable list must not be wrapped
+            // in a ScrollView, or the outer scrollView steals the list's drags.
+            root.addView(body, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+        }
 
         setContentView(root)
         setCanceledOnTouchOutside(true)

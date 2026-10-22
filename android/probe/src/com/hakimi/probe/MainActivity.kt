@@ -33,6 +33,7 @@ import com.hakimi.probe.ui.CoreData
 import com.hakimi.probe.ui.CoreParser
 import com.hakimi.probe.ui.DiagnoseOutcome
 import com.hakimi.probe.ui.DiagnoseResultSheet
+import com.hakimi.probe.ui.ExcludedAppsSheet
 import com.hakimi.probe.ui.HomeScreen
 import com.hakimi.probe.ui.Host
 import com.hakimi.probe.ui.Palette
@@ -589,6 +590,29 @@ class MainActivity : Activity(), Host {
             handler.postDelayed({ waitForStop(attempt + 1, then) }, 150L)
         } else {
             then()
+        }
+    }
+
+    override fun chooseExcludedApps() {
+        ExcludedAppsSheet(this, this).show()
+    }
+
+    override fun onExcludedAppsChanged() {
+        if (Prefs.mode(this) == Prefs.MODE_VPN &&
+            (HakimiVpnService.active || data.running)
+        ) {
+            showSnack("正在应用排除列表…")
+            startService(
+                Intent(this, HakimiVpnService::class.java)
+                    .setAction(HakimiVpnService.ACTION_STOP)
+            )
+            waitForStop(0) {
+                data = data.copy(running = false, listen = "")
+                render()
+                startAcceleration()
+            }
+        } else {
+            render()
         }
     }
 

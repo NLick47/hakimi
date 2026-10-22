@@ -231,8 +231,20 @@ class HakimiVpnService : VpnService() {
 
         // No allowed-application list: every app is captured. Exclude the
         // hakimi process itself so the core's catalog/DoH traffic cannot loop
-        // back into its own proxy.
-        runCatching { builder.addDisallowedApplication(packageName) }
+        // back into its own proxy, plus every app the user opted out of.
+        var excluded = 0
+        if (runCatching { builder.addDisallowedApplication(packageName) }.isSuccess) {
+            excluded++
+        }
+        Prefs.excludedApps(this).forEach { pkg ->
+            if (pkg == packageName) return@forEach
+            if (runCatching { packageManager.getApplicationInfo(pkg, 0) }.isFailure) {
+                return@forEach
+            }
+            if (runCatching { builder.addDisallowedApplication(pkg) }.isSuccess) {
+                excluded++
+            }
+        }
 
         excludeAllTraffic(builder)
         if (stopping) return
@@ -250,7 +262,7 @@ class HakimiVpnService : VpnService() {
         active = true
         lastError = ""
         retryDelay = 3_000L
-        Log.i(TAG, "VPN established apps=all proxy=127.0.0.1:$port")
+        Log.i(TAG, "VPN established apps=all excluded=$excluded proxy=127.0.0.1:$port")
         notice("hakimi VPN 加速中", "已接管全部应用")
         scheduleHealth(15_000L)
     }
