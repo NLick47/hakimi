@@ -37,7 +37,7 @@ const LEAF_ROTATE_HOURS: i64 = 24;
 /// Wildcard groups can expose an unbounded set of concrete hosts, so the
 /// per-domain leaf cache must not grow forever. Certificate generation is
 /// cheap enough to repeat; 512 covers the active set of a normal browser.
-const LEAF_CACHE_MAX: usize = 512;
+const LEAF_CACHE_MAX: usize = 128;
 const LEAF_CACHE_PRUNE_TO: usize = LEAF_CACHE_MAX * 3 / 4;
 const CA_STATUS_TTL: Duration = Duration::from_secs(10);
 

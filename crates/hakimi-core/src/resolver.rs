@@ -862,7 +862,7 @@ impl Resolver {
         // A client keeps a connection pool, so old ones must not pile up.  The
         // key changes when the endpoint or the timeout changes, and a dropped
         // client is simply rebuilt on the next query.
-        if clients.len() > 16 {
+        if clients.len() > 4 {
             clients.clear();
         }
         clients.insert(key, client.clone());

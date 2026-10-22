@@ -14,7 +14,7 @@ use crate::util::now;
 /// Wildcard groups can observe an unbounded set of concrete hosts. Keep the
 /// status map bounded so a crawler cannot turn the UI snapshot into a
 /// multi-megabyte clone every second.
-const MAX_STATUS_DOMAINS: usize = 8192;
+const MAX_STATUS_DOMAINS: usize = 4096;
 /// Evict in bulk so crossing the cap does not sort the map on every insert.
 const STATUS_PRUNE_TO: usize = MAX_STATUS_DOMAINS * 3 / 4;
 
@@ -588,6 +588,7 @@ mod tests {
             "the bulk prune should leave headroom below the cap"
         );
     }
+
 
 /// The snapshot the UI polls: a clone of every domain record plus the counts.
 #[test]

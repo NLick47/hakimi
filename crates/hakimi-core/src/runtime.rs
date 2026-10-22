@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,12 +35,12 @@ struct StatusProvider {
     resolver: Arc<Resolver>,
     ca: Arc<CertificateAuthority>,
     status: Arc<StatusStore>,
-    system_proxy: Arc<SystemProxyManager>,
     upstream: Arc<UpstreamPool>,
     started_at: DateTime<Utc>,
     proxy_running: Arc<AtomicBool>,
     proxy_listen: Arc<RwLock<Option<SocketAddr>>>,
     proxy_error: Arc<RwLock<Option<String>>>,
+    proxy_applied: Arc<RwLock<Option<bool>>>,
     current_network: Arc<RwLock<String>>,
 }
 
@@ -83,27 +83,9 @@ impl StatusProvider {
         let listen = *self.proxy_listen.read();
         let pac_url = listen.map(|addr| format!("http://{addr}/proxy.pac"));
         let proxy_error = self.proxy_error.read().clone();
-        let proxy_applied = if config.proxy.mode == ProxyMode::Off {
-            None
-        } else if let Some(url) = &pac_url {
-            match config.proxy.mode {
-                ProxyMode::Pac => self
-                    .system_proxy
-                    .status(Some(ProxyMode::Pac), Some(url.clone()))
-                    .ok()
-                    .map(|status| status.applied),
-                ProxyMode::Http => listen.map(|addr| {
-                    self.system_proxy
-                        .status(Some(ProxyMode::Http), Some(addr.to_string()))
-                        .ok()
-                        .map(|status| status.applied)
-                        .unwrap_or(false)
-                }),
-                ProxyMode::Off => None,
-            }
-        } else {
-            None
-        };
+        // The snapshot must not touch the OS proxy: it is polled every second
+        // by the UI. The last apply result is recorded by the runtime instead.
+        let proxy_applied = *self.proxy_applied.read();
         let mut warnings = Vec::new();
         if !ca.installed {
             warnings.push("ca_untrusted");
@@ -164,16 +146,11 @@ pub struct HakimiRuntime {
     proxy_running: Arc<AtomicBool>,
     proxy_listen: Arc<RwLock<Option<SocketAddr>>>,
     proxy_error: Arc<RwLock<Option<String>>>,
+    proxy_applied: Arc<RwLock<Option<bool>>>,
     handle: RwLock<Option<ProxyHandle>>,
     shutdown: RwLock<Option<watch::Sender<bool>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     started: AtomicBool,
-    /// Number of OS-proxy writes currently in flight. The write is not
-    /// visible to a probe until it completes, so health checks are optimistic
-    /// while this is non-zero: judging the old value would turn our own apply
-    /// into a false "someone else took over". A counter, not a flag, so
-    /// overlapping applies cannot end the window early.
-    proxy_syncs_in_flight: Arc<AtomicUsize>,
     /// Bounds concurrent diagnostic probes so one sweep does not open dozens
     /// of TLS connections at once.
     probe_gate: Arc<Semaphore>,
@@ -185,23 +162,6 @@ impl Drop for HakimiRuntime {
     /// never start the background flusher, so the last flush happens here.
     fn drop(&mut self) {
         self.cache.flush_if_dirty();
-    }
-}
-
-/// Keeps [`HakimiRuntime::proxy_syncs_in_flight`] raised for its lifetime,
-/// including on panic or when moved into a worker thread.
-struct ProxySyncGuard(Arc<AtomicUsize>);
-
-impl ProxySyncGuard {
-    fn begin(flag: &Arc<AtomicUsize>) -> Self {
-        flag.fetch_add(1, Ordering::SeqCst);
-        Self(flag.clone())
-    }
-}
-
-impl Drop for ProxySyncGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -239,6 +199,7 @@ impl HakimiRuntime {
         let proxy_running = Arc::new(AtomicBool::new(false));
         let proxy_listen = Arc::new(RwLock::new(None));
         let proxy_error = Arc::new(RwLock::new(None));
+        let proxy_applied = Arc::new(RwLock::new(None));
         let current_network = Arc::new(RwLock::new(network_id()));
         let status_provider = Arc::new(StatusProvider {
             config: config.clone(),
@@ -247,12 +208,12 @@ impl HakimiRuntime {
             resolver: resolver.clone(),
             ca: ca.clone(),
             status: status.clone(),
-            system_proxy: system_proxy.clone(),
             upstream: upstream.clone(),
             started_at,
             proxy_running: proxy_running.clone(),
             proxy_listen: proxy_listen.clone(),
             proxy_error: proxy_error.clone(),
+            proxy_applied: proxy_applied.clone(),
             current_network,
         });
         let runtime = Arc::new(Self {
@@ -271,11 +232,11 @@ impl HakimiRuntime {
             proxy_running,
             proxy_listen,
             proxy_error,
+            proxy_applied,
             handle: RwLock::new(None),
             shutdown: RwLock::new(None),
             tasks: Mutex::new(Vec::new()),
             started: AtomicBool::new(false),
-            proxy_syncs_in_flight: Arc::new(AtomicUsize::new(0)),
             probe_gate: Arc::new(Semaphore::new(8)),
             started_at,
         });
@@ -416,8 +377,7 @@ impl HakimiRuntime {
         }
 
         if config.proxy.mode == ProxyMode::Off {
-            let _ = self.system_proxy.restore();
-            *self.proxy_error.write() = None;
+            let _ = self.restore_system_proxy();
         } else if !apply_proxy {
             // The caller (the UI state machine) owns OS-proxy policy; the only
             // thing handled here is a stale takeover of ours from a previous
@@ -425,15 +385,12 @@ impl HakimiRuntime {
             tracing::info!("started without applying the system proxy");
             self.disable_system_proxy();
         } else if config.proxy.takeover {
+            // The apply records `proxy_applied`/`proxy_error` itself.
             if let Err(error) = self.apply_system_proxy() {
-                // A silent failure here leaves the user "accelerating" without a proxy
-                // and with no way to notice; surface it in the status instead.
                 tracing::error!(error = %error, "failed to apply the system proxy");
-                *self.proxy_error.write() =
-                    Some(format!("system proxy apply failed: {error:#}"));
-            } else {
-                *self.proxy_error.write() = None;
             }
+        } else {
+            *self.proxy_applied.write() = None;
         }
 
         let ca_status = self.ca.status();
@@ -456,7 +413,6 @@ impl HakimiRuntime {
         );
         Ok(())
     }
-
 
     pub async fn stop(self: &Arc<Self>) -> Result<()> {
         let was_started = self.started.swap(false, Ordering::SeqCst);
@@ -485,70 +441,55 @@ impl HakimiRuntime {
         Ok(())
     }
 
-    /// Environment check for the acceleration toggle: the PAC must actually be
-    /// enabled on a network service, not merely present as a URL.
-    ///
-    /// While an apply/disable is in flight the answer is optimistically
-    /// healthy. The OS does not reflect the new value until the write
-    /// completes, and an observation made in that window says nothing about
-    /// whether another program took over.
-    pub fn system_proxy_healthy(&self) -> bool {
-        let config = self.config.snapshot();
-        if config.proxy.mode == ProxyMode::Off || !config.proxy.takeover {
-            return true;
-        }
-        let Some(url) = self.pac_url() else {
-            return true;
-        };
-        if self.proxy_syncs_in_flight.load(Ordering::SeqCst) > 0 {
-            return true;
-        }
-        self.system_proxy.pac_health(&url)
+    /// The result of the last system-proxy write. `None` means no takeover is
+    /// active (off/deferred), which is not a failure. This reads memory only;
+    /// the OS is never queried from the UI poll path.
+    pub fn system_proxy_applied(&self) -> bool {
+        self.proxy_applied.read().unwrap_or(true)
     }
 
     /// Disable a PAC takeover that points at this instance. Only this
     /// instance's own PAC is touched; a user-configured proxy is left alone.
     pub fn disable_system_proxy(&self) {
-        let _sync = ProxySyncGuard::begin(&self.proxy_syncs_in_flight);
         self.disable_system_proxy_inner();
     }
 
     fn disable_system_proxy_inner(&self) {
+        *self.proxy_applied.write() = None;
+        *self.proxy_error.write() = None;
         let Some(url) = self.pac_url() else {
             return;
         };
-        if self.system_proxy.pac_health(&url) {
+        // This is a one-shot check at startup, not a periodic probe.
+        let ours = self
+            .system_proxy
+            .status(Some(ProxyMode::Pac), Some(url.clone()))
+            .map(|status| status.applied)
+            .unwrap_or(false);
+        if ours {
             tracing::info!("stale PAC takeover found; switching it off");
             self.system_proxy.pac_disable();
         }
     }
 
     pub fn apply_system_proxy(&self) -> Result<SystemProxyStatus> {
-        let _sync = ProxySyncGuard::begin(&self.proxy_syncs_in_flight);
         self.apply_system_proxy_inner()
     }
 
-    /// Apply the OS proxy on a worker thread. The guard is created before the
-    /// thread starts and moved into it, so the window covers the spawn as well
-    /// as the write itself.
+    /// Apply the OS proxy on a worker thread: the write runs several OS
+    /// commands and must never block the UI thread.
     pub fn apply_system_proxy_async(self: &Arc<Self>) {
-        let sync = ProxySyncGuard::begin(&self.proxy_syncs_in_flight);
         let runtime = self.clone();
         std::thread::spawn(move || {
-            let _sync = sync;
             if let Err(error) = runtime.apply_system_proxy_inner() {
                 tracing::error!(error = %error, "failed to apply the system proxy");
             }
         });
     }
 
-    /// Disable the PAC takeover on a worker thread, with the same in-flight
-    /// guarantee as [`Self::apply_system_proxy_async`].
     pub fn disable_system_proxy_async(self: &Arc<Self>) {
-        let sync = ProxySyncGuard::begin(&self.proxy_syncs_in_flight);
         let runtime = self.clone();
         std::thread::spawn(move || {
-            let _sync = sync;
             runtime.disable_system_proxy_inner();
         });
     }
@@ -556,8 +497,13 @@ impl HakimiRuntime {
     /// Restore OS proxy settings saved by a previous `serve` (also usable from a separate
     /// process after the proxy was terminated).
     pub fn restore_system_proxy(&self) -> Result<bool> {
-        let _sync = ProxySyncGuard::begin(&self.proxy_syncs_in_flight);
-        self.system_proxy.restore()
+        let result = self.system_proxy.restore();
+        *self.proxy_applied.write() = None;
+        *self.proxy_error.write() = match &result {
+            Ok(_) => None,
+            Err(error) => Some(format!("{error:#}")),
+        };
+        result
     }
 
     fn apply_system_proxy_inner(&self) -> Result<SystemProxyStatus> {
@@ -565,9 +511,13 @@ impl HakimiRuntime {
         tracing::info!("applying the system proxy");
         let config = self.config.snapshot();
         if !config.proxy.takeover || config.proxy.mode == ProxyMode::Off {
+            *self.proxy_applied.write() = None;
+            *self.proxy_error.write() = None;
             return self.system_proxy.status(Some(config.proxy.mode), None);
         }
         let Some(listen) = *self.proxy_listen.read() else {
+            *self.proxy_applied.write() = None;
+            *self.proxy_error.write() = None;
             return self.system_proxy.status(Some(config.proxy.mode), None);
         };
         let result = match config.proxy.mode {
@@ -582,15 +532,26 @@ impl HakimiRuntime {
             "system proxy apply finished"
         );
         match &result {
-            Ok(status) if status.applied => {
-                *self.proxy_error.write() = None;
-                tracing::info!(mode = %status.mode, "system proxy applied");
-            }
             Ok(status) => {
-                *self.proxy_error.write() = Some("system proxy setting was not applied".into());
-                tracing::warn!(mode = %status.mode, "system proxy setting was not applied");
+                *self.proxy_applied.write() = Some(status.applied);
+                *self.proxy_error.write() = status.error.clone().or_else(|| {
+                    (!status.applied).then(|| "system proxy setting was not applied".into())
+                });
+                if status.applied {
+                    if let Some(error) = &status.error {
+                        tracing::warn!(
+                            mode = %status.mode,
+                            error = %error,
+                            "system proxy applied with warnings"
+                        );
+                    }
+                    tracing::info!(mode = %status.mode, "system proxy applied");
+                } else {
+                    tracing::warn!(mode = %status.mode, "system proxy setting was not applied");
+                }
             }
             Err(error) => {
+                *self.proxy_applied.write() = Some(false);
                 *self.proxy_error.write() = Some(format!("{error:#}"));
                 tracing::warn!(error = %error, "failed to apply the system proxy");
             }
@@ -617,7 +578,12 @@ impl HakimiRuntime {
     }
 
     pub async fn diagnose(&self, domain: &str) -> DomainDiagnostics {
-        self.engine.decide_https(domain).await.diagnostics.as_ref().clone()
+        self.engine
+            .decide_https(domain)
+            .await
+            .diagnostics
+            .as_ref()
+            .clone()
     }
 
     pub async fn refresh_catalogs(&self, force: bool) -> Vec<Result<RefreshReport>> {
@@ -728,7 +694,12 @@ impl HakimiRuntime {
     }
 
     pub async fn probe_domain(&self, domain: &str) -> DomainDiagnostics {
-        self.engine.decide_https(domain).await.diagnostics.as_ref().clone()
+        self.engine
+            .decide_https(domain)
+            .await
+            .diagnostics
+            .as_ref()
+            .clone()
     }
 
     /// Probe every exact domain of every enabled group once, honouring the
@@ -880,7 +851,11 @@ impl HakimiRuntime {
     /// concrete host set is unbounded. A HEAD request establishes (or reuses) the pooled
     /// upstream connection, resolves DoH/ECH only when needed, and records a reusable route.
     /// True when `host` belongs to an enabled group, so warming it is useful.
-    fn host_in_enabled_group(config: &AppConfig, matcher: &crate::domain::DomainMatcher, host: &str) -> bool {
+    fn host_in_enabled_group(
+        config: &AppConfig,
+        matcher: &crate::domain::DomainMatcher,
+        host: &str,
+    ) -> bool {
         matcher
             .match_host(host)
             .and_then(|id| config.group(id))

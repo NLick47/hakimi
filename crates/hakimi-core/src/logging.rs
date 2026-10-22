@@ -20,7 +20,7 @@ const DIAGNOSTIC_LOG_LINES: usize = 300;
 /// Bounded queue between request workers and the log writer. A page-load burst
 /// can produce thousands of events; keeping the queue finite means a stalled
 /// disk can never turn logging into unbounded memory growth.
-const LOG_QUEUE_CAPACITY: usize = 8192;
+const LOG_QUEUE_CAPACITY: usize = 2048;
 
 /// Events that were dropped because the writer could not keep up.
 static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);

@@ -588,7 +588,6 @@ export component AppWindow inherits Window {
     in property <string> ca-action-error;
     in property <bool> ca-busy: false;
     in property <bool> proxy-ok: true;
-    in property <bool> proxy-taken-over: false;
     in-out property <bool> ob-installing: false;
 
     // Sidebar counters, pre-formatted by the host.
@@ -790,32 +789,7 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    if root.proxy-taken-over: Rectangle {
-                        background: #FFF6E5;
-                        border-radius: 8px;
-                        border-width: 1px;
-                        border-color: #F0DFC0;
-
-                        VerticalLayout {
-                            padding: 10px;
-                            spacing: 6px;
-
-                            Text {
-                                text: "PAC 代理已被更改，已自动暂停加速";
-                                font-size: 11.5px;
-                                color: #8A6116;
-                                wrap: word-wrap;
-                            }
-                            Text {
-                                text: "可能是其他代理软件接管了系统代理。关闭它之后重新打开加速开关即可恢复。";
-                                font-size: 11px;
-                                color: #8A6116;
-                                wrap: word-wrap;
-                            }
-                        }
-                    }
-
-                    if (!root.ca-installed || !root.proxy-ok) && !root.proxy-taken-over: Rectangle {
+                    if (!root.ca-installed || !root.proxy-ok): Rectangle {
                         background: #FFF6E5;
                         border-radius: 8px;
                         border-width: 1px;
@@ -1222,12 +1196,12 @@ export component AppWindow inherits Window {
                             alignment: center;
                             spacing: 2px;
                             Text {
-                                text: root.proxy-ok ? "系统代理已生效" : "系统代理未生效";
+                                text: root.proxy-ok ? "系统代理已写入" : "系统代理写入失败";
                                 font-size: 13px;
                                 color: #1B1F24;
                             }
                             Text {
-                                text: root.proxy-ok ? "浏览器流量会经过 hakimi" : "点击修复后自动重新应用 PAC 设置";
+                                text: root.proxy-ok ? "PAC 已写入系统；其他代理开启时可能优先生效" : "点击重新应用；其他代理开启时请先关闭";
                                 font-size: 11.5px;
                                 color: root.proxy-ok ? #6B7480 : #C0392B;
                             }

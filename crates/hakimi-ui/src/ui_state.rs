@@ -92,12 +92,6 @@ pub struct AppModel {
     /// once-a-second environment sync, which recomputes the page from state and
     /// would otherwise bounce the user back to the home page immediately.
     fix_page_open: bool,
-    /// Consecutive unhealthy probes. A single flaky health check must not flip
-    /// the whole acceleration off; two in a row are treated as real.
-    unhealthy_streak: u32,
-    /// The system proxy was taken over by other software while running:
-    /// acceleration auto-paused and the UI shows a hint. Never auto-fought.
-    takeover: bool,
 }
 
 impl Default for AppModel {
@@ -110,8 +104,6 @@ impl Default for AppModel {
                 proxy_ok: true,
             },
             fix_page_open: false,
-            unhealthy_streak: 0,
-            takeover: false,
         }
     }
 }
@@ -136,15 +128,6 @@ impl AppModel {
     /// The master switch. Turning acceleration ON with a broken environment
     /// does not accelerate: it parks in [`AccelState::AwaitingEnvironment`].
     pub fn toggle(&mut self, env: EnvState) -> Effects {
-        // Turning acceleration on after a takeover is explicit user intent:
-        // put our PAC back. This must be an effect, not a doctored health
-        // value — the health observation is what declared the takeover, and
-        // faking it healthy is what made the retry skip the apply entirely.
-        let reassert = self.takeover;
-        if reassert {
-            self.takeover = false;
-            self.unhealthy_streak = 0;
-        }
         self.env = env;
         self.accel = match self.accel {
             AccelState::Running => AccelState::Stopped,
@@ -156,15 +139,7 @@ impl AppModel {
                 }
             }
         };
-        if self.accel == AccelState::Running {
-            // A fresh Running state gets a full strike window; the apply it
-            // schedules may not be visible to the very next probe.
-            self.unhealthy_streak = 0;
-            if reassert {
-                return self.effects_with(Effects::running);
-            }
-        }
-        self.effects_apply_if_needed()
+        self.effects()
     }
 
     /// Stop acceleration outright. Used when the selection becomes empty:
@@ -173,8 +148,6 @@ impl AppModel {
     /// on and is idempotent.
     pub fn stop(&mut self) -> Effects {
         let was_active = self.accel != AccelState::Stopped;
-        self.takeover = false;
-        self.unhealthy_streak = 0;
         self.accel = AccelState::Stopped;
         if was_active {
             Effects::stopped()
@@ -184,41 +157,13 @@ impl AppModel {
     }
 
     /// Periodic environment probe. A pending resume completes itself the
-    /// moment the environment passes.
+    /// moment the environment passes. A failed proxy write only updates the
+    /// warning state; it never pauses a running acceleration.
     pub fn env_changed(&mut self, env: EnvState) -> Effects {
-        let mut env = env;
-        // Health is only judged while running: a stopped app has no PAC claim
-        // to defend. Two *consecutive* unhealthy probes are real, wherever the
-        // streak started — a single flaky probe (or one that raced the apply
-        // we just scheduled) is absorbed.
-        if self.accel == AccelState::Running {
-            if env.proxy_ok {
-                self.unhealthy_streak = 0;
-            } else {
-                self.unhealthy_streak += 1;
-                if self.unhealthy_streak < 2 {
-                    env.proxy_ok = true;
-                }
-            }
-        } else {
-            self.unhealthy_streak = 0;
-        }
         self.env = env;
-        if self.accel == AccelState::Running && !self.env.proxy_ok {
-            // The system proxy was taken over by other software (or cleared
-            // externally). Pause and yield: fighting for the setting would be
-            // a proxy war with whatever the user chose to run instead.
-            tracing::warn!(
-                "system proxy changed externally while running; pausing acceleration"
-            );
-            self.takeover = true;
-            self.accel = AccelState::Stopped;
-            return Effects::stopped();
-        }
         if self.accel == AccelState::AwaitingEnvironment && self.env.allows_acceleration() {
             self.accel = AccelState::Running;
-            self.unhealthy_streak = 0;
-            return self.effects_apply_if_needed();
+            return self.effects();
         }
         Effects::default()
     }
@@ -243,12 +188,6 @@ impl AppModel {
         self.accel
     }
 
-    /// The system proxy was taken over while running and acceleration
-    /// auto-paused. Drives the home page hint.
-    pub fn takeover(&self) -> bool {
-        self.takeover
-    }
-
     pub fn env(&self) -> &EnvState {
         &self.env
     }
@@ -266,20 +205,6 @@ impl AppModel {
 
     fn effects(&self) -> Effects {
         self.effects_with(Effects::running)
-    }
-
-    /// Same as [`Self::effects`], but the proxy apply is skipped when the
-    /// system proxy is already healthy — turning acceleration on must not
-    /// re-run `networksetup` for a PAC that is already in place.
-    fn effects_apply_if_needed(&self) -> Effects {
-        match self.accel {
-            AccelState::Running => {
-                let mut effects = Effects::running();
-                effects.apply_proxy = !self.env.proxy_ok;
-                effects
-            }
-            _ => self.effects(),
-        }
     }
 
     fn effects_with(&self, running: impl Fn() -> Effects) -> Effects {
@@ -327,8 +252,8 @@ pub fn execute_startup(effects: &Effects, runtime: &HakimiRuntime) -> StartMode 
 }
 
 /// Execute the effects of a transition. The only place that drives the runtime
-/// from state. The runtime owns OS-proxy work (and the "write in flight" state
-/// that keeps a racing health probe from reporting a takeover).
+/// from state. The runtime owns OS-proxy writes and remembers the result of
+/// the one-time read-back verification.
 pub fn execute(effects: &Effects, runtime: &Arc<HakimiRuntime>) {
     if effects.resume {
         runtime.resume();
@@ -352,7 +277,6 @@ pub fn sync_window(model: &AppModel, app: &AppWindow) {
     app.set_ca_installed(env.ca_ok);
     app.set_ca_error(SharedString::from(env.ca_error.clone()));
     app.set_proxy_ok(env.proxy_ok);
-    app.set_proxy_taken_over(model.takeover());
     if env.ca_ok || !env.ca_error.is_empty() {
         // Install finished (or failed loudly): the wait-for-dialog state can go.
         app.set_ob_installing(false);
@@ -365,51 +289,22 @@ pub fn sync_window(model: &AppModel, app: &AppWindow) {
 
 // -- environment probing ------------------------------------------------------
 
-/// Probe the environment. Spawns subprocesses (the CA status, and `scutil` on
-/// macOS), so it must run OFF the UI thread — callers post the result back
-/// through the event loop. Proxy health is owned by the runtime: it caches
-/// the platform probe and reports optimistic health while it is changing the
-/// setting itself, so there is deliberately no second cache here.
+/// Probe the environment. Spawns subprocesses (the CA status, and `security`
+/// on macOS), so it must run OFF the UI thread — callers post the result back
+/// through the event loop. The system-proxy result is the last write recorded
+/// by the runtime; no OS proxy process is spawned here.
 pub fn probe_env(runtime: &HakimiRuntime) -> EnvState {
     let ca = runtime.ca().status();
     EnvState {
         ca_ok: ca.installed,
         ca_error: ca.error.unwrap_or_default(),
-        proxy_ok: runtime.system_proxy_healthy(),
+        proxy_ok: runtime.system_proxy_applied(),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn one_flaky_health_check_does_not_flip_proxy_ok() {
-        let mut model = AppModel::default();
-        model.startup(EnvState {
-            ca_ok: true,
-            ca_error: String::new(),
-            proxy_ok: true,
-        });
-
-        // One flaky health check is absorbed.
-        let flaky = EnvState { ca_ok: true, ca_error: String::new(), proxy_ok: false };
-        let _ = model.env_changed(flaky.clone());
-        assert!(model.env().proxy_ok, "a single unhealthy probe must be absorbed");
-
-        // Two in a row are real.
-        let _ = model.env_changed(flaky);
-        assert!(!model.env().proxy_ok);
-
-        // Recovery is immediate.
-        let _ = model.env_changed(EnvState {
-            ca_ok: true,
-            ca_error: String::new(),
-            proxy_ok: true,
-        });
-        assert!(model.env().proxy_ok);
-    }
 
     #[test]
     fn settle_holds_probing_sites_on_testing() {
@@ -558,13 +453,10 @@ mod tests {
         assert_eq!(effects, Effects::default(), "still broken: nothing to do");
         assert_eq!(model.accel(), AccelState::AwaitingEnvironment);
 
-        // The PAC was disabled while gated, so the proxy_ok half of the env is
-        // still false — entering Running re-applies it.
-        let fixed = EnvState {
-            ca_ok: true,
-            ca_error: String::new(),
-            proxy_ok: false,
-        };
+        // The gated start deferred the PAC; `proxy_ok` cannot be trusted here
+        // (it means "the last write succeeded", not "a write happened").
+        // Entering Running must always re-apply.
+        let fixed = env(true);
         let effects = model.env_changed(fixed);
         assert_eq!(model.accel(), AccelState::Running);
         assert!(effects.resume && effects.apply_proxy);
@@ -576,11 +468,17 @@ mod tests {
         model.startup(env(true));
         // The environment degrades after launch (e.g. the CA was removed).
         model.env_changed(env(false));
-        assert!(!model.fix_page(), "a degraded env alone must not hijack the window");
+        assert!(
+            !model.fix_page(),
+            "a degraded env alone must not hijack the window"
+        );
 
         model.open_fix();
         assert!(model.fix_page());
-        assert!(!model.fix_blocked(), "opened by hand, not by a blocked start");
+        assert!(
+            !model.fix_blocked(),
+            "opened by hand, not by a blocked start"
+        );
 
         // The once-a-second sync recomputes the page from state; the manual
         // visit has to survive it.
@@ -618,15 +516,15 @@ mod tests {
     }
 
     #[test]
-    fn turning_on_does_not_reapply_an_healthy_proxy() {
+    fn turning_on_reasserts_the_proxy() {
         let mut model = AppModel::default();
         model.startup(env(true));
         model.toggle(env(true)); // → Stopped
         let effects = model.toggle(env(true)); // → Running again
         assert!(effects.resume);
         assert!(
-            !effects.apply_proxy,
-            "a healthy PAC must not be re-applied on every toggle"
+            effects.apply_proxy,
+            "entering Running must write/verify the proxy instead of trusting a PAC from an earlier run"
         );
     }
 
@@ -652,64 +550,47 @@ mod tests {
     }
 
     #[test]
-    fn takeover_retry_reapplies_the_proxy() {
+    fn a_failed_proxy_write_does_not_pause_acceleration() {
         let mut model = AppModel::default();
         model.startup(env(true));
 
-        let unhealthy = EnvState {
+        let failed = EnvState {
             ca_ok: true,
             ca_error: String::new(),
             proxy_ok: false,
         };
-        model.env_changed(unhealthy.clone());
-        let effects = model.env_changed(unhealthy.clone());
-        assert!(effects.pause, "two unhealthy probes must pause acceleration");
-        assert!(model.takeover());
-        assert_eq!(model.accel(), AccelState::Stopped);
-
-        // Turning acceleration back on is explicit user intent to put our PAC
-        // back; it must apply, not just resume and wait to be taken over again.
-        let effects = model.toggle(unhealthy);
-        assert_eq!(model.accel(), AccelState::Running);
-        assert!(!model.takeover());
-        assert!(effects.resume);
-        assert!(
-            effects.apply_proxy,
-            "a takeover retry must re-apply the PAC instead of trusting the probe that declared the takeover"
+        let effects = model.env_changed(failed);
+        assert_eq!(effects, Effects::default());
+        assert_eq!(
+            model.accel(),
+            AccelState::Running,
+            "a proxy write failure is a warning, never an auto-pause"
         );
     }
 
     #[test]
-    fn entering_running_gets_a_full_strike_window() {
-        // The CA is fixed while the proxy is known unhealthy: the auto-resume
-        // schedules an apply, and the first subsequent false probe may still
-        // race that write. It must not count as a takeover yet.
+    fn toggling_after_a_failed_proxy_write_reapplies_without_pausing() {
         let mut model = AppModel::default();
-        let broken_ca = EnvState {
-            ca_ok: false,
-            ca_error: "not trusted".into(),
-            proxy_ok: false,
-        };
-        model.startup(broken_ca.clone()); // Stopped: CA is the gate
-        model.toggle(broken_ca); // AwaitingEnvironment
-
-        let fixed_ca = EnvState {
+        model.startup(env(true));
+        let failed = EnvState {
             ca_ok: true,
             ca_error: String::new(),
             proxy_ok: false,
         };
-        let effects = model.env_changed(fixed_ca.clone());
-        assert_eq!(model.accel(), AccelState::Running);
-        assert!(effects.apply_proxy, "entering Running must reconcile the PAC");
+        model.env_changed(failed);
+        model.toggle(env(true)); // running → stopped
 
-        let effects = model.env_changed(fixed_ca.clone());
-        assert_eq!(effects, Effects::default(), "the first false probe is absorbed");
+        let effects = model.toggle(EnvState {
+            ca_ok: true,
+            ca_error: String::new(),
+            proxy_ok: false,
+        });
         assert_eq!(model.accel(), AccelState::Running);
-        assert!(!model.takeover());
-
-        let effects = model.env_changed(fixed_ca);
-        assert!(effects.pause);
-        assert!(model.takeover(), "the second consecutive false probe is real");
+        assert!(effects.resume);
+        assert!(
+            effects.apply_proxy,
+            "a failed write must be retried when the user turns acceleration back on"
+        );
     }
 }
 

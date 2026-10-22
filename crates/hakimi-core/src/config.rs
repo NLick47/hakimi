@@ -205,8 +205,10 @@ impl Default for AdvancedConfig {
             last_good_days: 7,
             prewarm_concurrency: 8,
             plan_cache_secs: 600,
-            upstream_idle_secs: 300,
-            upstream_max_idle_per_host: 16,
+            // A lean background profile: idle connections are the biggest
+            // per-connection cost, and the proxy sits idle most of the time.
+            upstream_idle_secs: 120,
+            upstream_max_idle_per_host: 8,
             http1_hosts: vec![
                 // pximg origins advertise h2 but throttle per connection; parallel h1
                 // connections each get their own TCP window and are faster in aggregate.

@@ -639,7 +639,10 @@ impl DecisionEngine {
             cache: cache_status,
             error: None,
             detail: None,
-            attempts,
+            // The failed candidates are logged above and only shown on the
+            // error page, which is built for a failed state.  Keeping them
+            // would make every visited domain carry a few strings.
+            attempts: Vec::new(),
             suggestions: Vec::new(),
         });
         let (degraded, score) =

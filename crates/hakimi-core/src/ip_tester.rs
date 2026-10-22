@@ -211,7 +211,7 @@ impl TlsContext {
         }
         let config = Arc::new(config);
         let mut configs = self.configs.write();
-        if configs.len() > 4096 {
+        if configs.len() > 512 {
             configs.retain(|_, entry| Arc::strong_count(entry) > 1);
         }
         configs.insert(key, config.clone());
