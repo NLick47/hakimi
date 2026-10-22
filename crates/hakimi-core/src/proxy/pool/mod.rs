@@ -42,6 +42,7 @@ use crate::config::AppConfig;
 use crate::decision::{ConnectPlan, DecisionEngine, Route, RouteCursor};
 use crate::domain::DomainMatcher;
 use crate::ip_tester::TlsContext;
+use crate::status::DomainDiagnostics;
 use crate::strategy::{FailureReason, TlsMode};
 
 /// Request body type understood by the pooled clients. Forwarded requests stream the
@@ -1091,15 +1092,46 @@ impl RouteConnector {
 }
 
 fn discovery_failure_detail(cursor: &mut RouteCursor) -> String {
-    cursor
-        .outcome()
-        .and_then(|outcome| outcome.diagnostics.detail.clone())
-        .or_else(|| {
-            cursor
-                .outcome()
-                .map(|outcome| format!("{:?}", outcome.diagnostics.state))
+    match cursor.outcome() {
+        Some(outcome) => outcome
+            .diagnostics
+            .detail
+            .clone()
+            .unwrap_or_else(|| describe_discovery_failure(&outcome.diagnostics)),
+        None => "route discovery failed before any candidate was available".into(),
+    }
+}
+
+/// Describe a failure outcome that carries no detail.
+///
+/// The state must never be used as the error text: during warm-up it is
+/// `Checking`, which says nothing about the failure and leaks an internal UI
+/// marker into the 502 page. The reason and the attempt trace are the only
+/// parts an operator can act on.
+fn describe_discovery_failure(diagnostics: &DomainDiagnostics) -> String {
+    let reason = diagnostics
+        .error
+        .map(FailureReason::as_str)
+        .unwrap_or("unknown");
+    if diagnostics.attempts.is_empty() {
+        return format!("route discovery failed: {reason} (no attempt detail was recorded)");
+    }
+    let attempts = diagnostics
+        .attempts
+        .iter()
+        .map(|attempt| {
+            let error = attempt.error.map(FailureReason::as_str).unwrap_or("-");
+            format!(
+                "{}@{}#{}:{}",
+                attempt.strategy.as_str(),
+                attempt.ip,
+                error,
+                attempt.source.as_str()
+            )
         })
-        .unwrap_or_else(|| "no route candidate succeeded".into())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("route discovery failed: {reason}; attempts: {attempts}")
 }
 
 struct PooledIo {

@@ -12,7 +12,7 @@ use crate::config::{ConfigManager, DomainRule, GroupConfig, RoutePolicy};
 use crate::decision::DecisionEngine;
 use crate::paths::Paths;
 use crate::resolver::{DohResolution, EchOutcome, IpResolver, Resolver};
-use crate::status::StatusStore;
+use crate::status::{AttemptRecord, StatusStore};
 use crate::strategy::IpSource;
 use crate::util::now;
 
@@ -96,6 +96,30 @@ fn engine_for_with_resolver(
     let tls = TlsContext::new().unwrap();
     let engine = DecisionEngine::new(config.clone(), cache, catalogs, resolver, tls, status);
     (engine, config)
+}
+
+#[test]
+fn discovery_failure_detail_does_not_leak_the_state_name() {
+    let mut diagnostics =
+        DomainDiagnostics::checking(Some("github".into()), "github.com", Vec::new(), 0);
+    diagnostics.error = Some(FailureReason::TcpTimeout);
+    diagnostics.attempts = vec![AttemptRecord {
+        strategy: TlsMode::Direct,
+        ip: "20.205.243.166".parse().unwrap(),
+        source: IpSource::Cache,
+        sni: None,
+        error: Some(FailureReason::TcpTimeout),
+        detail: Some("connect timed out".into()),
+        latency_ms: None,
+    }];
+
+    let detail = describe_discovery_failure(&diagnostics);
+    assert!(detail.contains("tcp_timeout"), "{detail}");
+    assert!(detail.contains("20.205.243.166"), "{detail}");
+    assert!(
+        !detail.contains("Checking"),
+        "the fallback must describe the failure, not leak the UI state: {detail}"
+    );
 }
 
 /// A cancelled route discovery must not poison the domain. The leader's
