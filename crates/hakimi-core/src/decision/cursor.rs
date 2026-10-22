@@ -164,11 +164,31 @@ impl RouteCursor {
             .get(rule_index)
             .and_then(|rule| rule.route.as_ref())
             .unwrap_or(&group.default_route);
-        let route_attempts = if tls {
+        let mut route_attempts = if tls {
             route.attempts.clone()
         } else {
             vec![RouteAttempt::Direct]
         };
+        // A cold ECH-first route used to block the whole cursor on the HTTPS RR
+        // lookup even when the route explicitly allows Direct fallback. Move
+        // that fallback ahead of the lookup so the race can open its first TCP
+        // connection immediately; the ECH plan is still generated (and raced)
+        // on the next `next_plan` call once the lookup has a value. A fresh
+        // cached config keeps ECH in its configured first position.
+        if tls {
+            let cold_ech = route_attempts
+                .iter()
+                .position(|attempt| attempt.ech_source().is_some());
+            let direct = route_attempts
+                .iter()
+                .position(|attempt| matches!(attempt, RouteAttempt::Direct));
+            if let (Some(cold_ech), Some(direct)) = (cold_ech, direct) {
+                if direct > cold_ech && engine.cache.ech(&domain, true).is_none() {
+                    let direct = route_attempts.remove(direct);
+                    route_attempts.insert(cold_ech, direct);
+                }
+            }
+        }
 
         Self {
             engine,

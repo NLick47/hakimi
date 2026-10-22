@@ -155,6 +155,42 @@ impl IpResolver for SlowEchResolver {
     }
 }
 
+/// An ECH-first route with a Direct fallback must not keep the cursor from
+/// starting the fallback while the HTTPS RR lookup is slow. The ECH plan is
+/// still offered on the next round, so both can race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_ech_route_hedges_direct_before_doh_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let resolver = Arc::new(SlowEchResolver::default());
+    let engine = engine_for_test(
+        dir.path(),
+        RoutePolicy::ech_shared(),
+        "203.0.113.10".parse().unwrap(),
+        Vec::new(),
+        resolver.clone(),
+    );
+    let mut cursor = match engine.route("upstream.test", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+
+    let started = Instant::now();
+    let plan = tokio::time::timeout(Duration::from_millis(500), cursor.next_plan())
+        .await
+        .expect("the direct fallback waited for the cold ECH lookup")
+        .expect("a direct plan");
+    assert_eq!(plan.mode, TlsMode::Direct);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the direct fallback was held behind the ECH lookup"
+    );
+    assert_eq!(
+        resolver.ech_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the first plan must not start the ECH lookup"
+    );
+}
+
 fn engine_for_test(
     dir: &std::path::Path,
     route: RoutePolicy,
