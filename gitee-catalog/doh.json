@@ -2,20 +2,19 @@
   "v": 1,
   "doh": [
     {
-      "name": "CleanBrowsing Family",
-      "url": "https://doh.cleanbrowsing.org/doh/family-filter/"
-    },
-    {
-      "name": "CleanBrowsing Adult",
-      "url": "https://doh.cleanbrowsing.org/doh/adult-filter/"
-    },
-    {
       "name": "CleanBrowsing Security",
-      "url": "https://doh.cleanbrowsing.org/doh/security-filter/"
+      "url": "https://doh.cleanbrowsing.org/doh/security-filter/",
+      "bootstrapIp": "185.228.168.9"
     },
     {
       "name": "Applied Privacy",
-      "url": "https://doh.applied-privacy.net/query"
+      "url": "https://doh.applied-privacy.net/query",
+      "bootstrapIp": "146.255.56.98"
+    },
+    {
+      "name": "DeCloudUs",
+      "url": "https://dns.decloudus.com/dns-query",
+      "bootstrapIp": "46.224.208.209"
     }
   ]
 }
