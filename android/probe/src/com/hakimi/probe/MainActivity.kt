@@ -1462,7 +1462,7 @@ class MainActivity : Activity(), Host {
         if (latest.isEmpty()) return
         if (AppVersion.isNewer(latest, appVersionName)) {
             updateStateNow = UpdateState.Available(
-                UpdateInfo(latest, UpdateChecker.releaseUrl(latest), "")
+                UpdateInfo(latest, UpdateChecker.RELEASES_URL)
             )
             nav.setBadge(2, true)
         } else {
@@ -1557,7 +1557,7 @@ class MainActivity : Activity(), Host {
         if (info == null) {
             openUrl(UpdateChecker.RELEASES_URL)
         } else {
-            openUrl(info.url.ifEmpty { UpdateChecker.releaseUrl(info.version) })
+            openUrl(info.url.ifEmpty { UpdateChecker.RELEASES_URL })
         }
     }
 

@@ -16,6 +16,9 @@
 //! - [`logging`] local logging and redaction
 
 /// Version of the linked core crate, reported separately from the client shell.
+///
+/// This is the core package version from `crates/hakimi-core/Cargo.toml`, not
+/// the client release tag. Release CI only overwrites the workspace version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]

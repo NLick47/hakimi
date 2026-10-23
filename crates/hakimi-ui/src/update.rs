@@ -1,8 +1,10 @@
-//! Update checks against the project's GitHub releases.
+//! Update checks against the project's release manifest.
 //!
-//! A check only reads release metadata. The app never downloads or installs
-//! anything itself: the UI opens the release page in the browser, so a
-//! tampered response can at worst open a GitHub URL.
+//! The manifest is a small JSON asset attached to every GitHub Release. It
+//! contains one entry per client, so a desktop-only release cannot make the
+//! Android app think it has an update (and vice versa). The app never
+//! downloads or installs anything itself: the UI opens the release page in the
+//! browser, so a tampered manifest can at worst open a GitHub URL.
 
 use std::cmp::Ordering;
 use std::time::Duration;
@@ -13,8 +15,8 @@ use serde_json::Value;
 pub const PROJECT: &str = "NLick47/hakimi";
 pub const RELEASES_URL: &str = "https://github.com/NLick47/hakimi/releases";
 
-fn api_url() -> String {
-    format!("https://api.github.com/repos/{PROJECT}/releases/latest")
+fn manifest_url() -> String {
+    format!("https://github.com/{PROJECT}/releases/latest/download/latest.json")
 }
 
 pub fn current_version() -> &'static str {
@@ -25,7 +27,6 @@ pub fn current_version() -> &'static str {
 pub struct Release {
     pub version: String,
     pub url: String,
-    pub notes: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,7 +35,7 @@ pub enum CheckOutcome {
     Available(Release),
 }
 
-/// Asks GitHub for the newest published (non-prerelease) release.
+/// Reads the manifest attached to the newest published release.
 pub async fn check() -> Result<CheckOutcome> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(6))
@@ -43,12 +44,11 @@ pub async fn check() -> Result<CheckOutcome> {
         .build()
         .context("building the update client")?;
     let response = client
-        .get(api_url())
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
+        .get(manifest_url())
+        .header("Accept", "application/json")
         .send()
         .await
-        .context("requesting the latest release")?;
+        .context("requesting the update manifest")?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         // No release has been published yet; that is not an error.
         return Ok(CheckOutcome::UpToDate);
@@ -60,51 +60,68 @@ pub async fn check() -> Result<CheckOutcome> {
     let body: Value = response
         .json()
         .await
-        .context("decoding the latest release")?;
-    parse_release(&body, current_version())
+        .context("decoding the update manifest")?;
+    parse_manifest(&body, current_version())
 }
 
 /// Separated from the request so version handling is testable without a network.
-pub fn parse_release(body: &Value, current: &str) -> Result<CheckOutcome> {
-    let tag = body
-        .get("tag_name")
+pub fn parse_manifest(body: &Value, current: &str) -> Result<CheckOutcome> {
+    let schema = body.get("schema").and_then(Value::as_u64);
+    if schema != Some(1) {
+        bail!("unsupported update manifest schema");
+    }
+
+    let Some(desktop) = body.get("desktop").and_then(Value::as_object) else {
+        // The first releases may not contain a desktop build yet.
+        return Ok(CheckOutcome::UpToDate);
+    };
+    let version = desktop
+        .get("version")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim();
-    let version = tag.strip_prefix('v').unwrap_or(tag).trim();
+    let version = version.strip_prefix('v').unwrap_or(version).trim();
     if version.is_empty() || parse_version(version).is_none() {
-        bail!("the latest release has no usable version tag");
+        bail!("the update manifest has no usable desktop version");
     }
     if !is_newer(version, current) {
         return Ok(CheckOutcome::UpToDate);
     }
-    let fallback = format!("{RELEASES_URL}/tag/v{version}");
-    let url = body
-        .get("html_url")
+
+    let release = body
+        .get("release")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let fallback = if safe_tag(release) {
+        format!("{RELEASES_URL}/tag/{release}")
+    } else {
+        RELEASES_URL.to_string()
+    };
+    let url = desktop
+        .get("url")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|url| safe_release_url(url))
         .map(str::to_string)
         .unwrap_or(fallback);
-    let notes = body
-        .get("body")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .chars()
-        .take(8000)
-        .collect();
     Ok(CheckOutcome::Available(Release {
         version: version.to_string(),
         url,
-        notes,
     }))
 }
 
-/// The API payload is untrusted input. Only the project's own release pages
-/// may be opened, so a modified response cannot redirect the user elsewhere.
+fn safe_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+/// The manifest is untrusted input. Only the project's own release pages may
+/// be opened, so a modified manifest cannot redirect the user elsewhere.
 fn safe_release_url(url: &str) -> bool {
-    url.starts_with("https://github.com/NLick47/hakimi/")
+    url.starts_with("https://github.com/NLick47/hakimi/releases/")
 }
 
 pub fn is_newer(candidate: &str, current: &str) -> bool {
@@ -205,52 +222,85 @@ mod tests {
     #[test]
     fn current_release_is_not_an_update() {
         let body = json!({
-            "tag_name": "v0.1.0",
-            "html_url": "https://github.com/NLick47/hakimi/releases/tag/v0.1.0",
-            "body": ""
+            "schema": 1,
+            "release": "release-2026.10.23",
+            "desktop": {
+                "version": "0.1.0",
+                "url": "https://github.com/NLick47/hakimi/releases/tag/release-2026.10.23"
+            }
         });
         assert_eq!(
-            parse_release(&body, "0.1.0").unwrap(),
+            parse_manifest(&body, "0.1.0").unwrap(),
             CheckOutcome::UpToDate
         );
     }
 
     #[test]
-    fn release_payload_is_extracted() {
+    fn desktop_entry_is_extracted() {
         let body = json!({
-            "tag_name": "v0.2.0",
-            "html_url": "https://github.com/NLick47/hakimi/releases/tag/v0.2.0",
-            "body": "  - 新的更新检查  \n"
+            "schema": 1,
+            "release": "release-2026.10.23",
+            "desktop": {
+                "version": "0.2.0",
+                "url": "https://github.com/NLick47/hakimi/releases/tag/release-2026.10.23"
+            }
         });
-        let outcome = parse_release(&body, "0.1.0").unwrap();
         assert_eq!(
-            outcome,
+            parse_manifest(&body, "0.1.0").unwrap(),
             CheckOutcome::Available(Release {
                 version: "0.2.0".into(),
-                url: "https://github.com/NLick47/hakimi/releases/tag/v0.2.0".into(),
-                notes: "- 新的更新检查".into(),
+                url: "https://github.com/NLick47/hakimi/releases/tag/release-2026.10.23".into(),
             })
         );
     }
 
     #[test]
-    fn unsafe_or_missing_urls_fall_back_to_the_project_page() {
+    fn android_only_manifest_is_up_to_date() {
         let body = json!({
-            "tag_name": "v0.2.0",
-            "html_url": "https://example.com/download",
+            "schema": 1,
+            "release": "release-2026.10.23",
+            "android": {
+                "version": "0.2.0",
+                "url": "https://github.com/NLick47/hakimi/releases/tag/release-2026.10.23"
+            }
         });
-        let CheckOutcome::Available(release) = parse_release(&body, "0.1.0").unwrap() else {
-            panic!("expected an update");
-        };
         assert_eq!(
-            release.url,
-            "https://github.com/NLick47/hakimi/releases/tag/v0.2.0"
+            parse_manifest(&body, "0.1.0").unwrap(),
+            CheckOutcome::UpToDate
         );
     }
 
     #[test]
-    fn invalid_tags_are_rejected() {
-        assert!(parse_release(&json!({ "tag_name": "nightly" }), "0.1.0").is_err());
-        assert!(parse_release(&json!({}), "0.1.0").is_err());
+    fn unsafe_or_missing_urls_fall_back_to_the_project_release() {
+        let body = json!({
+            "schema": 1,
+            "release": "release-2026.10.23",
+            "desktop": {
+                "version": "0.2.0",
+                "url": "https://example.com/download"
+            }
+        });
+        let CheckOutcome::Available(release) = parse_manifest(&body, "0.1.0").unwrap() else {
+            panic!("expected an update");
+        };
+        assert_eq!(
+            release.url,
+            "https://github.com/NLick47/hakimi/releases/tag/release-2026.10.23"
+        );
+    }
+
+    #[test]
+    fn invalid_manifest_is_rejected() {
+        assert!(parse_manifest(&json!({}), "0.1.0").is_err());
+        assert!(parse_manifest(
+            &json!({ "schema": 2, "desktop": { "version": "0.2.0" } }),
+            "0.1.0"
+        )
+        .is_err());
+        assert!(parse_manifest(
+            &json!({ "schema": 1, "desktop": { "version": "nightly" } }),
+            "0.1.0"
+        )
+        .is_err());
     }
 }

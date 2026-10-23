@@ -10,6 +10,7 @@
 #   ABIS=arm64-v8a                 (default; use x86_64 for an emulator)
 #   VERSION_NAME / VERSION_CODE    (passed to aapt2, override the manifest)
 #   APK_OUT                        (output path, default ./hakimi-probe.apk)
+#   DEBUGGABLE=1                   (inject android:debuggable="true" into a build-local manifest)
 #   HAKIMI_OFFLINE=1               (add --offline to cargo)
 #   ANDROID_KEYSTORE               (default: ./debug.keystore)
 #   ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD
@@ -25,9 +26,10 @@ JNI_DIR="$REPO/target/android-jni"
 # emulator, or ABIS="arm64-v8a x86_64" for a combined local build.
 ABIS="${ABIS:-arm64-v8a}"
 
-# Local builds follow the Rust workspace version so the APK, the desktop
-# client and the core report the same number. Release CI passes VERSION_NAME
-# and VERSION_CODE from the tag, which override these defaults.
+# Local builds follow the Rust workspace version for the client/APK version.
+# The proxy core keeps its own version in crates/hakimi-core/Cargo.toml.
+# Release CI passes VERSION_NAME and VERSION_CODE from the tag, which override
+# these defaults.
 workspace_version() {
   awk '
     /^\[workspace\.package\]/ { section = 1; next }
@@ -230,11 +232,38 @@ rm -rf "$BUILD" "$ROOT/jniLibs"
 mkdir -p "$BUILD/classes" "$BUILD/gen" "$BUILD/dex" "$BUILD/lib"
 mkdir -p "$ROOT/jniLibs"
 
+# `android:debuggable` defaults to false, which is what release builds need.
+# DEBUGGABLE=1 injects it into a build-local manifest so local debugging does
+# not require keeping the flag in the checked-in manifest.
+MANIFEST="$ROOT/AndroidManifest.xml"
+if [ "${DEBUGGABLE:-0}" = "1" ]; then
+  MANIFEST="$BUILD/AndroidManifest.xml"
+  "$PYTHON" - "$ROOT/AndroidManifest.xml" "$MANIFEST" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+source, target = map(Path, sys.argv[1:3])
+text = source.read_text(encoding="utf-8")
+text = re.sub(r'\n\s*android:debuggable="[^"]*"', "", text)
+text, count = re.subn(
+    r"<application\b",
+    '<application\n        android:debuggable="true"',
+    text,
+    count=1,
+)
+if count != 1:
+    raise SystemExit(f"error: <application> not found in {source}")
+target.write_text(text, encoding="utf-8")
+PY
+  echo "debuggable: true"
+fi
+
 "$AAPT2" compile --dir "$ROOT/res" -o "$BUILD/res.zip"
 "$AAPT2" link \
   -o "$BUILD/app-unsigned.apk" \
   -I "$PLATFORM" \
-  --manifest "$ROOT/AndroidManifest.xml" \
+  --manifest "$MANIFEST" \
   -A "$ROOT/assets" \
   --min-sdk-version "$MIN_SDK" \
   --target-sdk-version "$TARGET_SDK" \

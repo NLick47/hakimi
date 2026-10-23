@@ -1,0 +1,469 @@
+name: Release
+
+# 手动发布：一次构建桌面端和 Android，生成完整的 latest.json，并创建 GitHub Release。
+# dry_run 只上传 Actions artifact，不创建 Release，也不会进入更新通道。
+# 推送到 ci/release-* 分支也会自动跑 dry-run，方便在合并前测试 CI。
+on:
+  push:
+    branches:
+      - "ci/release-*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只构建并上传 Actions artifact，不创建 Release"
+        required: true
+        default: false
+        type: boolean
+      release_tag:
+        description: "正式发布标签，例如 release-2026.10.23；dry_run 时可留空"
+        required: false
+        type: string
+      desktop_version:
+        description: "桌面端版本，例如 0.4.0"
+        required: true
+        type: string
+      android_version:
+        description: "Android 版本，例如 0.3.3"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hakimi-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      desktop_version: ${{ steps.meta.outputs.desktop_version }}
+      desktop_version_code: ${{ steps.meta.outputs.desktop_version_code }}
+      android_version: ${{ steps.meta.outputs.android_version }}
+      android_version_code: ${{ steps.meta.outputs.android_version_code }}
+      is_release: ${{ steps.meta.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate versions
+        id: meta
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
+          DESKTOP_VERSION: ${{ inputs.desktop_version }}
+          ANDROID_VERSION: ${{ inputs.android_version }}
+        run: |
+          set -euo pipefail
+
+          # 分支推送只用于 CI 测试，永远不创建 Release。
+          if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
+            DRY_RUN=true
+            DESKTOP_VERSION="${DESKTOP_VERSION:-0.1.0-ci.${GITHUB_RUN_NUMBER:-0}}"
+            ANDROID_VERSION="${ANDROID_VERSION:-0.1.0-ci.${GITHUB_RUN_NUMBER:-0}}"
+          fi
+
+          DESKTOP_VERSION="${DESKTOP_VERSION#v}"
+          ANDROID_VERSION="${ANDROID_VERSION#v}"
+
+          if [[ -z "$DESKTOP_VERSION" || -z "$ANDROID_VERSION" ]]; then
+            echo "::error::桌面端和 Android 版本都必须填写。"
+            exit 1
+          fi
+
+          DESKTOP_CODE="$(python3 scripts/ci/version.py "$DESKTOP_VERSION")"
+          ANDROID_CODE="$(python3 scripts/ci/version.py "$ANDROID_VERSION")"
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            IS_RELEASE=false
+            RELEASE_TAG="dry-run"
+          else
+            IS_RELEASE=true
+            RELEASE_TAG="$RELEASE_TAG_INPUT"
+            if [[ -z "$RELEASE_TAG" ]]; then
+              echo "::error::正式发布需要填写 release_tag，例如 release-2026.10.23。"
+              exit 1
+            fi
+            if [[ ! "$RELEASE_TAG" =~ ^release-[0-9A-Za-z._-]+$ ]]; then
+              echo "::error::release_tag 必须以 release- 开头，且只能包含字母、数字、点、下划线和连字符。"
+              exit 1
+            fi
+          fi
+
+          {
+            echo "release_tag=$RELEASE_TAG"
+            echo "desktop_version=$DESKTOP_VERSION"
+            echo "desktop_version_code=$DESKTOP_CODE"
+            echo "android_version=$ANDROID_VERSION"
+            echo "android_version_code=$ANDROID_CODE"
+            echo "is_release=$IS_RELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "release tag:       $RELEASE_TAG"
+          echo "desktop version:   $DESKTOP_VERSION (code $DESKTOP_CODE)"
+          echo "android version:   $ANDROID_VERSION (code $ANDROID_CODE)"
+          echo "create release:    $IS_RELEASE"
+
+  windows:
+    name: Windows x64
+    needs: prepare
+    runs-on: windows-latest
+    env:
+      # aws-lc-rs needs NASM on Windows. Use its checked-in prebuilt objects
+      # instead of installing an assembler on the runner.
+      AWS_LC_SYS_PREBUILT_NASM: "1"
+      # Link the VC runtime statically so the zip is a self-contained exe.
+      RUSTFLAGS: "-C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-desktop
+
+      - name: Set desktop version
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.desktop_version }}
+        run: python scripts/ci/version.py --apply "$VERSION"
+
+      - name: Build desktop UI
+        shell: bash
+        run: bash ./scripts/build-desktop.sh
+
+      - name: Package zip
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.desktop_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/desktop/hakimi-ui.exe dist/hakimi.exe
+          powershell -NoProfile -Command \
+            "Compress-Archive -Path 'dist/hakimi.exe' -DestinationPath 'dist/hakimi-${VERSION}-windows-x64.zip' -Force"
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hakimi-${{ needs.prepare.outputs.desktop_version }}-windows-x64
+          path: dist/hakimi-*-windows-x64.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS arm64
+    needs: prepare
+    runs-on: macos-latest
+    env:
+      # Build against an older SDK so the dmg also runs on older Macs.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify Apple Silicon runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(uname -m)" != "arm64" ]]; then
+            echo "::error::macos-latest is expected to be an Apple Silicon runner, got $(uname -m)"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-arm64-desktop
+
+      - name: Set desktop version
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.desktop_version }}
+        run: python3 scripts/ci/version.py --apply "$VERSION"
+
+      - name: Build desktop UI
+        shell: bash
+        run: bash ./scripts/build-desktop.sh
+
+      - name: Package dmg
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.desktop_version }}
+          VERSION_CODE: ${{ needs.prepare.outputs.desktop_version_code }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci/package-macos.sh "$VERSION" "$VERSION_CODE" target/desktop/hakimi-ui dist
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hakimi-${{ needs.prepare.outputs.desktop_version }}-macos-arm64
+          path: dist/hakimi-*-macos-arm64.dmg
+          if-no-files-found: error
+
+  android:
+    name: Android arm64
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android-arm64
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Set Android version
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.android_version }}
+        run: python3 scripts/ci/version.py --apply "$VERSION"
+
+      - name: Locate Kotlin compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          KOTLINC="$(command -v kotlinc || true)"
+          if [[ -n "$KOTLINC" ]]; then
+            KOTLIN_HOME="$(dirname "$(dirname "$(readlink -f "$KOTLINC")")")"
+          else
+            # Fallback for runner images without Kotlin preinstalled.
+            KOTLIN_VERSION="2.1.20"
+            KOTLIN_HOME="$RUNNER_TEMP/kotlin/kotlinc"
+            mkdir -p "$RUNNER_TEMP/kotlin"
+            curl -fsSL \
+              "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip" \
+              -o "$RUNNER_TEMP/kotlin.zip"
+            unzip -q "$RUNNER_TEMP/kotlin.zip" -d "$RUNNER_TEMP/kotlin"
+          fi
+
+          if [[ ! -x "$KOTLIN_HOME/bin/kotlinc" || ! -f "$KOTLIN_HOME/lib/kotlin-stdlib.jar" ]]; then
+            echo "::error::Kotlin compiler not found under $KOTLIN_HOME"
+            exit 1
+          fi
+          echo "KOTLIN_HOME=$KOTLIN_HOME" >> "$GITHUB_ENV"
+          "$KOTLIN_HOME/bin/kotlinc" -version
+
+      - name: Prepare Android signing key
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          IS_RELEASE: ${{ needs.prepare.outputs.is_release }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$KEYSTORE_B64" ]]; then
+            if [[ -z "$KEYSTORE_PASSWORD" || -z "$KEY_ALIAS" || -z "$KEY_PASSWORD" ]]; then
+              echo "::error::ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD 必须与 ANDROID_KEYSTORE_BASE64 一起配置。"
+              exit 1
+            fi
+
+            KEYSTORE="$RUNNER_TEMP/hakimi-release.keystore"
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$KEYSTORE"
+            keytool -list -keystore "$KEYSTORE" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+
+            {
+              echo "ANDROID_KEYSTORE=$KEYSTORE"
+              printf 'ANDROID_KEYSTORE_PASSWORD=%s\n' "$KEYSTORE_PASSWORD"
+              printf 'ANDROID_KEY_ALIAS=%s\n' "$KEY_ALIAS"
+              printf 'ANDROID_KEY_PASSWORD=%s\n' "$KEY_PASSWORD"
+            } >> "$GITHUB_ENV"
+          elif [[ "$IS_RELEASE" == "true" ]]; then
+            echo "::error::正式发布必须配置 ANDROID_KEYSTORE_BASE64 等签名 Secrets。"
+            exit 1
+          else
+            echo "::warning::未配置 Android 签名 Secrets，本次 dry_run 构建将使用 build.sh 自动生成的 debug keystore。"
+          fi
+
+      - name: Prepare Android CA
+        shell: bash
+        env:
+          CA_CERT_B64: ${{ secrets.HAKIMI_CA_CERT_BASE64 }}
+          CA_KEY_B64: ${{ secrets.HAKIMI_CA_KEY_BASE64 }}
+          IS_RELEASE: ${{ needs.prepare.outputs.is_release }}
+        run: |
+          set -euo pipefail
+
+          CA_DIR="$RUNNER_TEMP/hakimi-ca"
+
+          if [[ -n "$CA_CERT_B64" || -n "$CA_KEY_B64" ]]; then
+            if [[ -z "$CA_CERT_B64" || -z "$CA_KEY_B64" ]]; then
+              echo "::error::HAKIMI_CA_CERT_BASE64 和 HAKIMI_CA_KEY_BASE64 必须同时配置。"
+              exit 1
+            fi
+
+            mkdir -p "$CA_DIR"
+            printf '%s' "$CA_CERT_B64" | base64 -d > "$CA_DIR/ca.pem"
+            printf '%s' "$CA_KEY_B64" | base64 -d > "$CA_DIR/key.pem"
+            chmod 600 "$CA_DIR/key.pem"
+
+            CERT_PUB="$RUNNER_TEMP/ca-cert.pub"
+            KEY_PUB="$RUNNER_TEMP/ca-key.pub"
+            openssl x509 -in "$CA_DIR/ca.pem" -noout -pubkey > "$CERT_PUB"
+            openssl pkey -in "$CA_DIR/key.pem" -pubout > "$KEY_PUB"
+            cmp -s "$CERT_PUB" "$KEY_PUB"
+            rm -f "$CERT_PUB" "$KEY_PUB"
+          elif [[ "$IS_RELEASE" == "true" ]]; then
+            echo "::error::正式发布必须配置固定 CA 的 HAKIMI_CA_CERT_BASE64 和 HAKIMI_CA_KEY_BASE64。"
+            exit 1
+          else
+            echo "::warning::未配置固定 CA，本次 dry_run 构建将生成一次性 CA。"
+            CA_DIR="$GITHUB_WORKSPACE/android/probe/assets/ca"
+          fi
+
+          echo "HAKIMI_CA_DIR=$CA_DIR" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.android_version }}
+          VERSION_CODE: ${{ needs.prepare.outputs.android_version_code }}
+          ABIS: arm64-v8a
+          IS_RELEASE: ${{ needs.prepare.outputs.is_release }}
+          DEBUGGABLE: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          APK="$GITHUB_WORKSPACE/dist/hakimi-${VERSION}-android-arm64.apk"
+          (
+            cd android/probe
+            VERSION_NAME="$VERSION" \
+            VERSION_CODE="$VERSION_CODE" \
+            APK_OUT="$APK" \
+            bash ./build.sh
+          )
+
+          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --print-certs "$APK"
+          # Capture first: `aapt2 | head` can trip pipefail when aapt2 exits early.
+          BADGING="$("$ANDROID_HOME/build-tools/37.0.0/aapt2" dump badging "$APK")"
+          echo "$BADGING" | sed -n '1p'
+
+          if [[ "$IS_RELEASE" == "true" ]] && grep -q '^application-debuggable' <<< "$BADGING"; then
+            echo "::error::正式发布 APK 不允许包含 android:debuggable=\"true\"。"
+            exit 1
+          fi
+
+          ls -lh "$APK"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hakimi-${{ needs.prepare.outputs.android_version }}-android-arm64
+          path: dist/hakimi-*-android-arm64.apk
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [prepare, windows, macos, android]
+    if: needs.prepare.outputs.is_release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: hakimi-*
+          merge-multiple: true
+
+      - name: Check release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -s CHANGELOG.md ]]; then
+            echo "::error::正式发布前请先填写 CHANGELOG.md（更新公告）。"
+            exit 1
+          fi
+
+      - name: Verify release artifacts
+        shell: bash
+        env:
+          DESKTOP_VERSION: ${{ needs.prepare.outputs.desktop_version }}
+          ANDROID_VERSION: ${{ needs.prepare.outputs.android_version }}
+        run: |
+          set -euo pipefail
+          for file in \
+            "dist/hakimi-${DESKTOP_VERSION}-windows-x64.zip" \
+            "dist/hakimi-${DESKTOP_VERSION}-macos-arm64.dmg" \
+            "dist/hakimi-${ANDROID_VERSION}-android-arm64.apk"
+          do
+            if [[ ! -f "$file" ]]; then
+              echo "::error::missing release artifact: $file"
+              exit 1
+            fi
+          done
+          ls -lh dist
+
+      - name: Generate update manifest
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          DESKTOP_VERSION: ${{ needs.prepare.outputs.desktop_version }}
+          ANDROID_VERSION: ${{ needs.prepare.outputs.android_version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/update_manifest.py \
+            --output dist/latest.json \
+            --release "$RELEASE_TAG" \
+            --release-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}" \
+            --desktop-version "$DESKTOP_VERSION" \
+            --desktop-windows-asset "hakimi-${DESKTOP_VERSION}-windows-x64.zip" \
+            --desktop-macos-asset "hakimi-${DESKTOP_VERSION}-macos-arm64.dmg" \
+            --android-version "$ANDROID_VERSION" \
+            --android-apk-asset "hakimi-${ANDROID_VERSION}-android-arm64.apk"
+          cat dist/latest.json
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f SHA256SUMS.txt
+          sha256sum ./*.zip ./*.dmg ./*.apk ./latest.json > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          TITLE="hakimi release ${RELEASE_TAG#release-}"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+            gh release edit "$RELEASE_TAG" \
+              --title "$TITLE" \
+              --notes-file CHANGELOG.md
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes-file CHANGELOG.md
+          fi

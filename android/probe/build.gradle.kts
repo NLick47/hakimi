@@ -4,7 +4,7 @@ plugins {
 
 val repoRoot = rootProject.projectDir.parentFile.parentFile
 
-/** Keep IDE builds in step with build.sh and the Rust workspace version. */
+/** Keep IDE builds in step with build.sh and the client workspace version. */
 fun workspaceVersion(): String {
     val manifest = File(repoRoot, "Cargo.toml")
     var inPackage = false

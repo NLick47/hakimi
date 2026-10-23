@@ -8,7 +8,6 @@ import java.net.URL
 data class UpdateInfo(
     val version: String,
     val url: String,
-    val notes: String,
 )
 
 sealed class UpdateState {
@@ -20,31 +19,28 @@ sealed class UpdateState {
 }
 
 /**
- * Reads the newest published release from GitHub. The app never downloads an
- * APK itself: [UpdateInfo.url] points at the release page, which the browser
- * opens, so a tampered response cannot trigger an install inside hakimi.
+ * Reads the update manifest attached to the newest GitHub Release. The app
+ * never downloads an APK itself: [UpdateInfo.url] points at the release page,
+ * which the browser opens, so a tampered manifest cannot trigger an install
+ * inside hakimi.
  */
 object UpdateChecker {
-    private const val API = "https://api.github.com/repos/NLick47/hakimi/releases/latest"
+    private const val MANIFEST =
+        "https://github.com/NLick47/hakimi/releases/latest/download/latest.json"
     const val RELEASES_URL = "https://github.com/NLick47/hakimi/releases"
-    private const val MAX_NOTES = 8000
 
     sealed class Result {
         object UpToDate : Result()
         data class Newer(val info: UpdateInfo) : Result()
     }
 
-    fun releaseUrl(version: String): String =
-        "$RELEASES_URL/tag/v${version.trim().removePrefix("v")}"
-
     fun check(current: String): Result {
-        val connection = (URL(API).openConnection() as HttpURLConnection).apply {
+        val connection = (URL(MANIFEST).openConnection() as HttpURLConnection).apply {
             connectTimeout = 8_000
             readTimeout = 8_000
             instanceFollowRedirects = true
             requestMethod = "GET"
-            setRequestProperty("Accept", "application/vnd.github+json")
-            setRequestProperty("X-GitHub-Api-Version", "2022-11-28")
+            setRequestProperty("Accept", "application/json")
             setRequestProperty("User-Agent", "hakimi/$current")
         }
         try {
@@ -53,23 +49,36 @@ object UpdateChecker {
             if (code !in 200..299) throw IOException("HTTP $code")
 
             val body = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-            val release = JSONObject(body)
-            val version = release.optString("tag_name").trim().removePrefix("v").trim()
-            if (version.isEmpty()) throw IOException("release has no version tag")
+            val manifest = JSONObject(body)
+            if (manifest.optInt("schema", 0) != 1) {
+                throw IOException("unsupported update manifest schema")
+            }
+            val android = manifest.optJSONObject("android") ?: return Result.UpToDate
+            val version = android.optString("version").trim().removePrefix("v").trim()
+            if (version.isEmpty()) throw IOException("update manifest has no Android version")
             if (!AppVersion.isNewer(version, current)) {
                 return Result.UpToDate
             }
-            val url = release.optString("html_url").trim()
+
+            val release = manifest.optString("release").trim()
+            val fallback = if (safeTag(release)) {
+                "$RELEASES_URL/tag/$release"
+            } else {
+                RELEASES_URL
+            }
+            val url = android.optString("url").trim()
                 .takeIf { safeUrl(it) }
-                ?: releaseUrl(version)
-            val notes = release.optString("body").trim().take(MAX_NOTES)
-            return Result.Newer(UpdateInfo(version, url, notes))
+                ?: fallback
+            return Result.Newer(UpdateInfo(version, url))
         } finally {
             connection.disconnect()
         }
     }
 
-    /** The API response is untrusted; only the project's release pages open. */
+    /** The manifest is untrusted; only the project's release pages open. */
     private fun safeUrl(url: String): Boolean =
-        url.startsWith("https://github.com/NLick47/hakimi/")
+        url.startsWith("https://github.com/NLick47/hakimi/releases/")
+
+    private fun safeTag(tag: String): Boolean =
+        tag.isNotEmpty() && tag.all { it.isLetterOrDigit() || it == '-' || it == '_' || it == '.' }
 }

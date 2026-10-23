@@ -3,7 +3,7 @@ package com.hakimi.probe.ui
 import android.content.Context
 import com.hakimi.probe.UpdateInfo
 
-/** Release notes plus the one action that leaves the app for the browser. */
+/** Points at the release page, where the full update announcement lives. */
 class UpdateSheet(
     private val context: Context,
     private val host: Host,
@@ -24,7 +24,7 @@ class UpdateSheet(
         this.sheet = sheet
 
         val notes = context.text(
-            info.notes.ifBlank { "前往 GitHub Releases 查看完整更新说明。" },
+            "前往 GitHub Releases 查看完整更新说明。",
             12.5f,
             Palette.TEXT_2
         ).apply {
