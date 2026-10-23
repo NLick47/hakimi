@@ -1162,7 +1162,7 @@ async fn auto_interleaves_the_accelerated_route_after_direct() {
         .prober
         .working_fake_sni
         .lock()
-        .insert((ip, Some("www.baidu.com".into())));
+        .insert((ip, Some("www.bing.com".into())));
     match harness.engine.route("example.com", 443, true) {
         Route::Group(mut cursor) => {
             let first = cursor.next_plan().await.unwrap();
@@ -1170,7 +1170,7 @@ async fn auto_interleaves_the_accelerated_route_after_direct() {
             let second = cursor.next_plan().await.unwrap();
             assert_eq!(second.mode, TlsMode::FakeSni);
             assert_eq!(second.ip, ip);
-            assert_eq!(second.sni.as_deref(), Some("www.baidu.com"));
+            assert_eq!(second.sni.as_deref(), Some("www.bing.com"));
         }
         _ => panic!("expected a group cursor"),
     }
@@ -1186,16 +1186,16 @@ async fn auto_falls_back_to_fake_sni_and_caches_it() {
         .prober
         .working_fake_sni
         .lock()
-        .insert((ip, Some("www.baidu.com".into())));
+        .insert((ip, Some("www.bing.com".into())));
     let outcome = harness.engine.decide_https("example.com").await;
     let plan = outcome.plan.expect("fake SNI should succeed");
     assert_eq!(plan.mode, TlsMode::FakeSni);
-    assert_eq!(plan.sni.as_deref(), Some("www.baidu.com"));
+    assert_eq!(plan.sni.as_deref(), Some("www.bing.com"));
     let cached = harness
         .cache
         .sni("test", "example.com", &network_id())
         .expect("winning SNI should be cached");
-    assert_eq!(cached.sni.as_deref(), Some("www.baidu.com"));
+    assert_eq!(cached.sni.as_deref(), Some("www.bing.com"));
 }
 
 #[tokio::test]

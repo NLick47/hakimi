@@ -201,10 +201,7 @@ impl Default for AdvancedConfig {
         Self {
             fake_sni_candidates: vec![
                 String::new(),
-                "www.baidu.com".to_string(),
-                "www.cloudflare.com".to_string(),
                 "www.bing.com".to_string(),
-                "www.apple.com".to_string(),
             ],
             max_candidates_per_domain: 8,
             ip_timeout_ms: 2_000,
