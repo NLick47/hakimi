@@ -7,6 +7,11 @@ license.workspace = true
 description = "hakimi desktop UI: Slint, Fluent style, one switch and a site list"
 build = "build.rs"
 
+[features]
+# Offscreen `--shot` rendering is a development aid. Debug builds always keep
+# it; release builds include it only when this feature is explicitly enabled.
+dev-shot = []
+
 [dependencies]
 slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-default", "renderer-femtovg", "renderer-software", "system-tray"] }
 hakimi-core = { path = "../hakimi-core" }

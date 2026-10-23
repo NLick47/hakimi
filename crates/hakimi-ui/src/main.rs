@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -20,12 +25,13 @@ slint::include_modules!();
 mod model;
 mod ui_state;
 
+#[cfg(any(debug_assertions, feature = "dev-shot", test))]
+pub(crate) use model::build_snapshot;
 #[cfg(test)]
 pub(crate) use model::icon_key_for;
 pub(crate) use model::{
-    build_sites, build_snapshot, builtin_group_ids, finish_snapshot, format_route,
-    normalize_domain_host, parse_route, route_from_preset, route_preset_index, text, SiteData,
-    SweepState, SITE_ICONS,
+    build_sites, builtin_group_ids, finish_snapshot, format_route, normalize_domain_host,
+    parse_route, route_from_preset, route_preset_index, text, SiteData, SweepState,
 };
 
 pub(crate) fn data_dir() -> Option<PathBuf> {
@@ -789,12 +795,26 @@ fn release_ui_caches(app: &AppWindow) {
     ASSETS.with(|assets| assets.borrow_mut().clear());
 }
 
+/// Site logos are embedded in the executable. `CARGO_MANIFEST_DIR` is an
+/// absolute path on the build machine, so loading them from disk would fail
+/// once the binary is copied to another machine.
+const ICON_ASSETS: [(&str, &[u8]); 9] = [
+    ("pixiv", include_bytes!("../assets/pixiv.png")),
+    ("hitomi", include_bytes!("../assets/hitomi.png")),
+    ("poipiku", include_bytes!("../assets/poipiku.png")),
+    ("booth", include_bytes!("../assets/booth.png")),
+    ("steam", include_bytes!("../assets/steam.png")),
+    ("github", include_bytes!("../assets/github.png")),
+    ("ao3", include_bytes!("../assets/ao3.png")),
+    ("eh", include_bytes!("../assets/eh.png")),
+    ("hanime", include_bytes!("../assets/hanime.png")),
+];
+
 pub(crate) fn load_assets() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
     ASSETS.with(|assets| {
         let mut map = assets.borrow_mut();
-        for key in SITE_ICONS {
-            if let Ok(image) = slint::Image::load_from_path(&dir.join(format!("{key}.png"))) {
+        for &(key, bytes) in &ICON_ASSETS {
+            if let Ok(image) = slint::Image::load_from_data(bytes, Some("png")) {
                 map.insert(key.to_string(), image);
             }
         }
@@ -1153,6 +1173,7 @@ fn unique_group_id(config: &hakimi_core::config::AppConfig, domain: &str) -> Str
 
 // -- offscreen rendering (development aid) ------------------------------------
 
+#[cfg(any(debug_assertions, feature = "dev-shot"))]
 fn sample_status() -> Value {
     serde_json::json!({
         "ca": { "present": true, "supported": true, "installed": false },
@@ -1180,6 +1201,7 @@ fn sample_status() -> Value {
     })
 }
 
+#[cfg(any(debug_assertions, feature = "dev-shot"))]
 fn sample_config() -> Value {
     serde_json::json!({
         "proxy": { "port": 8443 },
@@ -1223,6 +1245,7 @@ fn sample_config() -> Value {
 
 /// Renders the window into a raw RGBA file so the layout can be reviewed
 /// without a display. Usage: `hakimi-ui --shot <prefix> [--page N] [--running]`.
+#[cfg(any(debug_assertions, feature = "dev-shot"))]
 fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     use_light_appearance();
     let app = AppWindow::new()?;
@@ -1521,20 +1544,23 @@ fn cached_config(revision: u64, fetch: impl FnOnce() -> Value) -> Rc<Value> {
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if let Some(index) = args.iter().position(|arg| arg == "--shot") {
-        let prefix = args
-            .get(index + 1)
-            .cloned()
-            .unwrap_or_else(|| "/tmp/hakimi-ui".into());
-        let page = args
-            .iter()
-            .position(|arg| arg == "--page")
-            .and_then(|i| args.get(i + 1))
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(0);
-        let running = args.iter().any(|arg| arg == "--running");
-        return shot(&prefix, page, running);
+    #[cfg(any(debug_assertions, feature = "dev-shot"))]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(index) = args.iter().position(|arg| arg == "--shot") {
+            let prefix = args
+                .get(index + 1)
+                .cloned()
+                .unwrap_or_else(|| "/tmp/hakimi-ui".into());
+            let page = args
+                .iter()
+                .position(|arg| arg == "--page")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0);
+            let running = args.iter().any(|arg| arg == "--running");
+            return shot(&prefix, page, running);
+        }
     }
 
     // Single instance: a second long-running app would fight over the proxy port.

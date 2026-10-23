@@ -463,6 +463,7 @@ pub(crate) fn finish_snapshot(
 }
 
 /// Convenience wrapper used by tests and the offscreen `--shot` renderer.
+#[cfg(any(debug_assertions, feature = "dev-shot", test))]
 pub(crate) fn build_snapshot(
     status: &Value,
     config: &Value,

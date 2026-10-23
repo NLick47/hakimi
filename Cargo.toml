@@ -90,6 +90,19 @@ strip = "symbols"
 [profile.release.package."*"]
 opt-level = "s"
 
+# Desktop UI only: panic=abort removes the unwinding tables from the final
+# binary. This is a separate profile so `release` keeps unwind for the C ABI
+# (`hakimi-ffi` uses catch_unwind) and Android keeps it for the JNI shell.
+[profile.desktop-release]
+inherits = "release"
+panic = "abort"
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+
+[profile.desktop-release.package."*"]
+opt-level = "s"
+
 # Android ships inside an APK, so it trades throughput for size. Panic
 # strategy stays `unwind`: the JNI shell uses `catch_unwind` to turn a panic
 # into an error instead of killing the app process.
