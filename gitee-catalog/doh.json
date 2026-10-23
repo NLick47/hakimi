@@ -2,6 +2,10 @@
   "v": 1,
   "doh": [
     {
+      "name": "Piku Relay",
+      "url": "https://pic-relay.cyou/dns-query"
+    },
+    {
       "name": "CleanBrowsing Security",
       "url": "https://doh.cleanbrowsing.org/doh/security-filter/",
       "bootstrapIp": "185.228.168.9"
