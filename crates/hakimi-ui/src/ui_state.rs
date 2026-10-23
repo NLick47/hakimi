@@ -109,20 +109,14 @@ impl Default for AppModel {
 }
 
 impl AppModel {
-    /// App launch. A healthy environment starts accelerating right away; a
-    /// broken one stays stopped and only raises the banner — the app never
-    /// hijacks the window on its own, the user decides when to go fix it.
+    /// App launch. Acceleration always starts paused; taking over the system
+    /// proxy is an explicit user action. A stale takeover from a previous run
+    /// is still rolled back, so browsing keeps working directly in the
+    /// meantime.
     pub fn startup(&mut self, env: EnvState) -> Effects {
         self.env = env;
-        if self.env.allows_acceleration() {
-            self.accel = AccelState::Running;
-            self.effects()
-        } else {
-            // Same shape as a gated start (pause + leave the OS proxy alone),
-            // minus the fix page: `fix_page_open` stays false.
-            self.accel = AccelState::Stopped;
-            Effects::awaiting()
-        }
+        self.accel = AccelState::Stopped;
+        Effects::awaiting()
     }
 
     /// The master switch. Turning acceleration ON with a broken environment
@@ -397,38 +391,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn startup_with_broken_environment_stays_stopped_without_the_fix_page() {
+    /// The state right after the user flips acceleration on at launch.
+    fn running_model() -> AppModel {
         let mut model = AppModel::default();
-        let effects = model.startup(env(false));
-        assert_eq!(model.accel(), AccelState::Stopped);
-        assert!(
-            !model.fix_page(),
-            "launch must not hijack the window; the banner is enough"
-        );
-        assert!(effects.pause && effects.disable_proxy && !effects.resume);
-        assert_eq!(start_mode(&effects), StartMode::Deferred);
+        model.startup(env(true));
+        model.toggle(env(true));
+        model
     }
 
     #[test]
-    fn startup_with_healthy_environment_maps_to_takeover() {
-        let mut model = AppModel::default();
-        let effects = model.startup(env(true));
-        assert_eq!(start_mode(&effects), StartMode::Takeover);
+    fn startup_always_starts_paused() {
+        for healthy in [true, false] {
+            let mut model = AppModel::default();
+            let effects = model.startup(env(healthy));
+            assert_eq!(model.accel(), AccelState::Stopped);
+            assert!(
+                !model.fix_page(),
+                "launch must not hijack the window; the banner is enough"
+            );
+            assert!(effects.pause && effects.disable_proxy && !effects.resume);
+            assert_eq!(start_mode(&effects), StartMode::Deferred);
+        }
     }
 
     #[test]
-    fn startup_with_healthy_environment_runs() {
-        let mut model = AppModel::default();
-        let effects = model.startup(env(true));
-        assert_eq!(model.accel(), AccelState::Running);
-        assert!(effects.resume && effects.apply_proxy);
+    fn start_mode_follows_the_proxy_effect() {
+        assert_eq!(start_mode(&Effects::running()), StartMode::Takeover);
+        assert_eq!(start_mode(&Effects::awaiting()), StartMode::Deferred);
     }
 
     #[test]
     fn toggle_refuses_to_accelerate_with_broken_environment() {
-        let mut model = AppModel::default();
-        model.startup(env(true));
+        let mut model = running_model();
         let effects = model.toggle(env(false)); // was running → stop
         assert_eq!(model.accel(), AccelState::Stopped);
         assert!(effects.pause && !effects.resume);
@@ -441,8 +435,7 @@ mod tests {
 
     #[test]
     fn pending_resume_completes_itself_when_environment_passes() {
-        let mut model = AppModel::default();
-        model.startup(env(true));
+        let mut model = running_model();
         model.toggle(env(true)); // running → stopped
         model.toggle(env(false)); // user wants it on, env broken
         assert_eq!(model.accel(), AccelState::AwaitingEnvironment);
@@ -462,8 +455,7 @@ mod tests {
 
     #[test]
     fn manually_opened_fix_page_survives_environment_ticks() {
-        let mut model = AppModel::default();
-        model.startup(env(true));
+        let mut model = running_model();
         // The environment degrades after launch (e.g. the CA was removed).
         model.env_changed(env(false));
         assert!(
@@ -486,8 +478,7 @@ mod tests {
 
     #[test]
     fn dismissing_a_manual_visit_does_not_stop_acceleration() {
-        let mut model = AppModel::default();
-        model.startup(env(true));
+        let mut model = running_model();
         model.open_fix();
 
         let effects = model.dismiss_fix();
@@ -498,8 +489,7 @@ mod tests {
 
     #[test]
     fn dismissing_the_fix_page_stays_stopped() {
-        let mut model = AppModel::default();
-        model.startup(env(true));
+        let mut model = running_model();
         model.toggle(env(true)); // running → stopped
         model.toggle(env(false)); // user wants it on, env broken → gated
         assert!(model.fix_page());
@@ -515,8 +505,7 @@ mod tests {
 
     #[test]
     fn turning_on_reasserts_the_proxy() {
-        let mut model = AppModel::default();
-        model.startup(env(true));
+        let mut model = running_model();
         model.toggle(env(true)); // → Stopped
         let effects = model.toggle(env(true)); // → Running again
         assert!(effects.resume);
@@ -528,16 +517,14 @@ mod tests {
 
     #[test]
     fn stop_never_requires_an_healthy_environment() {
-        let mut model = AppModel::default();
-        model.startup(env(true));
+        let mut model = running_model();
         model.toggle(env(false)); // → Stopped
         assert_eq!(model.accel(), AccelState::Stopped);
     }
 
     #[test]
     fn clearing_the_selection_stops_acceleration() {
-        let mut model = AppModel::default();
-        model.startup(env(true));
+        let mut model = running_model();
 
         let effects = model.stop();
         assert_eq!(model.accel(), AccelState::Stopped);
@@ -549,8 +536,7 @@ mod tests {
 
     #[test]
     fn a_failed_proxy_write_does_not_pause_acceleration() {
-        let mut model = AppModel::default();
-        model.startup(env(true));
+        let mut model = running_model();
 
         let failed = EnvState {
             ca_ok: true,
@@ -568,8 +554,7 @@ mod tests {
 
     #[test]
     fn toggling_after_a_failed_proxy_write_reapplies_without_pausing() {
-        let mut model = AppModel::default();
-        model.startup(env(true));
+        let mut model = running_model();
         let failed = EnvState {
             ca_ok: true,
             ca_error: String::new(),

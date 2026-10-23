@@ -317,6 +317,7 @@ export component AlreadyRunningWindow inherits Window {
     width: 340px;
     height: 120px;
     background: #FFFFFF;
+    icon: @image-url("../assets/app-icon.png");
 
     VerticalLayout {
         alignment: center;
@@ -639,42 +640,6 @@ component PillButton inherits Rectangle {
     }
 }
 
-component InfoRow inherits Rectangle {
-    in property <string> label;
-    in property <string> value;
-
-    height: 52px;
-
-    HorizontalLayout {
-        padding-left: 16px;
-        padding-right: 16px;
-        spacing: 12px;
-
-        VerticalLayout {
-            width: 112px;
-            alignment: center;
-
-            Text {
-                text: root.label;
-                font-size: 13px;
-                color: #1B1F24;
-            }
-        }
-
-        Rectangle { horizontal-stretch: 1; }
-
-        VerticalLayout {
-            alignment: center;
-
-            Text {
-                text: root.value;
-                font-size: 12px;
-                color: #5C6670;
-            }
-        }
-    }
-}
-
 // -- site editor -------------------------------------------------------------
 
 component ChoicePill inherits Rectangle {
@@ -711,6 +676,7 @@ export component AppWindow inherits Window {
     width: 800px;
     height: 600px;
     background: #F3F4F5;
+    icon: @image-url("../assets/app-icon.png");
 
     in property <[SiteEntry]> sites;
     in property <string> status-subtitle: "正在启动";
@@ -746,9 +712,16 @@ export component AppWindow inherits Window {
     in-out property <string> cfg-catalog-doh;
     in property <string> cfg-data-dir;
     in property <string> cfg-version;
+    in property <string> cfg-core-version;
     in property <string> cfg-error;
     // `proxy.port` etc. — the field that produced cfg-error, so only it turns red.
     in property <string> cfg-error-key;
+
+    // Update check. The host runs it once a day and on demand; the UI only
+    // reflects the last result.
+    in property <bool> update-checking: false;
+    in property <bool> update-available: false;
+    in property <string> update-status: "尚未检查";
 
     // Site editor overlay.
     in-out property <bool> editor-open: false;
@@ -784,6 +757,8 @@ export component AppWindow inherits Window {
     callback settings-action(int);
     callback save-string(string, string);
     callback open-data-dir();
+    callback check-update();
+    callback open-update();
     callback open-editor(string);
     callback close-editor();
     callback save-editor();
@@ -809,29 +784,11 @@ export component AppWindow inherits Window {
                 padding-right: 10px;
                 spacing: 9px;
 
-                Rectangle {
+                if root.page == 1: Rectangle {
                     width: 28px;
                     height: parent.height;
 
-                    if root.page == 0: Rectangle {
-                        width: 20px;
-                        height: 20px;
-                        x: (parent.width - self.width) / 2;
-                        y: (parent.height - self.height) / 2;
-                        border-radius: 5px;
-                        background: #0067C0;
-
-                        Path {
-                            width: 11px;
-                            height: 11px;
-                            x: (parent.width - self.width) / 2;
-                            y: (parent.height - self.height) / 2;
-                            commands: "M 6.6 0.5 L 1.8 6.2 L 4.9 6.2 L 4.1 10.5 L 9.1 4.3 L 5.7 4.3 Z";
-                            fill: #FFFFFF;
-                        }
-                    }
-
-                    if root.page == 1: BackIcon {
+                    BackIcon {
                         x: (parent.width - self.width) / 2;
                         y: (parent.height - self.height) / 2;
                         clicked => { root.page = 0; }
@@ -842,12 +799,6 @@ export component AppWindow inherits Window {
                     alignment: center;
                     horizontal-stretch: 1;
 
-                    if root.page == 0: Text {
-                        text: "hakimi";
-                        font-size: 13.5px;
-                        font-weight: 600;
-                        color: #1B1F24;
-                    }
                     if root.page == 1: Text {
                         text: "设置";
                         font-size: 13.5px;
@@ -863,6 +814,19 @@ export component AppWindow inherits Window {
                         x: (parent.width - self.width) / 2;
                         y: (parent.height - self.height) / 2;
                         clicked => { root.page = 1; }
+                    }
+
+                    // A quiet marker instead of a popup: the settings row
+                    // carries the details once the user opens it.
+                    if root.page == 0 && root.update-available: Rectangle {
+                        width: 7px;
+                        height: 7px;
+                        x: parent.width - 10px;
+                        y: 8px;
+                        border-radius: 3.5px;
+                        background: #0067C0;
+                        border-width: 1px;
+                        border-color: #F3F4F5;
                     }
                 }
             }
@@ -1799,9 +1763,65 @@ export component AppWindow inherits Window {
 
                             RowLine { }
 
-                            InfoRow {
-                                label: "版本";
-                                value: root.cfg-version;
+                            Rectangle {
+                                height: 52px;
+
+                                HorizontalLayout {
+                                    padding-left: 16px;
+                                    padding-right: 14px;
+                                    spacing: 12px;
+
+                                    VerticalLayout {
+                                        width: 112px;
+                                        alignment: center;
+                                        Text {
+                                            text: "检查更新";
+                                            font-size: 13px;
+                                            color: #1B1F24;
+                                        }
+                                    }
+
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        alignment: center;
+                                        spacing: 2px;
+
+                                        Text {
+                                            text: root.update-status;
+                                            font-size: 12px;
+                                            color: root.update-available ? #0067C0 : #6B7480;
+                                            overflow: elide;
+                                        }
+
+                                        Text {
+                                            text: "客户端版本 " + root.cfg-version
+                                                + " · Rust Core " + root.cfg-core-version;
+                                            font-size: 10.5px;
+                                            color: #6B7480;
+                                            overflow: elide;
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        width: 72px;
+                                        height: parent.height;
+
+                                        PillButton {
+                                            width: parent.width;
+                                            y: (parent.height - self.height) / 2;
+                                            label: root.update-available
+                                                ? "下载"
+                                                : (root.update-checking ? "检查中…" : "检查");
+                                            clicked => {
+                                                if root.update-available {
+                                                    root.open-update();
+                                                } else if !root.update-checking {
+                                                    root.check-update();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2091,7 +2111,6 @@ export component TrayRoot inherits SystemTrayIcon {
     in property <bool> running: false;
     callback show-main();
     callback toggle-master();
-    callback probe-selected();
     callback quit();
     clicked => { root.show-main(); }
     Menu {
@@ -2103,10 +2122,6 @@ export component TrayRoot inherits SystemTrayIcon {
         MenuItem {
             title: root.running ? "停止加速" : "开启加速";
             activated => { root.toggle-master(); }
-        }
-        MenuItem {
-            title: "检测选中";
-            activated => { root.probe-selected(); }
         }
         MenuSeparator {}
         MenuItem {

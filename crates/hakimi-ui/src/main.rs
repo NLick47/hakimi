@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use hakimi_core::config::{AppConfig, DomainRule, GroupConfig, RouteAttempt, RoutePolicy};
@@ -24,6 +25,7 @@ slint::include_modules!();
 
 mod model;
 mod ui_state;
+mod update;
 
 #[cfg(any(debug_assertions, feature = "dev-shot", test))]
 pub(crate) use model::build_snapshot;
@@ -57,6 +59,46 @@ fn use_light_appearance() {
 #[cfg(not(target_os = "macos"))]
 fn use_light_appearance() {}
 
+/// The window is a fixed light surface, so a system-dark title bar reads as a
+/// rendering bug and its controls become hard to see. Force the non-client
+/// area to the same palette instead of following the system theme.
+#[cfg(windows)]
+fn apply_light_title_bar(window: &slint::Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+    };
+
+    let window_handle = window.window_handle();
+    let Ok(handle) = window_handle.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = win32.hwnd.get() as *mut core::ffi::c_void;
+
+    let set = |attribute: u32, value: &u32| unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            attribute,
+            value as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        ) == 0
+    };
+
+    let light = 0u32;
+    if !set(DWMWA_USE_IMMERSIVE_DARK_MODE as u32, &light) {
+        // Windows 10 builds before 20H1 used attribute 19.
+        let _ = set(19, &light);
+    }
+    // COLORREF is 0x00BBGGRR.
+    let _ = set(DWMWA_CAPTION_COLOR as u32, &0x00F5_F4F3); // #F3F4F5
+    let _ = set(DWMWA_TEXT_COLOR as u32, &0x0024_1F1B); // #1B1F24
+    let _ = set(DWMWA_BORDER_COLOR as u32, &0x00E8_E4E1); // #E1E4E8
+}
+
 /// Raise the app after a tray click. AppKit only activates the app when the
 /// click lands on its own window or menu, so a background app stays behind
 /// whatever else is on screen.
@@ -83,8 +125,36 @@ fn reveal_window(app: &AppWindow) {
     let window = app.window();
     window.set_minimized(false);
     let _ = window.show();
+    activate_window(&window);
     activate_app();
 }
+
+/// Windows does not let a background app raise itself with `show()` alone.
+/// The tray click is a user input to this process, so restoring and setting
+/// the foreground window is allowed here.
+#[cfg(windows)]
+fn activate_window(window: &slint::Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+
+    let window_handle = window.window_handle();
+    let Ok(handle) = window_handle.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = win32.hwnd.get() as *mut core::ffi::c_void;
+    unsafe {
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+    }
+}
+
+#[cfg(not(windows))]
+fn activate_window(_window: &slint::Window) {}
 
 fn color(hex: &str) -> Color {
     let value = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0x88_88_88);
@@ -150,6 +220,102 @@ thread_local! {
     static SITES_EXPANDED_STATE: Cell<bool> = const { Cell::new(false) };
     static WINDOW_STATE: std::cell::RefCell<Option<(slint::PhysicalPosition, slint::PhysicalSize)>> =
         const { std::cell::RefCell::new(None) };
+    // The update check outlives window rebuilds: its result is still valid
+    // after the user closes and reopens the window from the tray.
+    static UPDATE: RefCell<UpdateUi> = RefCell::new(UpdateUi::default());
+    static UPDATE_LAST_ATTEMPT: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// How long a completed check suppresses the automatic one.
+const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+struct UpdateUi {
+    checking: bool,
+    available: Option<update::Release>,
+    status: String,
+}
+
+impl Default for UpdateUi {
+    fn default() -> Self {
+        Self {
+            checking: false,
+            available: None,
+            status: "尚未检查".to_string(),
+        }
+    }
+}
+
+/// Mirrors the process-wide update state into a window. Properties are only
+/// written here, so a rebuilt window picks up a check that finished while it
+/// did not exist.
+fn apply_update(app: &AppWindow) {
+    UPDATE.with(|slot| {
+        let state = slot.borrow();
+        app.set_update_checking(state.checking);
+        app.set_update_available(state.available.is_some());
+        app.set_update_status(SharedString::from(state.status.clone()));
+    });
+}
+
+/// Runs one check off the UI thread. Duplicate requests (a click landing while
+/// the automatic check is in flight) are ignored instead of stacking up.
+fn start_update_check(app: &AppWindow, spawner: &tokio::runtime::Handle) {
+    if UPDATE.with(|slot| slot.borrow().checking) {
+        return;
+    }
+    UPDATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        state.checking = true;
+        state.status = "正在检查更新…".to_string();
+    });
+    apply_update(app);
+
+    spawner.spawn(async move {
+        let outcome = update::check().await;
+        let _ = slint::invoke_from_event_loop(move || {
+            UPDATE.with(|slot| {
+                let mut state = slot.borrow_mut();
+                state.checking = false;
+                match outcome {
+                    Ok(update::CheckOutcome::Available(release)) => {
+                        state.status = format!("发现新版本 v{}", release.version);
+                        state.available = Some(release);
+                    }
+                    Ok(update::CheckOutcome::UpToDate) => {
+                        state.status = "已是最新版本".to_string();
+                        state.available = None;
+                    }
+                    Err(error) => {
+                        tracing::info!(
+                            error = %format!("{error:#}"),
+                            "the update check failed"
+                        );
+                        state.status = "暂时无法检查更新".to_string();
+                        state.available = None;
+                    }
+                }
+            });
+            // The window that started the check may have been closed while it
+            // was in flight; apply the result to whichever window is live now.
+            WINDOW.with(|slot| {
+                if let Some(shell) = slot.borrow().as_ref() {
+                    apply_update(&shell.app);
+                }
+            });
+        });
+    });
+}
+
+/// Automatic checks run at most once a day while a window exists. A failed
+/// attempt also counts, so an offline machine is not retried every tick.
+fn maybe_auto_update(app: &AppWindow, spawner: &tokio::runtime::Handle) {
+    let due = UPDATE_LAST_ATTEMPT
+        .with(|slot| slot.get().is_none_or(|at| at.elapsed() >= UPDATE_INTERVAL));
+    if !due {
+        return;
+    }
+    UPDATE_LAST_ATTEMPT.with(|slot| slot.set(Some(Instant::now())));
+    start_update_check(app, spawner);
 }
 
 struct WindowShell {
@@ -408,6 +574,33 @@ fn wire_window(app: &AppWindow, ctx: &UiContext) {
         });
     }
     {
+        let spawner = spawner.clone();
+        let weak = app.as_weak();
+        app.on_check_update(move || {
+            if let Some(app) = weak.upgrade() {
+                // A manual check resets the daily timer: the next automatic
+                // one is a day after this click, not sooner.
+                UPDATE_LAST_ATTEMPT.with(|slot| slot.set(Some(Instant::now())));
+                start_update_check(&app, &spawner);
+            }
+        });
+    }
+    {
+        app.on_open_update(move || {
+            let url = UPDATE.with(|slot| {
+                slot.borrow()
+                    .available
+                    .as_ref()
+                    .map(|release| release.url.clone())
+            });
+            if let Some(url) = url {
+                std::thread::spawn(move || {
+                    let _ = open::that(url);
+                });
+            }
+        });
+    }
+    {
         let runtime = runtime.clone();
         let weak = app.as_weak();
         app.on_open_editor(move |id| {
@@ -552,6 +745,7 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
         ctx.runtime.paths().root().display().to_string(),
     ));
     app.set_cfg_version(SharedString::from(env!("CARGO_PKG_VERSION")));
+    app.set_cfg_core_version(SharedString::from(hakimi_core::VERSION));
 
     wire_window(&app, ctx);
 
@@ -565,6 +759,8 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
 
     MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
     refresh(&app, &ctx.runtime, &ctx.expanded.borrow(), &ctx.sweep);
+    apply_update(&app);
+    maybe_auto_update(&app, &ctx.spawner);
 
     let id = NEXT_WINDOW_ID.with(|next| {
         let id = next.get() + 1;
@@ -578,6 +774,7 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
         let runtime = ctx.runtime.clone();
         let expanded = ctx.expanded.clone();
         let sweep = ctx.sweep.clone();
+        let spawner = ctx.spawner.clone();
         let closing = closing.clone();
         timer.start(
             slint::TimerMode::Repeated,
@@ -619,8 +816,20 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
                     return;
                 }
                 refresh(&app, &runtime, &expanded.borrow(), &sweep);
+                maybe_auto_update(&app, &spawner);
             },
         );
+    }
+    // The native window may not have an HWND yet when build_window returns;
+    // apply the title-bar palette after the first event-loop turn.
+    #[cfg(windows)]
+    {
+        let weak = app.as_weak();
+        slint::Timer::single_shot(Duration::from_millis(100), move || {
+            if let Some(app) = weak.upgrade() {
+                apply_light_title_bar(&app.window());
+            }
+        });
     }
     Ok(WindowShell {
         app,
@@ -1271,6 +1480,11 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     app.set_cfg_catalog_doh(SharedString::from(settings.catalog_doh.clone()));
     app.set_cfg_data_dir(SharedString::from("~/Library/Application Support/hakimi"));
     app.set_cfg_version(SharedString::from(env!("CARGO_PKG_VERSION")));
+    app.set_cfg_core_version(SharedString::from(hakimi_core::VERSION));
+    if std::env::var("HAKIMI_UI_UPDATE").is_ok() {
+        app.set_update_available(true);
+        app.set_update_status(SharedString::from("发现新版本 v0.2.0"));
+    }
     app.set_status_subtitle(SharedString::from(subtitle));
     app.set_running(running);
     app.set_page(page);
@@ -1576,6 +1790,15 @@ fn main() -> Result<()> {
             // Visible feedback instead of a silently dead second launch.
             let notice = AlreadyRunningWindow::new()?;
             notice.show()?;
+            #[cfg(windows)]
+            {
+                let weak = notice.as_weak();
+                slint::Timer::single_shot(Duration::from_millis(100), move || {
+                    if let Some(notice) = weak.upgrade() {
+                        apply_light_title_bar(&notice.window());
+                    }
+                });
+            }
             let timer = slint::Timer::default();
             timer.start(
                 slint::TimerMode::SingleShot,
@@ -1673,6 +1896,19 @@ fn main() -> Result<()> {
                         eprintln!("hakimi-ui: showing the window failed: {error}");
                         return;
                     }
+                    reveal_window(&shell.app);
+                    #[cfg(windows)]
+                    {
+                        // The raw HWND may not exist yet when show() returns
+                        // from a tray rebuild; retry once the event loop has
+                        // created the native window.
+                        let weak = shell.app.as_weak();
+                        slint::Timer::single_shot(Duration::from_millis(120), move || {
+                            if let Some(app) = weak.upgrade() {
+                                activate_window(&app.window());
+                            }
+                        });
+                    }
                     WINDOW.with(|slot| *slot.borrow_mut() = Some(shell));
                 }
                 Err(error) => eprintln!("hakimi-ui: rebuilding the window failed: {error:#}"),
@@ -1711,30 +1947,6 @@ fn main() -> Result<()> {
                 if let Some(tray) = slot.borrow().as_ref() {
                     tray.set_running(running);
                 }
-            });
-        }
-    });
-    tray.on_probe_selected({
-        let ctx = ctx.clone();
-        move || {
-            let existing = WINDOW.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .map(|shell| (shell.closing.clone(), shell.app.as_weak()))
-            });
-            if let Some((closing, weak)) = existing {
-                if !closing.get() {
-                    if let Some(app) = weak.upgrade() {
-                        app.invoke_probe_selected();
-                        return;
-                    }
-                }
-            }
-            // No window: run the sweep directly; the status store still
-            // records every result for the next window.
-            let runtime = ctx.runtime.clone();
-            ctx.spawner.spawn(async move {
-                runtime.probe_sweep().await;
             });
         }
     });
