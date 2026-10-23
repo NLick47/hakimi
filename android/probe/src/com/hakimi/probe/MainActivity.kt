@@ -44,6 +44,7 @@ import com.hakimi.probe.ui.SiteEditorSheet
 import com.hakimi.probe.ui.SiteInfo
 import com.hakimi.probe.ui.SitesScreen
 import com.hakimi.probe.ui.TopBar
+import com.hakimi.probe.ui.UpdateSheet
 import com.hakimi.probe.ui.column
 import com.hakimi.probe.ui.clickOnce
 import com.hakimi.probe.ui.dp
@@ -69,6 +70,9 @@ class MainActivity : Activity(), Host {
         private const val REQUEST_SAVE_CA = 42
         private const val REQUEST_NOTIFICATIONS = 43
         private const val REQUEST_VPN = 44
+
+        /** Automatic checks are spaced a day apart; manual checks ignore this. */
+        private const val UPDATE_INTERVAL_MS = 24L * 60 * 60 * 1000
     }
 
     /** Trusted in either the user store or the system store. */
@@ -118,6 +122,24 @@ class MainActivity : Activity(), Host {
 
     override val savingConfig: Boolean
         get() = configSaving
+
+    private var appVersionName = "0.0.0"
+    private var coreVersionName = ""
+
+    override val appVersion: String
+        get() = appVersionName
+
+    override val coreVersion: String
+        get() = coreVersionName
+
+    @Volatile
+    private var updateStateNow: UpdateState = UpdateState.Idle
+
+    override val updateState: UpdateState
+        get() = updateStateNow
+
+    private var updateChecking = false
+    private var updateSheet: UpdateSheet? = null
 
     private val handler = Handler(Looper.getMainLooper())
     private val operations = Executors.newFixedThreadPool(3)
@@ -175,9 +197,14 @@ class MainActivity : Activity(), Host {
         super.onCreate(savedInstanceState)
         lastCaExportName = Prefs.caExportName(this)
         awaitingCaInstall = Prefs.awaitingCaInstall(this)
+        appVersionName = runCatching {
+            packageManager.getPackageInfo(packageName, 0).versionName
+        }.getOrNull().orEmpty().ifEmpty { "0.0.0" }
+        coreVersionName = runCatching { Native.version() }.getOrDefault("")
         buildShell()
         edgeToEdge()
         buildScreens()
+        restoreKnownUpdate()
         handleIntent(intent)
     }
 
@@ -269,6 +296,9 @@ class MainActivity : Activity(), Host {
         }
         handler.removeCallbacks(pollTask)
         handler.post(pollTask)
+        handler.post {
+            if (resumed) maybeAutoCheckUpdate()
+        }
     }
 
     override fun onPause() {
@@ -1421,6 +1451,113 @@ class MainActivity : Activity(), Host {
                     Prefs.setAwaitingCaInstall(this, false)
                 }
             }
+        }
+    }
+
+    // -- updates -------------------------------------------------------------
+
+    /** Restores an update found before the process last exited, without a network call. */
+    private fun restoreKnownUpdate() {
+        val latest = Prefs.updateLatest(this)
+        if (latest.isEmpty()) return
+        if (AppVersion.isNewer(latest, appVersionName)) {
+            updateStateNow = UpdateState.Available(
+                UpdateInfo(latest, UpdateChecker.releaseUrl(latest), "")
+            )
+            nav.setBadge(2, true)
+        } else {
+            // This install already caught up; drop the stale marker.
+            Prefs.setUpdateLatest(this, "")
+        }
+    }
+
+    private fun maybeAutoCheckUpdate() {
+        val last = Prefs.updateCheckedAt(this)
+        val elapsed = System.currentTimeMillis() - last
+        if (last > 0 && elapsed in 0 until UPDATE_INTERVAL_MS) return
+        checkUpdate(manual = false)
+    }
+
+    override fun checkUpdate(manual: Boolean) {
+        if (updateChecking) {
+            if (manual) showSnack("正在检查更新，请稍候")
+            return
+        }
+        updateChecking = true
+        updateStateNow = UpdateState.Checking
+        if (manual) showSnack("正在检查更新…")
+        render()
+
+        operations.execute {
+            val result = runCatching { UpdateChecker.check(appVersionName) }
+            handler.post {
+                if (isFinishing || isDestroyed) return@post
+                updateChecking = false
+                Prefs.setUpdateCheckedAt(this, System.currentTimeMillis())
+                var available: UpdateInfo? = null
+                updateStateNow = result.fold(
+                    onSuccess = { outcome ->
+                        when (outcome) {
+                            is UpdateChecker.Result.Newer -> {
+                                available = outcome.info
+                                Prefs.setUpdateLatest(this, outcome.info.version)
+                                UpdateState.Available(outcome.info)
+                            }
+                            UpdateChecker.Result.UpToDate -> {
+                                Prefs.setUpdateLatest(this, "")
+                                UpdateState.UpToDate
+                            }
+                        }
+                    },
+                    onFailure = { error ->
+                        Log.w(TAG, "update check failed", error)
+                        UpdateState.Failed
+                    },
+                )
+                nav.setBadge(2, available != null)
+                render()
+                val info = available
+                when {
+                    info != null -> {
+                        if (manual) {
+                            // The sheet already announced it; don't repeat it
+                            // as a toast on the next automatic check.
+                            Prefs.setUpdateNotified(this, info.version)
+                            showUpdateSheet()
+                        } else {
+                            notifyUpdateOnce(info)
+                        }
+                    }
+                    manual && updateStateNow == UpdateState.UpToDate -> {
+                        showSnack("已是最新版本 $appVersionName")
+                    }
+                    manual && updateStateNow == UpdateState.Failed -> {
+                        showSnack("检查更新失败，请稍后再试", error = true)
+                    }
+                }
+            }
+        }
+    }
+
+    /** The automatic check announces a version only once. */
+    private fun notifyUpdateOnce(info: UpdateInfo) {
+        if (Prefs.updateNotified(this) == info.version) return
+        Prefs.setUpdateNotified(this, info.version)
+        showSnack("发现新版本 v${info.version}，可在设置中查看")
+    }
+
+    override fun showUpdateSheet() {
+        val info = (updateStateNow as? UpdateState.Available)?.info ?: return
+        if (updateSheet?.isShowing == true) return
+        updateSheet = UpdateSheet(this, this, info).also { it.show() }
+    }
+
+    override fun openUpdate() {
+        val info = (updateStateNow as? UpdateState.Available)?.info
+        if (info == null) {
+            openUrl(UpdateChecker.RELEASES_URL)
+        } else {
+            openUrl(info.url.ifEmpty { UpdateChecker.releaseUrl(info.version) })
         }
     }
 

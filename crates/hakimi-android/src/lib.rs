@@ -340,6 +340,16 @@ pub extern "system" fn Java_com_hakimi_probe_Native_status(
     new_string(&mut env, value)
 }
 
+/// Version baked into the native library. Unlike `status`, this works before
+/// the runtime is initialized, so the settings page can always show it.
+#[no_mangle]
+pub extern "system" fn Java_com_hakimi_probe_Native_version(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    new_string(&mut env, hakimi_core::VERSION.to_string())
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_hakimi_probe_Native_caPem(
     mut env: JNIEnv,

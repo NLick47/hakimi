@@ -10,6 +10,7 @@ import android.widget.TextView
 import com.hakimi.probe.Bootstrap
 import com.hakimi.probe.CaTrust
 import com.hakimi.probe.Prefs
+import com.hakimi.probe.UpdateState
 
 class SettingsScreen(private val context: Context, private val host: Host) {
     val view: ScrollView = ScrollView(context).apply {
@@ -22,10 +23,6 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         orientation = LinearLayout.VERTICAL
         setPadding(0, context.dp(12f), 0, context.dp(104f))
     }
-
-    private val appVersion: String = runCatching {
-        context.packageManager.getPackageInfo(context.packageName, 0).versionName
-    }.getOrNull().orEmpty().ifEmpty { "0.3" }
 
     private lateinit var envRow: SettingRow
     private lateinit var serviceRow: SettingRow
@@ -45,7 +42,7 @@ class SettingsScreen(private val context: Context, private val host: Host) {
     private lateinit var logRow: SettingRow
     private lateinit var exportDiagnosticsRow: SettingRow
 
-    private lateinit var versionRow: SettingRow
+    private lateinit var updateRow: SettingRow
 
     init {
         view.addView(content, LinearLayout.LayoutParams(
@@ -157,12 +154,18 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         content.addView(space(10f))
 
         content.addView(section("关于"))
-        versionRow = SettingRow(context, "版本", "Kotlin · 原生 View · Rust core")
-        versionRow.hideChevron()
+        updateRow = SettingRow(context, "检查更新")
+        updateRow.clickOnce(700L) {
+            when (host.updateState) {
+                UpdateState.Checking -> host.showSnack("正在检查更新，请稍候")
+                is UpdateState.Available -> host.showUpdateSheet()
+                else -> host.checkUpdate(manual = true)
+            }
+        }
         val dataRow = SettingRow(context, "数据目录", "点击复制应用私有路径")
         dataRow.setValue(Bootstrap.dataDir(context).absolutePath)
         dataRow.clickOnce(1200L) { host.copy(Bootstrap.dataDir(context).absolutePath, "数据目录") }
-        content.addView(rowsCard(versionRow, dataRow))
+        content.addView(rowsCard(updateRow, dataRow))
         content.addView(space(16f))
 
         content.addView(context.text("本地处理 · 不收集浏览数据", 11f, Palette.MUTED).apply {
@@ -257,7 +260,30 @@ class SettingsScreen(private val context: Context, private val host: Host) {
             if (host.exportingDiagnostics) "导出中…" else "",
             Palette.MUTED
         )
-        versionRow.setValue(appVersion)
+        val coreVersion = host.coreVersion.ifEmpty { data.version }.ifEmpty { "—" }
+        updateRow.setSubtitle("客户端版本 ${host.appVersion} · Rust Core $coreVersion")
+        when (val update = host.updateState) {
+            UpdateState.Idle -> {
+                updateRow.setValue("尚未检查", Palette.MUTED)
+                updateRow.setBusy(false)
+            }
+            UpdateState.Checking -> {
+                updateRow.setValue("检查中…", Palette.MUTED)
+                updateRow.setBusy(true)
+            }
+            UpdateState.UpToDate -> {
+                updateRow.setValue("已是最新", Palette.GREEN)
+                updateRow.setBusy(false)
+            }
+            is UpdateState.Available -> {
+                updateRow.setValue("v${update.info.version}", Palette.ACCENT)
+                updateRow.setBusy(false)
+            }
+            UpdateState.Failed -> {
+                updateRow.setValue("暂时无法检查", Palette.AMBER)
+                updateRow.setBusy(false)
+            }
+        }
     }
 
     private fun excludedSummary(packages: Set<String>): String {

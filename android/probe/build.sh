@@ -24,8 +24,45 @@ JNI_DIR="$REPO/target/android-jni"
 # Official releases are arm64-only. Pass ABIS=x86_64 when building for an
 # emulator, or ABIS="arm64-v8a x86_64" for a combined local build.
 ABIS="${ABIS:-arm64-v8a}"
-VERSION_NAME="${VERSION_NAME:-0.3}"
-VERSION_CODE="${VERSION_CODE:-3}"
+
+# Local builds follow the Rust workspace version so the APK, the desktop
+# client and the core report the same number. Release CI passes VERSION_NAME
+# and VERSION_CODE from the tag, which override these defaults.
+workspace_version() {
+  awk '
+    /^\[workspace\.package\]/ { section = 1; next }
+    /^\[/ { section = 0 }
+    section && /^[[:space:]]*version[[:space:]]*=/ {
+      sub(/^[^"]*"/, "")
+      sub(/".*$/, "")
+      print
+      exit
+    }
+  ' "$REPO/Cargo.toml"
+}
+
+DEFAULT_VERSION_NAME="$(workspace_version)"
+if [ -z "$DEFAULT_VERSION_NAME" ]; then
+  echo "could not read [workspace.package] version from Cargo.toml" >&2
+  exit 1
+fi
+VERSION_NAME="${VERSION_NAME:-$DEFAULT_VERSION_NAME}"
+
+# Same derivation as the release workflow: major * 1_000_000 + minor * 1_000
+# + patch, ignoring prerelease/build metadata.
+version_base="${VERSION_NAME%%[-+]*}"
+IFS=. read -r version_major version_minor version_patch <<< "$version_base"
+version_major="${version_major:-0}"
+version_minor="${version_minor:-0}"
+version_patch="${version_patch:-0}"
+case "$version_major$version_minor$version_patch" in
+  ''|*[!0-9]*)
+    echo "VERSION_NAME must start with a numeric major.minor.patch: $VERSION_NAME" >&2
+    exit 1
+    ;;
+esac
+DEFAULT_VERSION_CODE=$((10#$version_major * 1000000 + 10#$version_minor * 1000 + 10#$version_patch))
+VERSION_CODE="${VERSION_CODE:-$DEFAULT_VERSION_CODE}"
 APK_OUT="${APK_OUT:-$ROOT/hakimi-probe.apk}"
 MIN_SDK="${MIN_SDK:-26}"
 TARGET_SDK="${TARGET_SDK:-35}"

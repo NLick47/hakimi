@@ -2,6 +2,39 @@ plugins {
     id("com.android.application") version "9.3.0"
 }
 
+val repoRoot = rootProject.projectDir.parentFile.parentFile
+
+/** Keep IDE builds in step with build.sh and the Rust workspace version. */
+fun workspaceVersion(): String {
+    val manifest = File(repoRoot, "Cargo.toml")
+    var inPackage = false
+    for (line in manifest.readLines()) {
+        val trimmed = line.trim()
+        if (trimmed.startsWith("[")) {
+            inPackage = trimmed == "[workspace.package]"
+            continue
+        }
+        if (inPackage) {
+            val value = Regex("""^version\s*=\s*"([^"]+)"""")
+                .find(trimmed)
+                ?.groupValues
+                ?.get(1)
+            if (value != null) return value
+        }
+    }
+    error("could not read [workspace.package] version from ${manifest.path}")
+}
+
+fun versionCodeFor(version: String): Int {
+    val parts = version.substringBefore('-').substringBefore('+').split('.')
+    val major = parts.getOrNull(0)?.toIntOrNull() ?: 0
+    val minor = parts.getOrNull(1)?.toIntOrNull() ?: 0
+    val patch = parts.getOrNull(2)?.toIntOrNull() ?: 0
+    return major * 1_000_000 + minor * 1_000 + patch
+}
+
+val appVersion = workspaceVersion()
+
 android {
     namespace = "com.hakimi.probe"
     compileSdk = 37
@@ -11,8 +44,8 @@ android {
         applicationId = "com.hakimi.probe"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.3"
+        versionCode = versionCodeFor(appVersion)
+        versionName = appVersion
     }
 
     sourceSets {
@@ -57,7 +90,6 @@ android {
 // Android Studio's Gradle build does not compile Rust on its own. Without
 // this, jniLibs/ keeps whatever `build.sh` copied last and debug APKs ship a
 // stale native core. Build it here and copy the result before packaging.
-val repoRoot = rootProject.projectDir.parentFile.parentFile
 val cargoHome = System.getenv("CARGO_HOME")
     ?: File(System.getProperty("user.home"), ".cargo").absolutePath
 val cargoBin = File(cargoHome, "bin")

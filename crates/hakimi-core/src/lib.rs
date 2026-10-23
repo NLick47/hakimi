@@ -15,6 +15,9 @@
 //! - [`status`] group/domain state and diagnostics
 //! - [`logging`] local logging and redaction
 
+/// Version of the linked core crate, reported separately from the client shell.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[cfg(test)]
 mod bench;
 pub mod ca;

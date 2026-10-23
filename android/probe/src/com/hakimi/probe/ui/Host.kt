@@ -1,5 +1,6 @@
 package com.hakimi.probe.ui
 
+import com.hakimi.probe.UpdateState
 import org.json.JSONObject
 
 data class DiagnoseOutcome(
@@ -25,6 +26,9 @@ interface Host {
     val loadingLog: Boolean
     val exportingDiagnostics: Boolean
     val savingConfig: Boolean
+    val appVersion: String
+    val coreVersion: String
+    val updateState: UpdateState
 
     fun toggleAcceleration()
     fun setGroupEnabled(site: SiteInfo, enabled: Boolean)
@@ -51,6 +55,9 @@ interface Host {
     fun openCaInstallSettings()
     fun openCaLockSettings()
     fun recheckCa()
+    fun checkUpdate(manual: Boolean)
+    fun showUpdateSheet()
+    fun openUpdate()
     fun openUrl(url: String)
     fun copy(text: String, label: String)
     fun openSite(site: SiteInfo)

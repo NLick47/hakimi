@@ -1,8 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.hakimi.probe"
-    android:versionCode="3"
-    android:versionName="0.3">
+    package="com.hakimi.probe">
 
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
 
@@ -24,9 +22,8 @@
 
     <application
         android:allowBackup="false"
-        android:debuggable="true"
         android:icon="@mipmap/ic_launcher"
-        android:label="hakimi"
+        android:label="Hakimi"
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
         android:networkSecurityConfig="@xml/network_security_config"

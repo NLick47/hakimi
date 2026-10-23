@@ -540,10 +540,11 @@ class BottomNav(context: Context) : LinearLayout(context) {
 class SettingRow(
     context: Context,
     title: String,
-    subtitle: String,
+    subtitle: String = "",
 ) : LinearLayout(context) {
     private val valueView: TextView
     private val chevron: TextView
+    private val subtitleView: TextView
 
     init {
         orientation = HORIZONTAL
@@ -554,9 +555,11 @@ class SettingRow(
         val texts = context.column()
         addView(texts, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
         texts.addView(context.text(title, 14.5f, Palette.TEXT, medium = true))
-        val sub = context.text(subtitle, 12f, Palette.MUTED)
-        sub.setPadding(0, context.dp(3f), 0, 0)
-        texts.addView(sub)
+        subtitleView = context.text(subtitle, 12f, Palette.MUTED).apply {
+            setPadding(0, context.dp(3f), 0, 0)
+            visibility = if (subtitle.isEmpty()) View.GONE else View.VISIBLE
+        }
+        texts.addView(subtitleView)
 
         valueView = context.text("", 12.5f, Palette.TEXT_2)
         valueView.gravity = Gravity.END
@@ -577,6 +580,13 @@ class SettingRow(
     fun setValue(text: String, color: Int = Palette.TEXT_2) {
         valueView.text = text
         valueView.setTextColor(color)
+    }
+
+    /** Updates the second line without rebuilding the row. */
+    fun setSubtitle(text: String) {
+        if (subtitleView.text.toString() == text) return
+        subtitleView.text = text
+        subtitleView.visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
     }
 
     /** Visually locks a row while its async action is still running. */

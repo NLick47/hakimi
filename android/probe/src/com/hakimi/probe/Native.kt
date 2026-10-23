@@ -23,6 +23,9 @@ object Native {
 
     @JvmStatic external fun status(): String
 
+    /** Core version baked into the native library, available before startup. */
+    @JvmStatic external fun version(): String
+
     @JvmStatic external fun config(): String
 
     @JvmStatic external fun defaultCatalogUrls(): String
