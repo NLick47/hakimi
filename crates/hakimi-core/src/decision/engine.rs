@@ -47,11 +47,11 @@ pub struct DecisionEngine {
     plan_cache_count: AtomicUsize,
     /// Routes that produced an HTTP rejection (403/421/451). Keyed by
     /// `domain|mode`; entries expire after [`ROUTE_REJECTION_TTL`].
-    route_rejections: parking_lot::RwLock<HashMap<String, Instant>>,
+    pub(super) route_rejections: parking_lot::RwLock<HashMap<String, Instant>>,
     /// Individual IPs that returned an abuse/block page for a domain. Unlike
     /// `route_rejections`, only the address is dropped; other IPs on the same
     /// route mode may still work.
-    ip_rejections: parking_lot::RwLock<HashMap<String, HashMap<IpAddr, Instant>>>,
+    pub(super) ip_rejections: parking_lot::RwLock<HashMap<String, HashMap<IpAddr, Instant>>>,
     /// The route that was last logged for a domain.
     ///
     /// The resolution line is by far the most frequent line in the log: a
@@ -565,6 +565,19 @@ impl DecisionEngine {
         );
     }
 
+    /// Apply the status policy shared by real upstream traffic. Candidate-level
+    /// block pages take precedence for groups that opt in, so one abusive IP
+    /// does not discard an otherwise healthy route mode. Everything else falls
+    /// back to the route-level rejection policy.
+    pub fn note_upstream_response(&self, domain: &str, port: u16, tls: bool, status: StatusCode) {
+        if matches!(status.as_u16(), 400 | 403 | 429 | 451)
+            && self.note_blocked_candidate(domain, port, tls, status)
+        {
+            return;
+        }
+        self.note_http_rejection(domain, port, tls, status);
+    }
+
     /// A block or rate-limit page is tied to the candidate IP, not necessarily
     /// to the route mode. Penalize just that IP and re-plan; rejecting the
     /// whole mode would also discard its healthy addresses. Only groups that
@@ -624,6 +637,22 @@ impl DecisionEngine {
     /// Configuration edits can change the route a rejection belonged to.
     pub fn clear_route_rejections(&self) {
         self.route_rejections.write().clear();
+    }
+
+    /// Forget all observations tied to the previous local network. The
+    /// remembered last-good entry is intentionally kept (the fresh race still
+    /// tests it first), but route decisions, rejection timers and quality
+    /// rankings were learned on a path that may no longer exist.
+    pub fn on_network_change(&self) {
+        self.forget_all_plans();
+        self.clear_route_rejections();
+        self.ip_rejections.write().clear();
+        {
+            let mut scores = self.ip_scores.write();
+            scores.clear();
+        }
+        self.ip_score_count.store(0, Ordering::Relaxed);
+        self.cache.clear_ip_scores();
     }
 
     pub fn forget_plan(&self, domain: &str, port: u16, tls: bool) {

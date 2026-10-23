@@ -7,7 +7,7 @@ use std::time::Duration as StdDuration;
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::strategy::IpSource;
@@ -168,6 +168,10 @@ pub struct CacheManager {
     path: PathBuf,
     data: RwLock<CacheData>,
     dirty: AtomicBool,
+    /// Stop handle for the one background flusher. Keeping it here makes
+    /// `start_auto_flush` idempotent and lets the runtime cancel the task on
+    /// stop instead of leaving a flusher behind for a stopped runtime.
+    auto_flush_stop: Mutex<Option<tokio::sync::watch::Sender<()>>>,
 }
 
 impl CacheManager {
@@ -194,6 +198,7 @@ impl CacheManager {
             path,
             data: RwLock::new(data),
             dirty: AtomicBool::new(false),
+            auto_flush_stop: Mutex::new(None),
         })
     }
 
@@ -252,22 +257,45 @@ impl CacheManager {
 
     /// Start the background flusher. Cache writes are hints, so a few seconds of latency is
     /// fine while the fsyncs move off the request path entirely.
+    ///
+    /// Starting twice is a no-op: the runtime may start, stop and start again,
+    /// and each cache must never accumulate a second flusher.
     pub fn start_auto_flush(self: &Arc<Self>, interval: StdDuration) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             tracing::debug!("no tokio runtime available; the cache is written on shutdown");
             return;
         };
+        let mut stop = self.auto_flush_stop.lock();
+        if stop.is_some() {
+            return;
+        }
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(());
+        *stop = Some(stop_tx);
+        drop(stop);
+
         let manager = self.clone();
         handle.spawn(async move {
             loop {
-                tokio::time::sleep(interval).await;
-                // Serializing the cache and fsyncing it are blocking operations.
-                // Keep them off the async workers so a slow disk cannot stall
-                // proxy request handling.
-                let manager = manager.clone();
-                let _ = tokio::task::spawn_blocking(move || manager.flush_if_dirty()).await;
+                tokio::select! {
+                    _ = stop_rx.changed() => break,
+                    _ = tokio::time::sleep(interval) => {
+                        // Serializing the cache and fsyncing it are blocking operations.
+                        // Keep them off the async workers so a slow disk cannot stall
+                        // proxy request handling.
+                        let manager = manager.clone();
+                        let _ = tokio::task::spawn_blocking(move || manager.flush_if_dirty()).await;
+                    }
+                }
             }
         });
+    }
+
+    /// Stop the background flusher, if one is running. Safe to call repeatedly
+    /// and from `HakimiRuntime::stop`/`Drop`.
+    pub fn stop_auto_flush(&self) {
+        if let Some(stop) = self.auto_flush_stop.lock().take() {
+            let _ = stop.send(());
+        }
     }
 
     fn expire(data: &mut CacheData, now: DateTime<Utc>) {
@@ -439,6 +467,18 @@ impl CacheManager {
                 failures,
             }),
         );
+    }
+
+    /// Discard all persisted quality samples. The decision engine calls this
+    /// after a network change: scores describe the old path and would otherwise
+    /// survive a restart and rank candidates for a network they never saw.
+    pub fn clear_ip_scores(&self) {
+        let mut data = self.data.write();
+        if data.ip_scores.is_empty() {
+            return;
+        }
+        data.ip_scores.clear();
+        self.mark_dirty(&data);
     }
 
     /// Drop remembered routes that no freshness setting can use anymore, and cap
@@ -668,6 +708,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = CacheManager::load(dir.path().join("state.json")).unwrap();
         (dir, manager)
+    }
+
+    #[tokio::test]
+    async fn auto_flush_can_be_started_idempotently_and_stopped() {
+        let (_dir, cache) = manager();
+        let cache = Arc::new(cache);
+        let interval = StdDuration::from_secs(3600);
+
+        cache.start_auto_flush(interval);
+        assert!(cache.auto_flush_stop.lock().is_some());
+        cache.start_auto_flush(interval);
+        assert!(
+            cache.auto_flush_stop.lock().is_some(),
+            "a second start must not replace the existing flusher"
+        );
+
+        cache.stop_auto_flush();
+        assert!(cache.auto_flush_stop.lock().is_none());
+
+        cache.start_auto_flush(interval);
+        assert!(
+            cache.auto_flush_stop.lock().is_some(),
+            "a stopped runtime must be able to start a fresh flusher"
+        );
+        cache.stop_auto_flush();
+    }
+
+    #[test]
+    fn clearing_ip_scores_removes_and_persists_the_cleared_state() {
+        let (_dir, cache) = manager();
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        cache.put_ip_score("example.com", ip, 120.0, 2, 0);
+        assert_eq!(cache.ip_scores().len(), 1);
+
+        cache.clear_ip_scores();
+        assert!(cache.ip_scores().is_empty());
+        cache.flush_if_dirty();
+
+        let reloaded = CacheManager::load(cache.path()).unwrap();
+        assert!(
+            reloaded.ip_scores().is_empty(),
+            "cleared scores must not return after a restart"
+        );
     }
 
     #[test]

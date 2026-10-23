@@ -2,7 +2,7 @@ use std::collections::{HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -591,18 +591,51 @@ fn plan_cache_count_tracks_inserts_replacements_and_removals() {
 }
 
 #[test]
-fn network_change_drops_remembered_plans() {
+fn network_change_clears_network_scoped_state() {
     let h = harness(&["example.com"], RoutePolicy::direct());
+    let ip: IpAddr = "1.1.1.1".parse().unwrap();
     h.engine
         .remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
     assert!(h.engine.cached_plan("example.com", 443, true).is_some());
 
-    h.engine.forget_all_plans();
+    h.engine
+        .route_rejections
+        .write()
+        .insert("example.com|direct".into(), Instant::now());
+    h.engine
+        .ip_rejections
+        .write()
+        .entry("example.com".into())
+        .or_default()
+        .insert(ip, Instant::now());
+    h.engine.record_ip("example.com", ip, Some(25), false);
+    assert!(h.engine.route_rejected("example.com", TlsMode::Direct));
+    assert!(h.engine.ip_rejected("example.com", ip));
+    assert_eq!(h.cache.ip_scores().len(), 1);
+
+    h.engine.on_network_change();
+
     assert!(
         h.engine.cached_plan("example.com", 443, true).is_none(),
         "a plan remembered on the old network must not survive"
     );
     assert_eq!(h.engine.plan_cache_len(), 0);
+    assert!(
+        !h.engine.route_rejected("example.com", TlsMode::Direct),
+        "route rejection timers must not leak across networks"
+    );
+    assert!(
+        !h.engine.ip_rejected("example.com", ip),
+        "candidate rejections must not leak across networks"
+    );
+    assert!(
+        h.engine.ip_scores.read().is_empty(),
+        "quality scores describe the old network"
+    );
+    assert!(
+        h.cache.ip_scores().is_empty(),
+        "cleared scores must also be removed from the persisted cache"
+    );
 }
 
 #[test]
@@ -772,6 +805,32 @@ async fn blocked_warmup_penalizes_only_the_cached_ip() {
     };
     let plan = cursor.next_plan().await.expect("good IP plan");
     assert_eq!(plan.ip, good);
+}
+
+#[test]
+fn real_traffic_block_pages_use_candidate_recovery_for_opted_groups() {
+    let h = harness(
+        &["example.com"],
+        RoutePolicy::sni(vec!["www.baidu.com".into()]),
+    );
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::FakeSni, Some("www.baidu.com"))));
+    h.engine
+        .note_upstream_response("example.com", 443, true, http::StatusCode::FORBIDDEN);
+    assert!(h.engine.route_rejected("example.com", TlsMode::FakeSni));
+
+    let bad: IpAddr = "1.1.1.1".parse().unwrap();
+    let mut github_plan = test_plan(TlsMode::Direct, None);
+    github_plan.domain = "github.com".into();
+    github_plan.group_id = "github".into();
+    h.engine.remember_plan_arc(Arc::new(github_plan));
+    h.engine
+        .note_upstream_response("github.com", 443, true, http::StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        !h.engine.route_rejected("github.com", TlsMode::Direct),
+        "a block page for one opted-in candidate must not discard the whole mode"
+    );
+    assert!(h.engine.ip_rejected("github.com", bad));
 }
 
 #[tokio::test]
@@ -1050,6 +1109,45 @@ async fn skip_once_prefers_new_remote_ip() {
     let outcome = harness.engine.decide_https("example.com").await;
     assert_eq!(outcome.plan.unwrap().ip.to_string(), "8.8.8.8");
     assert!(!harness.cache.has_skip_once("example.com"));
+}
+
+#[tokio::test]
+async fn skip_once_is_consumed_by_the_first_planner_not_by_construction() {
+    let harness = harness(&["example.com"], RoutePolicy::direct());
+    *harness.remote.catalog.lock() = true;
+    *harness.remote.ips.lock() = Some(vec!["8.8.8.8".parse().unwrap()]);
+    harness.cache.put_last_good(LastGoodEntry {
+        domain: "example.com".into(),
+        ip: "1.1.1.1".parse().unwrap(),
+        source: IpSource::Remote,
+        network_id: network_id(),
+        saved_at: now(),
+        catalog_version: 1,
+    });
+    harness.cache.mark_skip_once(["example.com"]);
+
+    let follower = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    assert!(follower.skip_once());
+    assert!(
+        harness.cache.has_skip_once("example.com"),
+        "constructing a follower/preconnect cursor must not consume the hint"
+    );
+    drop(follower);
+
+    let mut leader = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    assert!(harness.cache.has_skip_once("example.com"));
+    let plan = leader.next_plan().await.expect("a remote plan");
+    assert_eq!(plan.ip.to_string(), "8.8.8.8");
+    assert!(
+        !harness.cache.has_skip_once("example.com"),
+        "the first cursor that actually plans must consume the one-shot hint"
+    );
 }
 
 #[tokio::test]

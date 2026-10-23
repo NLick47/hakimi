@@ -53,6 +53,11 @@ pub struct RouteCursor {
     doh_loaded: bool,
     doh: DohExpansion,
     skip_once: bool,
+    /// Whether this cursor already consumed the one-shot catalog update hint.
+    /// The hint is deliberately not consumed by `new`: follower and preconnect
+    /// cursors are constructed but never race, and must not steal the marker
+    /// from the connection that actually produces plans.
+    skip_consumed: bool,
     remote_available: bool,
     /// Ordered attempts of the matched domain rule.
     route_attempts: Vec<RouteAttempt>,
@@ -102,9 +107,11 @@ impl RouteCursor {
         let (skip_hint, last_good) = engine
             .cache
             .route_hints(&domain, config.advanced.last_good_days);
-        // The common case is an empty set. Only take the write lock (and
-        // re-check) when the read-only hint saw a marker.
-        let skip_once = skip_hint && engine.cache.take_skip_once(&domain);
+        // Do not consume the one-shot marker here. `connect_group` builds
+        // cursors for followers and preconnect-only workspaces too; consuming
+        // on construction let one of them steal the hint before the elected
+        // leader raced. The candidate order still uses the read-only hint.
+        let skip_once = skip_hint;
         // One catalog snapshot for both the IPs and the "catalog loaded" flag.
         let (remote, remote_available) = engine.remote.remote_ips_with_catalog(&domain);
 
@@ -220,6 +227,7 @@ impl RouteCursor {
             doh_loaded: false,
             doh: DohExpansion::default(),
             skip_once,
+            skip_consumed: false,
             remote_available,
             route_attempts,
             attempt_index: 0,
@@ -262,6 +270,19 @@ impl RouteCursor {
     /// any cached route.
     pub fn skip_once(&self) -> bool {
         self.skip_once
+    }
+
+    /// Consume the catalog marker only when this cursor actually starts racing.
+    /// Followers and preconnect cursors are dropped without calling `next_plan`,
+    /// so they leave the marker for the elected leader.
+    fn consume_skip_once(&mut self) {
+        if self.skip_consumed {
+            return;
+        }
+        self.skip_consumed = true;
+        if self.skip_once {
+            self.engine.cache.take_skip_once(&self.domain);
+        }
     }
 
     /// Restrict this cursor to raw direct tunnels.
@@ -375,6 +396,7 @@ impl RouteCursor {
         if self.finished {
             return None;
         }
+        self.consume_skip_once();
         loop {
             if self.finished {
                 return None;

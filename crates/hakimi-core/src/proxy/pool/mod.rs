@@ -366,7 +366,7 @@ impl UpstreamPool {
                 // status back so the next connection drops that route.
                 if let Some(host) = debug_host {
                     self.engine
-                        .note_http_rejection(host, port, tls, response.status());
+                        .note_upstream_response(host, port, tls, response.status());
                 }
                 if response.version() == http::Version::HTTP_2 {
                     self.stats.responses_h2.fetch_add(1, Ordering::Relaxed);

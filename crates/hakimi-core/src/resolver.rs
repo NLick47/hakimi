@@ -19,6 +19,10 @@ use crate::util::{now, redact_url};
 
 const SHARED_ECH_DOMAIN: &str = "cloudflare-ech.com";
 const SHARED_ECH_TTL_SECS: u32 = 30 * 60;
+/// The DNS wire-format message is limited to 64 KiB. Enforce the limit while
+/// reading, not after `Response::bytes()` has already buffered an unbounded
+/// chunked response from a broken or hostile DoH endpoint.
+const MAX_DOH_RESPONSE_BYTES: usize = 65_535;
 /// After a DoH TTL expires, serve the still-usable answer for this short grace
 /// period while a background query refreshes it. Without the grace, every
 /// expired entry paid the full DoH timeout before the page could connect.
@@ -116,6 +120,28 @@ pub struct Resolver {
     /// Config/catalog revisions plus the derived endpoint list. A DoH query
     /// used to rebuild and re-clone this list on every cache miss.
     endpoint_cache: Arc<RwLock<EndpointCache>>,
+}
+
+async fn read_limited_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_DOH_RESPONSE_BYTES as u64)
+    {
+        bail!("DoH response is larger than {MAX_DOH_RESPONSE_BYTES} bytes");
+    }
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(0)
+            .min(MAX_DOH_RESPONSE_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response.chunk().await.context("reading DoH response")? {
+        if body.len().saturating_add(chunk.len()) > MAX_DOH_RESPONSE_BYTES {
+            bail!("DoH response is larger than {MAX_DOH_RESPONSE_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 impl Resolver {
@@ -932,17 +958,7 @@ impl Resolver {
         if !status.is_success() {
             bail!("DoH endpoint returned HTTP {status}");
         }
-        if response
-            .content_length()
-            .map(|len| len > 65_535)
-            .unwrap_or(false)
-        {
-            bail!("DoH response is larger than 65535 bytes");
-        }
-        let body = response.bytes().await.context("reading DoH response")?;
-        if body.len() > 65_535 {
-            bail!("DoH response is larger than 65535 bytes");
-        }
+        let body = read_limited_body(response).await?;
         let parsed = dns::parse_response(&body).context("parsing DoH response")?;
         if parsed.id != id {
             bail!(
@@ -1118,6 +1134,8 @@ mod tests {
     use crate::catalog::CatalogManager;
     use crate::config::ConfigManager;
     use crate::paths::Paths;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn resolver(dir: &std::path::Path) -> (Arc<ConfigManager>, Arc<CacheManager>, Arc<Resolver>) {
         let paths = Paths::new(dir);
@@ -1230,6 +1248,54 @@ mod tests {
         );
         // Let the background refresh observe the empty endpoint list and exit.
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_chunked_doh_body_is_rejected_while_streaming() {
+        crate::util::install_crypto_provider();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: application/dns-message\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let chunk = vec![b'x'; 4096];
+            for _ in 0..20 {
+                let header = format!("{:x}\r\n", chunk.len());
+                if socket.write_all(header.as_bytes()).await.is_err() {
+                    return;
+                }
+                if socket.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                if socket.write_all(b"\r\n").await.is_err() {
+                    return;
+                }
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        let error = read_limited_body(response).await.unwrap_err();
+        assert!(
+            error.to_string().contains("larger"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

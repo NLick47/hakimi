@@ -177,6 +177,7 @@ impl Drop for HakimiRuntime {
     /// The cache holds hints, and every write is deferred.  One-shot commands
     /// never start the background flusher, so the last flush happens here.
     fn drop(&mut self) {
+        self.cache.stop_auto_flush();
         self.cache.flush_if_dirty();
     }
 }
@@ -432,6 +433,7 @@ impl HakimiRuntime {
     }
 
     pub async fn stop(self: &Arc<Self>) -> Result<()> {
+        self.cache.stop_auto_flush();
         let was_started = self.started.swap(false, Ordering::SeqCst);
         if was_started {
             if let Some(shutdown) = self.shutdown.write().take() {
@@ -881,7 +883,7 @@ impl HakimiRuntime {
                     // A remembered route may be unreachable on the new network. Force
                     // new connections to re-race routes while still testing the
                     // last-good IP first.
-                    runtime.engine.forget_all_plans();
+                    runtime.engine.on_network_change();
                     let _ = runtime.resolver.health_check().await;
                     runtime.warm_groups().await;
                 }

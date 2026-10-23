@@ -182,6 +182,52 @@ async fn cancelled_discovery_does_not_poison_the_domain() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_real_block_page_penalizes_the_candidate_ip() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buffer = [0_u8; 8192];
+        let _ = socket.read(&mut buffer).await;
+        let _ = socket
+            .write_all(
+                b"HTTP/1.1 429 Too Many Requests\r\n\
+                  Content-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, config) = engine_for(dir.path());
+    config
+        .mutate(|config| {
+            config.groups[0].id = "github".into();
+            Ok(())
+        })
+        .unwrap();
+    let tls = TlsContext::new().unwrap();
+    let pool = UpstreamPool::new(engine.clone(), tls, &config.snapshot());
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://upstream.test:{port}/"))
+        .body(Either::Right(Full::new(Bytes::new())))
+        .unwrap();
+
+    let response = pool.send(request, false).await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        engine.cached_plan("upstream.test", port, false).is_none(),
+        "the blocked route must be dropped"
+    );
+    let scores = engine.cache.ip_scores();
+    let (_, _, entry) = scores
+        .iter()
+        .find(|(domain, ip, _)| domain == "upstream.test" && ip.to_string() == "127.0.0.1")
+        .expect("the blocked address should have a failure score");
+    assert!(entry.failures > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http1_connections_are_reused() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
