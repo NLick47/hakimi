@@ -320,7 +320,7 @@ class SiteRowView(
         texts.setPadding(context.dp(11f), 0, context.dp(8f), 0)
         addView(texts, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
 
-        nameView = context.text("", if (compact) 15f else 15.5f, Palette.TEXT, medium = true)
+        nameView = context.text("", 14.5f, Palette.TEXT, medium = true)
         nameView.maxLines = 1
         nameView.ellipsize = android.text.TextUtils.TruncateAt.END
         texts.addView(nameView)
@@ -577,6 +577,12 @@ class SettingRow(
     fun setValue(text: String, color: Int = Palette.TEXT_2) {
         valueView.text = text
         valueView.setTextColor(color)
+    }
+
+    /** Visually locks a row while its async action is still running. */
+    fun setBusy(busy: Boolean) {
+        isEnabled = !busy
+        alpha = if (busy) 0.55f else 1f
     }
 
     fun hideChevron() {

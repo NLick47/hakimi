@@ -40,6 +40,10 @@ class SettingsScreen(private val context: Context, private val host: Host) {
     private lateinit var resetCatalogRow: SettingRow
     private lateinit var alwaysOnRow: SettingRow
     private lateinit var batteryRow: SettingRow
+    private lateinit var refreshCatalogRow: SettingRow
+    private lateinit var diagnoseRow: SettingRow
+    private lateinit var logRow: SettingRow
+    private lateinit var exportDiagnosticsRow: SettingRow
 
     private lateinit var versionRow: SettingRow
 
@@ -58,14 +62,15 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         serviceRow = SettingRow(context, "核心服务", "本地加速核心的运行状态")
         serviceRow.hideChevron()
         content.addView(rowsCard(modeRow, excludedRow, envRow, serviceRow))
-        content.addView(space(8f))
+        content.addView(space(10f))
 
         content.addView(section("证书"))
         certRow = SettingRow(context, "本地 CA", "浏览器信任后才能通过 hakimi 加速")
         certRow.clickOnce { host.openCaSetup() }
         val certCard = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            background = context.rounded(Palette.SURFACE, 0f)
+            background = context.rounded(Palette.SURFACE, 18f, Palette.BORDER, 1f)
+            clipToOutline = true
         }
         certCard.addView(certRow)
         certCard.addView(context.divider(0f), LinearLayout.LayoutParams(
@@ -85,8 +90,14 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         certActions.addView(textAction("安装证书") { host.openCaSetup() })
         certActions.addView(textAction("导出备份") { host.exportCaBackup() })
         certCard.addView(certActions)
-        content.addView(certCard)
-        content.addView(space(8f))
+        content.addView(certCard, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            marginStart = context.dp(16f)
+            marginEnd = context.dp(16f)
+        })
+        content.addView(space(10f))
 
         content.addView(section("网络"))
         portRow = SettingRow(context, "本地端口", "修改前需要先停止加速")
@@ -114,40 +125,49 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         resetCatalogRow = SettingRow(context, "恢复默认目录", "把 IP/DoH 目录恢复为内置地址")
         resetCatalogRow.clickOnce { host.resetCatalogs() }
         content.addView(rowsCard(portRow, ipCatalogRow, dohCatalogRow, resetCatalogRow))
-        content.addView(space(8f))
+        content.addView(space(10f))
 
         content.addView(section("后台"))
         alwaysOnRow = SettingRow(context, "始终开启", "系统在开机后恢复 VPN")
-        alwaysOnRow.clickOnce { host.openVpnSettings() }
+        alwaysOnRow.clickOnce(1500L) { host.openVpnSettings() }
         batteryRow = SettingRow(context, "后台保活", "关闭电池优化，减少息屏回收")
-        batteryRow.clickOnce { host.requestBatteryExemption() }
+        batteryRow.clickOnce(1500L) { host.requestBatteryExemption() }
         content.addView(rowsCard(alwaysOnRow, batteryRow))
-        content.addView(space(8f))
+        content.addView(space(10f))
 
         content.addView(section("工具"))
-        val catalogs = SettingRow(context, "刷新远程目录", "重新拉取 IP 与 DoH 目录")
-        catalogs.clickOnce { host.refreshCatalogs() }
-        val diagnose = SettingRow(context, "域名诊断", "查看单域名的完整路由尝试过程")
-        diagnose.clickOnce { host.diagnosePrompt() }
-        val log = SettingRow(context, "运行日志", "最近的核心日志，便于定位问题")
-        log.clickOnce { host.showLog() }
-        val export = SettingRow(context, "导出诊断包", "包含脱敏配置与运行状态")
-        export.clickOnce { host.exportDiagnostics() }
-        content.addView(rowsCard(catalogs, diagnose, log, export))
-        content.addView(space(8f))
+        refreshCatalogRow = SettingRow(context, "刷新远程目录", "重新拉取 IP 与 DoH 目录")
+        refreshCatalogRow.clickOnce {
+            refreshCatalogRow.setBusy(true)
+            host.refreshCatalogs()
+        }
+        diagnoseRow = SettingRow(context, "域名诊断", "查看单域名的完整路由尝试过程")
+        diagnoseRow.clickOnce { host.diagnosePrompt() }
+        logRow = SettingRow(context, "运行日志", "最近的核心日志，便于定位问题")
+        logRow.clickOnce {
+            logRow.setBusy(true)
+            host.showLog()
+        }
+        exportDiagnosticsRow = SettingRow(context, "导出诊断包", "包含脱敏配置与运行状态")
+        exportDiagnosticsRow.clickOnce {
+            exportDiagnosticsRow.setBusy(true)
+            host.exportDiagnostics()
+        }
+        content.addView(rowsCard(refreshCatalogRow, diagnoseRow, logRow, exportDiagnosticsRow))
+        content.addView(space(10f))
 
         content.addView(section("关于"))
         versionRow = SettingRow(context, "版本", "Kotlin · 原生 View · Rust core")
         versionRow.hideChevron()
         val dataRow = SettingRow(context, "数据目录", "点击复制应用私有路径")
         dataRow.setValue(Bootstrap.dataDir(context).absolutePath)
-        dataRow.clickOnce { host.copy(Bootstrap.dataDir(context).absolutePath, "数据目录") }
+        dataRow.clickOnce(1200L) { host.copy(Bootstrap.dataDir(context).absolutePath, "数据目录") }
         content.addView(rowsCard(versionRow, dataRow))
         content.addView(space(16f))
 
-        content.addView(context.text("hakimi for Android", 11f, Palette.MUTED).apply {
+        content.addView(context.text("本地处理 · 不收集浏览数据", 11f, Palette.MUTED).apply {
             gravity = Gravity.CENTER
-            setPadding(0, context.dp(16f), 0, context.dp(16f))
+            setPadding(0, context.dp(14f), 0, context.dp(14f))
         })
     }
 
@@ -221,6 +241,22 @@ class SettingsScreen(private val context: Context, private val host: Host) {
             if (exempt) "已允许" else "受限制",
             if (exempt) Palette.GREEN else Palette.AMBER
         )
+
+        portRow.setBusy(host.savingConfig)
+        ipCatalogRow.setBusy(host.savingConfig)
+        dohCatalogRow.setBusy(host.savingConfig)
+        resetCatalogRow.setBusy(host.savingConfig)
+        refreshCatalogRow.setBusy(host.refreshingCatalogs)
+        diagnoseRow.setBusy(host.diagnosing)
+        logRow.setBusy(host.loadingLog)
+        exportDiagnosticsRow.setBusy(host.exportingDiagnostics)
+        refreshCatalogRow.setValue(if (host.refreshingCatalogs) "刷新中…" else "", Palette.MUTED)
+        diagnoseRow.setValue(if (host.diagnosing) "诊断中…" else "", Palette.MUTED)
+        logRow.setValue(if (host.loadingLog) "读取中…" else "", Palette.MUTED)
+        exportDiagnosticsRow.setValue(
+            if (host.exportingDiagnostics) "导出中…" else "",
+            Palette.MUTED
+        )
         versionRow.setValue(appVersion)
     }
 
@@ -242,7 +278,15 @@ class SettingsScreen(private val context: Context, private val host: Host) {
     private fun rowsCard(vararg rows: View): LinearLayout {
         val card = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            background = context.rounded(Palette.SURFACE, 0f)
+            background = context.rounded(Palette.SURFACE, 18f, Palette.BORDER, 1f)
+            clipToOutline = true
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                marginStart = context.dp(16f)
+                marginEnd = context.dp(16f)
+            }
         }
         rows.forEachIndexed { index, row ->
             if (index > 0) {

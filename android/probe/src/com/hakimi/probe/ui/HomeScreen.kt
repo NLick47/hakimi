@@ -1,7 +1,6 @@
 package com.hakimi.probe.ui
 
 import android.content.Context
-import android.graphics.Color
 import android.view.Gravity
 import android.view.View
 import android.widget.LinearLayout
@@ -24,10 +23,10 @@ class HomeScreen(private val context: Context, private val host: Host) {
     }
 
     private val hero = context.card(
-        radius = 12f,
+        radius = 18f,
         fill = Palette.SURFACE,
-        padding = 12f,
-        stroke = Color.TRANSPARENT
+        padding = 14f,
+        stroke = Palette.BORDER
     )
     private val ring = StatusRingView(context)
     private lateinit var heroTitle: TextView
@@ -49,7 +48,6 @@ class HomeScreen(private val context: Context, private val host: Host) {
         ))
 
         buildHero()
-        hero.elevation = context.dp(2f).toFloat()
         content.addView(hero, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
@@ -72,7 +70,10 @@ class HomeScreen(private val context: Context, private val host: Host) {
         content.addView(buildListPanel(), LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
+        ).apply {
+            marginStart = context.dp(16f)
+            marginEnd = context.dp(16f)
+        })
 
         content.addView(space(16f))
         content.addView(buildFooter())
@@ -82,6 +83,7 @@ class HomeScreen(private val context: Context, private val host: Host) {
         val vpnMode = Prefs.mode(context) == Prefs.MODE_VPN
         val vpnActive = vpnMode && HakimiVpnService.active
         ring.setActive(data.running || vpnActive)
+        heroAction.visibility = if (!host.caReady) View.GONE else View.VISIBLE
 
         when {
             !host.caReady -> {
@@ -170,17 +172,17 @@ class HomeScreen(private val context: Context, private val host: Host) {
 
         heroAction = context.text("暂停", 13.5f, Palette.ACCENT, medium = true).apply {
             gravity = Gravity.CENTER
-            setPadding(context.dp(12f), context.dp(9f), context.dp(12f), context.dp(9f))
+            setPadding(context.dp(12f), context.dp(8f), context.dp(12f), context.dp(8f))
             isClickable = true
             isFocusable = true
-            background = context.selectableBorderless()
+            background = context.ripple(Palette.ACCENT_SOFT, 12f, 0x1A0EA5E9)
         }
         inner.addView(heroAction)
     }
 
     private fun buildWarning(): LinearLayout {
         val card = context.card(
-            radius = 12f,
+            radius = 16f,
             fill = 0xFFFFF8EC.toInt(),
             padding = 12f,
             stroke = 0x33B07A1E
@@ -216,7 +218,7 @@ class HomeScreen(private val context: Context, private val host: Host) {
     private fun buildSectionHeader(): View {
         val row = context.row()
         row.setPadding(context.dp(16f), context.dp(20f), context.dp(16f), context.dp(8f))
-        row.addView(context.text("站点", 14f, Palette.TEXT, medium = true))
+        row.addView(context.text("站点", 12f, Palette.MUTED, medium = true))
         row.addView(View(context), LinearLayout.LayoutParams(0, 1, 1f))
         val more = context.text("全部", 13f, Palette.ACCENT, medium = true).apply {
             setPadding(context.dp(8f), context.dp(4f), 0, context.dp(4f))
@@ -229,7 +231,8 @@ class HomeScreen(private val context: Context, private val host: Host) {
     private fun buildListPanel(): View {
         val panel = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Palette.SURFACE)
+            background = context.rounded(Palette.SURFACE, 18f, Palette.BORDER, 1f)
+            clipToOutline = true
         }
         previewRows = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
         panel.addView(previewRows, LinearLayout.LayoutParams(
@@ -260,7 +263,7 @@ class HomeScreen(private val context: Context, private val host: Host) {
         })
         overview.isClickable = true
         overview.isFocusable = true
-        overview.setBackgroundColor(Palette.SURFACE)
+        overview.background = context.selectableBackground()
         overview.clickOnce { OverviewSheet(context, host).show() }
         panel.addView(overview, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,

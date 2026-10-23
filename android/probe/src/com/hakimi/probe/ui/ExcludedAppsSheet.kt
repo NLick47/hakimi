@@ -26,107 +26,128 @@ class ExcludedAppsSheet(
     private val context: Context,
     private val host: Host,
 ) {
+    private var sheet: Sheet? = null
+    private var opening = false
+
+    /**
+     * Idempotent: the app list is built on the UI thread, so a second tap while
+     * the first call is still building must not create another window.
+     */
     fun show() {
-        val installed = InstalledApps.launchable(context)
-        val sheet = Sheet(
-            context,
-            "排除应用",
-            "被排除的应用不经过 hakimi，直接连接网络；可多选",
-            scrollable = false
-        )
-        if (installed.isEmpty()) {
-            sheet.add(context.text("没有找到可排除的应用", 13f, Palette.TEXT_2))
-            sheet.primary("关闭") { sheet.dismiss() }
-            sheet.show()
-            return
-        }
-
-        val selected = Prefs.excludedApps(context).toMutableSet()
-        val count = context.text("", 11.5f, Palette.MUTED)
-        fun refreshCount() {
-            count.text = if (selected.isEmpty()) {
-                "未排除任何应用"
-            } else {
-                "已排除 ${selected.size} 个应用"
+        if (opening || sheet?.isShowing == true) return
+        opening = true
+        try {
+            val installed = InstalledApps.launchable(context)
+            val sheet = Sheet(
+                context,
+                "排除应用",
+                "被排除的应用不经过 hakimi，直接连接网络；可多选",
+                scrollable = false
+            )
+            this.sheet = sheet
+            sheet.setOnDismissListener {
+                if (this.sheet === sheet) this.sheet = null
+                opening = false
             }
-        }
-        refreshCount()
+            if (installed.isEmpty()) {
+                sheet.add(context.text("没有找到可排除的应用", 13f, Palette.TEXT_2))
+                sheet.primary("关闭") { sheet.dismiss() }
+                sheet.show()
+                return
+            }
 
-        val appAdapter = AppAdapter(installed, selected) { refreshCount() }
-
-        val search = EditText(context).apply {
-            hint = "搜索应用名或包名"
-            setSingleLine(true)
-            textSize = 14f
-            setTextColor(Palette.TEXT)
-            setHintTextColor(Palette.MUTED)
-            setPadding(context.dp(12f), context.dp(9f), context.dp(12f), context.dp(9f))
-            background = context.rounded(Palette.SURFACE_2, 12f, Palette.BORDER_STRONG)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_FILTER
-            imeOptions = EditorInfo.IME_ACTION_DONE
-            setOnEditorActionListener { _, actionId, _ ->
-                if (actionId == EditorInfo.IME_ACTION_DONE) {
-                    clearFocus()
-                    context.getSystemService(InputMethodManager::class.java)
-                        ?.hideSoftInputFromWindow(windowToken, 0)
-                    true
+            val selected = Prefs.excludedApps(context).toMutableSet()
+            val count = context.text("", 11.5f, Palette.MUTED)
+            fun refreshCount() {
+                count.text = if (selected.isEmpty()) {
+                    "未排除任何应用"
                 } else {
-                    false
+                    "已排除 ${selected.size} 个应用"
                 }
             }
-        }
-        search.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-            override fun afterTextChanged(s: Editable?) = appAdapter.filter(s?.toString().orEmpty())
-        })
+            refreshCount()
 
-        val clear = context.text("清空", 12.5f, Palette.ACCENT).apply {
-            setPadding(context.dp(12f), context.dp(8f), context.dp(2f), context.dp(8f))
-            isClickable = true
-            setOnClickListener {
-                selected.clear()
-                appAdapter.notifyDataSetChanged()
-                refreshCount()
+            val appAdapter = AppAdapter(installed, selected) { refreshCount() }
+
+            val search = EditText(context).apply {
+                hint = "搜索应用名或包名"
+                setSingleLine(true)
+                textSize = 14f
+                setTextColor(Palette.TEXT)
+                setHintTextColor(Palette.MUTED)
+                setPadding(context.dp(12f), context.dp(9f), context.dp(12f), context.dp(9f))
+                background = context.rounded(Palette.SURFACE_2, 12f, Palette.BORDER_STRONG)
+                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_FILTER
+                imeOptions = EditorInfo.IME_ACTION_DONE
+                setOnEditorActionListener { _, actionId, _ ->
+                    if (actionId == EditorInfo.IME_ACTION_DONE) {
+                        clearFocus()
+                        context.getSystemService(InputMethodManager::class.java)
+                            ?.hideSoftInputFromWindow(windowToken, 0)
+                        true
+                    } else {
+                        false
+                    }
+                }
             }
-        }
+            search.addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: Editable?) = appAdapter.filter(s?.toString().orEmpty())
+            })
 
-        val tools = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, context.dp(12f), 0, 0)
-        }
-        tools.addView(search, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        tools.addView(clear)
-        sheet.add(tools)
-        sheet.add(count.apply { setPadding(0, context.dp(6f), 0, context.dp(4f)) })
+            val clear = context.text("清空", 12.5f, Palette.ACCENT).apply {
+                setPadding(context.dp(12f), context.dp(8f), context.dp(2f), context.dp(8f))
+                isClickable = true
+                setOnClickListener {
+                    selected.clear()
+                    appAdapter.notifyDataSetChanged()
+                    refreshCount()
+                }
+            }
 
-        // A fixed-height ListView keeps the search field and the save/cancel
-        // row on screen no matter how many launchable apps the device has.
-        val list = ListView(context).apply {
-            adapter = appAdapter
-            divider = ColorDrawable(Palette.BORDER)
-            dividerHeight = context.dp(1f)
-            isVerticalScrollBarEnabled = false
-            overScrollMode = View.OVER_SCROLL_NEVER
-        }
-        val listHeight = (context.resources.displayMetrics.heightPixels * 0.52f).toInt()
-        sheet.add(list, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            listHeight
-        ))
+            val tools = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, context.dp(12f), 0, 0)
+            }
+            tools.addView(search, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            tools.addView(clear)
+            sheet.add(tools)
+            sheet.add(count.apply { setPadding(0, context.dp(6f), 0, context.dp(4f)) })
 
-        sheet.buttons(
-            "保存",
-            {
-                Prefs.setExcludedApps(context, selected)
-                sheet.dismiss()
-                host.onExcludedAppsChanged()
-            },
-            "取消",
-            { sheet.dismiss() }
-        )
-        sheet.show()
+            // A fixed-height ListView keeps the search field and the save/cancel
+            // row on screen no matter how many launchable apps the device has.
+            val list = ListView(context).apply {
+                adapter = appAdapter
+                divider = ColorDrawable(Palette.BORDER)
+                dividerHeight = context.dp(1f)
+                isVerticalScrollBarEnabled = false
+                overScrollMode = View.OVER_SCROLL_NEVER
+            }
+            val listHeight = (context.resources.displayMetrics.heightPixels * 0.52f).toInt()
+            sheet.add(list, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                listHeight
+            ))
+
+            sheet.buttons(
+                "保存",
+                {
+                    Prefs.setExcludedApps(context, selected)
+                    sheet.dismiss()
+                    host.onExcludedAppsChanged()
+                },
+                "取消",
+                { sheet.dismiss() }
+            )
+            sheet.show()
+        } catch (error: Throwable) {
+            this.sheet = null
+            host.showSnack("无法打开排除应用：${error.message}", error = true)
+        } finally {
+            opening = false
+        }
     }
 
     /**

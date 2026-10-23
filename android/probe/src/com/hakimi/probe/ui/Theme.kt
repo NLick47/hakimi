@@ -190,6 +190,20 @@ fun Context.ghostButton(label: CharSequence, action: () -> Unit): TextView =
         isFocusable = true
     }
 
+fun Context.dangerButton(label: CharSequence, action: () -> Unit): TextView =
+    text(label, 14f, Palette.DARK_TEXT, medium = true).apply {
+        gravity = Gravity.CENTER
+        setPadding(dp(18f), dp(14f), dp(18f), dp(14f))
+        background = RippleDrawable(
+            ColorStateList.valueOf(0x44FFFFFF),
+            gradient(intArrayOf(Palette.RED, 0xFFE07A7A.toInt()), 12f),
+            null
+        )
+        clickOnce { action() }
+        isClickable = true
+        isFocusable = true
+    }
+
 fun Context.iconButton(res: Int, tint: Int = Palette.TEXT, size: Float = 44f, action: () -> Unit): View =
     android.widget.FrameLayout(this).apply {
         layoutParams = LinearLayout.LayoutParams(dp(size), dp(size))

@@ -14,7 +14,7 @@ class SitesScreen(private val context: Context, private val host: Host) {
 
     private val content = LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(0, 0, 0, context.dp(104f))
+        setPadding(0, context.dp(12f), 0, context.dp(104f))
     }
 
     private lateinit var listRows: LinearLayout
@@ -28,12 +28,20 @@ class SitesScreen(private val context: Context, private val host: Host) {
 
         listRows = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            background = context.rounded(Palette.SURFACE, 0f)
+            background = context.rounded(Palette.SURFACE, 18f, Palette.BORDER, 1f)
+            clipToOutline = true
         }
         content.addView(listRows, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
+        ).apply {
+            marginStart = context.dp(16f)
+            marginEnd = context.dp(16f)
+        })
+        content.addView(context.text("本地处理 · 不收集浏览数据", 11f, Palette.MUTED).apply {
+            gravity = android.view.Gravity.CENTER
+            setPadding(0, context.dp(14f), 0, context.dp(14f))
+        })
     }
 
     fun refresh(core: CoreData) {

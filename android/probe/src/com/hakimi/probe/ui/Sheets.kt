@@ -1,9 +1,7 @@
 package com.hakimi.probe.ui
 
 import android.content.Context
-import android.graphics.Color
 import android.text.InputType
-import android.view.Gravity
 import android.view.WindowManager
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -59,7 +57,7 @@ object Sheets {
         edit.requestFocus()
         sheet.window?.setSoftInputMode(
             WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE or
-                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
         )
     }
 
@@ -75,21 +73,16 @@ object Sheets {
         sheet.add(context.text(message, 13f, Palette.TEXT_2).apply {
             setLineSpacing(context.dp(4f).toFloat(), 1f)
         })
-        val row = context.row()
-        val cancel = context.nativeTextButton("取消") { sheet.dismiss() }
-        row.addView(cancel, LinearLayout.LayoutParams(0, context.dp(46f), 1f))
-        row.addView(android.view.View(context), LinearLayout.LayoutParams(context.dp(10f), 1))
-        val confirm = context.nativePrimaryButton(confirmLabel) {
-            sheet.dismiss()
-            onConfirm()
-        }.apply {
-            if (danger) backgroundTintList = android.content.res.ColorStateList.valueOf(Palette.RED)
-        }
-        row.addView(confirm, LinearLayout.LayoutParams(0, context.dp(46f), 1f))
-        sheet.add(row, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = context.dp(18f) })
+        sheet.buttons(
+            confirmLabel,
+            {
+                sheet.dismiss()
+                onConfirm()
+            },
+            "取消",
+            { sheet.dismiss() },
+            danger = danger,
+        )
         sheet.show()
     }
 
@@ -121,16 +114,12 @@ object Sheets {
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = context.dp(14f) })
-        val row = context.row()
-        row.addView(context.nativeTextButton(copyLabel) { onCopy(content) },
-            LinearLayout.LayoutParams(0, context.dp(48f), 1f))
-        row.addView(android.view.View(context), LinearLayout.LayoutParams(context.dp(8f), 1))
-        val close = context.nativePrimaryButton("关闭") { sheet.dismiss() }
-        row.addView(close, LinearLayout.LayoutParams(0, context.dp(48f), 1f))
-        sheet.add(row, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = context.dp(14f) })
+        sheet.buttons(
+            "关闭",
+            { sheet.dismiss() },
+            copyLabel,
+            { onCopy(content) },
+        )
         sheet.show()
     }
 }

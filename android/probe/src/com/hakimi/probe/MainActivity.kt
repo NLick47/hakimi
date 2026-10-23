@@ -104,6 +104,21 @@ class MainActivity : Activity(), Host {
     override val probing: Boolean
         get() = probeInFlight
 
+    override val refreshingCatalogs: Boolean
+        get() = catalogsRefreshing
+
+    override val diagnosing: Boolean
+        get() = diagnosingNow
+
+    override val loadingLog: Boolean
+        get() = logLoading
+
+    override val exportingDiagnostics: Boolean
+        get() = diagnosticsExporting
+
+    override val savingConfig: Boolean
+        get() = configSaving
+
     private val handler = Handler(Looper.getMainLooper())
     private val operations = Executors.newFixedThreadPool(3)
     private var pollInFlight = false
@@ -117,12 +132,20 @@ class MainActivity : Activity(), Host {
     private var starting = false
     private var lastAccelToggle = 0L
     private var exporting = false
-    private var refreshingCatalogs = false
-    private var diagnosing = false
+    private var catalogsRefreshing = false
+    private var diagnosingNow = false
+    private var logLoading = false
+    private var diagnosticsExporting = false
+    private var configSaving = false
     private var autoStartPending = false
     private var pendingVpnStart = false
     @Volatile private var staleProxyChecked = false
     private var tab = 0
+
+    /** One sheet instance for this activity; show() is idempotent. */
+    private val excludedAppsSheet: ExcludedAppsSheet by lazy {
+        ExcludedAppsSheet(this, this)
+    }
 
     private enum class CaWriteKind { INSTALL, BACKUP }
 
@@ -634,7 +657,7 @@ class MainActivity : Activity(), Host {
     }
 
     override fun chooseExcludedApps() {
-        ExcludedAppsSheet(this, this).show()
+        excludedAppsSheet.show()
     }
 
     override fun onExcludedAppsChanged() {
@@ -770,6 +793,10 @@ class MainActivity : Activity(), Host {
     }
 
     override fun diagnosePrompt() {
+        if (diagnosingNow) {
+            showSnack("正在诊断，请稍候")
+            return
+        }
         Sheets.input(
             this,
             "域名诊断",
@@ -784,8 +811,13 @@ class MainActivity : Activity(), Host {
     }
 
     override fun runDiagnose(domain: String, done: (DiagnoseOutcome) -> Unit) {
-        if (diagnosing) return
-        diagnosing = true
+        if (diagnosingNow) {
+            showSnack("正在诊断，请稍候")
+            return
+        }
+        diagnosingNow = true
+        showSnack("正在检测 $domain…")
+        render()
         operations.execute {
             val raw = runCatching { Native.diagnose(domain) }.getOrDefault("")
             val obj = runCatching { JSONObject(raw) }.getOrNull()
@@ -813,7 +845,8 @@ class MainActivity : Activity(), Host {
                 raw = raw,
             )
             handler.post {
-                diagnosing = false
+                diagnosingNow = false
+                render()
                 done(outcome)
             }
         }
@@ -822,6 +855,10 @@ class MainActivity : Activity(), Host {
     // -- settings ------------------------------------------------------------
 
     override fun editSetting(key: String, title: String, subtitle: String, value: String) {
+        if (configSaving) {
+            showSnack("正在保存设置，请稍候")
+            return
+        }
         if (key == "proxy.port" && (data.running || HakimiVpnService.active)) {
             showSnack("请先停止加速，再修改本地端口", error = true)
             return
@@ -895,6 +932,10 @@ class MainActivity : Activity(), Host {
     }
 
     override fun resetCatalogs() {
+        if (configSaving) {
+            showSnack("正在保存设置，请稍候")
+            return
+        }
         Sheets.confirm(
             this,
             "恢复默认目录",
@@ -928,10 +969,18 @@ class MainActivity : Activity(), Host {
     }
 
     override fun applyConfig(next: JSONObject, done: (Boolean, String?) -> Unit) {
+        if (configSaving) {
+            done(false, "正在保存设置，请稍候")
+            return
+        }
+        configSaving = true
+        render()
         operations.execute {
             val ok = runCatching { Native.applyConfig(next.toString()) }.getOrDefault(false)
             val error = if (ok) null else runCatching { Native.lastError() }.getOrDefault("")
             handler.post {
+                configSaving = false
+                render()
                 if (ok) refreshNow()
                 done(ok, error?.ifEmpty { "配置保存失败" })
             }
@@ -939,8 +988,12 @@ class MainActivity : Activity(), Host {
     }
 
     override fun refreshCatalogs() {
-        if (refreshingCatalogs) return
-        refreshingCatalogs = true
+        if (catalogsRefreshing) {
+            showSnack("正在刷新远程目录…")
+            return
+        }
+        catalogsRefreshing = true
+        render()
         showSnack("正在刷新远程目录…")
         operations.execute {
             val raw = runCatching { Native.refreshCatalogs(true) }.getOrDefault("[]")
@@ -961,7 +1014,8 @@ class MainActivity : Activity(), Host {
                 // Keep the generic failure message below.
             }
             handler.post {
-                refreshingCatalogs = false
+                catalogsRefreshing = false
+                render()
                 when {
                     errors.isNotEmpty() -> showSnack(errors.first(), error = true)
                     updated -> showSnack("远程目录已更新")
@@ -973,10 +1027,20 @@ class MainActivity : Activity(), Host {
     }
 
     override fun showLog() {
+        if (logLoading) {
+            showSnack("正在读取日志，请稍候")
+            return
+        }
+        logLoading = true
+        render()
         operations.execute {
             val path = runCatching { Native.logPath() }.getOrDefault("")
             if (path.isEmpty()) {
-                handler.post { showSnack("日志尚未生成", error = true) }
+                handler.post {
+                    logLoading = false
+                    render()
+                    showSnack("日志尚未生成", error = true)
+                }
                 return@execute
             }
             val content = try {
@@ -995,6 +1059,8 @@ class MainActivity : Activity(), Host {
                 "读取日志失败：$error"
             }
             handler.post {
+                logLoading = false
+                render()
                 if (content.isEmpty()) {
                     showSnack("日志尚未生成", error = true)
                 } else {
@@ -1007,10 +1073,18 @@ class MainActivity : Activity(), Host {
     }
 
     override fun exportDiagnostics() {
+        if (diagnosticsExporting) {
+            showSnack("正在导出诊断包，请稍候")
+            return
+        }
+        diagnosticsExporting = true
+        render()
         operations.execute {
             val path = runCatching { Native.exportDiagnostics() }.getOrDefault("")
             val error = runCatching { Native.lastError() }.getOrDefault("")
             handler.post {
+                diagnosticsExporting = false
+                render()
                 if (path.isEmpty()) {
                     showSnack(error.ifEmpty { "诊断包导出失败" }, error = true)
                 } else {
@@ -1129,6 +1203,10 @@ class MainActivity : Activity(), Host {
     }
 
     override fun recheckCa() {
+        if (syncingCa) {
+            showSnack("正在检查证书，请稍候")
+            return
+        }
         syncCaTrust {
             val trusted = userCaTrusted
             showSnack(

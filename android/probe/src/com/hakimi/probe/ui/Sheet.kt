@@ -9,6 +9,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -37,6 +38,23 @@ class Sheet(
         isVerticalScrollBarEnabled = false
         overScrollMode = View.OVER_SCROLL_NEVER
     }
+
+    // The dialog window spans the whole screen so an outside tap is consumed
+    // by this scrim instead of falling through to the activity and re-opening
+    // the sheet that was just dismissed.
+    private val overlay = FrameLayout(context).apply {
+        isClickable = true
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        setOnClickListener { dismiss() }
+    }
+
+    // Sticky action bar. It lives outside the scroll view so save/cancel stays
+    // reachable even when the sheet body is long or the keyboard is open.
+    private val footer = LinearLayout(context).apply {
+        orientation = LinearLayout.VERTICAL
+    }
+    private var footerContent: LinearLayout? = null
+    private var hasFooter = false
 
     init {
         val handle = View(context).apply {
@@ -89,18 +107,25 @@ class Sheet(
             ))
         }
 
-        setContentView(root)
+        root.isClickable = true
+        root.setOnClickListener { }
+        overlay.addView(root, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM
+        ))
+        setContentView(overlay)
         setCanceledOnTouchOutside(true)
         window?.apply {
             setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
             setLayout(
                 WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.WRAP_CONTENT
+                WindowManager.LayoutParams.MATCH_PARENT
             )
-            setGravity(Gravity.BOTTOM)
+            setGravity(Gravity.TOP or Gravity.START)
             addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
             setDimAmount(0.30f)
-            setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+            setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
         }
     }
 
@@ -121,7 +146,7 @@ class Sheet(
     }
 
     fun primary(label: String, action: () -> Unit): TextView {
-        val button = context.nativePrimaryButton(label, action)
+        val button = context.primaryButton(label, action)
         add(button, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             context.dp(48f)
@@ -130,27 +155,66 @@ class Sheet(
     }
 
     fun secondary(label: String, action: () -> Unit): TextView {
-        val button = context.nativeTextButton(label, action)
+        val button = context.ghostButton(label, action)
         add(button, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             context.dp(48f)
-        ).apply { topMargin = context.dp(2f) })
+        ).apply { topMargin = context.dp(8f) })
         return button
     }
 
-    fun buttons(primaryLabel: String, onPrimary: () -> Unit, secondaryLabel: String? = null, onSecondary: () -> Unit = {}) {
+    fun buttons(
+        primaryLabel: String,
+        onPrimary: () -> Unit,
+        secondaryLabel: String? = null,
+        onSecondary: () -> Unit = {},
+        danger: Boolean = false,
+    ) {
+        val content = ensureFooter()
         val row = context.row()
         if (secondaryLabel != null) {
-            val cancel = context.nativeTextButton(secondaryLabel, onSecondary)
-            row.addView(cancel, LinearLayout.LayoutParams(0, context.dp(48f), 1f))
-            row.addView(View(context), LinearLayout.LayoutParams(context.dp(8f), 1))
+            row.addView(
+                context.ghostButton(secondaryLabel, onSecondary),
+                LinearLayout.LayoutParams(0, context.dp(48f), 1f)
+            )
+            row.addView(View(context), LinearLayout.LayoutParams(context.dp(10f), 1))
         }
-        val confirm = context.nativePrimaryButton(primaryLabel, onPrimary)
-        row.addView(confirm, LinearLayout.LayoutParams(0, context.dp(48f), 1f))
-        add(row, LinearLayout.LayoutParams(
+        val primary = if (danger) {
+            context.dangerButton(primaryLabel, onPrimary)
+        } else {
+            context.primaryButton(primaryLabel, onPrimary)
+        }
+        row.addView(primary, LinearLayout.LayoutParams(0, context.dp(48f), 1f))
+        content.addView(row, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = context.dp(16f) })
+        ))
+    }
+
+    private fun ensureFooter(): LinearLayout {
+        footerContent?.let { return it }
+        val content = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, context.dp(12f), 0, 0)
+        }
+        footer.addView(
+            View(context).apply { setBackgroundColor(Palette.HAIRLINE) },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                context.dp(1f)
+            )
+        )
+        footer.addView(content, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        root.addView(footer, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = context.dp(14f) })
+        footerContent = content
+        hasFooter = true
+        return content
     }
 
     fun textButton(label: String, color: Int = Palette.ACCENT, action: () -> Unit): TextView {
@@ -169,10 +233,10 @@ class Sheet(
         window?.apply {
             setLayout(
                 WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.WRAP_CONTENT
+                WindowManager.LayoutParams.MATCH_PARENT
             )
-            setGravity(Gravity.BOTTOM)
-            setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+            setGravity(Gravity.TOP or Gravity.START)
+            setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
         }
         val decor = window?.decorView ?: return
         decor.setOnApplyWindowInsetsListener { _, insets ->
@@ -194,14 +258,19 @@ class Sheet(
                 context.dp(20f) + maxOf(nav, ime)
             )
             scroll.maxHeight = if (ime > 0) {
-                (context.resources.displayMetrics.heightPixels - ime - context.dp(150f))
+                val reserve = if (hasFooter) context.dp(220f) else context.dp(150f)
+                (context.resources.displayMetrics.heightPixels - ime - reserve)
                     .coerceAtLeast(context.dp(220f))
             } else {
-                (context.resources.displayMetrics.heightPixels * 0.74f).toInt()
+                val fraction = if (hasFooter) 0.64f else 0.74f
+                (context.resources.displayMetrics.heightPixels * fraction).toInt()
             }
             scroll.requestLayout()
             insets
         }
         decor.requestApplyInsets()
+        root.alpha = 0f
+        root.translationY = context.dp(18f).toFloat()
+        root.animate().alpha(1f).translationY(0f).setDuration(160L).start()
     }
 }

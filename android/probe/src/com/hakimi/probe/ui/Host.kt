@@ -20,6 +20,11 @@ interface Host {
     val caReady: Boolean
     val caLockReady: Boolean
     val caExportName: String
+    val refreshingCatalogs: Boolean
+    val diagnosing: Boolean
+    val loadingLog: Boolean
+    val exportingDiagnostics: Boolean
+    val savingConfig: Boolean
 
     fun toggleAcceleration()
     fun setGroupEnabled(site: SiteInfo, enabled: Boolean)

@@ -578,42 +578,86 @@ class SiteDetailSheet(
 ) {
     fun show() {
         val sheet = Sheet(context, site.name, site.summary)
+
+        val hero = context.card(
+            radius = 18f,
+            fill = Palette.SURFACE_HI,
+            padding = 14f,
+            stroke = Palette.BORDER,
+        )
         val header = context.row()
-        header.addView(siteTile(context, site, 54f))
+        header.addView(siteTile(context, site, 52f))
+
         val texts = context.column()
         texts.gravity = Gravity.CENTER_VERTICAL
         texts.setPadding(context.dp(12f), 0, context.dp(8f), 0)
+        val status = context.text(
+            if (site.enabled) "已启用" else "已停用",
+            12f,
+            if (site.enabled) Palette.GREEN else Palette.MUTED,
+            medium = true,
+        )
+        texts.addView(status)
         val meta = context.row()
-        meta.addView(context.pill("${site.exactDomains.size} 个域名", Palette.TEXT_2, Palette.SURFACE_2, 9f))
+        meta.setPadding(0, context.dp(5f), 0, 0)
+        meta.addView(context.pill(
+            "${site.exactDomains.size} 个域名",
+            Palette.TEXT_2,
+            Palette.SURFACE_2,
+            9f,
+        ))
         texts.addView(meta)
-        header.addView(texts, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        header.addView(texts, LinearLayout.LayoutParams(
+            0,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            1f,
+        ))
+
         val toggle = android.widget.Switch(context).apply {
             setShowText(false)
             isChecked = site.enabled
-            setOnCheckedChangeListener { _, checked ->
-                host.setGroupEnabled(site, checked)
-                host.showSnack(if (checked) "已启用 ${site.name}" else "已停用 ${site.name}")
-            }
+        }
+        toggle.setOnCheckedChangeListener { _, checked ->
+            status.text = if (checked) "已启用" else "已停用"
+            status.setTextColor(if (checked) Palette.GREEN else Palette.MUTED)
+            host.setGroupEnabled(site, checked)
+            host.showSnack(if (checked) "已启用 ${site.name}" else "已停用 ${site.name}")
         }
         header.addView(toggle)
-        sheet.add(header, LinearLayout.LayoutParams(
+        hero.addView(header, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = context.dp(10f) })
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ))
+        sheet.add(hero, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = context.dp(12f) })
 
         val actions = context.row()
-        actions.setPadding(0, context.dp(16f), 0, 0)
-        val visit = context.nativePrimaryButton("访问主页") { host.openUrl(site.homepage) }
-        actions.addView(visit, LinearLayout.LayoutParams(0, context.dp(48f), 1f))
-        actions.addView(View(context), LinearLayout.LayoutParams(context.dp(8f), 1))
-        val probe = context.nativeTextButton("立即检测") {
-            site.exactDomains.firstOrNull()?.let { domain ->
-                host.runDiagnose(domain) { outcome ->
-                    DiagnoseResultSheet(context, host, outcome).show()
+        actions.setPadding(0, context.dp(14f), 0, 0)
+        val probe = context.ghostButton("立即检测") {}
+        probe.clickOnce {
+            val domain = site.exactDomains.firstOrNull()
+            when {
+                host.diagnosing -> host.showSnack("正在诊断，请稍候")
+                domain == null -> host.showSnack("没有可探测的精确域名", error = true)
+                else -> {
+                    probe.text = "检测中…"
+                    probe.isEnabled = false
+                    probe.alpha = 0.6f
+                    host.runDiagnose(domain) { outcome ->
+                        probe.text = "立即检测"
+                        probe.isEnabled = true
+                        probe.alpha = 1f
+                        DiagnoseResultSheet(context, host, outcome).show()
+                    }
                 }
-            } ?: host.showSnack("没有可探测的精确域名", error = true)
+            }
         }
-        actions.addView(probe, LinearLayout.LayoutParams(0, context.dp(48f), 1f))
+        actions.addView(probe, LinearLayout.LayoutParams(0, context.dp(46f), 1f))
+        actions.addView(View(context), LinearLayout.LayoutParams(context.dp(10f), 1))
+        val visit = context.primaryButton("访问主页") { host.openUrl(site.homepage) }
+        actions.addView(visit, LinearLayout.LayoutParams(0, context.dp(46f), 1f))
         sheet.add(actions)
 
         if (site.domains.isNotEmpty()) {
@@ -637,6 +681,10 @@ class SiteDetailSheet(
             })
         }
 
+        val infoTitle = context.text("站点信息", 10.5f, Palette.MUTED, medium = true)
+        infoTitle.setPadding(0, context.dp(16f), 0, context.dp(8f))
+        sheet.add(infoTitle)
+
         val info = context.card(radius = 20f, padding = 0f)
         info.addView(infoRow(context, "访问地址", site.homepage) { host.openUrl(site.homepage) })
         info.addView(context.divider(14f), LinearLayout.LayoutParams(
@@ -657,21 +705,17 @@ class SiteDetailSheet(
             context.dp(1f)
         ))
         info.addView(infoRow(context, "站点 ID", site.id))
-        sheet.add(info, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = context.dp(14f) })
+        sheet.add(info)
 
-        val edit = context.nativeTextButton("编辑站点") {
-            sheet.dismiss()
-            host.openEditor(site)
-        }
-        sheet.add(edit, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            context.dp(48f)
-        ).apply { topMargin = context.dp(6f) })
-
-        sheet.textButton("关闭") { sheet.dismiss() }
+        sheet.buttons(
+            "编辑站点",
+            {
+                sheet.dismiss()
+                host.openEditor(site)
+            },
+            "关闭",
+            { sheet.dismiss() },
+        )
         sheet.show()
     }
 
@@ -715,8 +759,22 @@ class SiteDetailSheet(
         row.isClickable = true
         row.background = context.ripple(Color.TRANSPARENT, 14f, 0x140EA5E9)
         row.clickOnce {
-            host.runDiagnose(domain.host) { outcome ->
-                DiagnoseResultSheet(context, host, outcome).show()
+            if (host.diagnosing) {
+                host.showSnack("正在诊断，请稍候")
+            } else {
+                state.text = "检测中…"
+                state.setTextColor(Palette.ACCENT)
+                latency.text = "…"
+                row.isEnabled = false
+                row.alpha = 0.7f
+                host.runDiagnose(domain.host) { outcome ->
+                    state.text = domain.stateText
+                    state.setTextColor(domain.stateColor)
+                    latency.text = domain.latencyText
+                    row.isEnabled = true
+                    row.alpha = 1f
+                    DiagnoseResultSheet(context, host, outcome).show()
+                }
             }
         }
         return row
@@ -1047,14 +1105,12 @@ class DiagnoseResultSheet(
             sheet.add(card)
         }
 
-        val row = context.row()
-        row.setPadding(0, context.dp(16f), 0, 0)
-        val copy = context.nativeTextButton("复制原始 JSON") { host.copy(pretty(outcome.raw), "诊断 JSON") }
-        row.addView(copy, LinearLayout.LayoutParams(0, context.dp(48f), 1f))
-        row.addView(View(context), LinearLayout.LayoutParams(context.dp(8f), 1))
-        val close = context.nativePrimaryButton("关闭") { sheet.dismiss() }
-        row.addView(close, LinearLayout.LayoutParams(0, context.dp(48f), 1f))
-        sheet.add(row)
+        sheet.buttons(
+            "关闭",
+            { sheet.dismiss() },
+            "复制原始 JSON",
+            { host.copy(pretty(outcome.raw), "诊断 JSON") },
+        )
         sheet.show()
     }
 
