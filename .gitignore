@@ -11,6 +11,3 @@
 *.tmp.*
 *.log
 *.pid
-
-# Intentionally excluded from the repository per the project owner's request.
-/README.md
