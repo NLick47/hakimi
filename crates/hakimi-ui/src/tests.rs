@@ -192,7 +192,6 @@ fn icon_keys_match_whole_ids_and_slugs_only() {
     // Must not hand the E-Hentai logo to a slug that merely contains "eh".
     assert_eq!(icon_key_for("mehta-com"), "");
     // Sites that ship their own logo match by id.
-    assert_eq!(icon_key_for("nhentai"), "nhentai");
     assert_eq!(icon_key_for("hanime"), "hanime");
 }
 
@@ -405,7 +404,6 @@ fn visit_urls_use_canonical_homepages() {
             { "id": "ao3", "name": "AO3", "enabled": true, "domains": domains(&["archiveofourown.org"]) },
             { "id": "eh", "name": "E-Hentai", "enabled": true, "domains": domains(&["e-hentai.org"]) },
             { "id": "hitomi", "name": "Hitomi", "enabled": true, "domains": domains(&["hitomi.la"]) },
-            { "id": "nhentai", "name": "nhentai", "enabled": true, "domains": domains(&["nhentai.net"]) },
             { "id": "hanime", "name": "Hanime", "enabled": true, "domains": domains(&["hanime.tv"]) },
             { "id": "steam", "name": "Steam", "enabled": true, "domains": domains(&["store.steampowered.com"]) },
             { "id": "poipiku", "name": "Poipiku", "enabled": true, "domains": domains(&["poipiku.com"]) },
@@ -430,7 +428,6 @@ fn visit_urls_use_canonical_homepages() {
     assert_eq!(url("ao3"), "https://archiveofourown.org/");
     assert_eq!(url("eh"), "https://e-hentai.org/");
     assert_eq!(url("hitomi"), "https://hitomi.la/");
-    assert_eq!(url("nhentai"), "https://nhentai.net/");
     assert_eq!(url("hanime"), "https://hanime.tv/");
     assert_eq!(url("steam"), "https://store.steampowered.com/");
     assert_eq!(url("poipiku"), "https://poipiku.com/");

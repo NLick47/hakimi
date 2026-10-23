@@ -499,8 +499,8 @@ impl SweepState {
 /// Bundled site logos, matched against a group id. Exact ids and `<key>-…`
 /// slugs count; a bare `contains` would hand the E-Hentai logo to any domain
 /// that happens to have "eh" in the middle of its slug.
-pub(crate) const SITE_ICONS: [&str; 10] = [
-    "pixiv", "hitomi", "poipiku", "booth", "steam", "github", "ao3", "eh", "hanime", "nhentai",
+pub(crate) const SITE_ICONS: [&str; 9] = [
+    "pixiv", "hitomi", "poipiku", "booth", "steam", "github", "ao3", "eh", "hanime",
 ];
 
 pub(crate) fn icon_key_for(id: &str) -> String {

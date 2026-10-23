@@ -624,14 +624,6 @@ pub fn default_groups() -> Vec<GroupConfig> {
             "https://hitomi.la/",
         ),
         group(
-            "nhentai",
-            "nhentai",
-            vec![plain("nhentai.net"), plain("*.nhentai.net")],
-            RoutePolicy::auto(),
-            true,
-            "https://nhentai.net/",
-        ),
-        group(
             "hanime",
             "Hanime",
             vec![
@@ -1147,7 +1139,7 @@ mod tests {
     fn defaults_validate_and_match_document() {
         let config = AppConfig::default();
         config.validate().unwrap();
-        assert_eq!(config.groups.len(), 9);
+        assert_eq!(config.groups.len(), 8);
         let eh = config.group("eh").unwrap();
         assert!(eh.enabled);
         assert!(config.groups.iter().all(|group| group.enabled));
@@ -1155,19 +1147,13 @@ mod tests {
             config.group("poipiku").unwrap().default_route.attempts[0].mode(),
             TlsMode::Direct
         );
-        // The three adult sites ship enabled with their own CDN domains.
+        // The adult sites ship enabled with their own CDN domains.
         let hitomi = config.group("hitomi").unwrap();
         assert!(hitomi.enabled);
         assert!(hitomi
             .domains
             .iter()
             .any(|rule| rule.pattern == "*.gold-usergeneratedcontent.net"));
-        assert!(config
-            .group("nhentai")
-            .unwrap()
-            .domains
-            .iter()
-            .any(|rule| rule.pattern == "*.nhentai.net"));
         assert!(config
             .group("hanime")
             .unwrap()
@@ -1268,7 +1254,7 @@ mod tests {
         );
         // Hosts that answer directly start with a direct attempt so the
         // common case does not pay for a failed fake-SNI handshake.
-        for id in ["hitomi", "nhentai", "hanime", "poipiku"] {
+        for id in ["hitomi", "hanime", "poipiku"] {
             assert_eq!(
                 config.group(id).unwrap().default_route.attempts[0].mode(),
                 TlsMode::Direct,
@@ -1291,7 +1277,7 @@ mod tests {
         let config = AppConfig::default();
         assert!(config.group("github").unwrap().recovers_blocked_ips());
         for id in [
-            "pixiv", "ao3", "eh", "hitomi", "nhentai", "hanime", "steam", "poipiku",
+            "pixiv", "ao3", "eh", "hitomi", "hanime", "steam", "poipiku",
         ] {
             assert!(
                 !config.group(id).unwrap().recovers_blocked_ips(),

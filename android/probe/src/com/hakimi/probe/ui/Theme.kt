@@ -259,7 +259,6 @@ private val SITE_ICONS = mapOf(
     "ao3" to R.drawable.site_ao3,
     "eh" to R.drawable.site_eh,
     "hanime" to R.drawable.site_hanime,
-    "nhentai" to R.drawable.site_nhentai,
 )
 
 fun siteIconRes(id: String): Int {

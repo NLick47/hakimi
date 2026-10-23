@@ -208,7 +208,7 @@ data class CoreData(
 
 object CoreParser {
     private val BUILTIN_IDS = setOf(
-        "github", "pixiv", "ao3", "eh", "hitomi", "nhentai", "hanime", "steam", "poipiku"
+        "github", "pixiv", "ao3", "eh", "hitomi", "hanime", "steam", "poipiku"
     )
 
     fun parse(statusRaw: String, configRaw: String, userCaTrusted: Boolean): CoreData {
