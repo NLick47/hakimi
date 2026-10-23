@@ -1,11 +1,10 @@
 package com.hakimi.probe.ui
 
 import android.content.Context
-import android.content.Intent
 import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.drawable.ColorDrawable
-import android.provider.Settings
+import android.os.Build
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
@@ -17,11 +16,14 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupWindow
 import android.widget.TextView
+import com.hakimi.probe.CaStore
+import com.hakimi.probe.CaTrust
 import com.hakimi.probe.R
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.IDN
 import java.net.URI
+import java.util.Locale
 
 private fun fieldLabel(context: Context, label: String): TextView =
     context.text(label, 10.5f, Palette.MUTED, medium = true).apply {
@@ -744,71 +746,236 @@ class SiteDetailSheet(
     }
 }
 
+private val CA_AMBER_FILL = 0xFFFFF8EC.toInt()
+private val CA_AMBER_STROKE = 0x33B07A1E
+private val CA_GREEN_FILL = 0xFFEAF7F2.toInt()
+private val CA_GREEN_STROKE = 0x33178F79
+private val CA_BLUE_FILL = 0xFFEAF6FC.toInt()
+private val CA_BLUE_STROKE = 0x330E9FD8
+
 class CaSetupSheet(
     private val context: Context,
     private val host: Host,
 ) {
+    private enum class CaState { CHECKING, NO_LOCK, NOT_INSTALLED, SAVED, TRUSTED }
+
+    private var sheet: Sheet? = null
+    private var signature = ""
+
     fun show() {
-        val data = host.core
-        val trusted = data.userCaTrusted
-        val sheet = Sheet(
-            context,
-            if (trusted) "证书已安装" else "安装证书",
-            if (trusted) null else "按下面三步操作"
-        )
-
-        val status = context.card(
-            radius = 12f,
-            fill = if (trusted) 0xFFEAF7F2.toInt() else 0xFFFFF8EC.toInt(),
-            padding = 14f,
-            stroke = if (trusted) 0x33178F79 else 0x33B07A1E
-        )
-        status.addView(context.text(
-            if (trusted) "已安装并受信任" else "尚未安装",
-            13f,
-            if (trusted) Palette.GREEN else Palette.AMBER,
-            medium = true
-        ))
-        sheet.add(status, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = context.dp(12f) })
-
-        step(sheet, 1, "导出证书", "保存到下载目录")
-        step(sheet, 2, "安装证书", "设置 → 安全 → 加密与凭据 → 安装证书 → CA 证书")
-        step(sheet, 3, "回来检查", "点下方「我已完成」")
-
-        if (!trusted) {
-            sheet.primary("导出证书") {
-                host.exportCa()
-            }
-            sheet.secondary("打开系统设置") {
-                openSecuritySettings()
-            }
-            sheet.textButton("我已完成，重新检查") {
-                host.recheckCa()
-                sheet.dismiss()
-            }
-        } else {
-            sheet.add(context.monospace(
-                "Subject  ${data.caSubject.ifEmpty { "CN=hakimi Local CA" }}\n" +
-                    "SHA-1    ${data.caFingerprint.ifEmpty { "—" }}\n" +
-                    "到期     ${data.caNotAfter.ifEmpty { "—" }}",
-                10f,
-                Palette.TEXT_2
-            ).apply {
-                background = context.rounded(0xFFF7FCFE.toInt(), 14f, Palette.BORDER, 1f)
-                setPadding(context.dp(14f), context.dp(12f), context.dp(14f), context.dp(12f))
-            }, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = context.dp(14f) })
-            sheet.primary("导出证书备份") { host.exportCa() }
-        }
-        sheet.show()
+        signature = currentSignature()
+        sheet = when (currentState()) {
+            CaState.CHECKING -> buildChecking()
+            CaState.NO_LOCK -> buildNoLock()
+            CaState.NOT_INSTALLED -> buildNotInstalled()
+            CaState.SAVED -> buildSaved()
+            CaState.TRUSTED -> buildTrusted()
+        }.also { it.show() }
     }
 
-    private fun step(sheet: Sheet, number: Int, title: String, subtitle: String) {
+    /** Rebuilds the sheet only when the trust/export/lock state actually changed. */
+    fun refresh() {
+        val current = sheet ?: return
+        if (!current.isShowing || currentSignature() == signature) return
+        current.dismiss()
+        sheet = null
+        show()
+    }
+
+    fun isShowing(): Boolean = sheet?.isShowing == true
+
+    fun dismiss() {
+        sheet?.dismiss()
+        sheet = null
+    }
+
+    private fun currentState(): CaState = when {
+        !host.caReady -> CaState.CHECKING
+        host.core.userCaTrusted -> CaState.TRUSTED
+        !host.caLockReady -> CaState.NO_LOCK
+        host.caExportName.isNotEmpty() -> CaState.SAVED
+        else -> CaState.NOT_INSTALLED
+    }
+
+    private fun currentSignature(): String =
+        "${host.caReady}|${host.core.userCaTrusted}|${host.caLockReady}|" +
+            "${host.caExportName}|${host.core.caFingerprintSha256}"
+
+    private fun buildChecking(): Sheet {
+        val sheet = Sheet(context, "证书", "读取本地 CA 与系统信任状态")
+        addStatus(
+            sheet,
+            "正在检查证书…",
+            null,
+            Palette.ACCENT,
+            CA_BLUE_FILL,
+            CA_BLUE_STROKE,
+        )
+        return sheet
+    }
+
+    private fun buildNoLock(): Sheet {
+        val saved = host.caExportName
+        val detail = if (saved.isEmpty()) {
+            "设置锁屏后再回来安装，否则系统可能不显示安装入口"
+        } else {
+            "已保存到 $saved；设置锁屏后再回来安装"
+        }
+        val sheet = Sheet(context, "先设置锁屏", "Android 11 及以上安装 CA 证书需要锁屏")
+        addStatus(
+            sheet,
+            "需要锁屏密码",
+            detail,
+            Palette.AMBER,
+            CA_AMBER_FILL,
+            CA_AMBER_STROKE,
+        )
+        step(sheet, 1, "设置锁屏", "设置 → 安全（或「安全和隐私」）→ 屏幕锁定（密码、图案或 PIN）")
+        step(sheet, 2, "回来继续", "设置完成后回到这里，会重新检查")
+        sheet.primary("去设置锁屏") { host.openCaLockSettings() }
+        sheet.secondary("仅保存证书") { host.saveCaForInstall() }
+        return sheet
+    }
+
+    private fun buildNotInstalled(): Sheet {
+        val sheet = Sheet(context, "安装证书", "保存到下载，然后在系统设置中安装")
+        addStatus(
+            sheet,
+            "尚未安装",
+            "浏览器需要信任这个 CA 才能通过 hakimi 加速",
+            Palette.AMBER,
+            CA_AMBER_FILL,
+            CA_AMBER_STROKE,
+        )
+        step(sheet, 1, "保存证书", "点下方按钮保存；Android 10+ 会直接存到下载")
+        step(
+            sheet,
+            2,
+            "系统设置安装",
+            installPath(),
+            "选「CA 证书」→ 仍然安装 → 选择「${installFileName()}」",
+        )
+        step(sheet, 3, "返回自动检查", "安装完成回到 hakimi；若状态没有变化，点「重新检查」")
+        addHint(sheet, "找不到入口？在设置顶部搜索「安装证书」。文件选择器若停在「最近」，切到「下载」。")
+        sheet.primary("保存并去安装") { host.exportCaForInstall() }
+        sheet.secondary("仅保存证书") { host.saveCaForInstall() }
+        sheet.textButton("重新检查") { host.recheckCa() }
+        return sheet
+    }
+
+    private fun buildSaved(): Sheet {
+        val name = host.caExportName
+        val sheet = Sheet(context, "安装证书", "证书已保存，继续在系统设置中安装")
+        addStatus(
+            sheet,
+            "已保存，等待安装",
+            "文件：$name",
+            Palette.AMBER,
+            CA_AMBER_FILL,
+            CA_AMBER_STROKE,
+        )
+        step(
+            sheet,
+            1,
+            "系统设置安装",
+            installPath(),
+            "选「CA 证书」→ 仍然安装 → 选择「$name」",
+        )
+        step(sheet, 2, "返回自动检查", "安装完成回到 hakimi；若状态没有变化，点「重新检查」")
+        addHint(sheet, "找不到入口？在设置顶部搜索「安装证书」。文件选择器若停在「最近」，切到「下载」。")
+        sheet.primary("打开系统设置") { host.openCaInstallSettings() }
+        sheet.secondary("重新检查") { host.recheckCa() }
+        sheet.textButton("重新保存") { host.saveCaForInstall() }
+        return sheet
+    }
+
+    private fun buildTrusted(): Sheet {
+        val data = host.core
+        val sha = if (data.caFingerprintSha256.isEmpty()) {
+            "—"
+        } else {
+            CaTrust.displaySha256(data.caFingerprintSha256)
+        }
+        val sheet = Sheet(context, "证书已安装")
+        addStatus(
+            sheet,
+            "已安装并受信任",
+            "升级 App 不需要重新安装；换机或重装系统时用备份恢复",
+            Palette.GREEN,
+            CA_GREEN_FILL,
+            CA_GREEN_STROKE,
+        )
+        sheet.add(context.monospace(
+            "Subject  ${data.caSubject.ifEmpty { "—" }}\n" +
+                "SHA-256  $sha\n" +
+                "到期     ${data.caNotAfter.take(10).ifEmpty { "—" }}",
+            10f,
+            Palette.TEXT_2,
+        ).apply {
+            background = context.rounded(0xFFF7FCFE.toInt(), 14f, Palette.BORDER, 1f)
+            setPadding(context.dp(14f), context.dp(12f), context.dp(14f), context.dp(12f))
+            setTextIsSelectable(true)
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = context.dp(14f) })
+        sheet.primary("完成") { dismiss() }
+        sheet.secondary("导出备份") { host.exportCaBackup() }
+        return sheet
+    }
+
+    private fun installPath(): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return "设置 → 安全 → 加密与凭据 → 安装证书（或「从存储设备安装」）→ CA 证书"
+        }
+        val maker = Build.MANUFACTURER.lowercase(Locale.ROOT)
+        return when {
+            maker.contains("xiaomi") || maker.contains("redmi") ->
+                "设置 → 密码与安全 → 系统安全 → 加密与凭据 → 安装证书 → CA 证书"
+            maker.contains("samsung") ->
+                "设置 → 生物识别和安全 → 其他安全设置 → 从设备存储安装证书"
+            else ->
+                "设置 → 安全（或「安全和隐私」）→ 更多安全设置 → 加密与凭据 → 安装证书 → CA 证书"
+        }
+    }
+
+    private fun installFileName(): String =
+        host.caExportName.ifEmpty { CaStore.INSTALL_NAME }
+
+    private fun addStatus(
+        sheet: Sheet,
+        title: String,
+        detail: String?,
+        color: Int,
+        fill: Int,
+        stroke: Int,
+    ) {
+        val card = context.card(radius = 12f, fill = fill, padding = 14f, stroke = stroke)
+        card.addView(context.text(title, 13f, color, medium = true))
+        if (!detail.isNullOrEmpty()) {
+            card.addView(context.text(detail, 10.5f, Palette.TEXT_2).apply {
+                setPadding(0, context.dp(4f), 0, 0)
+            })
+        }
+        sheet.add(card, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = context.dp(12f) })
+    }
+
+    private fun addHint(sheet: Sheet, text: String) {
+        sheet.add(context.text(text, 10f, Palette.MUTED).apply {
+            setPadding(context.dp(2f), context.dp(10f), context.dp(2f), 0)
+        })
+    }
+
+    private fun step(
+        sheet: Sheet,
+        number: Int,
+        title: String,
+        subtitle: String,
+        detail: String? = null,
+    ) {
         val row = context.row()
         row.setPadding(0, context.dp(14f), 0, 0)
         row.addView(context.text("$number", 11f, Palette.ACCENT, medium = true).apply {
@@ -821,24 +988,13 @@ class CaSetupSheet(
         texts.addView(context.text(subtitle, 10.5f, Palette.MUTED).apply {
             setPadding(0, context.dp(3f), 0, 0)
         })
+        if (!detail.isNullOrEmpty()) {
+            texts.addView(context.text(detail, 10f, Palette.TEXT_2).apply {
+                setPadding(0, context.dp(4f), 0, 0)
+            })
+        }
         row.addView(texts, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         sheet.add(row)
-    }
-
-    private fun openSecuritySettings() {
-        val intent = Intent(Settings.ACTION_SECURITY_SETTINGS)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        try {
-            context.startActivity(intent)
-        } catch (_: Throwable) {
-            try {
-                context.startActivity(
-                    Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            } catch (_: Throwable) {
-                host.showSnack("无法打开系统设置，请手动进入安全设置", error = true)
-            }
-        }
     }
 }
 

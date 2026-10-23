@@ -91,9 +91,15 @@ class HomeScreen(private val context: Context, private val host: Host) {
                 heroAction.isEnabled = false
             }
             !data.userCaTrusted -> {
-                heroTitle.text = "需要设置证书"
-                heroSubtitle.text = "安装本地 CA 后启用"
-                heroAction.text = "设置"
+                if (!host.caLockReady) {
+                    heroTitle.text = "需要设置锁屏"
+                    heroSubtitle.text = "Android 11 及以上安装 CA 需要锁屏"
+                    heroAction.text = "设置"
+                } else {
+                    heroTitle.text = "需要安装证书"
+                    heroSubtitle.text = "安装本地 CA 后才能加速"
+                    heroAction.text = "安装"
+                }
                 heroAction.isEnabled = true
                 heroAction.clickOnce { host.openCaSetup() }
             }

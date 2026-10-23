@@ -2,9 +2,9 @@ package com.hakimi.probe
 
 import android.Manifest
 import android.app.Activity
+import android.app.KeyguardManager
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -12,12 +12,11 @@ import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
-import android.provider.MediaStore
+import android.provider.DocumentsContract
 import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
@@ -60,6 +59,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
 import java.util.concurrent.Executors
 
 class MainActivity : Activity(), Host {
@@ -70,14 +71,27 @@ class MainActivity : Activity(), Host {
         private const val REQUEST_VPN = 44
     }
 
+    /** Trusted in either the user store or the system store. */
     @Volatile
     private var userCaTrusted = false
 
     @Volatile
     private var caChecked = false
 
+    @Volatile
+    private var resumed = false
+
     override val caReady: Boolean
         get() = caChecked
+
+    override val caLockReady: Boolean
+        get() = Build.VERSION.SDK_INT < Build.VERSION_CODES.R ||
+            getSystemService(KeyguardManager::class.java)?.isDeviceSecure == true
+
+    private var lastCaExportName = ""
+
+    override val caExportName: String
+        get() = lastCaExportName.ifEmpty { Prefs.caExportName(this) }
 
     private var data: CoreData = CoreParser.parse("{}", "{}", false)
 
@@ -95,7 +109,11 @@ class MainActivity : Activity(), Host {
     private var pollInFlight = false
     private var syncingCa = false
     private val caCallbacks = ArrayList<() -> Unit>()
-    private var pendingCaPem = ""
+    private var caSheet: CaSetupSheet? = null
+    private var pendingCaWrite: PendingCaWrite? = null
+    private var awaitingCaInstall = false
+    private var reopenCaSheet = false
+    private var startAfterCaInstall = false
     private var starting = false
     private var lastAccelToggle = 0L
     private var exporting = false
@@ -105,6 +123,15 @@ class MainActivity : Activity(), Host {
     private var pendingVpnStart = false
     @Volatile private var staleProxyChecked = false
     private var tab = 0
+
+    private enum class CaWriteKind { INSTALL, BACKUP }
+
+    private data class PendingCaWrite(
+        val der: ByteArray,
+        val kind: CaWriteKind,
+        val suggestedName: String,
+        val openSettings: Boolean,
+    )
 
     private lateinit var topBar: TopBar
     private lateinit var screenHost: FrameLayout
@@ -123,6 +150,8 @@ class MainActivity : Activity(), Host {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        lastCaExportName = Prefs.caExportName(this)
+        awaitingCaInstall = Prefs.awaitingCaInstall(this)
         buildShell()
         edgeToEdge()
         buildScreens()
@@ -209,12 +238,18 @@ class MainActivity : Activity(), Host {
 
     override fun onResume() {
         super.onResume()
-        syncCaTrust { maybeAutoStart() }
+        resumed = true
+        syncCaTrust {
+            if (!resumed) return@syncCaTrust
+            maybeAutoStart()
+            afterCaSync()
+        }
         handler.removeCallbacks(pollTask)
         handler.post(pollTask)
     }
 
     override fun onPause() {
+        resumed = false
         handler.removeCallbacks(pollTask)
         super.onPause()
     }
@@ -240,6 +275,7 @@ class MainActivity : Activity(), Host {
         if (userCaTrusted) {
             startAcceleration()
         } else {
+            startAfterCaInstall = true
             openCaSetup()
         }
     }
@@ -275,6 +311,7 @@ class MainActivity : Activity(), Host {
                         )
                     }
                 }
+                if (resumed) caSheet?.refresh()
                 render()
             }
         }
@@ -351,9 +388,11 @@ class MainActivity : Activity(), Host {
     private fun startAcceleration() {
         if (data.running || starting || HakimiVpnService.active) return
         if (!userCaTrusted) {
+            startAfterCaInstall = true
             openCaSetup()
             return
         }
+        startAfterCaInstall = false
         requestNotificationPermission()
 
         if (Prefs.mode(this) == Prefs.MODE_VPN) {
@@ -416,6 +455,7 @@ class MainActivity : Activity(), Host {
 
     private fun stopAcceleration() {
         starting = false
+        startAfterCaInstall = false
         if (Prefs.mode(this) == Prefs.MODE_VPN) {
             if (Prefs.systemAlwaysOn(this)) {
                 showAlwaysOnStop()
@@ -984,16 +1024,193 @@ class MainActivity : Activity(), Host {
     // -- certificate ---------------------------------------------------------
 
     override fun openCaSetup() {
-        CaSetupSheet(this, this).show()
+        if (isFinishing || isDestroyed) return
+        val current = caSheet
+        if (current?.isShowing() == true) {
+            current.refresh()
+            return
+        }
+        caSheet = CaSetupSheet(this, this).also { it.show() }
+    }
+
+    override fun exportCaForInstall() = exportCa(openSettings = true)
+
+    override fun saveCaForInstall() = exportCa(openSettings = false)
+
+    override fun exportCaBackup() {
+        if (exporting) return
+        exporting = true
+        operations.execute {
+            val der = CaTrust.der(runCatching { Bootstrap.caPem(this) }.getOrDefault(""))
+            handler.post {
+                exporting = false
+                if (der == null) {
+                    showSnack("证书尚未准备好，请稍后重试", error = true)
+                    return@post
+                }
+                val name = backupName()
+                pendingCaWrite = PendingCaWrite(
+                    der,
+                    CaWriteKind.BACKUP,
+                    name,
+                    openSettings = false,
+                )
+                launchCaDocument(name)
+            }
+        }
+    }
+
+    /**
+     * Writes the install copy. Android 10+ targets the single file in
+     * Downloads; older systems (and MediaStore failures) use SAF. When
+     * [openSettings] is true the security screen is opened right away and
+     * [afterCaSync] checks the result on return.
+     */
+    private fun exportCa(openSettings: Boolean) {
+        if (exporting) return
+        exporting = true
+        operations.execute {
+            val pem = runCatching { Bootstrap.caPem(this) }.getOrDefault("")
+            val der = CaTrust.der(pem)
+            if (der == null) {
+                handler.post {
+                    exporting = false
+                    showSnack("证书尚未准备好，请稍后重试", error = true)
+                }
+                return@execute
+            }
+
+            val saved = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                try {
+                    CaStore.saveToDownloads(contentResolver, packageName, der, caExportName)
+                } catch (error: Throwable) {
+                    Log.w(TAG, "saving CA to Downloads failed", error)
+                    null
+                }
+            } else {
+                null
+            }
+
+            handler.post {
+                exporting = false
+                if (saved == null) {
+                    pendingCaWrite = PendingCaWrite(
+                        der,
+                        CaWriteKind.INSTALL,
+                        CaStore.INSTALL_NAME,
+                        openSettings,
+                    )
+                    launchCaDocument(CaStore.INSTALL_NAME)
+                    return@post
+                }
+                lastCaExportName = saved
+                Prefs.setCaExportName(this, saved)
+                if (openSettings) {
+                    awaitingCaInstall = true
+                    Prefs.setAwaitingCaInstall(this, true)
+                    caSheet?.dismiss()
+                    caSheet = null
+                    val opened = openSecuritySettings()
+                    showSnack(
+                        if (opened) "已保存到 $saved，请继续安装"
+                        else "已保存到 $saved，请手动打开系统设置安装",
+                        error = !opened,
+                    )
+                    if (!opened) {
+                        awaitingCaInstall = false
+                        Prefs.setAwaitingCaInstall(this, false)
+                    }
+                } else {
+                    showSnack("已保存到 $saved")
+                    if (!isFinishing && !isDestroyed) caSheet?.refresh()
+                }
+            }
+        }
     }
 
     override fun recheckCa() {
         syncCaTrust {
+            val trusted = userCaTrusted
             showSnack(
-                if (userCaTrusted) "证书已受信任" else "仍未能从用户证书库中找到该 CA",
-                error = !userCaTrusted
+                if (trusted) "证书已安装并受信任"
+                else "还没有检测到证书，请确认安装时选择的是「${caFileName()}」",
+                error = !trusted,
             )
+            caSheet?.refresh()
         }
+    }
+
+    override fun openCaInstallSettings() {
+        if (isFinishing || isDestroyed) return
+        awaitingCaInstall = true
+        Prefs.setAwaitingCaInstall(this, true)
+        caSheet?.dismiss()
+        caSheet = null
+        if (!openSecuritySettings()) {
+            awaitingCaInstall = false
+            Prefs.setAwaitingCaInstall(this, false)
+            showSnack("无法打开系统设置，请手动进入安全设置", error = true)
+        }
+    }
+
+    override fun openCaLockSettings() {
+        if (isFinishing || isDestroyed) return
+        caSheet?.dismiss()
+        caSheet = null
+        reopenCaSheet = true
+        if (!openSecuritySettings()) {
+            reopenCaSheet = false
+            showSnack("无法打开系统设置，请手动设置锁屏", error = true)
+        }
+    }
+
+    private fun openSecuritySettings(): Boolean {
+        val intents = listOf(
+            Intent(Settings.ACTION_SECURITY_SETTINGS),
+            Intent(Settings.ACTION_SETTINGS),
+        )
+        for (intent in intents) {
+            try {
+                startActivity(intent)
+                return true
+            } catch (_: Throwable) {
+            }
+        }
+        return false
+    }
+
+    /** Runs after every CA probe; closes the loop with the system installer. */
+    private fun afterCaSync() {
+        caSheet?.refresh()
+        var installed = false
+        if (awaitingCaInstall) {
+            awaitingCaInstall = false
+            Prefs.setAwaitingCaInstall(this, false)
+            if (!userCaTrusted) {
+                reopenCaSheet = false
+                showSnack(
+                    "还没有检测到证书，请确认安装时选择的是「${caFileName()}」",
+                    error = true,
+                )
+                openCaSetup()
+                return
+            }
+            installed = true
+        }
+        if (startAfterCaInstall && userCaTrusted) {
+            startAfterCaInstall = false
+            showSnack("证书已安装，正在开启加速")
+            startAcceleration()
+        } else if (installed) {
+            showSnack("证书已安装，可以开始加速了")
+        } else if (reopenCaSheet) {
+            if (userCaTrusted) {
+                showSnack("证书已安装，可以开始加速了")
+            } else {
+                openCaSetup()
+            }
+        }
+        reopenCaSheet = false
     }
 
     private fun syncCaTrust(then: (() -> Unit)? = null) {
@@ -1002,13 +1219,13 @@ class MainActivity : Activity(), Host {
         syncingCa = true
         operations.execute {
             val initialized = runCatching { Bootstrap.init(this) }.getOrDefault(false)
-            val pem = if (initialized) {
-                runCatching { Native.caPem() }.getOrDefault("")
-            } else {
-                ""
-            }
-            val trusted = initialized && CaTrust.isUserTrusted(pem)
-            Log.i(TAG, "ca init=$initialized trusted=$trusted pem=${pem.length}")
+            val pem = runCatching { Bootstrap.caPem(this) }.getOrDefault("")
+            val trust = CaTrust.trust(pem)
+            val trusted = trust.user || trust.system
+            Log.i(
+                TAG,
+                "ca init=$initialized user=${trust.user} system=${trust.system} pem=${pem.length}",
+            )
             try {
                 File(filesDir, "ca-store.txt").writeText(CaTrust.listTrusted())
             } catch (error: Throwable) {
@@ -1020,6 +1237,15 @@ class MainActivity : Activity(), Host {
                 syncingCa = false
                 caChecked = true
                 if (isFinishing || isDestroyed) return@post
+                if (data.userCaTrusted != trusted) {
+                    data = data.copy(userCaTrusted = trusted)
+                }
+                if (!resumed) {
+                    caCallbacks.clear()
+                    return@post
+                }
+                render()
+                caSheet?.refresh()
                 val callbacks = caCallbacks.toList()
                 caCallbacks.clear()
                 callbacks.forEach { callback ->
@@ -1030,69 +1256,31 @@ class MainActivity : Activity(), Host {
         }
     }
 
-    override fun exportCa() {
-        if (exporting) return
-        exporting = true
-        operations.execute {
-            val pem = runCatching { Native.caPem() }.getOrDefault("")
-            if (pem.isEmpty()) {
-                handler.post {
-                    exporting = false
-                    showSnack("证书尚未生成，请先启动一次核心", error = true)
-                }
-                return@execute
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                try {
-                    saveCaToDownloads(pem)
-                    handler.post {
-                        exporting = false
-                        showSnack("证书已保存到「下载/hakimi-ca.crt」")
-                    }
-                } catch (error: Throwable) {
-                    Log.w(TAG, "saving CA via MediaStore failed", error)
-                    handler.post {
-                        exporting = false
-                        launchCaDocument(pem)
-                    }
-                }
-            } else {
-                handler.post {
-                    exporting = false
-                    launchCaDocument(pem)
-                }
-            }
-        }
-    }
+    private fun backupName(): String =
+        "hakimi-ca-${LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE)}.crt"
 
-    private fun saveCaToDownloads(pem: String) {
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, "hakimi-ca.crt")
-            put(MediaStore.MediaColumns.MIME_TYPE, "application/x-x509-ca-cert")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-            put(MediaStore.MediaColumns.IS_PENDING, 1)
-        }
-        val resolver = contentResolver
-        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: throw IllegalStateException("MediaStore insert returned null")
-        resolver.openOutputStream(uri)?.use { output ->
-            output.write(pem.toByteArray(Charsets.UTF_8))
-        } ?: throw IllegalStateException("cannot open $uri")
-        values.clear()
-        values.put(MediaStore.MediaColumns.IS_PENDING, 0)
-        resolver.update(uri, values, null, null)
-    }
+    private fun caFileName(): String = caExportName.ifEmpty { CaStore.INSTALL_NAME }
 
-    private fun launchCaDocument(pem: String) {
-        pendingCaPem = pem
+    private fun launchCaDocument(name: String) {
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
-            putExtra(Intent.EXTRA_TITLE, "hakimi-ca.crt")
+            putExtra(Intent.EXTRA_TITLE, name)
+            runCatching {
+                putExtra(
+                    DocumentsContract.EXTRA_INITIAL_URI,
+                    DocumentsContract.buildRootUri(
+                        "com.android.externalstorage.documents",
+                        "downloads",
+                    ),
+                )
+            }
         }
         try {
             startActivityForResult(intent, REQUEST_SAVE_CA)
         } catch (error: Throwable) {
+            pendingCaWrite = null
+            exporting = false
             showSnack("无法打开文件选择器：$error", error = true)
         }
     }
@@ -1110,24 +1298,50 @@ class MainActivity : Activity(), Host {
             }
             return
         }
-        if (requestCode != REQUEST_SAVE_CA || resultCode != RESULT_OK) return
-        val uri: Uri = result?.data ?: return
-        val pem = pendingCaPem
-        if (pem.isEmpty()) return
+        if (requestCode != REQUEST_SAVE_CA) return
+        val pending = pendingCaWrite
+        val uri = if (resultCode == RESULT_OK) result?.data else null
+        if (pending == null || uri == null) {
+            pendingCaWrite = null
+            exporting = false
+            return
+        }
         operations.execute {
-            val ok = try {
-                contentResolver.openOutputStream(uri)?.use { output ->
-                    output.write(pem.toByteArray(Charsets.UTF_8))
-                } != null
-            } catch (error: Throwable) {
-                Log.w(TAG, "writing CA failed", error)
-                false
-            }
+            val ok = CaStore.writeDocument(contentResolver, uri, pending.der)
+            val name = CaStore.displayName(contentResolver, uri)
+                .ifEmpty { pending.suggestedName }
             handler.post {
+                pendingCaWrite = null
+                exporting = false
+                if (!ok) {
+                    showSnack("保存证书失败", error = true)
+                    return@post
+                }
+                if (pending.kind == CaWriteKind.BACKUP) {
+                    showSnack("证书备份已保存：$name")
+                    return@post
+                }
+                lastCaExportName = name
+                Prefs.setCaExportName(this, name)
+                if (!pending.openSettings) {
+                    showSnack("已保存到 $name")
+                    if (!isFinishing && !isDestroyed) caSheet?.refresh()
+                    return@post
+                }
+                awaitingCaInstall = true
+                Prefs.setAwaitingCaInstall(this, true)
+                caSheet?.dismiss()
+                caSheet = null
+                val opened = openSecuritySettings()
                 showSnack(
-                    if (ok) "证书已保存，请安装为 CA 证书" else "保存证书失败",
-                    error = !ok
+                    if (opened) "已保存到 $name，请继续安装"
+                    else "已保存到 $name，请手动打开系统设置安装",
+                    error = !opened,
                 )
+                if (!opened) {
+                    awaitingCaInstall = false
+                    Prefs.setAwaitingCaInstall(this, false)
+                }
             }
         }
     }

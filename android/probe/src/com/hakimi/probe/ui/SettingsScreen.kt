@@ -8,6 +8,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import com.hakimi.probe.Bootstrap
+import com.hakimi.probe.CaTrust
 import com.hakimi.probe.Prefs
 
 class SettingsScreen(private val context: Context, private val host: Host) {
@@ -60,7 +61,7 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         content.addView(space(8f))
 
         content.addView(section("证书"))
-        certRow = SettingRow(context, "本地 CA", "ECH 与 SNI 修改的信任基础")
+        certRow = SettingRow(context, "本地 CA", "浏览器信任后才能通过 hakimi 加速")
         certRow.clickOnce { host.openCaSetup() }
         val certCard = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
@@ -81,8 +82,8 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         ))
         val certActions = context.row()
         certActions.setPadding(context.dp(6f), 0, context.dp(16f), context.dp(8f))
-        certActions.addView(textAction("导出证书") { host.exportCa() })
-        certActions.addView(textAction("安装指引") { host.openCaSetup() })
+        certActions.addView(textAction("安装证书") { host.openCaSetup() })
+        certActions.addView(textAction("导出备份") { host.exportCaBackup() })
         certCard.addView(certActions)
         content.addView(certCard)
         content.addView(space(8f))
@@ -165,6 +166,7 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         envRow.setValue(
             when {
                 !host.caReady -> "检查中"
+                !trusted && !host.caLockReady -> "需设置锁屏"
                 !trusted -> "证书未安装"
                 data.running -> "运行中"
                 else -> "待开启"
@@ -180,10 +182,25 @@ class SettingsScreen(private val context: Context, private val host: Host) {
             if (data.running) "运行中" else "已停止",
             if (data.running) Palette.GREEN else Palette.MUTED
         )
-        certRow.setValue(if (trusted) "已信任" else "未信任", if (trusted) Palette.GREEN else Palette.AMBER)
+        certRow.setValue(
+            when {
+                !host.caReady -> "检查中"
+                trusted -> "已信任"
+                !host.caLockReady -> "需锁屏"
+                else -> "未安装"
+            },
+            when {
+                !host.caReady -> Palette.MUTED
+                trusted -> Palette.GREEN
+                else -> Palette.AMBER
+            }
+        )
 
         certInfo.text = buildString {
-            append(data.caSubject.ifEmpty { "CN=hakimi Local CA" })
+            append(data.caSubject.ifEmpty { "—" })
+            if (data.caFingerprintSha256.isNotEmpty()) {
+                append("\nSHA-256  ").append(CaTrust.displaySha256(data.caFingerprintSha256))
+            }
             if (data.caNotAfter.isNotEmpty()) {
                 append("\n到期  ").append(data.caNotAfter.take(10))
             }

@@ -33,9 +33,9 @@ object CoreController {
                 return@execute
             }
             val initialized = runCatching { Bootstrap.init(app) }.getOrDefault(false)
-            val trusted = initialized && runCatching {
-                CaTrust.isUserTrusted(Native.caPem())
-            }.getOrDefault(false)
+            val trusted = CaTrust.isTrusted(
+                runCatching { Bootstrap.caPem(app) }.getOrDefault("")
+            )
             runCatching { Native.setCaTrusted(trusted) }
             clearLegacyProxy(app)
             val started = initialized && runCatching { Native.startProxy() }.getOrDefault(false)

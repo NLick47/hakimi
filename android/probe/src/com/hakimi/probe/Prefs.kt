@@ -14,6 +14,8 @@ object Prefs {
     private const val DESIRED = "desired_running"
     private const val MODE = "run_mode"
     private const val EXCLUDED_APPS = "vpn_excluded_apps"
+    private const val CA_EXPORT_NAME = "ca_export_name"
+    private const val AWAITING_CA_INSTALL = "awaiting_ca_install"
 
     fun get(context: Context): SharedPreferences =
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
@@ -38,6 +40,22 @@ object Prefs {
 
     fun setExcludedApps(context: Context, packages: Set<String>) {
         get(context).edit().putStringSet(EXCLUDED_APPS, packages.toSet()).commit()
+    }
+
+    /** Last CA file this device exported, used to keep the install sheet honest. */
+    fun caExportName(context: Context): String =
+        get(context).getString(CA_EXPORT_NAME, "") ?: ""
+
+    fun setCaExportName(context: Context, name: String) {
+        get(context).edit().putString(CA_EXPORT_NAME, name).commit()
+    }
+
+    /** True while the user is away in the system certificate installer. */
+    fun awaitingCaInstall(context: Context): Boolean =
+        get(context).getBoolean(AWAITING_CA_INSTALL, false)
+
+    fun setAwaitingCaInstall(context: Context, awaiting: Boolean) {
+        get(context).edit().putBoolean(AWAITING_CA_INSTALL, awaiting).commit()
     }
 
     fun systemAlwaysOn(context: Context): Boolean = runCatching {

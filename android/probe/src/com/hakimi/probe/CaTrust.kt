@@ -4,7 +4,6 @@ import android.util.Log
 import java.io.ByteArrayInputStream
 import java.security.KeyStore
 import java.security.MessageDigest
-import java.security.cert.Certificate
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 
@@ -12,14 +11,66 @@ import java.security.cert.X509Certificate
 object CaTrust {
     private const val TAG = "Hakimi"
 
-    fun isUserTrusted(caPem: String?): Boolean = contains(caPem, "user:")
+    data class Trust(val user: Boolean, val system: Boolean) {
+        val any: Boolean get() = user || system
+    }
 
-    fun isSystemTrusted(caPem: String?): Boolean = contains(caPem, "system:")
+    fun trust(caPem: String?): Trust {
+        val targetDer = der(caPem) ?: return Trust(false, false)
+        return try {
+            val store = KeyStore.getInstance("AndroidCAStore").apply { load(null, null) }
+            var user = false
+            var system = false
+            val aliases = store.aliases()
+            while (aliases.hasMoreElements() && (!user || !system)) {
+                val alias = aliases.nextElement()
+                val isUser = alias.startsWith("user:")
+                val isSystem = alias.startsWith("system:")
+                if (!isUser && !isSystem) continue
+                val candidate = store.getCertificate(alias) ?: continue
+                if (!candidate.encoded.contentEquals(targetDer)) continue
+                if (isUser) user = true else system = true
+            }
+            Trust(user, system)
+        } catch (error: Throwable) {
+            Log.w(TAG, "CA store probe failed: $error")
+            Trust(false, false)
+        }
+    }
+
+    fun isUserTrusted(caPem: String?): Boolean = trust(caPem).user
+
+    fun isSystemTrusted(caPem: String?): Boolean = trust(caPem).system
+
+    fun isTrusted(caPem: String?): Boolean = trust(caPem).any
 
     fun describe(caPem: String?): String {
         if (caPem.isNullOrEmpty()) return "CA not generated yet"
-        return "user=${isUserTrusted(caPem)} system=${isSystemTrusted(caPem)}"
+        val trust = trust(caPem)
+        return "user=${trust.user} system=${trust.system}"
     }
+
+    /** Parses the PEM into the DER bytes the platform installers expect. */
+    fun der(caPem: String?): ByteArray? {
+        if (caPem.isNullOrEmpty()) return null
+        return runCatching {
+            CertificateFactory.getInstance("X.509")
+                .generateCertificate(ByteArrayInputStream(caPem.toByteArray(Charsets.UTF_8)))
+                .encoded
+        }.getOrNull()
+    }
+
+    fun sha256Hex(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
+    fun shortSha256(bytes: ByteArray, length: Int = 8): String =
+        sha256Hex(bytes).take(length)
+
+    /** Compact fingerprint for narrow UI rows: first 12 bytes, colon separated. */
+    fun displaySha256(value: String): String =
+        if (value.length <= 24) value
+        else value.chunked(2).take(12).joinToString(":") + "…"
 
     /** Dump every AndroidCAStore entry (alias, subject, SHA-256) for diagnostics. */
     fun listTrusted(): String = buildString {
@@ -42,32 +93,6 @@ object CaTrust {
             }
         } catch (error: Throwable) {
             append("error: ").append(error).append('\n')
-        }
-    }
-
-    private fun contains(caPem: String?, prefix: String): Boolean {
-        if (caPem.isNullOrEmpty()) return false
-        return try {
-            val factory = CertificateFactory.getInstance("X.509")
-            val target = factory.generateCertificate(
-                ByteArrayInputStream(caPem.toByteArray(Charsets.UTF_8))
-            ) as X509Certificate
-            val targetDer = target.encoded
-
-            val store = KeyStore.getInstance("AndroidCAStore").apply { load(null, null) }
-            val aliases = store.aliases()
-            while (aliases.hasMoreElements()) {
-                val alias = aliases.nextElement()
-                if (!alias.startsWith(prefix)) continue
-                val candidate: Certificate? = store.getCertificate(alias)
-                if (candidate != null && candidate.encoded.contentEquals(targetDer)) {
-                    return true
-                }
-            }
-            false
-        } catch (error: Throwable) {
-            Log.w(TAG, "CA store probe failed: $error")
-            false
         }
     }
 }

@@ -170,7 +170,9 @@ class HakimiVpnService : VpnService() {
                 return@start
             }
 
-            val trusted = runCatching { CaTrust.isUserTrusted(Native.caPem()) }.getOrDefault(false)
+            val trusted = CaTrust.isTrusted(
+                runCatching { Bootstrap.caPem(this) }.getOrDefault("")
+            )
             runCatching { Native.setCaTrusted(trusted) }
             if (!trusted) {
                 lastError = "证书未安装"

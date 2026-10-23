@@ -18,6 +18,8 @@ interface Host {
     val core: CoreData
     val probing: Boolean
     val caReady: Boolean
+    val caLockReady: Boolean
+    val caExportName: String
 
     fun toggleAcceleration()
     fun setGroupEnabled(site: SiteInfo, enabled: Boolean)
@@ -38,7 +40,11 @@ interface Host {
     fun showLog()
     fun exportDiagnostics()
     fun openCaSetup()
-    fun exportCa()
+    fun exportCaForInstall()
+    fun saveCaForInstall()
+    fun exportCaBackup()
+    fun openCaInstallSettings()
+    fun openCaLockSettings()
     fun recheckCa()
     fun openUrl(url: String)
     fun copy(text: String, label: String)
