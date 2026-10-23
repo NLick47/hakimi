@@ -118,6 +118,123 @@ fn activate_app() {
 #[cfg(not(target_os = "macos"))]
 fn activate_app() {}
 
+/// The app keeps running in the menu bar after the window closes. Switch to an
+/// accessory app so closing the window also removes the Dock icon; the tray
+/// and the proxy stay alive.
+#[cfg(target_os = "macos")]
+fn set_dock_visible(visible: bool) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let policy = if visible {
+        NSApplicationActivationPolicy::Regular
+    } else {
+        NSApplicationActivationPolicy::Accessory
+    };
+    let _ = app.setActivationPolicy(policy);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_dock_visible(_visible: bool) {}
+
+/// While the window is closed the app is an accessory app without a Dock icon.
+/// Reopening it from Finder (or `open`) still sends
+/// `applicationShouldHandleReopen:` to the delegate, so hook that method to
+/// bring the window back. Winit installs its own delegate but does not
+/// implement this method, and replacing the delegate would break winit's
+/// event loop, so the method is added to the existing delegate class.
+#[cfg(target_os = "macos")]
+mod macos_reopen {
+    use std::cell::{Cell, RefCell};
+    use std::ffi::CString;
+    use std::rc::Rc;
+
+    use objc2::encode::{Encode, Encoding};
+    use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
+    use objc2::{sel, MainThreadMarker};
+    use objc2_app_kit::NSApplication;
+
+    thread_local! {
+        // The callback rebuilds the window through the same path as the tray
+        // menu, so both entry points share the window's lifecycle bookkeeping.
+        static SHOW_MAIN: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+        static INSTALLED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    unsafe extern "C-unwind" fn should_reopen(
+        _this: *mut AnyObject,
+        _cmd: Sel,
+        _sender: *mut NSApplication,
+        _has_visible_windows: Bool,
+    ) -> Bool {
+        SHOW_MAIN.with(|slot| {
+            if let Some(show) = slot.borrow().clone() {
+                show();
+            }
+        });
+        Bool::YES
+    }
+
+    pub(super) fn install(show_main: impl Fn() + 'static) {
+        SHOW_MAIN.with(|slot| *slot.borrow_mut() = Some(Rc::new(show_main)));
+
+        if INSTALLED.with(Cell::get) {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        let Some(delegate) = app.delegate() else {
+            return;
+        };
+
+        let sel = sel!(applicationShouldHandleReopen:hasVisibleWindows:);
+        let object: &AnyObject = delegate.as_ref();
+        let class: &'static AnyClass = object.class();
+        if class.instance_method(sel).is_some() {
+            INSTALLED.with(|flag| flag.set(true));
+            return;
+        }
+
+        // Encoding order is return value, self, selector, then arguments.
+        // BOOL is `_Bool` on Apple Silicon and `signed char` on Intel, so ask
+        // objc2 instead of hardcoding "B@:@B".
+        let types = CString::new(format!(
+            "{}{}{}{}{}",
+            Bool::ENCODING,
+            Encoding::Object,
+            Encoding::Sel,
+            Encoding::Object,
+            Bool::ENCODING
+        ))
+        .expect("method encoding cannot contain a NUL byte");
+        let imp: objc2::runtime::Imp = unsafe {
+            std::mem::transmute::<
+                unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut NSApplication, Bool) -> Bool,
+                objc2::runtime::Imp,
+            >(should_reopen)
+        };
+        let added = unsafe {
+            objc2::ffi::class_addMethod(
+                class as *const AnyClass as *mut AnyClass,
+                sel,
+                imp,
+                types.as_ptr(),
+            )
+        };
+        if added.as_bool() {
+            INSTALLED.with(|flag| flag.set(true));
+        } else {
+            eprintln!("hakimi-ui: could not install the macOS reopen handler");
+        }
+    }
+}
+
 /// Bring the main window back to the front. A minimized window is still
 /// "shown" as far as Slint is concerned, so `show()` alone is a no-op: the
 /// minimized state has to be dropped first.
@@ -749,6 +866,14 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
 
     wire_window(&app, ctx);
 
+    #[cfg(target_os = "macos")]
+    app.window().on_close_requested(|| {
+        // Closing the window parks the app in the tray. Remove the Dock icon
+        // at the same time; showing the window switches back to Regular.
+        set_dock_visible(false);
+        slint::CloseRequestResponse::HideWindow
+    });
+
     // Restore the UI state the previous window left behind.
     app.set_page(PAGE_STATE.with(Cell::get));
     app.set_sites_expanded(SITES_EXPANDED_STATE.with(Cell::get));
@@ -837,6 +962,51 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
         id,
         closing,
     })
+}
+
+/// Shows the main window, rebuilding it when it was previously closed to the
+/// tray. Used by the tray menu and the macOS reopen callback.
+fn show_main_window(ctx: &UiContext) {
+    set_dock_visible(true);
+    let existing = WINDOW.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|shell| (shell.closing.clone(), shell.app.as_weak()))
+    });
+    if let Some((closing, weak)) = existing {
+        if !closing.get() {
+            if let Some(app) = weak.upgrade() {
+                load_assets();
+                reveal_window(&app);
+                refresh(&app, &ctx.runtime, &ctx.expanded.borrow(), &ctx.sweep);
+            }
+            return;
+        }
+    }
+    // No live window (closed to the tray, or closing): build one.
+    match build_window(ctx) {
+        Ok(shell) => {
+            if let Err(error) = shell.app.show() {
+                eprintln!("hakimi-ui: showing the window failed: {error}");
+                return;
+            }
+            reveal_window(&shell.app);
+            #[cfg(windows)]
+            {
+                // The raw HWND may not exist yet when show() returns from a
+                // tray rebuild; retry once the event loop has created the
+                // native window.
+                let weak = shell.app.as_weak();
+                slint::Timer::single_shot(Duration::from_millis(120), move || {
+                    if let Some(app) = weak.upgrade() {
+                        activate_window(&app.window());
+                    }
+                });
+            }
+            WINDOW.with(|slot| *slot.borrow_mut() = Some(shell));
+        }
+        Err(error) => eprintln!("hakimi-ui: rebuilding the window failed: {error:#}"),
+    }
 }
 
 /// Sidebar counters for the desktop layout.
@@ -1873,47 +2043,7 @@ fn main() -> Result<()> {
     let tray = TrayRoot::new()?;
     tray.on_show_main({
         let ctx = ctx.clone();
-        move || {
-            let existing = WINDOW.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .map(|shell| (shell.closing.clone(), shell.app.as_weak()))
-            });
-            if let Some((closing, weak)) = existing {
-                if !closing.get() {
-                    if let Some(app) = weak.upgrade() {
-                        load_assets();
-                        reveal_window(&app);
-                        refresh(&app, &ctx.runtime, &ctx.expanded.borrow(), &ctx.sweep);
-                    }
-                    return;
-                }
-            }
-            // No live window (closed to the tray, or closing): build one.
-            match build_window(&ctx) {
-                Ok(shell) => {
-                    if let Err(error) = shell.app.show() {
-                        eprintln!("hakimi-ui: showing the window failed: {error}");
-                        return;
-                    }
-                    reveal_window(&shell.app);
-                    #[cfg(windows)]
-                    {
-                        // The raw HWND may not exist yet when show() returns
-                        // from a tray rebuild; retry once the event loop has
-                        // created the native window.
-                        let weak = shell.app.as_weak();
-                        slint::Timer::single_shot(Duration::from_millis(120), move || {
-                            if let Some(app) = weak.upgrade() {
-                                activate_window(&app.window());
-                            }
-                        });
-                    }
-                    WINDOW.with(|slot| *slot.borrow_mut() = Some(shell));
-                }
-                Err(error) => eprintln!("hakimi-ui: rebuilding the window failed: {error:#}"),
-            }
-        }
+        move || show_main_window(&ctx)
     });
     tray.on_toggle_master({
         let ctx = ctx.clone();
@@ -2003,8 +2133,17 @@ fn main() -> Result<()> {
     // The initial window. `run_event_loop` keeps running while the tray icon
     // exists; closing the window drops the component without stopping it.
     let shell = build_window(&ctx)?;
+    set_dock_visible(true);
     shell.app.show()?;
     WINDOW.with(|slot| *slot.borrow_mut() = Some(shell));
+
+    // The backend has created its event loop (and winit's delegate) by now.
+    #[cfg(target_os = "macos")]
+    macos_reopen::install({
+        let ctx = ctx.clone();
+        move || show_main_window(&ctx)
+    });
+
     slint::run_event_loop()?;
 
     // Quitting stops the proxy and restores the system proxy state.
