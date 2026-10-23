@@ -315,6 +315,30 @@ async fn cold_route_prefetch_starts_dns_and_ech_work() {
 }
 
 #[tokio::test]
+async fn cold_route_prefetch_queries_doh_when_catalog_is_full() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    *h.remote.catalog.lock() = true;
+    let dead: Vec<IpAddr> = (1..=8)
+        .map(|last| format!("203.0.113.{last}").parse().unwrap())
+        .collect();
+    *h.remote.ips.lock() = Some(dead);
+
+    h.engine
+        .prefetch_cold_route("example.com", 443, &RoutePolicy::direct());
+    for _ in 0..50 {
+        if h.resolver.doh_calls.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        h.resolver.doh_calls.load(Ordering::SeqCst),
+        1,
+        "a full catalog cannot expand to DoH until a candidate fails; the lookup must start early"
+    );
+}
+
+#[tokio::test]
 async fn route_sni_hosts_drive_fake_sni_plans() {
     let route = RoutePolicy::new(vec![RouteAttempt::Sni {
         sni: vec!["WWW.Baidu.com".into()],
@@ -826,6 +850,177 @@ async fn doh_is_used_after_initial_candidates_fail() {
     assert_eq!(plan.ip.to_string(), "9.9.9.9");
     assert_eq!(outcome.diagnostics.ip_source, Some(IpSource::Doh));
     assert_eq!(outcome.diagnostics.doh_source, Some(DohSource::Primary));
+}
+
+/// A catalog entry may legally fill the whole candidate cap. If every one of
+/// those addresses is black-holed, DoH must still get a chance: otherwise a
+/// full (but stale or poisoned) catalog permanently disables the fallback.
+#[tokio::test]
+async fn doh_is_used_when_the_catalog_fills_the_candidate_cap() {
+    let harness = harness(&["example.com"], RoutePolicy::direct());
+    *harness.remote.catalog.lock() = true;
+    let dead: Vec<IpAddr> = (1..=8)
+        .map(|last| format!("203.0.113.{last}").parse().unwrap())
+        .collect();
+    *harness.remote.ips.lock() = Some(dead.clone());
+    harness
+        .prober
+        .working
+        .lock()
+        .insert("9.9.9.9".parse().unwrap());
+    harness.resolver.answers.lock().push_back(Ok(DohResolution {
+        ips: vec!["9.9.9.9".parse().unwrap()],
+        hints: Vec::new(),
+        source: DohSource::Primary,
+        endpoint: "primary".into(),
+        stale: false,
+        ttl: 60,
+        fallback_used: false,
+    }));
+
+    let outcome = harness.engine.decide_https("example.com").await;
+    assert_eq!(
+        harness.resolver.doh_calls.load(Ordering::SeqCst),
+        1,
+        "the full catalog must not suppress the DoH fallback"
+    );
+    let plan = outcome
+        .plan
+        .expect("the working DoH address must be used after the catalog is exhausted");
+    assert_eq!(plan.ip.to_string(), "9.9.9.9");
+    assert_eq!(outcome.diagnostics.ip_source, Some(IpSource::Doh));
+    assert_eq!(outcome.diagnostics.doh_source, Some(DohSource::Primary));
+    let calls = harness.prober.calls.lock();
+    assert_eq!(
+        calls.len(),
+        dead.len() + 1,
+        "each catalog address must be attempted before the DoH address: {calls:?}"
+    );
+    assert!(
+        calls[..dead.len()]
+            .iter()
+            .all(|(ip, _, _)| dead.contains(ip)),
+        "the catalog addresses must be exhausted first: {calls:?}"
+    );
+    let doh_ip: IpAddr = "9.9.9.9".parse().unwrap();
+    assert_eq!(calls[dead.len()].0, doh_ip);
+}
+
+/// A full catalog must not truncate a multi-address DoH answer to a single
+/// fallback: if the first DoH address is also black-holed, the next one has to
+/// be tried too.
+#[tokio::test]
+async fn every_doh_address_is_tried_after_a_full_catalog_fails() {
+    let harness = harness(&["example.com"], RoutePolicy::direct());
+    *harness.remote.catalog.lock() = true;
+    let dead: Vec<IpAddr> = (1..=8)
+        .map(|last| format!("203.0.113.{last}").parse().unwrap())
+        .collect();
+    *harness.remote.ips.lock() = Some(dead);
+    let first_doh: IpAddr = "9.9.9.9".parse().unwrap();
+    let working_doh: IpAddr = "8.8.8.8".parse().unwrap();
+    harness.prober.working.lock().insert(working_doh);
+    harness.resolver.answers.lock().push_back(Ok(DohResolution {
+        ips: vec![first_doh, working_doh],
+        hints: Vec::new(),
+        source: DohSource::Primary,
+        endpoint: "primary".into(),
+        stale: false,
+        ttl: 60,
+        fallback_used: false,
+    }));
+
+    let outcome = harness.engine.decide_https("example.com").await;
+    let plan = outcome.plan.expect("the second DoH address must be tried");
+    assert_eq!(plan.ip, working_doh);
+    let calls = harness.prober.calls.lock();
+    assert_eq!(calls.len(), 10, "eight catalog + two DoH probes: {calls:?}");
+    assert_eq!(calls[8].0, first_doh);
+    assert_eq!(calls[9].0, working_doh);
+}
+
+/// The fallback must not depend on the configured cap or on the catalog
+/// having fewer addresses than the cap. Exercise every legal combination:
+/// a catalog with 0..=8 addresses and `maxCandidatesPerDomain` 1..=8.
+#[tokio::test]
+async fn doh_fallback_works_for_every_catalog_and_cap_combination() {
+    let doh_ip: IpAddr = "9.9.9.9".parse().unwrap();
+    for max in 1..=8usize {
+        for catalog_len in 0..=8usize {
+            let harness = harness(&["example.com"], RoutePolicy::direct());
+            harness
+                .engine
+                .config
+                .mutate(|config| {
+                    config.advanced.max_candidates_per_domain = max;
+                    Ok(())
+                })
+                .unwrap();
+            *harness.remote.catalog.lock() = true;
+            let dead: Vec<IpAddr> = (1..=catalog_len)
+                .map(|last| format!("203.0.113.{last}").parse().unwrap())
+                .collect();
+            *harness.remote.ips.lock() = Some(dead);
+            harness.prober.working.lock().insert(doh_ip);
+            harness.resolver.answers.lock().push_back(Ok(DohResolution {
+                ips: vec![doh_ip],
+                hints: Vec::new(),
+                source: DohSource::Primary,
+                endpoint: "primary".into(),
+                stale: false,
+                ttl: 60,
+                fallback_used: false,
+            }));
+
+            let outcome = harness.engine.decide_https("example.com").await;
+            let plan = outcome.plan.unwrap_or_else(|| {
+                panic!("max={max} catalog_len={catalog_len}: DoH address was not used")
+            });
+            assert_eq!(
+                plan.ip, doh_ip,
+                "max={max} catalog_len={catalog_len}: wrong winning address"
+            );
+            assert_eq!(
+                harness.resolver.doh_calls.load(Ordering::SeqCst),
+                1,
+                "max={max} catalog_len={catalog_len}: DoH must be queried exactly once"
+            );
+            let calls = harness.prober.calls.lock();
+            assert_eq!(
+                calls.len(),
+                catalog_len.min(max) + 1,
+                "max={max} catalog_len={catalog_len}: every initial candidate and \
+                 then the DoH address must be probed: {calls:?}"
+            );
+            assert_eq!(
+                calls.last().map(|call| call.0),
+                Some(doh_ip),
+                "max={max} catalog_len={catalog_len}: DoH must be the last attempt"
+            );
+        }
+    }
+}
+
+/// DoH is a fallback, not an unconditional second source: a healthy catalog
+/// address must satisfy the route without a lookup, even when the list is full.
+#[tokio::test]
+async fn a_working_full_catalog_does_not_query_doh() {
+    let harness = harness(&["example.com"], RoutePolicy::direct());
+    *harness.remote.catalog.lock() = true;
+    let ips: Vec<IpAddr> = (1..=8)
+        .map(|last| format!("203.0.113.{last}").parse().unwrap())
+        .collect();
+    let working = ips[2];
+    *harness.remote.ips.lock() = Some(ips.clone());
+    harness.prober.working.lock().insert(working);
+
+    let outcome = harness.engine.decide_https("example.com").await;
+    assert_eq!(outcome.plan.unwrap().ip, working);
+    assert_eq!(
+        harness.resolver.doh_calls.load(Ordering::SeqCst),
+        0,
+        "a working catalog address must not trigger an unnecessary lookup"
+    );
 }
 
 #[tokio::test]

@@ -532,16 +532,29 @@ impl RouteCursor {
                 self.candidate_index += 1;
                 return Some(candidate);
             }
-            // Expand with DoH once a few initial candidates have been consumed instead of
-            // only at full exhaustion: a stale or poisoned catalog would otherwise pay its
-            // whole serial timeout before DoH is ever consulted.
+            // Expand with DoH when the catalog/cache candidates are used up.
+            //
+            // The initial list is capped at `max`, but DoH is the last-resort
+            // fallback. If the cap is full (a catalog may legally contain eight
+            // addresses), requiring room below `max` would disable DoH forever:
+            // every catalog address could be black-holed and the working DoH
+            // answer would never be tried. Allow one extra DoH wave after a
+            // full initial list has been consumed; thin lists keep the original
+            // single cap.
+            let within_initial_cap = self.candidates.len() < self.max;
+            let initial_exhausted = self.candidate_index >= self.candidates.len();
             if !self.doh_loaded
-                && self.candidates.len() < self.max
+                && (within_initial_cap || initial_exhausted)
                 && self.candidate_index >= EARLY_DOH_AFTER.min(self.candidates.len())
             {
+                let limit = if within_initial_cap {
+                    self.max
+                } else {
+                    self.candidates.len().saturating_add(self.max)
+                };
                 let engine = self.engine.clone();
                 let expansion = engine
-                    .expand_doh(&self.domain, &mut self.candidates, self.max)
+                    .expand_doh(&self.domain, &mut self.candidates, limit)
                     .await;
                 // Set the flag only after the await: a cancelled race must not
                 // permanently skip the DoH expansion for this route cursor.

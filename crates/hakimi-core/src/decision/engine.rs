@@ -452,7 +452,12 @@ impl DecisionEngine {
         // go — and the DoH lookup that could have supplied an alternative only
         // starts once the first attempt has already burned its timeout.
         let known = last_good.is_some() as usize + remote.as_ref().map_or(0, Vec::len);
-        if known < EARLY_DOH_AFTER {
+        // A thin list has no fallback. A *full* list is the other dangerous
+        // case: the cursor only expands to DoH after one of those candidates
+        // has already failed, and all of them may be black-holed. Start the
+        // lookup during the browser handshake in both cases, so the answer is
+        // cached by the time the first failure releases the fallback.
+        if known < EARLY_DOH_AFTER || known >= config.advanced.max_candidates_per_domain {
             let resolver = self.resolver.clone();
             let domain = domain.to_string();
             tokio::spawn(async move {
@@ -1116,7 +1121,7 @@ impl DecisionEngine {
         &self,
         domain: &str,
         candidates: &mut Vec<Candidate>,
-        max: usize,
+        limit: usize,
     ) -> DohExpansion {
         let started = std::time::Instant::now();
         match self.resolver.doh_ips(domain).await {
@@ -1136,11 +1141,12 @@ impl DecisionEngine {
                 };
                 let before = candidates.len();
                 for ip in ips.iter().copied().chain(hints.iter().copied()) {
-                    if candidates.len() >= max {
+                    if candidates.len() >= limit {
                         break;
                     }
-                    // The candidate list is capped at eight entries, so a
-                    // linear scan replaces the per-cursor hash set.
+                    // The list is bounded (the initial cap plus at most one
+                    // DoH fallback wave), so a linear scan replaces the
+                    // per-cursor hash set.
                     if !candidates.iter().any(|candidate| candidate.ip == ip)
                         && !self.ip_rejected(domain, ip)
                     {

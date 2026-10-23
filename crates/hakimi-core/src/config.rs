@@ -170,6 +170,8 @@ impl Default for ProxyConfig {
 pub struct AdvancedConfig {
     /// Fake SNI candidates in order. An empty string means "send no SNI".
     pub fake_sni_candidates: Vec<String>,
+    /// Maximum number of catalog/last-good candidates. If all of them fail,
+    /// one DoH fallback wave may add up to the same number again.
     pub max_candidates_per_domain: usize,
     pub ip_timeout_ms: u64,
     pub last_good_days: i64,
