@@ -220,6 +220,9 @@ impl StatusStore {
         let mut map = self.domains.write();
         let mut unchanged_checking = false;
         let mut state_change: Option<(State, State)> = None;
+        // Keep the log payload out of the map write guard. `tracing` may block
+        // on the log writer, and status readers must not wait for it.
+        let mut transition_log: Option<(State, State, Arc<DomainDiagnostics>)> = None;
         if let Some(existing) = map.get_mut(&diagnostics.domain) {
             // Never let a slower, older probe overwrite a newer result.
             if existing.last_check > diagnostics.last_check
@@ -236,21 +239,12 @@ impl StatusStore {
             // it tells whether a site just broke or just recovered, and when.
             // `Checking` is a transient marker, not a real transition — logging
             // it buries the Failed<->Normal lines that actually matter.
-            if existing.state != diagnostics.state
-                && existing.state != State::Checking
-                && diagnostics.state != State::Checking
-            {
-                tracing::info!(
-                    domain = %diagnostics.domain,
-                    from = ?existing.state,
-                    to = ?diagnostics.state,
-                    latency_ms = diagnostics.latency_ms,
-                    error = ?diagnostics.error,
-                    "domain state changed"
-                );
-            }
             if existing.state != diagnostics.state {
                 state_change = Some((existing.state, diagnostics.state));
+                if existing.state != State::Checking && diagnostics.state != State::Checking {
+                    transition_log =
+                        Some((existing.state, diagnostics.state, diagnostics.clone()));
+                }
             }
             // Reuse the existing key: the common path is an update of a known
             // domain, so there is no reason to clone its name for the map.
@@ -281,6 +275,17 @@ impl StatusStore {
         if !unchanged_checking {
             self.revision.fetch_add(1, Ordering::SeqCst);
         }
+        drop(map);
+        if let Some((from, to, diagnostics)) = transition_log {
+            tracing::info!(
+                domain = %diagnostics.domain,
+                from = ?from,
+                to = ?to,
+                latency_ms = diagnostics.latency_ms,
+                error = ?diagnostics.error,
+                "domain state changed"
+            );
+        }
     }
 
     /// Warmup failures are recorded as Checking so a first attempt that is
@@ -291,6 +296,7 @@ impl StatusStore {
         let mut map = self.domains.write();
         let mut counts = self.counts.write();
         let mut changed = false;
+        let mut transitions: Vec<(String, Option<FailureReason>)> = Vec::new();
         for domain in domains {
             let Some(entry) = map.get_mut(domain) else {
                 continue;
@@ -300,13 +306,7 @@ impl StatusStore {
             }
             let mut updated = (**entry).clone();
             updated.state = State::Failed;
-            tracing::info!(
-                domain = %domain,
-                from = ?State::Checking,
-                to = ?State::Failed,
-                error = ?updated.error,
-                "domain state changed"
-            );
+            transitions.push((domain.clone(), updated.error));
             counts.remove(State::Checking);
             counts.add(State::Failed);
             *entry = Arc::new(updated);
@@ -314,6 +314,17 @@ impl StatusStore {
         }
         if changed {
             self.revision.fetch_add(1, Ordering::SeqCst);
+        }
+        drop(counts);
+        drop(map);
+        for (domain, error) in transitions {
+            tracing::info!(
+                domain = %domain,
+                from = ?State::Checking,
+                to = ?State::Failed,
+                error = ?error,
+                "domain state changed"
+            );
         }
     }
 

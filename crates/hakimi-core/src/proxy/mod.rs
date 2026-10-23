@@ -198,7 +198,14 @@ async fn serve_connection(stream: TcpStream, ctx: Arc<ProxyContext>) -> Result<(
 }
 
 async fn handle_request(mut req: Request<Incoming>, ctx: Arc<ProxyContext>) -> Response<ProxyBody> {
-    if is_local_request(&req, &ctx) {
+    // Local endpoints are a tiny minority of proxy traffic, but
+    // `is_local_request` has to inspect the Host header (and an IP literal).
+    // Match the path first so ordinary traffic never pays for that check.
+    let local_path = {
+        let path = req.uri().path();
+        path == "/proxy.pac" || path.starts_with("/hakimi/")
+    };
+    if local_path && is_local_request(&req, &ctx) {
         match req.uri().path() {
             "/proxy.pac" => {
                 return text_response(

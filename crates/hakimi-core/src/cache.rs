@@ -367,6 +367,9 @@ impl CacheManager {
         last_good: Option<LastGoodEntry>,
         score: Option<IpScoreUpdate<'_>>,
     ) {
+        // Format the map key before taking the cache write lock; this runs on
+        // every successful connection and does not need the lock to allocate.
+        let score_key = score.map(|score| format!("{}|{}", score.domain, score.ip));
         let mut data = self.data.write();
         let timestamp = now();
         let mut changed = false;
@@ -384,8 +387,7 @@ impl CacheManager {
                 changed = true;
             }
         }
-        if let Some(score) = score {
-            let key = format!("{}|{}", score.domain, score.ip);
+        if let (Some(score), Some(key)) = (score, score_key) {
             data.ip_scores.insert(
                 key,
                 IpScoreEntry {

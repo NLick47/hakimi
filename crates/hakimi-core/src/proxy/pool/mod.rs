@@ -194,10 +194,11 @@ fn build_client(
         .pool_idle_timeout(idle)
         .pool_max_idle_per_host(max_idle)
         .timer(TokioTimer::new())
-        .http2_adaptive_window(true)
-        // Larger than the 64 KiB h2 defaults: a 1 MB image over a 50 ms
-        // link would otherwise need ~16 window updates before reaching
-        // line rate. Adaptive window still grows beyond these.
+        // The effective upstream policy is a fixed 1 MiB stream / 4 MiB
+        // connection window: hyper's `initial_*_window_size` setters disable
+        // the adaptive window. Do not add `http2_adaptive_window(true)` here
+        // unless these fixed sizes are removed as well; otherwise the call
+        // order silently decides which policy wins.
         .http2_initial_stream_window_size(1024 * 1024)
         .http2_initial_connection_window_size(4 * 1024 * 1024)
         // A half-open HTTP/2 connection used to stay in the pool for up to
