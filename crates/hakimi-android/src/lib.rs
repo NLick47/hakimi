@@ -9,9 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use hakimi_core::config::{
-    AppConfig, DohEndpoint, DomainRule, GroupConfig, ProxyMode, RoutePolicy,
-};
+use hakimi_core::config::{AppConfig, DomainRule, GroupConfig, ProxyMode, RoutePolicy};
 use hakimi_core::runtime::HakimiRuntime;
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jstring, JNI_FALSE, JNI_TRUE};
@@ -65,30 +63,6 @@ fn initialize(data_dir: &str) -> Result<()> {
     }
     config.proxy.bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
     config.proxy.takeover = false;
-    // The desktop defaults (CleanBrowsing / Applied Privacy) are often
-    // unreachable from mobile networks. Seed domestic DoH endpoints only on a
-    // fresh profile; afterwards the settings page owns these values.
-    const DESKTOP_DOH: &str = "https://doh.cleanbrowsing.org/doh/security-filter/";
-    if config.doh.primary == DESKTOP_DOH {
-        config.doh.primary = "https://dns.alidns.com/dns-query".to_string();
-        config.doh.fallback = "https://doh.pub/dns-query".to_string();
-    }
-    if config.doh.custom.is_empty() {
-        config.doh.custom = vec![
-            DohEndpoint {
-                name: "AliDNS".to_string(),
-                url: "https://dns.alidns.com/dns-query".to_string(),
-                bootstrap_ip: Some("223.5.5.5".parse().unwrap()),
-                enabled: true,
-            },
-            DohEndpoint {
-                name: "DNSPod".to_string(),
-                url: "https://doh.pub/dns-query".to_string(),
-                bootstrap_ip: Some("1.12.12.12".parse().unwrap()),
-                enabled: true,
-            },
-        ];
-    }
     // Probe-only group: Cloudflare publishes ECHConfig for this host, so a
     // successful ECH handshake proves the Android build's ECH path end to end.
     // Idempotent: the group is persisted to config.json after the first start.
