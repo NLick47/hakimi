@@ -910,6 +910,10 @@ impl Resolver {
                 fetched_at: now(),
             });
         } else if qtype == TYPE_HTTPS {
+            // HTTPS RRs only feed the ECH cache. A `CachedAnswer` with an
+            // empty IP list is never read (fresh/stale resolution only looks
+            // at A/AAAA) and used to occupy the bounded answer cache, evicting
+            // real addresses. It also encoded the ECHConfigList a second time.
             if let Some(ech) = &answer.ech {
                 self.cache.put_ech(CachedEch {
                     domain: domain.to_string(),
@@ -918,18 +922,6 @@ impl Resolver {
                     fetched_at: now(),
                 });
             }
-            self.cache.put_doh_answer(CachedAnswer {
-                domain: domain.to_string(),
-                qtype,
-                ips: Vec::new(),
-                hints: answer.hints.clone(),
-                ech_config: answer
-                    .ech
-                    .as_ref()
-                    .map(|ech| base64::engine::general_purpose::STANDARD.encode(ech)),
-                ttl_secs: answer.ttl,
-                fetched_at: now(),
-            });
         }
     }
 
@@ -1459,5 +1451,26 @@ mod tests {
                 .is_some(),
             "the last-resort path may still use the usable answer"
         );
+    }
+
+    #[test]
+    fn https_answers_use_only_the_ech_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, cache, resolver) = resolver(dir.path());
+        let answer = ResolvedAnswer {
+            ips: Vec::new(),
+            hints: vec!["203.0.113.9".parse().unwrap()],
+            ech: Some(vec![1, 2, 3, 4]),
+            ttl: 60,
+            cname: None,
+            https_present: true,
+        };
+        resolver.store_answer("pixiv.net", TYPE_HTTPS, &answer);
+        assert_eq!(
+            cache.stats().doh_answers,
+            0,
+            "an HTTPS RR has no addresses; caching it only evicts real A/AAAA answers"
+        );
+        assert_eq!(cache.stats().ech_configs, 1);
     }
 }

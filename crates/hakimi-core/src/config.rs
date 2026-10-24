@@ -479,12 +479,29 @@ impl GroupConfig {
             .find(|rule| rule.pattern.eq_ignore_ascii_case(pattern))
     }
 
+    /// Route for a rule index already resolved by [`DomainMatcher`].
+    ///
+    /// The matcher stores the rule index alongside the group id, so hot paths
+    /// that already matched the host can select the per-domain route without
+    /// scanning every rule in the group again.
+    pub fn route_at(&self, rule_index: usize) -> &RoutePolicy {
+        self.domains
+            .get(rule_index)
+            .and_then(|rule| rule.route.as_ref())
+            .unwrap_or(&self.default_route)
+    }
+
     pub fn route_modes(&self, host: &str) -> Vec<TlsMode> {
-        self.route_for(host)
-            .attempts
-            .iter()
-            .map(RouteAttempt::mode)
-            .collect()
+        self.route_modes_for(self.route_for(host))
+    }
+
+    /// The configured modes of the route selected by [`Self::route_at`].
+    pub fn route_modes_at(&self, rule_index: usize) -> Vec<TlsMode> {
+        self.route_modes_for(self.route_at(rule_index))
+    }
+
+    fn route_modes_for(&self, route: &RoutePolicy) -> Vec<TlsMode> {
+        route.attempts.iter().map(RouteAttempt::mode).collect()
     }
 
     /// True when any route in this group may fall back to Cloudflare's shared
@@ -1190,6 +1207,55 @@ mod tests {
             Some("github")
         );
         assert_eq!(matcher.match_host("i.pximg.net"), Some("pixiv"));
+    }
+
+    #[test]
+    fn route_at_matches_route_for_for_exact_wildcard_and_default_rules() {
+        let default_route = RoutePolicy::sni(Vec::new());
+        let group = GroupConfig {
+            id: "test".into(),
+            name: "Test".into(),
+            domains: vec![
+                DomainRule::new("exact.example"),
+                DomainRule::routed("*.wild.example", RoutePolicy::direct()),
+                DomainRule::routed("www.wild.example", RoutePolicy::ech_shared()),
+                DomainRule::routed("other.example", RoutePolicy::direct()),
+            ],
+            enabled: true,
+            homepage: None,
+            default_route: default_route.clone(),
+        };
+        let config = AppConfig {
+            groups: vec![group.clone()],
+            ..AppConfig::default()
+        };
+        let matcher = config.matcher().unwrap();
+        for host in [
+            "exact.example",
+            "a.wild.example",
+            "www.wild.example",
+            "other.example",
+            "unmatched.example",
+        ] {
+            let Some((_, rule_index)) = matcher.match_entry_normalized(host) else {
+                continue;
+            };
+            assert_eq!(
+                group.route_at(rule_index),
+                group.route_for(host),
+                "the matcher's rule index must select the same route as the linear scan for {host}"
+            );
+            assert_eq!(
+                group.route_modes_at(rule_index),
+                group.route_modes(host),
+                "the indexed mode list must match the scanned list for {host}"
+            );
+        }
+        assert_eq!(
+            group.route_at(group.domains.len()),
+            &default_route,
+            "an out-of-range index must fall back to the default route"
+        );
     }
 
     #[test]

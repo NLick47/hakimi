@@ -330,10 +330,13 @@ impl DecisionEngine {
                 "hakimi is paused; traffic is not intercepted",
             ));
         }
-        self.status.mark_checking(
+        // The matcher already resolved the rule index. Building the mode list
+        // lazily avoids both a rule scan and an allocation when the status
+        // debounce below decides that this reconnect needs no new record.
+        self.status.mark_checking_lazy(
             Some(group.id.as_str()),
             &normalized,
-            group.route_modes(&normalized),
+            || group.route_modes_at(rule_index),
             config.catalog_version,
         );
         // The cursor keeps an index into this immutable config snapshot, so a
@@ -383,7 +386,7 @@ impl DecisionEngine {
         if self.cache.has_skip_once(&plan.domain) {
             return None;
         }
-        let group_id = matcher.match_normalized(&plan.domain)?;
+        let (group_id, rule_index) = matcher.match_entry_normalized(&plan.domain)?;
         // The domain may have been moved to another group; its old route (and
         // especially its old fake SNI) must not leak into the new group.
         if plan.group_id != group_id {
@@ -394,7 +397,11 @@ impl DecisionEngine {
             return None;
         }
         if tls {
-            let route = group.route_for(&plan.domain);
+            // The matcher and the config snapshot are published together, so
+            // the rule index resolves the same route as `route_for` did while
+            // avoiding a scan over every domain in the group on every reused
+            // cold plan.
+            let route = group.route_at(rule_index);
             if !route.contains_mode(plan.mode) {
                 return None;
             }

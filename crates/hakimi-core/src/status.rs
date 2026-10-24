@@ -335,6 +335,25 @@ impl StatusStore {
         configured_modes: Vec<TlsMode>,
         catalog_version: u64,
     ) {
+        self.mark_checking_lazy(group, domain, || configured_modes, catalog_version);
+    }
+
+    /// [`Self::mark_checking`] with the configured-mode list built lazily.
+    ///
+    /// A cold page asset burst often reconnects to the same domain within the
+    /// one-second debounce below. Building `configured_modes` (a rule scan and
+    /// a `Vec` allocation for groups with many domains) before that check
+    /// wasted that work on every connection. The closure runs only when a new
+    /// Checking record is actually published.
+    pub(crate) fn mark_checking_lazy<F>(
+        &self,
+        group: Option<&str>,
+        domain: &str,
+        configured_modes: F,
+        catalog_version: u64,
+    ) where
+        F: FnOnce() -> Vec<TlsMode>,
+    {
         // A connection that succeeds and is followed immediately by another
         // connection (image hosts with HTTP/1.1, or a page's asset burst)
         // would otherwise flip Normal -> Checking -> Normal for every dial,
@@ -358,7 +377,7 @@ impl StatusStore {
         self.record(DomainDiagnostics::checking(
             group.map(str::to_owned),
             domain,
-            configured_modes,
+            configured_modes(),
             catalog_version,
         ));
     }
@@ -553,6 +572,42 @@ mod tests {
             store.revision(),
             revision,
             "a cold connect that is already marked Checking must not force a UI snapshot rebuild"
+        );
+    }
+
+    #[test]
+    fn the_checking_debounce_skips_the_mode_list_entirely() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let store = StatusStore::new();
+        let builds = AtomicUsize::new(0);
+        store.mark_checking_lazy(
+            Some("github"),
+            "example.com",
+            || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                vec![TlsMode::Direct]
+            },
+            1,
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+
+        // The record is fresh and Checking, so the debounce returns before
+        // touching the configured modes. A page asset burst must not scan the
+        // group's rule list or allocate a Vec for every reconnect.
+        store.mark_checking_lazy(
+            Some("github"),
+            "example.com",
+            || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                vec![TlsMode::FakeSni]
+            },
+            1,
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.get("example.com").unwrap().configured_modes,
+            vec![TlsMode::Direct]
         );
     }
 

@@ -100,12 +100,12 @@ pub(super) async fn handle_connect(
     };
 
     let (config, matcher) = ctx.config.snapshot_and_matcher();
-    let group_id = if is_ip {
+    let matched = if is_ip {
         None
     } else {
-        matcher.match_normalized(&host)
+        matcher.match_entry_normalized(&host)
     };
-    let Some(group_id) = group_id else {
+    let Some((group_id, rule_index)) = matched else {
         // These branches are terminal, so move the host into the tunnel info
         // instead of cloning it once more.
         return tunnel_to_host(req, host, port).await;
@@ -116,6 +116,9 @@ pub(super) async fn handle_connect(
     if !group.enabled || ctx.status.paused() {
         return tunnel_to_host(req, host, port).await;
     }
+    // Resolve the per-domain route once from the matcher's rule index. The
+    // previous code scanned every rule in the group twice per CONNECT.
+    let route = group.route_at(rule_index);
 
     // Explicitly direct groups never need MITM. When the CA is not trusted we also keep
     // Auto groups on the raw path: a direct origin still works, while an ECH/fake-SNI
@@ -125,7 +128,7 @@ pub(super) async fn handle_connect(
     // instead of being awaited by itself. A stale cached address that accepts TCP
     // but never completes the handshake would otherwise hold CONNECT for the full
     // per-candidate timeout before the healthy catalog/DNS route is tried.
-    let direct_only = group.route_for(&host).is_direct_only();
+    let direct_only = route.is_direct_only();
     let cached_plan = if direct_only {
         ctx.engine
             .cached_plan(&host, port, true)
@@ -140,8 +143,7 @@ pub(super) async fn handle_connect(
     // The browser is about to perform its local TLS handshake. Use that time
     // to resolve the cold DoH/ECH route instead of waiting for the first HTTP
     // request to trigger it.
-    ctx.engine
-        .prefetch_cold_route(&host, port, group.route_for(&host));
+    ctx.engine.prefetch_cold_route(&host, port, route);
 
     // ECH / fake SNI / Auto without a direct route: terminate browser TLS locally and let
     // the pooled upstream client pick direct/ECH/SNI on the real request. The real

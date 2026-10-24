@@ -1408,3 +1408,44 @@ async fn an_exhausted_cursor_reports_the_last_attempt_error() {
         );
     }
 }
+
+/// A group with the maximum practical rule count stresses the per-cold-connection
+/// route lookup. This is a benchmark only; run it with `--ignored`.
+#[test]
+#[ignore = "micro benchmark"]
+fn bench_wide_group_route() {
+    let domains: Vec<String> = (0..511)
+        .map(|index| format!("host{index}.example.com"))
+        .chain(std::iter::once("last.example.com".to_string()))
+        .collect();
+    let refs: Vec<&str> = domains.iter().map(String::as_str).collect();
+    let h = harness(&refs, RoutePolicy::sni(Vec::new()));
+    *h.remote.catalog.lock() = true;
+    *h.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+    let group = h.engine.config.snapshot().group("test").unwrap().clone();
+    crate::bench::measure("decision.route.wide", 20_000, || {
+        let _ = h.engine.route("last.example.com", 443, true);
+    });
+    crate::bench::measure("group.route_modes.wide", 200_000, || {
+        let _ = group.route_modes("last.example.com");
+    });
+}
+
+/// The cached-plan validation also resolves the per-domain route; a wide group
+/// makes the difference between an index lookup and a linear rule scan visible.
+#[test]
+#[ignore = "micro benchmark"]
+fn bench_wide_group_plan_cache_lookup() {
+    let domains: Vec<String> = (0..511)
+        .map(|index| format!("host{index}.example.com"))
+        .chain(std::iter::once("last.example.com".to_string()))
+        .collect();
+    let refs: Vec<&str> = domains.iter().map(String::as_str).collect();
+    let h = harness(&refs, RoutePolicy::sni(Vec::new()));
+    let mut plan = test_plan(TlsMode::Direct, None);
+    plan.domain = "last.example.com".into();
+    h.engine.remember_plan_arc(Arc::new(plan));
+    crate::bench::measure("decision.cached_plan.wide", 100_000, || {
+        let _ = h.engine.cached_plan("last.example.com", 443, true);
+    });
+}
