@@ -1199,6 +1199,39 @@ async fn auto_falls_back_to_fake_sni_and_caches_it() {
 }
 
 #[tokio::test]
+async fn a_timed_out_fake_sni_still_allows_the_direct_fallback() {
+    // A TLS handshake can be blocked for one fake SNI while the same address
+    // answers the real SNI. Marking the whole address dead after that timeout
+    // skipped the configured direct fallback and reported a total failure even
+    // though direct would have worked.
+    let harness = harness(&["example.com"], RoutePolicy::sni(Vec::new()));
+    *harness.remote.catalog.lock() = true;
+    *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group cursor"),
+    };
+    let sni = cursor.next_plan().await.expect("a fake-SNI plan");
+    assert_eq!(sni.mode, TlsMode::FakeSni);
+
+    // The fake-SNI handshake timed out (the same classification the pooled
+    // connector uses for an outer TLS timeout).
+    cursor.note_failure(
+        &sni,
+        FailureReason::TcpTimeout,
+        "TLS handshake timed out".into(),
+    );
+
+    let direct = cursor
+        .next_plan()
+        .await
+        .expect("the direct fallback for the same address must still be planned");
+    assert_eq!(direct.mode, TlsMode::Direct);
+    assert_eq!(direct.ip, sni.ip);
+}
+
+#[tokio::test]
 async fn failure_returns_reasons_and_attempts() {
     let harness = harness(&["example.com"], RoutePolicy::direct());
     *harness.remote.catalog.lock() = true;
@@ -1339,4 +1372,3 @@ async fn an_exhausted_cursor_reports_the_last_attempt_error() {
         );
     }
 }
-

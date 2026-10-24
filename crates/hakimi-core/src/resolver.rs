@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
-use futures_util::future::{select, Either};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
 use rand::Rng;
 use serde::Serialize;
@@ -108,12 +108,25 @@ impl IpResolver for Resolver {
 /// failure.
 type EndpointCache = Option<(u64, u64, Arc<Vec<EffectiveEndpoint>>)>;
 
+/// Keep a bounded number of reqwest clients, and never evict the built-in
+/// primary/fallback while a custom or catalog endpoint is available to drop.
+/// The old policy cleared the whole map when a fifth endpoint appeared, which
+/// threw away the HTTP/2 connection and TLS session of the hot endpoints on
+/// every health check.
+const MAX_DOH_CLIENTS: usize = 16;
+
+struct CachedDohClient {
+    client: reqwest::Client,
+    source: DohSource,
+    created_at: Instant,
+}
+
 #[derive(Clone)]
 pub struct Resolver {
     cache: Arc<CacheManager>,
     config: Arc<ConfigManager>,
     catalogs: Arc<CatalogManager>,
-    clients: Arc<RwLock<HashMap<String, reqwest::Client>>>,
+    clients: Arc<RwLock<HashMap<String, CachedDohClient>>>,
     health: Arc<RwLock<HashMap<String, DohHealth>>>,
     shared_ech_lock: Arc<tokio::sync::Mutex<()>>,
     query_locks: Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -732,109 +745,105 @@ impl Resolver {
             bail!("no DoH endpoint is configured");
         }
         let mut attempts = Vec::new();
+        // A NOERROR response with no address records is a successful exchange
+        // but not a usable route. A filtering resolver can return exactly that
+        // while the configured fallback still has the address, so an empty
+        // answer must not win the race and cancel the other endpoint.
+        let address_query = matches!(qtype, TYPE_A | TYPE_AAAA);
+        let mut empty_answer: Option<(usize, ResolvedAnswer)> = None;
 
         // Primary and fallback race each other: the first successful answer wins, so a
         // dead or slow primary costs nothing on cache misses instead of a full timeout.
         // The dropped loser gets no health record; periodic health checks cover that.
         if endpoints.len() >= 2 {
             let started = Instant::now();
-            let fa = Box::pin(self.query_endpoint(&endpoints[0], domain, qtype));
-            let fb = Box::pin(self.query_endpoint(&endpoints[1], domain, qtype));
-            let winner: Option<(usize, ResolvedAnswer)> = match select(fa, fb).await {
-                Either::Left((Ok(answer), _)) => Some((0, answer)),
-                Either::Right((Ok(answer), _)) => Some((1, answer)),
-                Either::Left((Err(error_a), right)) => {
-                    attempts.push(DohAttemptError {
-                        endpoint: endpoints[0].name.clone(),
-                        source: endpoints[0].source,
-                        error: format!("{error_a:#}"),
-                    });
-                    self.record_health(
-                        &endpoints[0],
-                        false,
-                        started.elapsed(),
-                        Some(format!("{error_a:#}")),
-                    );
-                    match right.await {
-                        Ok(answer) => Some((1, answer)),
-                        Err(error_b) => {
-                            attempts.push(DohAttemptError {
-                                endpoint: endpoints[1].name.clone(),
-                                source: endpoints[1].source,
-                                error: format!("{error_b:#}"),
-                            });
-                            self.record_health(
-                                &endpoints[1],
-                                false,
-                                started.elapsed(),
-                                Some(format!("{error_b:#}")),
-                            );
-                            None
-                        }
-                    }
-                }
-                Either::Right((Err(error_b), left)) => {
-                    attempts.push(DohAttemptError {
-                        endpoint: endpoints[1].name.clone(),
-                        source: endpoints[1].source,
-                        error: format!("{error_b:#}"),
-                    });
-                    self.record_health(
-                        &endpoints[1],
-                        false,
-                        started.elapsed(),
-                        Some(format!("{error_b:#}")),
-                    );
-                    match left.await {
-                        Ok(answer) => Some((0, answer)),
-                        Err(error_a) => {
-                            attempts.push(DohAttemptError {
-                                endpoint: endpoints[0].name.clone(),
-                                source: endpoints[0].source,
-                                error: format!("{error_a:#}"),
-                            });
-                            self.record_health(
-                                &endpoints[0],
-                                false,
-                                started.elapsed(),
-                                Some(format!("{error_a:#}")),
-                            );
-                            None
-                        }
-                    }
-                }
-            };
-            if let Some((index, answer)) = winner {
+            let mut pending: FuturesUnordered<
+                futures_util::future::BoxFuture<'_, (usize, Result<ResolvedAnswer>)>,
+            > = FuturesUnordered::new();
+            pending.push(Box::pin(async {
+                (
+                    0usize,
+                    self.query_endpoint(&endpoints[0], domain, qtype).await,
+                )
+            }));
+            pending.push(Box::pin(async {
+                (
+                    1usize,
+                    self.query_endpoint(&endpoints[1], domain, qtype).await,
+                )
+            }));
+            while let Some((index, result)) = pending.next().await {
                 let endpoint = &endpoints[index];
-                self.record_health(endpoint, true, started.elapsed(), None);
-                self.store_answer(domain, qtype, &answer);
-                return Ok(TypeQuery {
-                    answer,
-                    source: endpoint.source,
-                    endpoint: endpoint.name.clone(),
-                    fallback_used: index != 0,
-                    attempts,
-                });
+                match result {
+                    Ok(answer) => {
+                        self.record_health(endpoint, true, started.elapsed(), None);
+                        if !address_query || !answer.ips.is_empty() {
+                            self.store_answer(domain, qtype, &answer);
+                            return Ok(TypeQuery {
+                                answer,
+                                source: endpoint.source,
+                                endpoint: endpoint.name.clone(),
+                                fallback_used: index != 0,
+                                attempts,
+                            });
+                        }
+                        // Keep waiting for the other endpoint; if neither has
+                        // an address, the empty answer still lets the caller
+                        // try AAAA and report a precise error.
+                        if empty_answer.is_none() {
+                            empty_answer = Some((index, answer));
+                        }
+                    }
+                    Err(error) => {
+                        self.record_health(
+                            endpoint,
+                            false,
+                            started.elapsed(),
+                            Some(format!("{error:#}")),
+                        );
+                        tracing::debug!(
+                            endpoint = %redact_url(&endpoint.url),
+                            domain = %domain,
+                            qtype,
+                            error = %error,
+                            "DoH query failed"
+                        );
+                        attempts.push(DohAttemptError {
+                            endpoint: endpoint.name.clone(),
+                            source: endpoint.source,
+                            error: format!("{error:#}"),
+                        });
+                    }
+                }
             }
-            // Both raced endpoints failed; the remaining ones are tried serially below.
+            // Both raced endpoints failed (or answered empty); the remaining
+            // endpoints are tried serially below so a custom endpoint can
+            // still supply an address.
         }
 
-        for endpoint in endpoints
-            .iter()
-            .skip(if endpoints.len() >= 2 { 2 } else { 0 })
+        for (index, endpoint) in
+            endpoints
+                .iter()
+                .enumerate()
+                .skip(if endpoints.len() >= 2 { 2 } else { 0 })
         {
             let started = Instant::now();
             match self.query_endpoint(endpoint, domain, qtype).await {
                 Ok(answer) => {
                     self.record_health(endpoint, true, started.elapsed(), None);
-                    self.store_answer(domain, qtype, &answer);
-                    return Ok(TypeQuery {
-                        answer,
-                        source: endpoint.source,
-                        endpoint: endpoint.name.clone(),
-                        fallback_used: !attempts.is_empty(),
-                        attempts,
-                    });
+                    if !address_query || !answer.ips.is_empty() {
+                        self.store_answer(domain, qtype, &answer);
+                        return Ok(TypeQuery {
+                            answer,
+                            source: endpoint.source,
+                            endpoint: endpoint.name.clone(),
+                            fallback_used: index != 0 || !attempts.is_empty(),
+                            attempts,
+                        });
+                    }
+                    if empty_answer.is_none() {
+                        empty_answer = Some((index, answer));
+                    }
                 }
                 Err(error) => {
                     self.record_health(
@@ -858,6 +867,21 @@ impl Resolver {
                 }
             }
         }
+
+        // Every endpoint answered without an address. Return the empty answer
+        // (instead of "all endpoints failed") so the caller queries AAAA and
+        // reports that DoH had no records, not that DoH was unreachable.
+        if let Some((index, answer)) = empty_answer {
+            let endpoint = &endpoints[index];
+            return Ok(TypeQuery {
+                answer,
+                source: endpoint.source,
+                endpoint: endpoint.name.clone(),
+                fallback_used: index != 0 || !attempts.is_empty(),
+                attempts,
+            });
+        }
+
         let detail = attempts
             .iter()
             .map(|attempt| format!("{}: {}", attempt.endpoint, attempt.error))
@@ -1011,8 +1035,8 @@ impl Resolver {
                 .unwrap_or_default(),
             timeout.as_secs()
         );
-        if let Some(client) = self.clients.read().get(&key) {
-            return Ok(client.clone());
+        if let Some(entry) = self.clients.read().get(&key) {
+            return Ok(entry.client.clone());
         }
         crate::util::install_crypto_provider();
         let mut builder = reqwest::Client::builder()
@@ -1041,13 +1065,27 @@ impl Resolver {
         }
         let client = builder.build().context("building DoH client")?;
         let mut clients = self.clients.write();
-        // A client keeps a connection pool, so old ones must not pile up.  The
-        // key changes when the endpoint or the timeout changes, and a dropped
-        // client is simply rebuilt on the next query.
-        if clients.len() > 4 {
-            clients.clear();
+        if !clients.contains_key(&key) && clients.len() >= MAX_DOH_CLIENTS {
+            // Prefer evicting a catalog/custom client over the primary or
+            // fallback, whose connections are used on every cache miss.
+            let evict = clients
+                .iter()
+                .filter(|(_, entry)| entry.source == DohSource::Custom)
+                .min_by_key(|(_, entry)| entry.created_at)
+                .or_else(|| clients.iter().min_by_key(|(_, entry)| entry.created_at))
+                .map(|(key, _)| key.clone());
+            if let Some(key) = evict {
+                clients.remove(&key);
+            }
         }
-        clients.insert(key, client.clone());
+        clients.insert(
+            key,
+            CachedDohClient {
+                client: client.clone(),
+                source: endpoint.source,
+                created_at: Instant::now(),
+            },
+        );
         Ok(client)
     }
 
@@ -1098,7 +1136,6 @@ impl Resolver {
             }
         }
     }
-
 }
 
 fn normalize_query_name(domain: &str) -> String {
@@ -1194,6 +1231,51 @@ mod tests {
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0].source, DohSource::Primary);
         assert_eq!(endpoints[1].source, DohSource::Custom);
+    }
+
+    #[test]
+    fn doh_client_cache_keeps_the_hot_endpoints_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, resolver) = resolver(dir.path());
+        let endpoints = resolver.effective_endpoints();
+        for endpoint in endpoints.iter() {
+            resolver
+                .client_for(endpoint, Duration::from_secs(3))
+                .unwrap();
+        }
+        for index in 0..(MAX_DOH_CLIENTS + 8) {
+            let endpoint = EffectiveEndpoint {
+                name: format!("custom{index}"),
+                url: format!("https://custom{index}.example/dns-query"),
+                bootstrap_ip: None,
+                source: DohSource::Custom,
+            };
+            resolver
+                .client_for(&endpoint, Duration::from_secs(3))
+                .unwrap();
+        }
+        let clients = resolver.clients.read();
+        assert!(
+            clients.len() <= MAX_DOH_CLIENTS,
+            "the client cache must stay bounded ({} entries)",
+            clients.len()
+        );
+        assert_eq!(
+            clients
+                .values()
+                .filter(|entry| entry.source == DohSource::Primary)
+                .count(),
+            1,
+            "the primary client must survive custom-endpoint churn"
+        );
+        assert_eq!(
+            clients
+                .values()
+                .filter(|entry| entry.source == DohSource::Fallback)
+                .count(),
+            1,
+            "the fallback client must survive custom-endpoint churn"
+        );
     }
 
     #[tokio::test]
