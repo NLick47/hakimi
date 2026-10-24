@@ -292,7 +292,7 @@ pub fn export_diagnostics(paths: &Paths, status: serde_json::Value) -> Result<Pa
     Ok(path)
 }
 
-/// Redact credentials/query strings from user-configurable URLs before exporting config.
+/// Redact credentials, paths and query strings from user-configurable URLs before exporting config.
 pub fn redact_config_value(mut value: serde_json::Value) -> serde_json::Value {
     fn walk(value: &mut serde_json::Value, key: Option<&str>) {
         match value {
@@ -315,6 +315,14 @@ pub fn redact_config_value(mut value: serde_json::Value) -> serde_json::Value {
                         | Some("ip")
                         | Some("doh")
                         | Some("signatureUrl")
+                        // Catalog status and config expose the source/mirror
+                        // URLs outside a `url` key. They can carry a token in
+                        // the path just like a DoH endpoint.
+                        | Some("source")
+                        | Some("ipSource")
+                        | Some("dohSource")
+                        | Some("ipMirrors")
+                        | Some("dohMirrors")
                 ) && text.starts_with("http") =>
             {
                 *text = redact_url(text);
@@ -434,11 +442,25 @@ mod tests {
     }
 
     #[test]
+    fn redacts_url_path_tokens() {
+        // NextDNS-style DoH URLs (and catalog mirrors) carry the credential in
+        // the path; clearing only the query would export it verbatim.
+        assert_eq!(
+            crate::util::redact_url("https://doh.example/dns-query/secret-token?x=1"),
+            "https://doh.example/redacted"
+        );
+        assert_eq!(
+            crate::util::redact_url("https://doh.example"),
+            "https://doh.example/"
+        );
+    }
+
+    #[test]
     fn redacts_ip_and_urls_in_log_lines() {
         let line = "resolved ip=20.205.243.166 url=https://doh.example/q?token=secret";
         let redacted = redact_log_line(line);
         assert!(redacted.contains("ip=20.205.243.x"));
-        assert!(redacted.contains("url=https://doh.example/q"));
+        assert!(redacted.contains("url=https://doh.example/redacted"));
         assert!(!redacted.contains("secret"));
     }
 
@@ -447,11 +469,27 @@ mod tests {
         let value = serde_json::json!({
             "doh": {"primary": "https://user:pass@doh.example/query?token=secret"},
             "url": "https://example.com/path?key=value",
+            "catalogs": {
+                "ipMirrors": ["https://mirror.example/ips/secret-token?key=value"],
+                "dohMirrors": ["https://mirror.example/doh/token"]
+            },
+            "ipSource": "https://catalog.example/ips/secret-token",
+            "dohSource": "https://catalog.example/doh/token",
             "name": "https://example.com/untouched"
         });
         let redacted = redact_config_value(value);
-        assert_eq!(redacted["doh"]["primary"], "https://doh.example/query");
-        assert_eq!(redacted["url"], "https://example.com/path");
+        assert_eq!(redacted["doh"]["primary"], "https://doh.example/redacted");
+        assert_eq!(redacted["url"], "https://example.com/redacted");
+        assert_eq!(
+            redacted["catalogs"]["ipMirrors"][0],
+            "https://mirror.example/redacted"
+        );
+        assert_eq!(
+            redacted["catalogs"]["dohMirrors"][0],
+            "https://mirror.example/redacted"
+        );
+        assert_eq!(redacted["ipSource"], "https://catalog.example/redacted");
+        assert_eq!(redacted["dohSource"], "https://catalog.example/redacted");
         assert_eq!(redacted["name"], "https://example.com/untouched");
     }
 }

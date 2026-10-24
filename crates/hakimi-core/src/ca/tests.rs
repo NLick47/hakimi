@@ -99,6 +99,38 @@ fn status_reports_the_pre_operation_state_while_busy() {
 }
 
 #[test]
+fn invalidating_status_clears_the_fast_installed_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    ca.store_status(Some(CaStatus {
+        present: true,
+        supported: true,
+        installed: true,
+        subject: None,
+        fingerprint_sha1: None,
+        fingerprint_sha256: None,
+        cert_path: None,
+        not_before: None,
+        not_after: None,
+        error: None,
+        note: None,
+    }));
+    assert!(ca.installed_flag.load(Ordering::Relaxed));
+
+    // Android calls this after the user removes the user-CA trust flag. The
+    // CONNECT hot path reads the mirror first, so clearing only the snapshot
+    // would keep reporting the old state as installed.
+    ca.invalidate_status();
+
+    assert!(ca.status_cache.lock().is_none());
+    assert!(
+        !ca.installed_flag.load(Ordering::Relaxed),
+        "the fast installed mirror must not outlive the invalidated snapshot"
+    );
+}
+
+#[test]
 fn stale_status_is_reused_while_another_probe_is_running() {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::new(dir.path());

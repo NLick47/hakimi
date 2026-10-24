@@ -148,7 +148,11 @@ async fn read_limited_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
             .unwrap_or(0)
             .min(MAX_DOH_RESPONSE_BYTES as u64) as usize,
     );
-    while let Some(chunk) = response.chunk().await.context("reading DoH response")? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| anyhow::anyhow!("reading DoH response: {}", error.without_url()))?
+    {
         if body.len().saturating_add(chunk.len()) > MAX_DOH_RESPONSE_BYTES {
             bail!("DoH response is larger than {MAX_DOH_RESPONSE_BYTES} bytes");
         }
@@ -977,7 +981,16 @@ impl Resolver {
             .body(query)
             .send()
             .await
-            .with_context(|| format!("POST {}", redact_url(&endpoint.url)))?;
+            .map_err(|error| {
+                // reqwest's Display repeats the request URL, including a token
+                // in the path. Keep only our already-redacted endpoint in the
+                // error that is stored in health/status and shown in exports.
+                anyhow::anyhow!(
+                    "POST {} failed: {}",
+                    redact_url(&endpoint.url),
+                    error.without_url()
+                )
+            })?;
         let status = response.status();
         if !status.is_success() {
             bail!("DoH endpoint returned HTTP {status}");
@@ -1330,6 +1343,38 @@ mod tests {
         );
         // Let the background refresh observe the empty endpoint list and exit.
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    #[tokio::test]
+    async fn doh_errors_do_not_leak_endpoint_path_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _, resolver) = resolver(dir.path());
+        config
+            .mutate(|config| {
+                // Port 1 is closed, so reqwest reports a request error. Its
+                // Display includes the full URL; the status/health record must
+                // not carry the credential from the path.
+                config.doh.primary = "https://127.0.0.1:1/dns-query/secret-token".into();
+                config.doh.fallback = config.doh.primary.clone();
+                config.doh.custom.clear();
+                Ok(())
+            })
+            .unwrap();
+
+        let health = resolver.health_check().await;
+        let errors: Vec<&str> = health
+            .iter()
+            .filter_map(|entry| entry.last_error.as_deref())
+            .collect();
+        let text = errors.join("\n");
+        assert!(
+            !text.contains("secret-token"),
+            "DoH health must not expose a token from the endpoint path: {text}"
+        );
+        assert!(
+            text.contains("redacted"),
+            "the error should name the endpoint with its path redacted: {text}"
+        );
     }
 
     #[tokio::test]

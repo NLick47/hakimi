@@ -277,6 +277,12 @@ pub fn redact_url(input: &str) -> String {
             let _ = url.set_password(None);
             url.set_query(None);
             url.set_fragment(None);
+            // DoH providers commonly put an account token in the path
+            // (`https://dns.nextdns.io/<id>`). Clearing only the query would
+            // export that credential in diagnostics and logs.
+            if !url.path().is_empty() && url.path() != "/" {
+                url.set_path("/redacted");
+            }
             url.to_string()
         }
         Err(_) => "<invalid-url>".to_string(),

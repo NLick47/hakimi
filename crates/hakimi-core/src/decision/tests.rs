@@ -1199,6 +1199,47 @@ async fn auto_falls_back_to_fake_sni_and_caches_it() {
 }
 
 #[tokio::test]
+async fn a_timed_out_direct_handshake_still_allows_fake_sni() {
+    // The reverse of the case above: the real SNI is filtered, so the direct
+    // TLS handshake times out. The address may still answer a fake SNI; only
+    // the remaining names on that address should be skipped after a fake-SNI
+    // timeout, not every non-direct mode.
+    let harness = harness(
+        &["example.com"],
+        RoutePolicy::new(vec![
+            RouteAttempt::Direct,
+            RouteAttempt::Sni {
+                sni: vec!["www.bing.com".into()],
+            },
+        ]),
+    );
+    *harness.remote.catalog.lock() = true;
+    *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group cursor"),
+    };
+    let direct = cursor.next_plan().await.expect("a direct plan");
+    assert_eq!(direct.mode, TlsMode::Direct);
+
+    // The pooled connector classifies an outer TLS-handshake timeout this way.
+    cursor.note_failure(
+        &direct,
+        FailureReason::TcpTimeout,
+        "TLS handshake timed out".into(),
+    );
+
+    let sni = cursor
+        .next_plan()
+        .await
+        .expect("the fake-SNI fallback for the same address must still be planned");
+    assert_eq!(sni.mode, TlsMode::FakeSni);
+    assert_eq!(sni.ip, direct.ip);
+    assert_eq!(sni.sni.as_deref(), Some("www.bing.com"));
+}
+
+#[tokio::test]
 async fn a_timed_out_fake_sni_still_allows_the_direct_fallback() {
     // A TLS handshake can be blocked for one fake SNI while the same address
     // answers the real SNI. Marking the whole address dead after that timeout

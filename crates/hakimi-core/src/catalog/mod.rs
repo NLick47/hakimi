@@ -22,6 +22,37 @@ use self::signature::CatalogSignature;
 const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 4096;
 
+/// Read a catalog response with a hard byte cap while it streams.
+///
+/// A source can omit `Content-Length` and keep a chunked body open. Buffering
+/// it with `Response::bytes()` would let that source grow the process until the
+/// request timeout, then allocate the whole body before the old size check.
+async fn read_limited_body(
+    mut response: reqwest::Response,
+    max: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > max as u64)
+    {
+        bail!("{label} is larger than {max} bytes");
+    }
+    let mut body =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(max as u64) as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| anyhow::anyhow!("reading {label} body: {}", error.without_url()))?
+    {
+        if body.len().saturating_add(chunk.len()) > max {
+            bail!("{label} is larger than {max} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogMeta {
@@ -596,19 +627,17 @@ impl CatalogManager {
                 }
             }
         }
-        let response = request.send().await.context("fetching catalog")?;
+        let response = request.send().await.map_err(|error| {
+            // reqwest repeats the request URL in its Display, and that URL can
+            // contain a credential in the path. The caller already prefixes the
+            // source (redacted), so drop the duplicate URL from this error.
+            anyhow::anyhow!("fetching catalog: {}", error.without_url())
+        })?;
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(FetchOutcome::NotModified);
         }
         if !response.status().is_success() {
             bail!("catalog source returned HTTP {}", response.status());
-        }
-        if response
-            .content_length()
-            .map(|len| len as usize > MAX_CATALOG_BYTES)
-            .unwrap_or(false)
-        {
-            bail!("catalog is larger than {MAX_CATALOG_BYTES} bytes");
         }
         let etag = response
             .headers()
@@ -620,10 +649,7 @@ impl CatalogManager {
             .get(reqwest::header::LAST_MODIFIED)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
-        let bytes = response.bytes().await.context("reading catalog body")?;
-        if bytes.len() > MAX_CATALOG_BYTES {
-            bail!("catalog is larger than {MAX_CATALOG_BYTES} bytes");
-        }
+        let bytes = read_limited_body(response, MAX_CATALOG_BYTES, "catalog").await?;
 
         if let Some(verifier) = signature {
             let signature_url = config
@@ -654,22 +680,12 @@ impl CatalogManager {
             .timeout(timeout)
             .send()
             .await
-            .context("fetching signature")?;
+            .map_err(|error| anyhow::anyhow!("fetching signature: {}", error.without_url()))?;
         if !response.status().is_success() {
             bail!("signature source returned HTTP {}", response.status());
         }
-        if response
-            .content_length()
-            .map(|len| len as usize > MAX_SIGNATURE_BYTES)
-            .unwrap_or(false)
-        {
-            bail!("signature is larger than {MAX_SIGNATURE_BYTES} bytes");
-        }
-        let bytes = response.bytes().await.context("reading signature body")?;
-        if bytes.len() > MAX_SIGNATURE_BYTES {
-            bail!("signature is larger than {MAX_SIGNATURE_BYTES} bytes");
-        }
-        Ok(bytes.to_vec())
+        let bytes = read_limited_body(response, MAX_SIGNATURE_BYTES, "signature").await?;
+        Ok(bytes)
     }
 
     fn persist_ip_meta(&self) {

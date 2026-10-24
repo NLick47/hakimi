@@ -242,7 +242,13 @@ impl CertificateAuthority {
     /// the user-CA trust flag so the next status probe reflects it immediately
     /// instead of waiting out the status TTL.
     pub fn invalidate_status(&self) {
-        *self.status_cache.lock() = None;
+        // The fast path reads `installed_flag` before looking at the cache, so
+        // clear both together. Otherwise invalidating a previously-trusted CA
+        // leaves `installed()` returning true until some caller runs a full
+        // status probe.
+        let mut cache = self.status_cache.lock();
+        self.installed_flag.store(false, Ordering::Relaxed);
+        *cache = None;
     }
 
     /// Authoritative status for CA operations and their result reporting. Waits

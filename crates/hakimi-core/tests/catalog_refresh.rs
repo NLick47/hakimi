@@ -67,6 +67,86 @@ async fn refresh_ip_catalog_with_etag_and_skip_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversized_chunked_catalog_is_rejected_while_streaming() {
+    // A catalog source can omit Content-Length and keep the body open. The
+    // refresh must stop at the byte cap instead of buffering an unbounded
+    // chunked body until the request timeout. This server sends more than the
+    // cap and then deliberately never terminates the chunked stream.
+    const CAP: usize = 2 * 1024 * 1024;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = vec![0u8; 8192];
+        let _ = stream.read(&mut buffer).await.unwrap();
+        if stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let body = vec![b' '; CAP + 1];
+        let header = format!("{:x}\r\n", body.len());
+        if stream.write_all(header.as_bytes()).await.is_err() {
+            return;
+        }
+        if stream.write_all(&body).await.is_err() {
+            return;
+        }
+        // Leave the body unfinished: a client that buffers the whole response
+        // waits for the request timeout instead of noticing the cap.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    paths.ensure().unwrap();
+    let config = Arc::new(ConfigManager::load_or_create(&paths).unwrap());
+    let mut value = AppConfig::default();
+    value.catalogs.ip = format!("http://{addr}/ips.json");
+    value.catalogs.timeout_secs = 5;
+    config.update(value).unwrap();
+    let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
+    let catalogs = CatalogManager::load(&paths, config, cache).unwrap();
+
+    let started = std::time::Instant::now();
+    let error = catalogs.refresh_ip(false).await.unwrap_err();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "the cap must stop the read before the 5s request timeout: {error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("larger than"),
+        "the error must name the byte cap: {error:#}"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_errors_do_not_leak_source_path_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    paths.ensure().unwrap();
+    let config = Arc::new(ConfigManager::load_or_create(&paths).unwrap());
+    let mut value = AppConfig::default();
+    value.catalogs.ip = "http://127.0.0.1:1/catalog/secret-token".into();
+    value.catalogs.timeout_secs = 1;
+    config.update(value).unwrap();
+    let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
+    let catalogs = CatalogManager::load(&paths, config, cache).unwrap();
+
+    let error = catalogs.refresh_ip(false).await.unwrap_err();
+    let text = format!("{error:#}");
+    assert!(
+        !text.contains("secret-token"),
+        "catalog errors must not expose a token from the source path: {text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn validation_failure_falls_back_to_mirror() {
     let good = r#"{"v":1,"groups":{"test":["example.com"]},"ips":{"example.com":["9.9.9.9"]}}"#;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -73,11 +73,11 @@ pub struct RouteCursor {
     sni_index: usize,
     /// IPs whose TCP connect was refused; every SNI variant on them would fail.
     dead_ips: HashSet<IpAddr>,
-    /// IPs whose connection attempt timed out. This does not prove the address
-    /// is useless: a fake-SNI handshake can be filtered while the real-SNI
-    /// handshake succeeds. Skip the remaining SNI variants, but keep the
-    /// address for the other configured modes (notably direct).
-    timed_out_ips: HashSet<IpAddr>,
+    /// IPs whose fake-SNI handshake timed out. A handshake can be filtered for
+    /// the fake name while the real SNI or another mode on the same address
+    /// still works, so only the remaining SNI variants are skipped and the
+    /// address stays available for direct/ECH.
+    timed_out_sni_ips: HashSet<IpAddr>,
     network: String,
     attempts: Vec<AttemptRecord>,
     last_reason: Option<FailureReason>,
@@ -246,7 +246,7 @@ impl RouteCursor {
             sni_attempt: None,
             sni_index: 0,
             dead_ips: HashSet::new(),
-            timed_out_ips: HashSet::new(),
+            timed_out_sni_ips: HashSet::new(),
             network: network_id(),
             attempts: Vec::new(),
             last_reason: None,
@@ -508,7 +508,7 @@ impl RouteCursor {
                         self.attempt_index = self.route_attempts.len();
                         continue;
                     }
-                    if self.timed_out_ips.contains(&candidate.ip) {
+                    if self.timed_out_sni_ips.contains(&candidate.ip) {
                         // A fake-SNI handshake may be filtered while the real
                         // SNI on the same address still works; skip the
                         // remaining SNI variants but keep other modes.
@@ -635,10 +635,12 @@ impl RouteCursor {
             FailureReason::TcpRefused => {
                 self.dead_ips.insert(plan.ip);
             }
-            FailureReason::TcpTimeout => {
-                // The timeout may have happened during TLS (not TCP), so the
-                // address is still worth trying with other modes.
-                self.timed_out_ips.insert(plan.ip);
+            // A timeout may have happened during TLS (not TCP), so the address
+            // is still worth trying with other modes. Only a fake-SNI timeout
+            // also condemns the remaining names on this address; a direct/ECH
+            // timeout must not hide fake SNI.
+            FailureReason::TcpTimeout if plan.mode == TlsMode::FakeSni => {
+                self.timed_out_sni_ips.insert(plan.ip);
             }
             _ => {}
         }

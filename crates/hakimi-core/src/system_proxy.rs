@@ -125,7 +125,7 @@ impl SystemProxyManager {
     ) -> Result<SystemProxyStatus> {
         let CurrentProxy { supported, current } = platform_current(mode)?;
         let applied = match (&current, &expected) {
-            (Some(current), Some(expected)) => current.contains(expected),
+            (Some(current), Some(expected)) => proxy_setting_matches(current, expected),
             _ => false,
         };
         Ok(SystemProxyStatus {
@@ -216,6 +216,22 @@ fn mode_name(mode: ProxyMode) -> &'static str {
         ProxyMode::Http => "http",
         ProxyMode::Off => "off",
     }
+}
+
+/// Compare the OS-reported setting with the one this instance wrote.
+///
+/// PAC values are URLs and keep the existing substring contract. HTTP values
+/// are socket addresses: macOS prints `Server: ::1` and `Port: 8443`, which
+/// becomes `::1:8443`, while `SocketAddr::to_string()` keeps the IPv6 brackets
+/// (`[::1]:8443`). Accept either spelling.
+fn proxy_setting_matches(current: &str, expected: &str) -> bool {
+    if current.contains(expected) {
+        return true;
+    }
+    expected
+        .parse::<SocketAddr>()
+        .ok()
+        .is_some_and(|address| current == format!("{}:{}", address.ip(), address.port()))
 }
 
 #[derive(Debug)]
@@ -1297,7 +1313,19 @@ mod current_proxy_tests {
         let current = parse_current_proxy(text, Some(ProxyMode::Http)).unwrap();
         assert_eq!(current, "127.0.0.1:8443");
         // The comparison the status does must now succeed.
-        assert!(current.contains("127.0.0.1:8443"));
+        assert!(proxy_setting_matches(&current, "127.0.0.1:8443"));
+    }
+
+    #[test]
+    fn an_ipv6_http_proxy_status_matches_the_host_port_form() {
+        // macOS reports the host and port separately, so an IPv6 listener
+        // (`[::1]:8443` as a SocketAddr) appears as `::1:8443`. Comparing it
+        // with `contains("[::1]:8443")` marked a working proxy as unapplied.
+        let text = "Enabled: Yes\nServer: ::1\nPort: 8443\n";
+        let current = parse_current_proxy(text, Some(ProxyMode::Http)).unwrap();
+        assert_eq!(current, "::1:8443");
+        assert!(proxy_setting_matches(&current, "[::1]:8443"));
+        assert!(!proxy_setting_matches(&current, "[::1]:8444"));
     }
 
     #[test]
