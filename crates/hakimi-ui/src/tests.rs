@@ -528,3 +528,33 @@ fn custom_groups_are_marked_for_deletion() {
     assert!(!sites.iter().find(|s| s.id == "pixiv").unwrap().custom);
     assert!(sites.iter().find(|s| s.id == "mine").unwrap().custom);
 }
+
+/// One UI refresh tick: status/config JSON in, raw rows out.
+#[test]
+#[ignore = "micro benchmark"]
+fn bench_build_sites_tick() {
+    let config = serde_json::to_value(AppConfig::default()).unwrap();
+    let domains: Vec<serde_json::Value> = (0..2048)
+        .map(|index| {
+            serde_json::json!({
+                "domain": format!("host{index}.example.test"),
+                "state": "normal",
+                "latencyMs": 42
+            })
+        })
+        .collect();
+    let status = serde_json::json!({ "domains": domains });
+    let expanded = HashSet::new();
+    // Warm the lazily built helpers the way the second tick does.
+    let _ = build_sites(&status, &config, &expanded);
+    let started = std::time::Instant::now();
+    for _ in 0..200 {
+        let _ = build_sites(&status, &config, &expanded);
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "{:<28} {:>10.1} ns/op   (200 rounds in {elapsed:?})",
+        "ui.build_sites",
+        elapsed.as_nanos() as f64 / 200.0
+    );
+}

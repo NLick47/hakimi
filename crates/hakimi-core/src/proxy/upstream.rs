@@ -559,7 +559,7 @@ pub(crate) fn diagnostics_error_page(
     diagnostics: &DomainDiagnostics,
     ctx: &ProxyContext,
 ) -> Response<ProxyBody> {
-    let ca = ctx.ca.status();
+    let ca = ctx.ca.status_cached();
     let mut attempts = String::new();
     if !diagnostics.attempts.is_empty() {
         attempts.push_str("<h2>Attempts</h2><table><tr><th>Strategy</th><th>IP</th><th>Source</th><th>SNI</th><th>Error</th><th>Detail</th></tr>");

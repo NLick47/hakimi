@@ -262,3 +262,224 @@ fn the_local_server_resumes_sessions() {
     server.join().unwrap();
     assert!(resumed, "the second local handshake must resume the session");
 }
+
+/// A cold CONNECT to a host the leaf cache has never seen pays for key
+/// generation and certificate signing before the browser TLS handshake starts.
+#[test]
+#[ignore = "micro benchmark"]
+fn bench_leaf_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    crate::bench::measure("ca.leaf_miss", 100, || {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let index = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = ca
+            .server_config(&format!("host{index}.example.test"))
+            .unwrap();
+    });
+    crate::bench::measure("ca.leaf_hit", 100_000, || {
+        let _ = ca.server_config("host.example.test").unwrap();
+    });
+}
+
+/// Fill the snapshot with a marker a real probe can never produce: seeing it in
+/// a return value proves that the caller did not run `security(1)` itself.
+fn backdate_snapshot(ca: &Arc<CertificateAuthority>, age: Duration) -> CaStatus {
+    let mut status = ca.status();
+    status.fingerprint_sha1 = Some("stale-marker".into());
+    *ca.status_cache.lock() = Some((Instant::now() - age, status.clone()));
+    status
+}
+
+/// Age the existing snapshot without touching the trust store, so a benchmark
+/// measures the read under test and not the setup.
+fn age_snapshot(ca: &Arc<CertificateAuthority>, age: Duration) {
+    let mut cache = ca.status_cache.lock();
+    match cache.as_mut() {
+        Some((at, _)) => *at = Instant::now() - age,
+        None => panic!("the snapshot must be filled before it can be aged"),
+    }
+}
+
+/// Wait (bounded) for the background probe to replace the marked snapshot.
+fn wait_for_background_refresh(ca: &Arc<CertificateAuthority>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let refreshed = ca.status_cache.lock().as_ref().is_some_and(|(at, status)| {
+            at.elapsed() < CA_STATUS_TTL
+                && status.fingerprint_sha1.as_deref() != Some("stale-marker")
+        });
+        if refreshed {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the background trust probe never refreshed the snapshot"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn stale_trust_status_is_answered_without_a_probe_on_the_caller() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    let stale = backdate_snapshot(&ca, CA_STATUS_TTL + Duration::from_secs(5));
+
+    let started = Instant::now();
+    let seen = ca.status_cached();
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        seen.fingerprint_sha1.as_deref(),
+        Some("stale-marker"),
+        "a stale read must be answered from the snapshot: a synchronous probe \
+         would have replaced the marker with the real fingerprint"
+    );
+    assert_eq!(seen.installed, stale.installed);
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "the polled status must not wait for `security(1)`; took {elapsed:?}"
+    );
+
+    // The refresh still happens — just not on the caller's thread.
+    wait_for_background_refresh(&ca);
+    assert_ne!(
+        ca.status_cached().fingerprint_sha1.as_deref(),
+        Some("stale-marker"),
+        "the refreshed snapshot must be what the next read sees"
+    );
+}
+
+#[test]
+fn the_first_trust_read_still_probes_synchronously() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    assert!(ca.status_cache.lock().is_none());
+
+    // Nothing to serve stale: showing "unknown" would be wrong for the first
+    // caller, so this one read still waits for the real probe.
+    let status = ca.status_cached();
+    assert!(status.present);
+    assert!(
+        ca.status_cache.lock().is_some(),
+        "the first read must fill the snapshot"
+    );
+}
+
+#[test]
+fn installed_reads_a_stale_snapshot_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    // A temp CA is never trusted, so the fast path stays off and the snapshot
+    // is what the CONNECT path reads.
+    assert!(!ca.installed_flag.load(Ordering::Relaxed));
+    backdate_snapshot(&ca, CA_STATUS_TTL + Duration::from_secs(5));
+
+    assert!(
+        !ca.installed(),
+        "the stale snapshot is what the CONNECT path must see"
+    );
+    assert_eq!(
+        ca.status_cache
+            .lock()
+            .as_ref()
+            .and_then(|(_, status)| status.fingerprint_sha1.clone()),
+        Some("stale-marker".to_string()),
+        "the CONNECT path must not run security(1) itself"
+    );
+    wait_for_background_refresh(&ca);
+
+    // With no snapshot at all the answer must be authoritative instead.
+    *ca.status_cache.lock() = None;
+    assert!(!ca.installed());
+    assert!(
+        ca.status_cache.lock().is_some(),
+        "an authoritative read still probes synchronously"
+    );
+}
+
+/// The stale read the UI poll and the CONNECT path used to pay for: a Keychain
+/// subprocess on the caller's thread every `CA_STATUS_TTL`.
+#[test]
+#[ignore = "micro benchmark"]
+fn bench_trust_status_when_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    let _ = ca.status();
+    let stale = CA_STATUS_TTL + Duration::from_secs(5);
+
+    crate::bench::measure("ca.status_stale_sync", 20, || {
+        age_snapshot(&ca, stale);
+        let _ = ca.status();
+    });
+    crate::bench::measure("ca.status_cached_stale", 20, || {
+        age_snapshot(&ca, stale);
+        let _ = ca.status_cached();
+    });
+}
+
+#[test]
+fn a_skipped_background_probe_does_not_disable_later_refreshes() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    backdate_snapshot(&ca, CA_STATUS_TTL + Duration::from_secs(5));
+
+    // The probe lock is held by a synchronous reader, so the queued background
+    // probe has to give up. Releasing the "queued" flag must not depend on the
+    // probe having actually run: a stuck flag would stop every later refresh
+    // and freeze the CA state for the rest of the process.
+    let held = ca.probe_lock.lock();
+    let seen = ca.status_cached();
+    assert_eq!(seen.fingerprint_sha1.as_deref(), Some("stale-marker"));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while ca.probe_pending.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !ca.probe_pending.load(Ordering::Acquire),
+        "a probe that could not run must still release the queued flag"
+    );
+    drop(held);
+
+    // The next stale read must be able to queue a probe again.
+    assert_eq!(
+        ca.status_cached().fingerprint_sha1.as_deref(),
+        Some("stale-marker")
+    );
+    wait_for_background_refresh(&ca);
+}
+
+#[test]
+fn an_operation_in_flight_never_triggers_a_background_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    let stale = backdate_snapshot(&ca, CA_STATUS_TTL + Duration::from_secs(5));
+
+    let _guard = ca.begin_operation();
+    let runs = ca.probe_runs.load(Ordering::Relaxed);
+
+    let seen = ca.status_cached();
+    assert_eq!(
+        seen.fingerprint_sha1.as_deref(),
+        Some("stale-marker"),
+        "during an operation callers must keep seeing the pre-operation state"
+    );
+    assert!(!ca.installed(), "the same holds for the CONNECT path");
+    assert!(
+        !ca.probe_pending.load(Ordering::Acquire),
+        "a probe queued mid-install could store a half-applied trust state"
+    );
+    assert_eq!(ca.probe_runs.load(Ordering::Relaxed), runs);
+
+    drop(_guard);
+    assert_eq!(stale.installed, false, "a temp CA is never trusted");
+}

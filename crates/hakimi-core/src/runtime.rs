@@ -83,7 +83,10 @@ impl StatusProvider {
 
     fn snapshot_json_inner(&self, every_domain: bool) -> serde_json::Value {
         let (config, config_revision) = self.config.snapshot_with_revision();
-        let ca = self.ca.status();
+        // The CA state is polled every second by the UI; a stale snapshot is
+        // served straight away and re-probed on the blocking pool so a poll
+        // never waits for `security(1)`.
+        let ca = self.ca.status_cached();
         let catalogs = self.catalogs.status();
         let groups = self.status.groups_snapshot(&config);
         // Serialize borrowed values: the status map stores shared records, and
@@ -1223,5 +1226,43 @@ mod status_snapshot_tests {
             .map(|record| record["domain"].as_str().unwrap())
             .collect();
         assert_eq!(domains, vec!["a.test", "c.test"]);
+    }
+
+    /// The poll the desktop UI runs every second on its own thread.
+    #[test]
+    #[ignore = "micro benchmark"]
+    fn bench_status_json_at_scale() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = HakimiRuntime::new(Some(dir.path().to_path_buf())).unwrap();
+        runtime
+            .config()
+            .mutate(|config| {
+                config.groups.clear();
+                for group in 0..32 {
+                    let domains = (0..64)
+                        .map(|index| DomainRule::new(&format!("site{index}.group{group}.test")))
+                        .collect();
+                    config.groups.push(GroupConfig {
+                        id: format!("group{group}"),
+                        name: format!("Group {group}"),
+                        domains,
+                        enabled: true,
+                        homepage: None,
+                        default_route: RoutePolicy::auto(),
+                    });
+                }
+                Ok(())
+            })
+            .unwrap();
+        for group in 0..32 {
+            for index in 0..64 {
+                record(&runtime.status, &format!("site{index}.group{group}.test"));
+            }
+        }
+        // Warm the domain-set cache the way the first real poll does.
+        let _ = runtime.status_json();
+        crate::bench::measure("status.json(2k)", 200, || {
+            let _ = runtime.status_json();
+        });
     }
 }

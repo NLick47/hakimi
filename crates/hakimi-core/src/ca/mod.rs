@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -62,6 +62,16 @@ struct LeafEntry {
     created_at: OffsetDateTime,
 }
 
+/// Releases the "a background probe is queued" flag when the queued task goes
+/// away — dropped before it ran (runtime shutdown), finished, or panicked.
+struct ProbeClaim(Arc<CertificateAuthority>);
+
+impl Drop for ProbeClaim {
+    fn drop(&mut self) {
+        self.0.probe_pending.store(false, Ordering::Release);
+    }
+}
+
 /// Local CA used only for enabled-group domains. Leaf certificates are generated on demand,
 /// cached for a day, and always carry the real domain in SAN; certificate verification is never
 /// disabled.
@@ -85,6 +95,11 @@ pub struct CertificateAuthority {
     // see that half-applied state and report "trusted" while the password
     // dialog is still on screen.
     busy: AtomicBool,
+    /// Trust probes that actually ran. Tests use it to prove that a
+    /// latency-sensitive caller never runs `security(1)` itself.
+    probe_runs: AtomicU64,
+    /// At most one background refresh is queued at a time.
+    probe_pending: AtomicBool,
 }
 
 impl CertificateAuthority {
@@ -110,6 +125,8 @@ impl CertificateAuthority {
             installed_flag: AtomicBool::new(false),
             probe_lock: Mutex::new(()),
             busy: AtomicBool::new(false),
+            probe_runs: AtomicU64::new(0),
+            probe_pending: AtomicBool::new(false),
         }))
     }
 
@@ -165,9 +182,15 @@ impl CertificateAuthority {
     }
 
     /// Trust state only, for the CONNECT hot path. A fresh cached snapshot is
-    /// read in place without cloning every fingerprint/path string; stale or
-    /// missing snapshots fall back to the full probe in [`Self::status`].
-    pub fn installed(&self) -> bool {
+    /// read in place without cloning every fingerprint/path string.
+    ///
+    /// A snapshot that has aged past [`CA_STATUS_TTL`] is answered immediately
+    /// and refreshed on the blocking pool: `trust_status` shells out to
+    /// `security(1)` for tens of milliseconds, and a CONNECT must never pay
+    /// that on a Tokio worker. Only a caller with no snapshot at all — the
+    /// first read after start or after [`Self::invalidate_status`] — runs the
+    /// probe itself, because guessing "untrusted" there would be wrong.
+    pub fn installed(self: &Arc<Self>) -> bool {
         // Test hook: a harness cannot install a CA without a user prompt.
         if crate::hooks::assume_ca_installed() {
             return true;
@@ -176,12 +199,106 @@ impl CertificateAuthority {
         if self.installed_flag.load(Ordering::Relaxed) {
             return true;
         }
-        if let Some((at, status)) = self.status_cache.lock().as_ref() {
-            if at.elapsed() < CA_STATUS_TTL {
-                return status.installed;
+        match self.cached_snapshot() {
+            None => self.status().installed,
+            Some((status, age)) => {
+                if age >= CA_STATUS_TTL {
+                    self.schedule_probe();
+                }
+                status.installed
             }
         }
-        self.status().installed
+    }
+
+    /// The cached snapshot and its age, or `None` when nothing has been probed
+    /// yet. While an operation is in flight the snapshot is the pre-operation
+    /// state, which is exactly what callers should keep seeing.
+    fn cached_snapshot(&self) -> Option<(CaStatus, Duration)> {
+        let cache = self.status_cache.lock();
+        if self.busy.load(Ordering::SeqCst) {
+            tracing::debug!("ca status asked during an operation; using the previous state");
+        }
+        cache
+            .as_ref()
+            .map(|(at, status)| (status.clone(), at.elapsed()))
+    }
+
+    /// Trust status for the latency-sensitive readers: the status snapshot the
+    /// desktop UI polls every second and the local error page. Stale is served
+    /// straight away and refreshed in the background, so a poll never stalls a
+    /// UI frame on a Keychain subprocess. See [`Self::installed`] for why the
+    /// first read still probes synchronously.
+    pub fn status_cached(self: &Arc<Self>) -> CaStatus {
+        match self.cached_snapshot() {
+            None => self.status(),
+            Some((status, age)) => {
+                if age >= CA_STATUS_TTL && !self.busy.load(Ordering::SeqCst) {
+                    self.schedule_probe();
+                }
+                status
+            }
+        }
+    }
+
+    /// Queue a trust probe for the blocking pool instead of running it here.
+    ///
+    /// The claim goes through [`Self::probe_lock`], the same lock the
+    /// synchronous path uses, so at most one probe runs and a caller that
+    /// arrives while one is in flight simply keeps the old snapshot.
+    fn schedule_probe(self: &Arc<Self>) {
+        if self.busy.load(Ordering::SeqCst) {
+            return;
+        }
+        if self
+            .probe_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        // The guard lives in the closure from the moment it is created, so the
+        // pending flag is released whether the task runs, is dropped before the
+        // runtime shuts down, or panics: a stuck flag would disable background
+        // refreshes for the rest of the process.
+        let claim = ProbeClaim(Arc::clone(self));
+        let this = Arc::clone(self);
+        let task = move || {
+            let _claim = claim;
+            this.refresh_snapshot();
+        };
+        match tokio::runtime::Handle::try_current() {
+            // `security(1)` must not run on an async worker: it would stall
+            // every other task pinned to that thread for its whole duration.
+            Ok(handle) => {
+                handle.spawn_blocking(task);
+            }
+            // No runtime (one-shot CLI commands, unit tests): a short-lived
+            // thread keeps the same non-blocking contract for the caller.
+            Err(_) => {
+                if let Err(error) = std::thread::Builder::new().spawn(task) {
+                    tracing::debug!(%error, "could not spawn the background ca probe");
+                }
+            }
+        }
+    }
+
+    /// Run one probe if no other caller holds [`Self::probe_lock`]. Used only
+    /// from the background; the synchronous readers still use [`Self::status`].
+    fn refresh_snapshot(self: &Arc<Self>) {
+        let Some(_probe) = self.probe_lock.try_lock() else {
+            return;
+        };
+        // An install/uninstall started while this task was queued: it owns the
+        // snapshot (and calls `status_now` itself), so stay out of its way.
+        if self.busy.load(Ordering::SeqCst) {
+            return;
+        }
+        let cached = self
+            .status_cache
+            .lock()
+            .as_ref()
+            .map(|(_, status)| status.clone());
+        self.probe_and_cache(cached);
     }
 
     /// Store (or drop) the cached trust snapshot.
@@ -266,6 +383,7 @@ impl CertificateAuthority {
     /// Probe the trust store and update the snapshot. Callers must hold
     /// `probe_lock`; `cached` is the previous snapshot used only for logging.
     fn probe_and_cache(&self, cached: Option<CaStatus>) -> CaStatus {
+        self.probe_runs.fetch_add(1, Ordering::Relaxed);
         let (subject, fingerprint_sha1, fingerprint_sha256, not_before, not_after) = {
             let material = self.material.read();
             (
