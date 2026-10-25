@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,6 +27,11 @@ const MAX_DOH_RESPONSE_BYTES: usize = 65_535;
 /// period while a background query refreshes it. Without the grace, every
 /// expired entry paid the full DoH timeout before the page could connect.
 const STALE_WHILE_REVALIDATE_SECS: i64 = 60;
+/// A stale answer is returned immediately while DoH refreshes it in the
+/// background. If DoH is down, one attempt per stale request would multiply
+/// the failure traffic; keep one attempt per domain per window instead.
+const STALE_REFRESH_BACKOFF: Duration = Duration::from_secs(5);
+const STALE_REFRESH_BACKOFF_MAX: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct EffectiveEndpoint {
@@ -130,6 +135,9 @@ pub struct Resolver {
     health: Arc<RwLock<HashMap<String, DohHealth>>>,
     shared_ech_lock: Arc<tokio::sync::Mutex<()>>,
     query_locks: Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// One stale-answer refresh attempt per domain per window. The map is
+    /// bounded like the query locks; entries are cheap and expire quickly.
+    stale_refresh_after: Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
     /// Config/catalog revisions plus the derived endpoint list. A DoH query
     /// used to rebuild and re-clone this list on every cache miss.
     endpoint_cache: Arc<RwLock<EndpointCache>>,
@@ -175,6 +183,7 @@ impl Resolver {
             health: Arc::new(RwLock::new(HashMap::new())),
             shared_ech_lock: Arc::new(tokio::sync::Mutex::new(())),
             query_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            stale_refresh_after: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             endpoint_cache: Arc::new(RwLock::new(None)),
         })
     }
@@ -259,7 +268,18 @@ impl Resolver {
     }
 
     pub fn health_snapshot(&self) -> Vec<DohHealth> {
-        let mut values: Vec<DohHealth> = self.health.read().values().cloned().collect();
+        // Health entries are keyed by endpoint URL and outlive a config edit.
+        // Drop entries for endpoints that are no longer configured so status
+        // and the UI do not keep showing a removed primary/fallback/custom DoH.
+        let endpoints = self.effective_endpoints();
+        let live: HashSet<&str> = endpoints
+            .iter()
+            .map(|endpoint| endpoint.url.as_str())
+            .collect();
+        let mut health = self.health.write();
+        health.retain(|url, _| live.contains(url.as_str()));
+        let mut values: Vec<DohHealth> = health.values().cloned().collect();
+        drop(health);
         values.sort_by(|a, b| a.url.cmp(&b.url));
         values
     }
@@ -376,9 +396,26 @@ impl Resolver {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        let domain = normalize_query_name(&domain);
+        // A burst of asset connections can all hit the same stale answer.
+        // Without a per-domain gate, each request would spawn another full
+        // DoH attempt after the previous one failed, amplifying an outage.
+        {
+            let now = Instant::now();
+            let mut refresh_after = self.stale_refresh_after.lock();
+            if refresh_after.get(&domain).is_some_and(|until| *until > now) {
+                return;
+            }
+            if refresh_after.len() >= STALE_REFRESH_BACKOFF_MAX {
+                refresh_after.retain(|_, until| *until > now);
+                if refresh_after.len() >= STALE_REFRESH_BACKOFF_MAX {
+                    refresh_after.clear();
+                }
+            }
+            refresh_after.insert(domain.clone(), now + STALE_REFRESH_BACKOFF);
+        }
         let resolver = self.clone();
         handle.spawn(async move {
-            let domain = normalize_query_name(&domain);
             let Some(_guard) = resolver.try_query_lock(format!("ip|{domain}")) else {
                 return;
             };
@@ -554,8 +591,13 @@ impl Resolver {
         }
 
         let mut live_error: Option<anyhow::Error> = None;
+        let mut live_failed = false;
         match self.query_one_type(&domain, TYPE_HTTPS).await {
             Ok(query) => {
+                // A successful NODATA answer is authoritative when every
+                // endpoint agreed. If another endpoint failed, keep the stale
+                // config as a last resort, matching the documented policy.
+                live_failed |= !query.attempts.is_empty();
                 if let Some(ech) = query.answer.ech {
                     self.cache.put_ech(CachedEch {
                         domain: domain.clone(),
@@ -572,6 +614,7 @@ impl Resolver {
                 }
             }
             Err(error) => {
+                live_failed = true;
                 live_error = Some(error);
             }
         }
@@ -600,21 +643,27 @@ impl Resolver {
             }
         }
 
-        if let Some(cached) = self.cache.ech(&domain, false) {
-            let config = base64::engine::general_purpose::STANDARD
-                .decode(&cached.ech_config)
-                .context("decoding cached ECH config")?;
-            tracing::warn!(
-                domain = %domain,
-                error = ?live_error,
-                "using stale ECH config after DoH failure"
-            );
-            return Ok(EchOutcome {
-                config,
-                source: DohSource::Cache,
-                endpoint: None,
-                stale: true,
-            });
+        // Do not override an authoritative live NODATA answer with a stale
+        // config. The domain may have removed ECH; offering the old config can
+        // turn every connection into a handshake failure. Stale is only a
+        // last resort when the live query (or one endpoint in the pair) failed.
+        if live_failed {
+            if let Some(cached) = self.cache.ech(&domain, false) {
+                let config = base64::engine::general_purpose::STANDARD
+                    .decode(&cached.ech_config)
+                    .context("decoding cached ECH config")?;
+                tracing::warn!(
+                    domain = %domain,
+                    error = ?live_error,
+                    "using stale ECH config after DoH failure"
+                );
+                return Ok(EchOutcome {
+                    config,
+                    source: DohSource::Cache,
+                    endpoint: None,
+                    stale: true,
+                });
+            }
         }
 
         if let Some(error) = live_error {
@@ -640,25 +689,30 @@ impl Resolver {
             });
         }
 
-        if let Ok(query) = self.query_one_type(SHARED_ECH_DOMAIN, TYPE_HTTPS).await {
-            if let Some(ech) = query.answer.ech {
-                self.cache.put_ech(CachedEch {
-                    domain: SHARED_ECH_DOMAIN.to_string(),
-                    ech_config: base64::engine::general_purpose::STANDARD.encode(&ech),
-                    ttl_secs: query.answer.ttl.max(SHARED_ECH_TTL_SECS),
-                    fetched_at: now(),
-                });
-                tracing::info!(
-                    endpoint = %query.endpoint,
-                    "using shared Cloudflare ECH config"
-                );
-                return Ok(EchOutcome {
-                    config: ech,
-                    source: query.source,
-                    endpoint: Some(query.endpoint),
-                    stale: false,
-                });
+        let mut live_failed = false;
+        match self.query_one_type(SHARED_ECH_DOMAIN, TYPE_HTTPS).await {
+            Ok(query) => {
+                live_failed |= !query.attempts.is_empty();
+                if let Some(ech) = query.answer.ech {
+                    self.cache.put_ech(CachedEch {
+                        domain: SHARED_ECH_DOMAIN.to_string(),
+                        ech_config: base64::engine::general_purpose::STANDARD.encode(&ech),
+                        ttl_secs: query.answer.ttl.max(SHARED_ECH_TTL_SECS),
+                        fetched_at: now(),
+                    });
+                    tracing::info!(
+                        endpoint = %query.endpoint,
+                        "using shared Cloudflare ECH config"
+                    );
+                    return Ok(EchOutcome {
+                        config: ech,
+                        source: query.source,
+                        endpoint: Some(query.endpoint),
+                        stale: false,
+                    });
+                }
             }
+            Err(_) => live_failed = true,
         }
 
         let alidns = EffectiveEndpoint {
@@ -667,37 +721,42 @@ impl Resolver {
             bootstrap_ip: None,
             source: DohSource::Custom,
         };
-        if let Ok(answer) = self
+        match self
             .query_endpoint(&alidns, SHARED_ECH_DOMAIN, TYPE_HTTPS)
             .await
         {
-            if let Some(ech) = answer.ech {
-                self.cache.put_ech(CachedEch {
-                    domain: SHARED_ECH_DOMAIN.to_string(),
-                    ech_config: base64::engine::general_purpose::STANDARD.encode(&ech),
-                    ttl_secs: answer.ttl.max(SHARED_ECH_TTL_SECS),
-                    fetched_at: now(),
-                });
-                tracing::info!("using shared Cloudflare ECH config from AliDNS");
-                return Ok(EchOutcome {
-                    config: ech,
-                    source: DohSource::Custom,
-                    endpoint: Some("AliDNS".to_string()),
-                    stale: false,
-                });
+            Ok(answer) => {
+                if let Some(ech) = answer.ech {
+                    self.cache.put_ech(CachedEch {
+                        domain: SHARED_ECH_DOMAIN.to_string(),
+                        ech_config: base64::engine::general_purpose::STANDARD.encode(&ech),
+                        ttl_secs: answer.ttl.max(SHARED_ECH_TTL_SECS),
+                        fetched_at: now(),
+                    });
+                    tracing::info!("using shared Cloudflare ECH config from AliDNS");
+                    return Ok(EchOutcome {
+                        config: ech,
+                        source: DohSource::Custom,
+                        endpoint: Some("AliDNS".to_string()),
+                        stale: false,
+                    });
+                }
             }
+            Err(_) => live_failed = true,
         }
 
-        if let Some(cached) = self.cache.ech(SHARED_ECH_DOMAIN, false) {
-            let config = base64::engine::general_purpose::STANDARD
-                .decode(&cached.ech_config)
-                .context("decoding stale shared ECH config")?;
-            return Ok(EchOutcome {
-                config,
-                source: DohSource::Cache,
-                endpoint: None,
-                stale: true,
-            });
+        if live_failed {
+            if let Some(cached) = self.cache.ech(SHARED_ECH_DOMAIN, false) {
+                let config = base64::engine::general_purpose::STANDARD
+                    .decode(&cached.ech_config)
+                    .context("decoding stale shared ECH config")?;
+                return Ok(EchOutcome {
+                    config,
+                    source: DohSource::Cache,
+                    endpoint: None,
+                    stale: true,
+                });
+            }
         }
 
         bail!("unable to fetch the shared Cloudflare ECH config")
@@ -752,8 +811,20 @@ impl Resolver {
         // A NOERROR response with no address records is a successful exchange
         // but not a usable route. A filtering resolver can return exactly that
         // while the configured fallback still has the address, so an empty
-        // answer must not win the race and cancel the other endpoint.
+        // answer must not win the race and cancel the other endpoint. The same
+        // applies to a missing HTTPS/ECH answer: the fallback may still have
+        // the ECHConfigList that the primary filtered out.
         let address_query = matches!(qtype, TYPE_A | TYPE_AAAA);
+        let useful_answer = |answer: &ResolvedAnswer| {
+            if address_query {
+                !answer.ips.is_empty()
+            } else {
+                // HTTPS RRs are only fetched for ECH here. An empty HTTPS RR
+                // is a valid NODATA answer, but it is not useful while another
+                // endpoint in the primary/fallback pair may still return ECH.
+                answer.ech.is_some()
+            }
+        };
         let mut empty_answer: Option<(usize, ResolvedAnswer)> = None;
 
         // Primary and fallback race each other: the first successful answer wins, so a
@@ -781,7 +852,7 @@ impl Resolver {
                 match result {
                     Ok(answer) => {
                         self.record_health(endpoint, true, started.elapsed(), None);
-                        if !address_query || !answer.ips.is_empty() {
+                        if useful_answer(&answer) {
                             self.store_answer(domain, qtype, &answer);
                             return Ok(TypeQuery {
                                 answer,
@@ -825,49 +896,58 @@ impl Resolver {
             // still supply an address.
         }
 
-        for (index, endpoint) in
-            endpoints
-                .iter()
-                .enumerate()
-                .skip(if endpoints.len() >= 2 { 2 } else { 0 })
-        {
-            let started = Instant::now();
-            match self.query_endpoint(endpoint, domain, qtype).await {
-                Ok(answer) => {
-                    self.record_health(endpoint, true, started.elapsed(), None);
-                    if !address_query || !answer.ips.is_empty() {
-                        self.store_answer(domain, qtype, &answer);
-                        return Ok(TypeQuery {
-                            answer,
-                            source: endpoint.source,
+        // For an address query, an empty answer is unusable, so trying every
+        // custom endpoint is worth the latency. For HTTPS/ECH a NODATA answer
+        // from the primary/fallback pair is a usable negative result; probing
+        // every custom endpoint serially would add one timeout per endpoint to
+        // every cold ECH route. Custom endpoints are only consulted when the
+        // raced pair did not produce any answer at all.
+        let pair_answered_empty = endpoints.len() >= 2 && empty_answer.is_some();
+        if !(qtype == TYPE_HTTPS && pair_answered_empty) {
+            for (index, endpoint) in
+                endpoints
+                    .iter()
+                    .enumerate()
+                    .skip(if endpoints.len() >= 2 { 2 } else { 0 })
+            {
+                let started = Instant::now();
+                match self.query_endpoint(endpoint, domain, qtype).await {
+                    Ok(answer) => {
+                        self.record_health(endpoint, true, started.elapsed(), None);
+                        if useful_answer(&answer) {
+                            self.store_answer(domain, qtype, &answer);
+                            return Ok(TypeQuery {
+                                answer,
+                                source: endpoint.source,
+                                endpoint: endpoint.name.clone(),
+                                fallback_used: index != 0 || !attempts.is_empty(),
+                                attempts,
+                            });
+                        }
+                        if empty_answer.is_none() {
+                            empty_answer = Some((index, answer));
+                        }
+                    }
+                    Err(error) => {
+                        self.record_health(
+                            endpoint,
+                            false,
+                            started.elapsed(),
+                            Some(format!("{error:#}")),
+                        );
+                        tracing::debug!(
+                            endpoint = %redact_url(&endpoint.url),
+                            domain = %domain,
+                            qtype,
+                            error = %error,
+                            "DoH query failed"
+                        );
+                        attempts.push(DohAttemptError {
                             endpoint: endpoint.name.clone(),
-                            fallback_used: index != 0 || !attempts.is_empty(),
-                            attempts,
+                            source: endpoint.source,
+                            error: format!("{error:#}"),
                         });
                     }
-                    if empty_answer.is_none() {
-                        empty_answer = Some((index, answer));
-                    }
-                }
-                Err(error) => {
-                    self.record_health(
-                        endpoint,
-                        false,
-                        started.elapsed(),
-                        Some(format!("{error:#}")),
-                    );
-                    tracing::debug!(
-                        endpoint = %redact_url(&endpoint.url),
-                        domain = %domain,
-                        qtype,
-                        error = %error,
-                        "DoH query failed"
-                    );
-                    attempts.push(DohAttemptError {
-                        endpoint: endpoint.name.clone(),
-                        source: endpoint.source,
-                        error: format!("{error:#}"),
-                    });
                 }
             }
         }

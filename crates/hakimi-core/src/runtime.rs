@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
 use serde_json::json;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::ca::{CaStatus, CertificateAuthority};
@@ -180,6 +180,36 @@ impl Drop for HakimiRuntime {
         self.cache.stop_auto_flush();
         self.cache.flush_if_dirty();
     }
+}
+
+/// The first warm attempt can race DoH resolution and fail without any route
+/// to dial. Give the resolver a quiet moment before trying once more.
+const WARM_RETRY_DELAY: Duration = Duration::from_millis(1500);
+
+/// Run a warm attempt, then release the concurrency slot while waiting before
+/// the retry. Holding the slot through the backoff serialized the retry sleeps:
+/// with N failing hosts and C slots, the next C hosts could not start their
+/// first attempt until the previous C finished sleeping, even though no network
+/// work was in flight.
+async fn warm_with_retry<F, Fut>(
+    permit: OwnedSemaphorePermit,
+    semaphore: Arc<Semaphore>,
+    delay: Duration,
+    mut warm: F,
+) -> bool
+where
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = bool> + Send,
+{
+    if warm().await {
+        return true;
+    }
+    drop(permit);
+    tokio::time::sleep(delay).await;
+    let Ok(_permit) = semaphore.acquire_owned().await else {
+        return false;
+    };
+    warm().await
 }
 
 impl HakimiRuntime {
@@ -999,16 +1029,14 @@ impl HakimiRuntime {
                 Err(_) => return,
             };
             let upstream = self.upstream.clone();
+            let retry_semaphore = semaphore.clone();
             handles.push(tokio::spawn(async move {
-                let _permit = permit;
-                if upstream.warm(&domain, 443).await {
-                    return true;
-                }
-                // The first attempt can race the DoH expansion and come back
-                // empty-handed; one quiet retry converts it into a pooled
-                // connection once the resolution has landed.
-                tokio::time::sleep(Duration::from_millis(1500)).await;
-                upstream.warm(&domain, 443).await
+                warm_with_retry(permit, retry_semaphore, WARM_RETRY_DELAY, move || {
+                    let upstream = upstream.clone();
+                    let domain = domain.clone();
+                    async move { upstream.warm(&domain, 443).await }
+                })
+                .await
             }));
         }
         // Give primary checks a head start so group state becomes useful earlier.
@@ -1019,13 +1047,14 @@ impl HakimiRuntime {
                 Err(_) => return,
             };
             let upstream = self.upstream.clone();
+            let retry_semaphore = semaphore.clone();
             handles.push(tokio::spawn(async move {
-                let _permit = permit;
-                if upstream.warm(&domain, 443).await {
-                    return true;
-                }
-                tokio::time::sleep(Duration::from_millis(1500)).await;
-                upstream.warm(&domain, 443).await
+                warm_with_retry(permit, retry_semaphore, WARM_RETRY_DELAY, move || {
+                    let upstream = upstream.clone();
+                    let domain = domain.clone();
+                    async move { upstream.warm(&domain, 443).await }
+                })
+                .await
             }));
         }
         // Summarize the warmup: how many routes are hot before the user opens
@@ -1060,6 +1089,56 @@ mod status_snapshot_tests {
     use super::*;
     use crate::config::{DomainRule, GroupConfig, RoutePolicy};
     use crate::status::DomainDiagnostics;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A failed first warm attempt must not keep the concurrency permit while
+    /// its retry delay is just a timer. Otherwise the retry sleeps of all
+    /// failing hosts serialize behind the Semaphore instead of overlapping.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warm_retry_releases_the_slot_during_backoff() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_task = attempts.clone();
+        let semaphore_for_task = semaphore.clone();
+        let task = tokio::spawn(async move {
+            warm_with_retry(
+                permit,
+                semaphore_for_task,
+                Duration::from_millis(300),
+                move || {
+                    let attempts = attempts_for_task.clone();
+                    async move {
+                        attempts.fetch_add(1, Ordering::Relaxed);
+                        false
+                    }
+                },
+            )
+            .await
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while attempts.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+
+        // The first attempt failed and the task is in its retry delay. The
+        // permit must already be free for another host to start warming.
+        let extra = loop {
+            match semaphore.clone().try_acquire_owned() {
+                Ok(permit) => break permit,
+                Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                Err(error) => panic!("the retry delay must release its permit: {error}"),
+            }
+        };
+        drop(extra);
+
+        assert!(!task.await.unwrap());
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
 
     fn record(status: &StatusStore, domain: &str) {
         status.record(DomainDiagnostics {

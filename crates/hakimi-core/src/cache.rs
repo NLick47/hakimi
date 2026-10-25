@@ -306,6 +306,15 @@ impl CacheManager {
         data.sni.retain(|_, sni| {
             now.signed_duration_since(sni.saved_at) <= Duration::days(MAX_SNI_AGE_DAYS)
         });
+        // These two maps are persisted even though their readers already
+        // filter by age. Dropping aged entries during the periodic flush keeps
+        // state.json from carrying records that can never be used again.
+        data.ip_scores.retain(|_, entry| {
+            now.signed_duration_since(entry.updated_at) <= Duration::days(MAX_IP_SCORE_AGE_DAYS)
+        });
+        data.last_good.retain(|_, entry| {
+            now.signed_duration_since(entry.saved_at) <= Duration::days(MAX_LAST_GOOD_AGE_DAYS)
+        });
     }
 
     /// Drop the oldest entries until the map is back under its cap.
@@ -1057,6 +1066,47 @@ mod tests {
             cache.sni("g", "example.com", "net").unwrap().sni.as_deref(),
             Some("www.baidu.com")
         );
+    }
+
+    #[test]
+    fn expire_drops_aged_ip_scores_and_routes() {
+        let now = now();
+        let mut data = CacheData::default();
+        data.ip_scores.insert(
+            "old.example|203.0.113.1".into(),
+            IpScoreEntry {
+                ewma_ms: 100.0,
+                successes: 1,
+                failures: 0,
+                updated_at: now - chrono::Duration::days(MAX_IP_SCORE_AGE_DAYS + 1),
+            },
+        );
+        data.ip_scores.insert(
+            "fresh.example|203.0.113.2".into(),
+            IpScoreEntry {
+                ewma_ms: 100.0,
+                successes: 1,
+                failures: 0,
+                updated_at: now,
+            },
+        );
+        let mut old_route = sample_entry("old.example", "203.0.113.1");
+        old_route.saved_at = now - chrono::Duration::days(MAX_LAST_GOOD_AGE_DAYS + 1);
+        data.last_good.insert(old_route.domain.clone(), old_route);
+        data.last_good.insert(
+            "fresh.example".into(),
+            sample_entry("fresh.example", "203.0.113.2"),
+        );
+
+        CacheManager::expire(&mut data, now);
+
+        assert!(
+            !data.ip_scores.contains_key("old.example|203.0.113.1"),
+            "an aged IP score must not survive a flush"
+        );
+        assert!(data.ip_scores.contains_key("fresh.example|203.0.113.2"));
+        assert!(!data.last_good.contains_key("old.example"));
+        assert!(data.last_good.contains_key("fresh.example"));
     }
 
     /// The two writes a successful connection does to the cache.

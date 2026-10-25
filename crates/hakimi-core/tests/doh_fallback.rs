@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use base64::Engine;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -17,18 +18,20 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 
 use hakimi_core::ca::CertificateAuthority;
-use hakimi_core::cache::CacheManager;
+use hakimi_core::cache::{CacheManager, CachedAnswer, CachedEch};
 use hakimi_core::catalog::CatalogManager;
 use hakimi_core::config::{ConfigManager, DohEndpoint};
 use hakimi_core::paths::Paths;
 use hakimi_core::resolver::Resolver;
 use hakimi_core::strategy::DohSource;
+use hakimi_core::util::now;
 
 /// The trust hook lives in the environment, which is process wide: the tests
 /// must not run at the same time.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const TYPE_A: u16 = 1;
+const TYPE_HTTPS: u16 = 65;
 const CLASS_IN: u16 = 1;
 
 fn push_name(out: &mut Vec<u8>, name: &str) {
@@ -48,6 +51,27 @@ fn answer_a(name: &str, ttl: u32, ip: [u8; 4]) -> Vec<u8> {
     out.extend_from_slice(&ttl.to_be_bytes());
     out.extend_from_slice(&4u16.to_be_bytes());
     out.extend_from_slice(&ip);
+    out
+}
+
+/// A DNS answer for `name` with one HTTPS record carrying an ECHConfigList.
+fn answer_https(name: &str, ttl: u32, ech: &[u8]) -> Vec<u8> {
+    let mut rdata = Vec::new();
+    // Priority 1, root target name.
+    rdata.extend_from_slice(&1u16.to_be_bytes());
+    push_name(&mut rdata, "");
+    // SvcParam key 5 (ech), with the opaque config as its value.
+    rdata.extend_from_slice(&5u16.to_be_bytes());
+    rdata.extend_from_slice(&(ech.len() as u16).to_be_bytes());
+    rdata.extend_from_slice(ech);
+
+    let mut out = Vec::new();
+    push_name(&mut out, name);
+    out.extend_from_slice(&TYPE_HTTPS.to_be_bytes());
+    out.extend_from_slice(&CLASS_IN.to_be_bytes());
+    out.extend_from_slice(&ttl.to_be_bytes());
+    out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    out.extend_from_slice(&rdata);
     out
 }
 
@@ -73,9 +97,11 @@ fn name_from_query(query: &[u8]) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum DohMode {
     Answer([u8; 4]),
+    /// A valid HTTP/DNS response with NOERROR and one HTTPS/ECH answer.
+    HttpsEch(Vec<u8>),
     /// A valid HTTP/DNS response with NOERROR and no answer records.
     Empty,
     Fail,
@@ -118,6 +144,7 @@ impl DohServer {
                 let acceptor = acceptor.clone();
                 let counter = counter.clone();
                 let connection_counter = connection_counter.clone();
+                let mode = mode.clone();
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(stream).await else {
                         return;
@@ -125,9 +152,10 @@ impl DohServer {
                     connection_counter.fetch_add(1, Ordering::Relaxed);
                     let service = service_fn(move |req: hyper::Request<Incoming>| {
                         let counter = counter.clone();
+                        let mode = mode.clone();
                         async move {
                             counter.fetch_add(1, Ordering::Relaxed);
-                            if matches!(mode, DohMode::Fail) {
+                            if matches!(&mode, DohMode::Fail) {
                                 return Ok::<_, Infallible>(
                                     hyper::Response::builder()
                                         .status(503)
@@ -149,14 +177,24 @@ impl DohServer {
                             response.extend_from_slice(&query[0..2]);
                             response.extend_from_slice(&0x8180u16.to_be_bytes());
                             response.extend_from_slice(&1u16.to_be_bytes());
-                            let answers = u16::from(matches!(mode, DohMode::Answer(_)));
+                            let answers = u16::from(matches!(
+                                &mode,
+                                DohMode::Answer(_) | DohMode::HttpsEch(_)
+                            ));
                             response.extend_from_slice(&answers.to_be_bytes());
                             response.extend_from_slice(&0u16.to_be_bytes());
                             response.extend_from_slice(&0u16.to_be_bytes());
                             response.extend_from_slice(&query[12..]);
-                            if let DohMode::Answer(ip) = mode {
-                                let name = name_from_query(&query);
-                                response.extend_from_slice(&answer_a(&name, 300, ip));
+                            match &mode {
+                                DohMode::Answer(ip) => {
+                                    let name = name_from_query(&query);
+                                    response.extend_from_slice(&answer_a(&name, 300, *ip));
+                                }
+                                DohMode::HttpsEch(ech) => {
+                                    let name = name_from_query(&query);
+                                    response.extend_from_slice(&answer_https(&name, 300, ech));
+                                }
+                                DohMode::Empty | DohMode::Fail => {}
                             }
                             Ok(hyper::Response::builder()
                                 .status(200)
@@ -435,4 +473,206 @@ async fn a_broken_primary_falls_back_to_the_second_endpoint() {
         .find(|entry| entry.url.contains(&primary.addr.port().to_string()))
         .expect("the primary has a health entry");
     assert!(!primary_health.healthy);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_https_answer_still_waits_for_fallback_ech() {
+    // A filtering primary can answer HTTPS with NOERROR and no records while
+    // the fallback still publishes an ECHConfigList. The empty answer must not
+    // cancel the fallback before its ECH answer is seen.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    paths.ensure().unwrap();
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    let roots = dir.path().join("extra-root.pem");
+    std::fs::write(&roots, ca.ca_pem()).unwrap();
+    std::env::set_var("HAKIMI_EXTRA_ROOT_CA", &roots);
+
+    let tls = ca.server_config("127.0.0.1").unwrap();
+    let primary = DohServer::spawn_mode(tls.clone(), DohMode::Empty).await;
+    let fallback = DohServer::spawn_mode(tls, DohMode::HttpsEch(vec![7, 7, 7, 7])).await;
+
+    let config = Arc::new(ConfigManager::load_or_create(&paths).unwrap());
+    config
+        .mutate(|config| {
+            config.doh.primary = format!("https://127.0.0.1:{}/dns-query", primary.addr.port());
+            config.doh.fallback = format!("https://127.0.0.1:{}/dns-query", fallback.addr.port());
+            Ok(())
+        })
+        .unwrap();
+    let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
+    let catalogs = CatalogManager::load(&paths, config.clone(), cache.clone()).unwrap();
+    let resolver = Resolver::new(cache.clone(), config.clone(), catalogs.clone());
+
+    let outcome = resolver.ech_config("example.com", false).await.unwrap();
+    assert_eq!(outcome.config, vec![7, 7, 7, 7]);
+    assert_eq!(outcome.source, DohSource::Fallback);
+    assert_eq!(primary.requests.load(Ordering::Relaxed), 1);
+    assert_eq!(fallback.requests.load(Ordering::Relaxed), 1);
+    assert!(
+        cache.ech("example.com", true).is_some(),
+        "the fallback ECH config must be cached"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authoritative_https_nodata_does_not_reuse_stale_ech() {
+    // If every live endpoint agrees that the HTTPS RR has no ECH, an expired
+    // config must not be used as if DoH had failed. ECH may have been removed
+    // from the domain, and offering the old config can break the handshake.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    paths.ensure().unwrap();
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    let roots = dir.path().join("extra-root.pem");
+    std::fs::write(&roots, ca.ca_pem()).unwrap();
+    std::env::set_var("HAKIMI_EXTRA_ROOT_CA", &roots);
+
+    let tls = ca.server_config("127.0.0.1").unwrap();
+    let primary = DohServer::spawn_mode(tls.clone(), DohMode::Empty).await;
+    let fallback = DohServer::spawn_mode(tls, DohMode::Empty).await;
+
+    let config = Arc::new(ConfigManager::load_or_create(&paths).unwrap());
+    config
+        .mutate(|config| {
+            config.doh.primary = format!("https://127.0.0.1:{}/dns-query", primary.addr.port());
+            config.doh.fallback = format!("https://127.0.0.1:{}/dns-query", fallback.addr.port());
+            Ok(())
+        })
+        .unwrap();
+    let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
+    cache.put_ech(CachedEch {
+        domain: "example.com".into(),
+        ech_config: base64::engine::general_purpose::STANDARD.encode([1, 2, 3]),
+        ttl_secs: 1,
+        fetched_at: now() - chrono::Duration::hours(2),
+    });
+    let catalogs = CatalogManager::load(&paths, config.clone(), cache.clone()).unwrap();
+    let resolver = Resolver::new(cache.clone(), config.clone(), catalogs.clone());
+
+    let error = resolver
+        .ech_config("example.com", false)
+        .await
+        .expect_err("a live NODATA answer must not fall back to stale ECH");
+    assert!(format!("{error:#}").contains("does not contain an ECH config"));
+    assert_eq!(primary.requests.load(Ordering::Relaxed), 1);
+    assert_eq!(fallback.requests.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_snapshot_drops_endpoints_removed_from_config() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    paths.ensure().unwrap();
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    let roots = dir.path().join("extra-root.pem");
+    std::fs::write(&roots, ca.ca_pem()).unwrap();
+    std::env::set_var("HAKIMI_EXTRA_ROOT_CA", &roots);
+
+    let tls = ca.server_config("127.0.0.1").unwrap();
+    let primary = DohServer::spawn_mode(tls.clone(), DohMode::Answer([93, 184, 216, 34])).await;
+    let fallback = DohServer::spawn_mode(tls, DohMode::Answer([203, 0, 113, 7])).await;
+
+    let config = Arc::new(ConfigManager::load_or_create(&paths).unwrap());
+    config
+        .mutate(|config| {
+            config.doh.primary = format!("https://127.0.0.1:{}/dns-query", primary.addr.port());
+            config.doh.fallback = format!("https://127.0.0.1:{}/dns-query", fallback.addr.port());
+            for index in 0..2 {
+                config.doh.custom.push(DohEndpoint {
+                    name: format!("custom{index}"),
+                    url: format!("https://127.0.0.1:{}/custom{index}", primary.addr.port()),
+                    bootstrap_ip: None,
+                    enabled: true,
+                });
+            }
+            Ok(())
+        })
+        .unwrap();
+    let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
+    let catalogs = CatalogManager::load(&paths, config.clone(), cache.clone()).unwrap();
+    let resolver = Resolver::new(cache, config.clone(), catalogs);
+
+    assert_eq!(resolver.health_check().await.len(), 4);
+    config
+        .mutate(|config| {
+            config.doh.custom.clear();
+            Ok(())
+        })
+        .unwrap();
+    let health = resolver.health_snapshot();
+    assert_eq!(
+        health.len(),
+        2,
+        "removed custom endpoints must disappear from the health snapshot"
+    );
+    assert!(
+        health.iter().all(|entry| !entry.name.starts_with("custom")),
+        "no removed endpoint may remain visible"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_answers_do_not_spawn_one_refresh_per_connection() {
+    // During a DoH outage, every cold connection can hit the same stale answer.
+    // The background refresh must be gated per domain instead of launching a
+    // fresh pair of endpoint requests for every connection.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    paths.ensure().unwrap();
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    let roots = dir.path().join("extra-root.pem");
+    std::fs::write(&roots, ca.ca_pem()).unwrap();
+    std::env::set_var("HAKIMI_EXTRA_ROOT_CA", &roots);
+
+    let tls = ca.server_config("127.0.0.1").unwrap();
+    let primary = DohServer::spawn_mode(tls.clone(), DohMode::Fail).await;
+    let fallback = DohServer::spawn_mode(tls, DohMode::Fail).await;
+
+    let config = Arc::new(ConfigManager::load_or_create(&paths).unwrap());
+    config
+        .mutate(|config| {
+            config.doh.primary = format!("https://127.0.0.1:{}/dns-query", primary.addr.port());
+            config.doh.fallback = format!("https://127.0.0.1:{}/dns-query", fallback.addr.port());
+            Ok(())
+        })
+        .unwrap();
+    let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
+    cache.put_doh_answer(CachedAnswer {
+        domain: "stale.example".into(),
+        qtype: TYPE_A,
+        ips: vec!["203.0.113.9".parse().unwrap()],
+        hints: Vec::new(),
+        ech_config: None,
+        ttl_secs: 30,
+        fetched_at: now() - chrono::Duration::seconds(40),
+    });
+    let catalogs = CatalogManager::load(&paths, config.clone(), cache.clone()).unwrap();
+    let resolver = Resolver::new(cache, config, catalogs);
+
+    for _ in 0..10 {
+        let resolution = resolver.resolve_ips("stale.example").await.unwrap();
+        assert!(resolution.stale);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while primary.requests.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let total =
+        primary.requests.load(Ordering::Relaxed) + fallback.requests.load(Ordering::Relaxed);
+    assert!(
+        total >= 1,
+        "the stale answer must trigger one refresh attempt"
+    );
+    assert!(
+        total <= 4,
+        "one stale burst must not launch a DoH attempt per connection (saw {total})"
+    );
 }

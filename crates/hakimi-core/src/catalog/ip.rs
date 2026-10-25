@@ -87,14 +87,16 @@ impl IpCatalog {
         self.ip_count
     }
 
-    /// All configured exact domains that are affected by this catalog's wildcard entries.
+    /// All configured exact domains that are affected by this catalog's
+    /// wildcard entries.
     pub fn exact_domains_matching_wildcards(&self, config: &AppConfig) -> Vec<String> {
-        let wildcard_suffixes: Vec<&str> = self
-            .ips
-            .keys()
-            .filter_map(|key| key.strip_prefix("*."))
-            .collect();
-        if wildcard_suffixes.is_empty() {
+        let suffixes = SuffixMatcher::new(
+            self.ips
+                .keys()
+                .filter_map(|key| key.strip_prefix("*."))
+                .map(ToOwned::to_owned),
+        );
+        if suffixes.is_empty() {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -104,13 +106,8 @@ impl IpCatalog {
                 .iter()
                 .filter(|rule| !rule.pattern.starts_with("*."))
             {
-                let domain = rule.pattern.as_str();
-                if wildcard_suffixes.iter().any(|suffix| {
-                    domain.len() > suffix.len()
-                        && domain.ends_with(suffix)
-                        && domain.as_bytes()[domain.len() - suffix.len() - 1] == b'.'
-                }) {
-                    out.push(domain.to_string());
+                if suffixes.matches(&rule.pattern) {
+                    out.push(rule.pattern.clone());
                 }
             }
         }
@@ -279,6 +276,7 @@ pub fn affected_domains(
         }
     }
 
+    let changed_wildcards = SuffixMatcher::new(changed_wildcards);
     if !changed_wildcards.is_empty() {
         for group in &config.groups {
             for rule in group
@@ -286,32 +284,71 @@ pub fn affected_domains(
                 .iter()
                 .filter(|rule| !rule.pattern.starts_with("*."))
             {
-                if matches_any_suffix(&rule.pattern, &changed_wildcards) {
+                if changed_wildcards.matches(&rule.pattern) {
                     affected.insert(rule.pattern.clone());
                 }
             }
         }
         for domain in cached_domains {
-            if matches_any_suffix(domain, &changed_wildcards) {
+            if changed_wildcards.matches(domain) {
                 affected.insert(domain.clone());
             }
         }
     }
 
-    // New exact entries always deserve one fresh probe, even on the first catalog load.
+    // New exact entries always deserve one fresh probe, even on the first
+    // catalog load. Wildcard-covered config domains were already added above:
+    // with no old catalog every wildcard is in `changed_wildcards`.
     if old.is_none() {
         affected.extend(new.ips.keys().filter(|key| !key.starts_with("*.")).cloned());
-        affected.extend(new.exact_domains_matching_wildcards(config));
     }
     affected
 }
 
-fn matches_any_suffix(domain: &str, suffixes: &[String]) -> bool {
-    suffixes.iter().any(|suffix| {
-        domain.len() > suffix.len()
-            && domain.ends_with(suffix)
-            && domain.as_bytes()[domain.len() - suffix.len() - 1] == b'.'
-    })
+/// Matches a host against a set of wildcard suffixes (without the leading `*.`).
+///
+/// Catalog refreshes used to compare every configured/cached domain against
+/// every changed wildcard. A first load changes all wildcards, so a wide group
+/// and a large catalog made that a quadratic walk. Above a small threshold,
+/// walk the host's label boundaries and use one hash lookup per label instead.
+struct SuffixMatcher {
+    suffixes: HashSet<String>,
+}
+
+impl SuffixMatcher {
+    fn new<I>(suffixes: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        Self {
+            suffixes: suffixes.into_iter().collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.suffixes.is_empty()
+    }
+
+    fn matches(&self, domain: &str) -> bool {
+        if self.suffixes.len() <= 8 {
+            return self
+                .suffixes
+                .iter()
+                .any(|suffix| suffix_matches(domain, suffix));
+        }
+        for (index, byte) in domain.bytes().enumerate() {
+            if byte == b'.' && self.suffixes.contains(&domain[index + 1..]) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn suffix_matches(domain: &str, suffix: &str) -> bool {
+    domain.len() > suffix.len()
+        && domain.ends_with(suffix)
+        && domain.as_bytes()[domain.len() - suffix.len() - 1] == b'.'
 }
 
 #[cfg(test)]
@@ -465,6 +502,81 @@ mod tests {
     }
 
     #[test]
+    fn suffix_matcher_only_matches_whole_labels() {
+        let small: Vec<String> = ["example.com", "cdn.example.com"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut large = small.clone();
+        large.extend((0..12).map(|index| format!("unrelated{index}.example.net")));
+        for suffixes in [small, large] {
+            let matcher = SuffixMatcher::new(suffixes.clone());
+            for domain in [
+                "a.example.com",
+                "example.com",
+                "notexample.com",
+                "cdn.example.com",
+                "a.b.cdn.example.com",
+                "cdn.example.com.evil",
+                "com",
+                "a.example.org",
+            ] {
+                let expected = suffixes.iter().any(|suffix| suffix_matches(domain, suffix));
+                assert_eq!(
+                    matcher.matches(domain),
+                    expected,
+                    "suffix mismatch for {domain} with {suffixes:?}"
+                );
+            }
+        }
+    }
+
+    /// A catalog update where every wildcard changed and the configured group
+    /// is large stresses the affected-domain computation. This runs on catalog
+    /// refreshes, not on the request path, but a full first load used to walk
+    /// every (domain, wildcard) pair several times.
+    #[test]
+    #[ignore = "micro benchmark"]
+    fn bench_affected_domains_wide() {
+        use crate::config::{DomainRule, GroupConfig};
+        use crate::domain::DomainMatcher;
+
+        const COUNT: usize = 4096;
+        let mut ips = HashMap::new();
+        for index in 0..COUNT {
+            ips.insert(
+                format!("*.sub{index}.example.com"),
+                vec!["1.1.1.1".parse().unwrap()],
+            );
+        }
+        let catalog = IpCatalog {
+            schema_version: IP_CATALOG_SCHEMA,
+            groups: BTreeMap::new(),
+            ips,
+            warnings: Vec::new(),
+            ip_count: COUNT,
+            matcher: DomainMatcher::default(),
+            wildcards: HashMap::new(),
+        };
+        let mut config = AppConfig::default();
+        config.groups = vec![GroupConfig {
+            id: "g".into(),
+            name: "G".into(),
+            domains: (0..COUNT)
+                .map(|index| DomainRule::new(format!("host{index}.sub{index}.example.com")))
+                .collect(),
+            ..GroupConfig::default()
+        }];
+        let cached: Vec<String> = (0..COUNT)
+            .map(|index| format!("cached{index}.sub{index}.example.com"))
+            .collect();
+
+        crate::bench::measure("catalog.affected.wide", 10, || {
+            let _ = affected_domains(None, &catalog, &config, &cached);
+        });
+    }
+
+    #[test]
     fn computes_affected_domains() {
         let old = validate(
             raw(r#"{"v":1,"groups":{"g":["github.com","*.github.com"]},
@@ -487,5 +599,28 @@ mod tests {
         assert!(affected.contains("github.com"));
         assert!(affected.contains("api.github.com"));
         assert!(!affected.contains("pixiv.net"));
+    }
+
+    #[test]
+    fn first_catalog_load_includes_wildcard_covered_domains() {
+        use crate::config::{DomainRule, GroupConfig};
+
+        let new = validate(
+            raw(r#"{"v":1,"groups":{"g":["*.example.com"]},
+                    "ips":{"*.example.com":["8.8.8.8"]}}"#),
+            &AppConfig::default(),
+        )
+        .unwrap();
+        let mut config = AppConfig::default();
+        config.groups = vec![GroupConfig {
+            id: "g".into(),
+            name: "G".into(),
+            domains: vec![DomainRule::new("www.example.com")],
+            ..GroupConfig::default()
+        }];
+
+        let affected = affected_domains(None, &new, &config, &["cached.example.com".to_string()]);
+        assert!(affected.contains("www.example.com"));
+        assert!(affected.contains("cached.example.com"));
     }
 }
