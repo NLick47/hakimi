@@ -481,5 +481,5 @@ fn an_operation_in_flight_never_triggers_a_background_probe() {
     assert_eq!(ca.probe_runs.load(Ordering::Relaxed), runs);
 
     drop(_guard);
-    assert_eq!(stale.installed, false, "a temp CA is never trusted");
+    assert!(!stale.installed, "a temp CA is never trusted");
 }

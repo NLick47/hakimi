@@ -558,15 +558,17 @@ mod tests {
             matcher: DomainMatcher::default(),
             wildcards: HashMap::new(),
         };
-        let mut config = AppConfig::default();
-        config.groups = vec![GroupConfig {
-            id: "g".into(),
-            name: "G".into(),
-            domains: (0..COUNT)
-                .map(|index| DomainRule::new(format!("host{index}.sub{index}.example.com")))
-                .collect(),
-            ..GroupConfig::default()
-        }];
+        let config = AppConfig {
+            groups: vec![GroupConfig {
+                id: "g".into(),
+                name: "G".into(),
+                domains: (0..COUNT)
+                    .map(|index| DomainRule::new(format!("host{index}.sub{index}.example.com")))
+                    .collect(),
+                ..GroupConfig::default()
+            }],
+            ..AppConfig::default()
+        };
         let cached: Vec<String> = (0..COUNT)
             .map(|index| format!("cached{index}.sub{index}.example.com"))
             .collect();
@@ -611,13 +613,15 @@ mod tests {
             &AppConfig::default(),
         )
         .unwrap();
-        let mut config = AppConfig::default();
-        config.groups = vec![GroupConfig {
-            id: "g".into(),
-            name: "G".into(),
-            domains: vec![DomainRule::new("www.example.com")],
-            ..GroupConfig::default()
-        }];
+        let config = AppConfig {
+            groups: vec![GroupConfig {
+                id: "g".into(),
+                name: "G".into(),
+                domains: vec![DomainRule::new("www.example.com")],
+                ..GroupConfig::default()
+            }],
+            ..AppConfig::default()
+        };
 
         let affected = affected_domains(None, &new, &config, &["cached.example.com".to_string()]);
         assert!(affected.contains("www.example.com"));

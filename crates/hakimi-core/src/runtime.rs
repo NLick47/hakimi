@@ -1240,7 +1240,7 @@ mod status_snapshot_tests {
                 config.groups.clear();
                 for group in 0..32 {
                     let domains = (0..64)
-                        .map(|index| DomainRule::new(&format!("site{index}.group{group}.test")))
+                        .map(|index| DomainRule::new(format!("site{index}.group{group}.test")))
                         .collect();
                     config.groups.push(GroupConfig {
                         id: format!("group{group}"),
