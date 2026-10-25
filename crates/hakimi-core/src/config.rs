@@ -530,6 +530,18 @@ fn host_matches_suffix(host: &str, suffix: &str) -> bool {
         && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
+/// True when `pattern` already is exactly what [`DomainPattern::parse`] would
+/// return, so canonicalizing it can be skipped without allocating. A pattern
+/// this plain cannot be rewritten, only rejected — and rejecting is
+/// [`AppConfig::validate`]'s job.
+fn is_canonical_pattern(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && !pattern.ends_with('.')
+        && pattern.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'*')
+        })
+}
+
 fn default_true() -> bool {
     true
 }
@@ -681,6 +693,30 @@ pub fn default_groups() -> Vec<GroupConfig> {
 }
 
 impl AppConfig {
+    /// Rewrite every domain rule to the canonical spelling the matcher already
+    /// matches with (trim, lowercase, IDNA, no trailing root dot).
+    ///
+    /// [`Self::route_for`] compares the raw rule string while
+    /// [`DomainMatcher`](crate::domain::DomainMatcher) normalizes it, so a rule
+    /// typed as `Example.com.` is selected by the matcher and then silently
+    /// ignored by the linear scan: `route_at(index)` and `route_for(host)` would
+    /// disagree about the same host. Running this once when a config enters the
+    /// process keeps both lookups on one spelling without paying for it on the
+    /// routing path. A rule that does not parse is left untouched so
+    /// [`Self::validate`] still reports it.
+    fn canonicalize(&mut self) {
+        for group in &mut self.groups {
+            for rule in &mut group.domains {
+                if is_canonical_pattern(&rule.pattern) {
+                    continue;
+                }
+                if let Ok(pattern) = DomainPattern::parse(&rule.pattern) {
+                    rule.pattern = pattern.as_str().to_owned();
+                }
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.proxy.port == 0 {
             bail!("proxy.port must not be 0");
@@ -1003,7 +1039,8 @@ impl ConfigManager {
         Self::new(path, config)
     }
 
-    fn new(path: PathBuf, config: AppConfig) -> Result<Self> {
+    fn new(path: PathBuf, mut config: AppConfig) -> Result<Self> {
+        config.canonicalize();
         config.validate()?;
         let matcher = Arc::new(config.matcher()?);
         Ok(Self {
@@ -1052,7 +1089,8 @@ impl ConfigManager {
         (Arc::clone(&inner.config), Arc::clone(&inner.matcher))
     }
 
-    pub fn update(&self, config: AppConfig) -> Result<()> {
+    pub fn update(&self, mut config: AppConfig) -> Result<()> {
+        config.canonicalize();
         config.validate()?;
         let matcher = Arc::new(config.matcher()?);
         atomic_write_json(&self.path, &config)?;
@@ -1256,6 +1294,93 @@ mod tests {
             &default_route,
             "an out-of-range index must fall back to the default route"
         );
+    }
+
+    /// The matcher normalizes a pattern (trim, lowercase, IDNA, no trailing
+    /// root dot) while `route_for` compares the raw string, so a rule typed by
+    /// hand with a trailing dot would be selected by the matcher and then
+    /// ignored by the linear scan. `validate()` only checks the *normalized*
+    /// pattern for duplicates, so such a config.json does load. Going through
+    /// the manager is the point: it is the only supported way into a running
+    /// instance, and it is what canonicalizes what it reads.
+    #[test]
+    fn hand_written_patterns_are_canonicalized_so_both_route_lookups_agree() {
+        let default_route = RoutePolicy::sni(Vec::new());
+        let config = AppConfig {
+            groups: vec![GroupConfig {
+                id: "test".into(),
+                name: "Test".into(),
+                domains: vec![
+                    DomainRule::routed("Trailing.Example.", RoutePolicy::direct()),
+                    DomainRule::routed("  spaced.example  ", RoutePolicy::ech_shared()),
+                    DomainRule::routed("*.wild.example.", RoutePolicy::direct()),
+                    DomainRule::new("plain.example"),
+                ],
+                enabled: true,
+                homepage: None,
+                default_route: default_route.clone(),
+            }],
+            ..AppConfig::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ConfigManager::new(dir.path().join("config.json"), config).unwrap();
+        let config = manager.snapshot();
+        let group = config.group("test").unwrap();
+        assert_eq!(group.domains[0].pattern, "trailing.example");
+        assert_eq!(group.domains[1].pattern, "spaced.example");
+        assert_eq!(group.domains[2].pattern, "*.wild.example");
+        assert_eq!(group.domains[3].pattern, "plain.example");
+
+        let matcher = manager.matcher();
+        for host in [
+            "trailing.example",
+            "spaced.example",
+            "a.wild.example",
+            "plain.example",
+            "unmatched.example",
+        ] {
+            let Some((group_id, rule_index)) = matcher.match_entry_normalized(host) else {
+                continue;
+            };
+            assert_eq!(group_id, "test");
+            assert_eq!(
+                group.route_at(rule_index),
+                group.route_for(host),
+                "the indexed route must equal the scanned route for {host} (rule {rule_index}: \
+                 {:?})",
+                group.domains[rule_index].pattern
+            );
+            assert_eq!(
+                group.route_modes_at(rule_index),
+                group.route_modes(host),
+                "the indexed mode list must equal the scanned list for {host}"
+            );
+        }
+        assert_eq!(
+            group.route_for("trailing.example"),
+            &RoutePolicy::direct(),
+            "the hand-written rule must keep the route the user gave it"
+        );
+    }
+
+    /// Canonicalizing must not swallow a bad pattern: `validate` still has to
+    /// reject it with the same error as before.
+    #[test]
+    fn canonicalizing_leaves_invalid_patterns_for_validate_to_reject() {
+        let mut config = AppConfig {
+            groups: vec![GroupConfig {
+                id: "test".into(),
+                name: "Test".into(),
+                domains: vec![DomainRule::new("bad..example")],
+                enabled: true,
+                homepage: None,
+                default_route: RoutePolicy::direct(),
+            }],
+            ..AppConfig::default()
+        };
+        config.canonicalize();
+        assert_eq!(config.groups[0].domains[0].pattern, "bad..example");
+        assert!(config.validate().is_err());
     }
 
     #[test]
