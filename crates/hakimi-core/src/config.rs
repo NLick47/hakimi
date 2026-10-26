@@ -1009,6 +1009,46 @@ struct Inner {
     matcher: Arc<DomainMatcher>,
 }
 
+/// 旧版本把默认值物化进了 config.json
+/// 文件值与旧默认完全一致时视为未设置，让新默认随升级生效
+fn strip_legacy_materialized_defaults(config: &mut AppConfig) {
+    const LEGACY_HTTP1_HOSTS: [&str; 3] = [
+        "*.pximg.net",
+        "img.poipiku.com",
+        "cdn.poipiku.com",
+    ];
+    let pinned = config
+        .advanced
+        .http1_hosts
+        .iter()
+        .map(String::as_str)
+        .eq(LEGACY_HTTP1_HOSTS);
+    if pinned {
+        config.advanced.http1_hosts = AdvancedConfig::default().http1_hosts;
+    }
+}
+
+/// 落盘文件只保留用户改过的值
+/// 与当前默认相等的 advanced 字段不写入，升级后新默认才能传播到老安装
+fn sanitized_persisted_value(config: &AppConfig) -> serde_json::Value {
+    let mut value = serde_json::to_value(config).unwrap_or(serde_json::Value::Null);
+    let defaults =
+        serde_json::to_value(AdvancedConfig::default()).unwrap_or(serde_json::Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        if let Some(advanced) = object.get_mut("advanced").and_then(|v| v.as_object_mut()) {
+            advanced.retain(|key, current| defaults.get(key) != Some(current));
+        }
+        if object
+            .get("advanced")
+            .and_then(|v| v.as_object())
+            .is_some_and(|advanced| advanced.is_empty())
+        {
+            object.remove("advanced");
+        }
+    }
+    value
+}
+
 impl ConfigManager {
     pub fn load_or_create(paths: &Paths) -> Result<Self> {
         paths.ensure()?;
@@ -1030,13 +1070,13 @@ impl ConfigManager {
                         "config.json does not match this build; regenerating defaults"
                     );
                     let config = AppConfig::default();
-                    atomic_write_json(&path, &config)?;
+                    atomic_write_json(&path, &sanitized_persisted_value(&config))?;
                     config
                 }
             }
         } else {
             let config = AppConfig::default();
-            atomic_write_json(&path, &config)?;
+            atomic_write_json(&path, &sanitized_persisted_value(&config))?;
             config
         };
         Self::new(path, config)
@@ -1049,6 +1089,7 @@ impl ConfigManager {
     }
 
     fn new(path: PathBuf, mut config: AppConfig) -> Result<Self> {
+        strip_legacy_materialized_defaults(&mut config);
         config.canonicalize();
         config.validate()?;
         let matcher = Arc::new(config.matcher()?);
@@ -1102,7 +1143,7 @@ impl ConfigManager {
         config.canonicalize();
         config.validate()?;
         let matcher = Arc::new(config.matcher()?);
-        atomic_write_json(&self.path, &config)?;
+        atomic_write_json(&self.path, &sanitized_persisted_value(&config))?;
         let mut guard = self.inner.write();
         guard.config = Arc::new(config);
         guard.matcher = matcher;
@@ -1567,13 +1608,64 @@ mod tests {
         let manager = ConfigManager::load_or_create(&paths).unwrap();
         let text = std::fs::read_to_string(paths.config_file()).unwrap();
         assert!(text.contains("\"catalogVersion\""));
-        assert!(text.contains("\"maxCandidatesPerDomain\""));
+        // 默认值不落盘，升级后新默认才能传播到老安装
+        assert!(!text.contains("\"maxCandidatesPerDomain\""));
+        assert!(!text.contains("\"advanced\""));
         let manager2 = ConfigManager::load(paths.config_file()).unwrap();
         assert_eq!(manager2.snapshot().groups.len(), config_defaults());
         manager.set_group_enabled("eh", false).unwrap();
         assert!(manager2.snapshot().group("eh").unwrap().enabled); // other holders are not auto-reloaded
         let manager3 = ConfigManager::load(paths.config_file()).unwrap();
         assert!(!manager3.snapshot().group("eh").unwrap().enabled);
+    }
+
+    #[test]
+    fn legacy_materialized_http1_hosts_adopt_new_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let mut legacy = AppConfig::default();
+        legacy.advanced.http1_hosts = vec![
+            "*.pximg.net".to_string(),
+            "img.poipiku.com".to_string(),
+            "cdn.poipiku.com".to_string(),
+        ];
+        std::fs::write(
+            paths.config_file(),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let manager = ConfigManager::load(paths.config_file()).unwrap();
+        assert_eq!(
+            manager.snapshot().advanced.http1_hosts,
+            AdvancedConfig::default().http1_hosts
+        );
+        // 重新落盘后默认字段不再出现
+        manager.update(manager.snapshot().as_ref().clone()).unwrap();
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(!text.contains("http1Hosts"));
+    }
+
+    #[test]
+    fn customized_http1_hosts_survive_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let mut custom = AppConfig::default();
+        custom.advanced.http1_hosts = vec!["i.pximg.net".to_string(), "origin.example.net".to_string()];
+        std::fs::write(
+            paths.config_file(),
+            serde_json::to_string(&custom).unwrap(),
+        )
+        .unwrap();
+
+        let manager = ConfigManager::load(paths.config_file()).unwrap();
+        assert_eq!(
+            manager.snapshot().advanced.http1_hosts,
+            vec!["i.pximg.net".to_string(), "origin.example.net".to_string()]
+        );
+        manager.update(manager.snapshot().as_ref().clone()).unwrap();
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(text.contains("\"http1Hosts\""));
     }
 
     #[test]
