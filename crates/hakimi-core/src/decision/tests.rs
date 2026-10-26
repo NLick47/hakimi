@@ -169,13 +169,13 @@ async fn a_successful_reprobe_pays_down_the_failure_history() {
 }
 
 #[tokio::test]
-async fn persisted_scores_keep_a_blocked_ip_demoted_after_restart() {
+async fn a_fresh_engine_seeds_scores_from_the_cache() {
     let h = harness(&["example.com"], RoutePolicy::auto());
     let ip: std::net::IpAddr = "203.0.113.30".parse().unwrap();
     h.engine.record_ip("example.com", ip, None, true);
     let demoted = h.engine.score_ip("example.com", ip);
 
-    // A "restart": a fresh engine seeded from the same cache.
+    // A fresh engine over the same cache.
     let restarted = DecisionEngine::new(
         h.engine.config.clone(),
         h.cache.clone(),
@@ -187,7 +187,7 @@ async fn persisted_scores_keep_a_blocked_ip_demoted_after_restart() {
     assert_eq!(
         restarted.score_ip("example.com", ip),
         demoted,
-        "the restart must remember that this ip was blocked"
+        "the fresh engine must remember that this ip was blocked"
     );
 }
 
@@ -634,7 +634,7 @@ fn network_change_clears_network_scoped_state() {
     );
     assert!(
         h.cache.ip_scores().is_empty(),
-        "cleared scores must also be removed from the persisted cache"
+        "cleared scores must disappear from the shared cache"
     );
 }
 
@@ -1091,7 +1091,6 @@ async fn skip_once_prefers_new_remote_ip() {
         domain: "example.com".into(),
         ip: "1.1.1.1".parse().unwrap(),
         source: IpSource::Remote,
-        network_id: network_id(),
         saved_at: now(),
         catalog_version: 1,
     });
@@ -1120,7 +1119,6 @@ async fn skip_once_is_consumed_by_the_first_planner_not_by_construction() {
         domain: "example.com".into(),
         ip: "1.1.1.1".parse().unwrap(),
         source: IpSource::Remote,
-        network_id: network_id(),
         saved_at: now(),
         catalog_version: 1,
     });

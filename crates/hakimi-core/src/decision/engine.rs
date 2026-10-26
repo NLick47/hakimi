@@ -14,7 +14,7 @@ use crate::domain::normalize_hostname;
 use crate::resolver::{DohResolution, IpResolver};
 use crate::status::{AttemptRecord, DomainDiagnostics, State, StatusStore};
 use crate::strategy::{CacheStatus, FailureReason, IpSource, TlsMode};
-use crate::util::{network_id, now};
+use crate::util::now;
 
 use super::cursor::{Route, RouteCursor};
 use super::plan::{ConnectPlan, DecisionOutcome, Prober};
@@ -100,8 +100,8 @@ impl DecisionEngine {
         prober: Arc<dyn Prober>,
         status: Arc<StatusStore>,
     ) -> Arc<Self> {
-        // Seed the in-memory quality map from the persisted one, so a restart
-        // keeps knowing that an IP was fast or blocked on this network.
+        // Scores live in memory only; seed from the cache so a second engine
+        // over the same cache sees the same table.
         let mut seeded_scores: HashMap<String, HashMap<IpAddr, IpScore>> = HashMap::new();
         for (domain, ip, entry) in cache.ip_scores() {
             seeded_scores.entry(domain).or_default().insert(
@@ -723,14 +723,14 @@ impl DecisionEngine {
         failed: bool,
     ) -> bool {
         let (degraded, score) = self.record_ip_in_memory(domain, ip, latency_ms, failed);
-        // Persist both outcomes: a restart must keep knowing that this IP was
-        // fast — or blocked — on this network. The cache batches disk writes.
+        // The quality sample stays in memory; it is relearned in a few
+        // connections and must not schedule a disk write.
         self.cache.record_outcome(None, score);
         degraded
     }
 
     /// Update the in-memory quality table and hand the sample back so the
-    /// caller can persist it together with the rest of the outcome.
+    /// caller can store it together with the rest of the outcome.
     pub(super) fn record_ip_in_memory<'a>(
         &self,
         domain: &'a str,
@@ -1032,7 +1032,6 @@ impl DecisionEngine {
                 domain: plan.domain.clone(),
                 ip: plan.ip,
                 source: plan.source,
-                network_id: network_id(),
                 saved_at: now(),
                 catalog_version: config.catalog_version,
             }),

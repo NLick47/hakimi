@@ -83,7 +83,6 @@ fn engine_for_with_resolver(
         domain: "upstream.test".into(),
         ip: "127.0.0.1".parse().unwrap(),
         source: IpSource::Cache,
-        network_id: "test".into(),
         saved_at: now(),
         catalog_version: 0,
     });
@@ -136,7 +135,6 @@ async fn cancelled_discovery_does_not_poison_the_domain() {
         domain: "upstream.test".into(),
         ip: "192.0.2.1".parse().unwrap(),
         source: IpSource::Cache,
-        network_id: "test".into(),
         saved_at: now(),
         catalog_version: 0,
     });
@@ -411,7 +409,6 @@ async fn refused_candidate_releases_the_hedge_window() {
         domain: "upstream.test".into(),
         ip: "::1".parse().unwrap(),
         source: IpSource::Cache,
-        network_id: "test".into(),
         saved_at: now(),
         catalog_version: 0,
     });
@@ -559,7 +556,6 @@ async fn concurrent_cold_connections_share_one_discovery() {
         domain: "upstream.test".into(),
         ip: "::1".parse().unwrap(),
         source: IpSource::Cache,
-        network_id: "test".into(),
         saved_at: now(),
         catalog_version: 0,
     });

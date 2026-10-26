@@ -11,10 +11,28 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::strategy::IpSource;
-use crate::util::{atomic_write, atomic_write_json, now, read_json};
+use crate::util::{atomic_write_private, now, read_json};
 
 const MAX_STALE_AGE_DAYS: i64 = 7;
 const MAX_SNI_AGE_DAYS: i64 = 30;
+/// Bump when the shape or meaning of the routes file changes. Unknown versions
+/// are discarded instead of being guessed at: the file only holds hints.
+const ROUTES_SCHEMA_VERSION: u32 = 1;
+/// Fake-SNI choices live in their own file: losing them costs a full SNI sweep
+/// per group, domain and network after every restart.
+const FAKE_SNI_FILE: &str = "fake-sni.json";
+const SNI_SCHEMA_VERSION: u32 = 1;
+/// The routes file is a cold-start hint, not a history of every visited host.
+/// 128 recent entries keep it small while still covering the active set.
+const MAX_LAST_GOOD: usize = 128;
+const LAST_GOOD_PRUNE_TO: usize = MAX_LAST_GOOD * 3 / 4;
+const MAX_LAST_GOOD_AGE_DAYS: i64 = 30;
+
+/// How often a dirty routes file is checkpointed while the process is running.
+/// The final write still happens on shutdown; this only bounds what a crash can
+/// lose. The file is tiny, so a five-minute cadence is cheap and avoids the old
+/// five-second full-cache fsync cycle.
+pub const CHECKPOINT_INTERVAL: StdDuration = StdDuration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,7 +40,6 @@ pub struct LastGoodEntry {
     pub domain: String,
     pub ip: IpAddr,
     pub source: IpSource,
-    pub network_id: String,
     pub saved_at: DateTime<Utc>,
     pub catalog_version: u64,
 }
@@ -87,8 +104,9 @@ pub struct CachedSni {
     pub saved_at: DateTime<Utc>,
 }
 
-/// Measured quality of one (domain, ip) pair. Persisted so a restart keeps the
-/// knowledge that an IP was blocked or slow on this network.
+/// Measured quality of one (domain, ip) pair. This is intentionally in-memory
+/// only: a few connections relearn it, and persisting it would make every
+/// connection dirty the routes file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IpScoreEntry {
@@ -98,7 +116,7 @@ pub struct IpScoreEntry {
     pub updated_at: DateTime<Utc>,
 }
 
-/// One IP quality sample to persist.
+/// One IP quality sample to update in memory.
 #[derive(Debug, Clone, Copy)]
 pub struct IpScoreUpdate<'a> {
     pub domain: &'a str,
@@ -116,40 +134,61 @@ const MAX_IP_SCORES: usize = 1024;
 const IP_SCORE_PRUNE_TO: usize = MAX_IP_SCORES * 3 / 4;
 /// Entries older than the widest freshness window can never be used again.
 const MAX_IP_SCORE_AGE_DAYS: i64 = 30;
-/// Same cap and age window for remembered routes; the pre-warm loop takes the
-/// newest 20, and 30 days is the widest freshness setting any config can use.
-const MAX_LAST_GOOD: usize = 512;
-/// Leave headroom after a prune so a page's asset burst does not rank-and-sort
-/// the remembered-route map on every new host.
-const LAST_GOOD_PRUNE_TO: usize = MAX_LAST_GOOD * 3 / 4;
-const MAX_LAST_GOOD_AGE_DAYS: i64 = 30;
-/// Resolved addresses, one A and one AAAA entry per domain.  These maps grow
-/// with every visited domain, so without a cap the cache and the JSON written
-/// from it would grow without bound: 5000 domains already meant 2.4 MB and an
-/// 83 ms flush.  The cache is a hint, an evicted answer is looked up again.
+/// Resolved addresses, one A and one AAAA entry per domain. These maps grow
+/// with every visited domain, so they stay bounded and in memory. An evicted
+/// answer is simply looked up again; none of it is part of the routes file.
 const MAX_DOH_ANSWERS: usize = 1024;
 const DOH_PRUNE_TO: usize = MAX_DOH_ANSWERS * 3 / 4;
-/// ECH configurations.  One per domain, and only for the groups that use ECH.
+/// ECH configurations. One per domain, and only for the groups that use ECH.
 const MAX_ECH_CONFIGS: usize = 256;
 const ECH_PRUNE_TO: usize = MAX_ECH_CONFIGS * 3 / 4;
 /// Remembered fake SNI names, one per group, domain and network.
 const MAX_FAKE_SNI: usize = 256;
 const SNI_PRUNE_TO: usize = MAX_FAKE_SNI * 3 / 4;
-/// Domains waiting for a re-plan after a catalog update.  A huge catalog
+/// Domains waiting for a re-plan after a catalog update. A huge catalog
 /// update can name thousands of domains; the flags are consumed by the next
 /// connection to each domain.
 const MAX_SKIP_ONCE: usize = 4096;
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[derive(Debug, Default)]
 struct CacheData {
     last_good: HashMap<String, LastGoodEntry>,
-    #[serde(default)]
     ip_scores: HashMap<String, IpScoreEntry>,
     skip_once: HashSet<String>,
     doh: HashMap<String, CachedAnswer>,
     ech: HashMap<String, CachedEch>,
     sni: HashMap<String, CachedSni>,
+}
+
+/// The only data that survives a restart: a small set of last working routes.
+/// The key is the domain, so the entry itself does not repeat it.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedLastGood {
+    ip: IpAddr,
+    source: IpSource,
+    saved_at: DateTime<Utc>,
+    catalog_version: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedRoutes {
+    schema_version: u32,
+    saved_at: DateTime<Utc>,
+    #[serde(default)]
+    last_good: HashMap<String, PersistedLastGood>,
+}
+
+/// Fake-SNI choices, kept apart from the routes file so a broken copy cannot
+/// cost the remembered routes.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedSni {
+    schema_version: u32,
+    saved_at: DateTime<Utc>,
+    #[serde(default)]
+    entries: Vec<CachedSni>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -162,107 +201,276 @@ pub struct CacheStats {
     pub fake_sni: usize,
 }
 
-/// Persistent local cache: last-good IPs, DoH answers, ECH configs and fake SNI. All writes
-/// are atomic, so a crash never leaves a half-written cache behind.
+/// Runtime hint cache plus two tiny persisted files.
+///
+/// DoH answers, ECH configs, one-shot flags and IP scores live only for this
+/// process. The routes file holds `last_good` (128 rows), the fake-SNI file
+/// holds the SNI choices, and both are written on shutdown plus a five-minute
+/// dirty checkpoint.
 pub struct CacheManager {
     path: PathBuf,
+    sni_path: PathBuf,
     data: RwLock<CacheData>,
-    dirty: AtomicBool,
-    /// Stop handle for the one background flusher. Keeping it here makes
-    /// `start_auto_flush` idempotent and lets the runtime cancel the task on
-    /// stop instead of leaving a flusher behind for a stopped runtime.
+    /// True only when `last_good` changed. Runtime-only caches never set it.
+    routes_dirty: AtomicBool,
+    /// True only when a fake-SNI choice changed, which is far rarer.
+    sni_dirty: AtomicBool,
+    /// Serializes the snapshot/write cycle. The background checkpoint and the
+    /// shutdown flush can overlap; without this, an older snapshot could rename
+    /// itself over a newer one.
+    flush_lock: Mutex<()>,
+    /// Stop handle for the one background checkpoint task. Keeping it here
+    /// makes `start_auto_flush` idempotent and lets the runtime cancel the task
+    /// on stop instead of leaving a flusher behind for a stopped runtime.
     auto_flush_stop: Mutex<Option<tokio::sync::watch::Sender<()>>>,
 }
 
 impl CacheManager {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
+        let sni_path = path.with_file_name(FAKE_SNI_FILE);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut data = match read_json::<CacheData>(&path) {
-            Ok(data) => data,
+        let mut data = match read_json::<PersistedRoutes>(&path) {
+            Ok(routes) if routes.schema_version == ROUTES_SCHEMA_VERSION => {
+                tracing::debug!(
+                    path = %path.display(),
+                    saved_at = %routes.saved_at,
+                    entries = routes.last_good.len(),
+                    "loaded remembered routes"
+                );
+                Self::from_persisted(routes)
+            }
+            Ok(routes) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    schema = routes.schema_version,
+                    expected = ROUTES_SCHEMA_VERSION,
+                    "routes file has an unknown schema; starting empty"
+                );
+                Self::quarantine(&path);
+                CacheData::default()
+            }
             Err(error) if path.exists() => {
                 tracing::warn!(
                     path = %path.display(),
                     error = %error,
-                    "cache is unreadable; starting with an empty cache"
+                    "routes file is unreadable; starting empty"
                 );
-                let _ = std::fs::rename(&path, path.with_extension("corrupt.json"));
+                Self::quarantine(&path);
                 CacheData::default()
             }
             Err(_) => CacheData::default(),
         };
-        Self::expire(&mut data, now());
+        data.sni = Self::load_sni(&sni_path);
+        let now = now();
+        Self::expire(&mut data, now);
+        Self::prune_last_good(&mut data);
         Ok(Self {
             path,
+            sni_path,
             data: RwLock::new(data),
-            dirty: AtomicBool::new(false),
+            routes_dirty: AtomicBool::new(false),
+            sni_dirty: AtomicBool::new(false),
+            flush_lock: Mutex::new(()),
             auto_flush_stop: Mutex::new(None),
         })
+    }
+
+    fn from_persisted(routes: PersistedRoutes) -> CacheData {
+        CacheData {
+            last_good: routes
+                .last_good
+                .into_iter()
+                .filter(|(domain, _)| !domain.is_empty())
+                .map(|(domain, entry)| {
+                    (
+                        domain.clone(),
+                        LastGoodEntry {
+                            domain,
+                            ip: entry.ip,
+                            source: entry.source,
+                            saved_at: entry.saved_at,
+                            catalog_version: entry.catalog_version,
+                        },
+                    )
+                })
+                .collect(),
+            ..CacheData::default()
+        }
+    }
+
+    /// Fake-SNI choices are optional: a broken copy only costs a new sweep, so
+    /// this never fails the load and never touches the routes file.
+    fn load_sni(path: &Path) -> HashMap<String, CachedSni> {
+        let entries = match read_json::<PersistedSni>(path) {
+            Ok(sni) if sni.schema_version == SNI_SCHEMA_VERSION => sni.entries,
+            Ok(sni) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    schema = sni.schema_version,
+                    expected = SNI_SCHEMA_VERSION,
+                    "fake-sni file has an unknown schema; starting empty"
+                );
+                Self::quarantine(path);
+                return HashMap::new();
+            }
+            Err(error) if path.exists() => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "fake-sni file is unreadable; starting empty"
+                );
+                Self::quarantine(path);
+                return HashMap::new();
+            }
+            Err(_) => return HashMap::new(),
+        };
+        let mut loaded: HashMap<String, CachedSni> = entries
+            .into_iter()
+            .filter(|entry| !entry.domain.is_empty())
+            .map(|entry| {
+                (
+                    sni_key(&entry.group, &entry.domain, &entry.network_id),
+                    entry,
+                )
+            })
+            .collect();
+        // A hand-edited or old file may hold more rows than the runtime allows.
+        Self::prune_by_age(&mut loaded, MAX_FAKE_SNI, SNI_PRUNE_TO, |entry| {
+            entry.saved_at
+        });
+        loaded
+    }
+
+    /// Keep a broken routes file for diagnosis but never let it block startup.
+    fn quarantine(path: &Path) {
+        let corrupt = path.with_extension("corrupt.json");
+        let _ = std::fs::remove_file(&corrupt);
+        if let Err(error) = std::fs::rename(path, &corrupt) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to quarantine an unreadable routes file"
+            );
+        }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Write both files immediately. The dirty flags are left alone: a
+    /// mutation may have happened after the snapshot and must still reach the
+    /// next checkpoint.
     pub fn save(&self) -> Result<()> {
-        let data = self.data.read();
-        atomic_write_json(&self.path, &*data)
+        let _guard = self.flush_lock.lock();
+        self.write_snapshot()?;
+        self.write_sni_snapshot()
     }
 
-    /// Record a cache mutation.
+    /// The request path only flips a flag. A checkpoint every
+    /// [`CHECKPOINT_INTERVAL`] and the final shutdown flush do the disk work.
+    fn mark_routes_dirty(&self) {
+        self.routes_dirty.store(true, Ordering::SeqCst);
+    }
+
+    fn mark_sni_dirty(&self) {
+        self.sni_dirty.store(true, Ordering::SeqCst);
+    }
+
+    /// Encode and write the last-good routes. The snapshot is taken under a
+    /// read lock, then encoded and written outside every data lock so a slow
+    /// disk never blocks lookups.
+    fn write_snapshot(&self) -> Result<()> {
+        let snapshot = {
+            let data = self.data.read();
+            PersistedRoutes {
+                schema_version: ROUTES_SCHEMA_VERSION,
+                saved_at: now(),
+                last_good: data
+                    .last_good
+                    .iter()
+                    .map(|(domain, entry)| {
+                        (
+                            domain.clone(),
+                            PersistedLastGood {
+                                ip: entry.ip,
+                                source: entry.source,
+                                saved_at: entry.saved_at,
+                                catalog_version: entry.catalog_version,
+                            },
+                        )
+                    })
+                    .collect(),
+            }
+        };
+        let bytes = serde_json::to_vec(&snapshot)?;
+        atomic_write_private(&self.path, &bytes)
+    }
+
+    /// Fake-SNI choices are tiny and change rarely, but losing them costs a
+    /// fresh sweep of TLS handshakes per domain after a restart.
+    fn write_sni_snapshot(&self) -> Result<()> {
+        let snapshot = {
+            let data = self.data.read();
+            PersistedSni {
+                schema_version: SNI_SCHEMA_VERSION,
+                saved_at: now(),
+                entries: data.sni.values().cloned().collect(),
+            }
+        };
+        let bytes = serde_json::to_vec(&snapshot)?;
+        atomic_write_private(&self.sni_path, &bytes)
+    }
+
+    /// Write whichever files changed since the last flush.
     ///
-    /// The cache holds hints (remembered routes, measured quality), so the
-    /// write is always deferred: the request path only flips a flag, the
-    /// background flusher writes the file, and the runtime flushes once more
-    /// when it shuts down.  Nothing in the request path waits on the disk.
-    fn mark_dirty(&self, _data: &CacheData) {
-        self.dirty.store(true, Ordering::SeqCst);
-    }
-
-    /// Write once if anything changed since the last flush. The JSON is encoded
-    /// under a read lock and written outside every lock, so a slow disk never
-    /// blocks lookups and nothing deep-clones the whole cache on the way out.
+    /// Returns true when a write was attempted, including a failed one: the
+    /// dirty flag stays set so the next checkpoint retries.
+    ///
+    /// The flush lock covers the snapshot and the rename, so the background
+    /// checkpoint and the shutdown flush can never write out of order.
     pub fn flush_if_dirty(&self) -> bool {
-        if !self.dirty.swap(false, Ordering::SeqCst) {
+        let _guard = self.flush_lock.lock();
+        let routes = self.routes_dirty.swap(false, Ordering::SeqCst);
+        let sni = self.sni_dirty.swap(false, Ordering::SeqCst);
+        if !routes && !sni {
             return false;
         }
-        // Expire under the write lock, then encode under the read lock: the
-        // encoding must not block the lookups of the request path.
+        // Expire under the write lock, then encode under the read lock.
         {
             let mut data = self.data.write();
             Self::expire(&mut data, now());
+            Self::prune_last_good(&mut data);
         }
-        let json = {
-            let data = self.data.read();
-            serde_json::to_string(&*data)
-        };
-        match json {
-            Ok(json) => {
-                if let Err(error) = atomic_write(&self.path, json.as_bytes()) {
-                    tracing::warn!(error = %error, "failed to persist cache");
-                    // Keep the flag: the next tick retries the write instead of
-                    // dropping the change on the floor.
-                    self.dirty.store(true, Ordering::SeqCst);
-                }
+        if routes {
+            if let Err(error) = self.write_snapshot() {
+                tracing::warn!(error = %error, "failed to persist remembered routes");
+                // Keep the flag: the next checkpoint retries instead of
+                // dropping the change on the floor.
+                self.routes_dirty.store(true, Ordering::SeqCst);
             }
-            Err(error) => {
-                tracing::warn!(error = %error, "failed to encode cache");
-                self.dirty.store(true, Ordering::SeqCst);
+        }
+        if sni {
+            if let Err(error) = self.write_sni_snapshot() {
+                tracing::warn!(error = %error, "failed to persist fake-sni choices");
+                self.sni_dirty.store(true, Ordering::SeqCst);
             }
         }
         true
     }
 
-    /// Start the background flusher. Cache writes are hints, so a few seconds of latency is
-    /// fine while the fsyncs move off the request path entirely.
+    /// Start the background checkpoint. The file holds only a small routes
+    /// list, and writes happen only when it changed, so a five-minute cadence
+    /// is enough to bound crash loss without touching the request path.
     ///
     /// Starting twice is a no-op: the runtime may start, stop and start again,
-    /// and each cache must never accumulate a second flusher.
+    /// and each cache must never accumulate a second checkpoint task.
     pub fn start_auto_flush(self: &Arc<Self>, interval: StdDuration) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            tracing::debug!("no tokio runtime available; the cache is written on shutdown");
+            tracing::debug!("no tokio runtime available; routes are written on shutdown");
             return;
         };
         let mut stop = self.auto_flush_stop.lock();
@@ -279,9 +487,7 @@ impl CacheManager {
                 tokio::select! {
                     _ = stop_rx.changed() => break,
                     _ = tokio::time::sleep(interval) => {
-                        // Serializing the cache and fsyncing it are blocking operations.
-                        // Keep them off the async workers so a slow disk cannot stall
-                        // proxy request handling.
+                        // Serializing and fsyncing must stay off the async workers.
                         let manager = manager.clone();
                         let _ = tokio::task::spawn_blocking(move || manager.flush_if_dirty()).await;
                     }
@@ -290,8 +496,9 @@ impl CacheManager {
         });
     }
 
-    /// Stop the background flusher, if one is running. Safe to call repeatedly
-    /// and from `HakimiRuntime::stop`/`Drop`.
+    /// Stop the background checkpoint, if one is running. Safe to call
+    /// repeatedly and from `HakimiRuntime::stop`/`Drop`. The caller still does
+    /// a final `flush_if_dirty`; `flush_lock` waits for any in-flight write.
     pub fn stop_auto_flush(&self) {
         if let Some(stop) = self.auto_flush_stop.lock().take() {
             let _ = stop.send(());
@@ -306,9 +513,8 @@ impl CacheManager {
         data.sni.retain(|_, sni| {
             now.signed_duration_since(sni.saved_at) <= Duration::days(MAX_SNI_AGE_DAYS)
         });
-        // These two maps are persisted even though their readers already
-        // filter by age. Dropping aged entries during the periodic flush keeps
-        // state.json from carrying records that can never be used again.
+        // `last_good` is the only map that reaches disk. The others are
+        // runtime hints: drop aged entries here so a long session stays bounded.
         data.ip_scores.retain(|_, entry| {
             now.signed_duration_since(entry.updated_at) <= Duration::days(MAX_IP_SCORE_AGE_DAYS)
         });
@@ -354,7 +560,7 @@ impl CacheManager {
     }
 
     /// Route-relevant fields of a remembered entry. The decision cursor only
-    /// needs the IP and strategy; avoid cloning the domain/network strings.
+    /// needs the IP and strategy; avoid cloning the domain string.
     pub fn last_good_route(&self, domain: &str, max_age_days: i64) -> Option<IpAddr> {
         let now = now();
         let data = self.data.read();
@@ -377,7 +583,7 @@ impl CacheManager {
         (skip_once, last_good)
     }
 
-    /// Persisted quality entries, for seeding the decision engine on startup.
+    /// In-memory quality entries, for seeding the decision engine on startup.
     /// Entries beyond the widest freshness window are dropped on the way in.
     pub fn ip_scores(&self) -> Vec<(String, IpAddr, IpScoreEntry)> {
         let now = now();
@@ -397,8 +603,9 @@ impl CacheManager {
             .collect()
     }
 
-    /// Persist one connection outcome: the remembered route and the IP quality
-    /// sample. One write lock covers both.
+    /// Update the remembered route and the in-memory IP quality sample. Only
+    /// the route change marks the routes file dirty; quality samples are
+    /// relearned and never touch the disk.
     pub fn record_outcome(
         &self,
         last_good: Option<LastGoodEntry>,
@@ -409,19 +616,20 @@ impl CacheManager {
         let score_key = score.map(|score| format!("{}|{}", score.domain, score.ip));
         let mut data = self.data.write();
         let timestamp = now();
-        let mut changed = false;
+        let mut route_changed = false;
         if let Some(entry) = last_good {
             let fresh = data.last_good.get(&entry.domain).is_some_and(|existing| {
                 existing.ip == entry.ip
                     && existing.source == entry.source
+                    && existing.catalog_version == entry.catalog_version
                     && timestamp.signed_duration_since(existing.saved_at) < Duration::seconds(60)
             });
             if !fresh {
                 data.last_good.insert(entry.domain.clone(), entry);
                 if data.last_good.len() > MAX_LAST_GOOD {
-                    self.prune_last_good(&mut data);
+                    Self::prune_last_good(&mut data);
                 }
-                changed = true;
+                route_changed = true;
             }
         }
         if let (Some(score), Some(key)) = (score, score_key) {
@@ -436,7 +644,7 @@ impl CacheManager {
             );
             // Prune lazily: a full scan on every write (record_ip runs on every
             // connection outcome) is wasted work; the map is bounded and the
-            // periodic flush already drops aged entries via `expire`.
+            // periodic checkpoint already drops aged entries via `expire`.
             if data.ip_scores.len() > MAX_IP_SCORES {
                 let mut by_age: Vec<(String, DateTime<Utc>)> = data
                     .ip_scores
@@ -449,10 +657,9 @@ impl CacheManager {
                     data.ip_scores.remove(&key);
                 }
             }
-            changed = true;
         }
-        if changed {
-            self.mark_dirty(&data);
+        if route_changed {
+            self.mark_routes_dirty();
         }
     }
 
@@ -478,21 +685,16 @@ impl CacheManager {
         );
     }
 
-    /// Discard all persisted quality samples. The decision engine calls this
+    /// Discard all in-memory quality samples. The decision engine calls this
     /// after a network change: scores describe the old path and would otherwise
-    /// survive a restart and rank candidates for a network they never saw.
+    /// rank candidates for a network they never saw.
     pub fn clear_ip_scores(&self) {
-        let mut data = self.data.write();
-        if data.ip_scores.is_empty() {
-            return;
-        }
-        data.ip_scores.clear();
-        self.mark_dirty(&data);
+        self.data.write().ip_scores.clear();
     }
 
     /// Drop remembered routes that no freshness setting can use anymore, and cap
-    /// the map so months of browsing do not grow state.json forever.
-    fn prune_last_good(&self, data: &mut CacheData) {
+    /// the map so a long session cannot grow the routes file forever.
+    fn prune_last_good(data: &mut CacheData) {
         let now = now();
         let stale: Vec<String> = data
             .last_good
@@ -543,7 +745,7 @@ impl CacheManager {
     pub fn remove_last_good(&self, domain: &str) {
         let mut data = self.data.write();
         if data.last_good.remove(domain).is_some() {
-            self.mark_dirty(&data);
+            self.mark_routes_dirty();
         }
     }
 
@@ -559,20 +761,13 @@ impl CacheManager {
         S: Into<String>,
     {
         let mut data = self.data.write();
-        let mut changed = false;
         for domain in domains {
-            if data.skip_once.insert(domain.into()) {
-                changed = true;
-            }
+            data.skip_once.insert(domain.into());
         }
         // A huge catalog update can name more domains than the flags are
         // worth; the set is a hint that the old route should be re-planned.
         if data.skip_once.len() > MAX_SKIP_ONCE {
             data.skip_once.clear();
-            changed = true;
-        }
-        if changed {
-            self.mark_dirty(&data);
         }
     }
 
@@ -587,11 +782,7 @@ impl CacheManager {
             return false;
         }
         let mut data = self.data.write();
-        let removed = data.skip_once.remove(domain);
-        if removed {
-            self.mark_dirty(&data);
-        }
-        removed
+        data.skip_once.remove(domain)
     }
 
     pub fn has_skip_once(&self, domain: &str) -> bool {
@@ -613,7 +804,6 @@ impl CacheManager {
         Self::prune_by_age(&mut data.doh, MAX_DOH_ANSWERS, DOH_PRUNE_TO, |answer| {
             answer.fetched_at
         });
-        self.mark_dirty(&data);
     }
 
     // ---- ECH -------------------------------------------------------------
@@ -636,7 +826,6 @@ impl CacheManager {
         Self::prune_by_age(&mut data.ech, MAX_ECH_CONFIGS, ECH_PRUNE_TO, |entry| {
             entry.fetched_at
         });
-        self.mark_dirty(&data);
     }
 
     // ---- fake SNI --------------------------------------------------------
@@ -667,7 +856,7 @@ impl CacheManager {
         Self::prune_by_age(&mut data.sni, MAX_FAKE_SNI, SNI_PRUNE_TO, |entry| {
             entry.saved_at
         });
-        self.mark_dirty(&data);
+        self.mark_sni_dirty();
     }
 
     pub fn remove_sni(&self, group: &str, domain: &str, network_id: &str) {
@@ -677,7 +866,7 @@ impl CacheManager {
             .remove(&sni_key(group, domain, network_id))
             .is_some()
         {
-            self.mark_dirty(&data);
+            self.mark_sni_dirty();
         }
     }
 
@@ -695,7 +884,8 @@ impl CacheManager {
     pub fn clear(&self) -> Result<()> {
         let mut data = self.data.write();
         *data = CacheData::default();
-        self.mark_dirty(&data);
+        self.mark_routes_dirty();
+        self.mark_sni_dirty();
         Ok(())
     }
 }
@@ -711,7 +901,6 @@ fn sni_key(group: &str, domain: &str, network_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::network_id;
 
     fn manager() -> (tempfile::TempDir, CacheManager) {
         let dir = tempfile::tempdir().unwrap();
@@ -744,21 +933,22 @@ mod tests {
         cache.stop_auto_flush();
     }
 
+    /// A quality sample is worth a few bytes of memory, not a disk write:
+    /// keeping it on disk made every connection dirty the whole file.
     #[test]
-    fn clearing_ip_scores_removes_and_persists_the_cleared_state() {
+    fn ip_scores_stay_in_memory_and_never_schedule_a_write() {
         let (_dir, cache) = manager();
         let ip: IpAddr = "203.0.113.5".parse().unwrap();
         cache.put_ip_score("example.com", ip, 120.0, 2, 0);
         assert_eq!(cache.ip_scores().len(), 1);
 
-        cache.clear_ip_scores();
-        assert!(cache.ip_scores().is_empty());
-        cache.flush_if_dirty();
-
-        let reloaded = CacheManager::load(cache.path()).unwrap();
         assert!(
-            reloaded.ip_scores().is_empty(),
-            "cleared scores must not return after a restart"
+            !cache.flush_if_dirty(),
+            "a quality sample alone must not schedule a write"
+        );
+        assert!(
+            !cache.path().exists(),
+            "nothing was written, so the routes file must not exist"
         );
     }
 
@@ -769,7 +959,6 @@ mod tests {
             domain: "github.com".into(),
             ip: "20.205.243.166".parse().unwrap(),
             source: IpSource::Remote,
-            network_id: network_id(),
             saved_at: now() - Duration::days(8),
             catalog_version: 3,
         });
@@ -778,7 +967,6 @@ mod tests {
             domain: "github.com".into(),
             ip: "20.205.243.166".parse().unwrap(),
             source: IpSource::Remote,
-            network_id: network_id(),
             saved_at: now() - Duration::days(2),
             catalog_version: 3,
         });
@@ -835,10 +1023,11 @@ mod tests {
         assert_eq!(scores[0].2.ewma_ms, 90.0);
     }
 
-    /// The maps that grow with the number of visited domains need a cap:
-    /// 5000 resolved domains meant 2.4 MB of cache and an 83 ms flush.
+    /// The maps that grow with the number of visited domains stay bounded, and
+    /// none of them may reach the routes file. 5000 resolved domains used to
+    /// mean 2.4 MB of cache and an 83 ms flush.
     #[test]
-    fn the_growing_maps_stay_bounded() {
+    fn runtime_only_maps_stay_bounded_and_off_disk() {
         let dir = tempfile::tempdir().unwrap();
         let cache = CacheManager::load(dir.path().join("state.json")).unwrap();
         for index in 0..5000u32 {
@@ -858,28 +1047,110 @@ mod tests {
                 ttl_secs: 300,
                 fetched_at: now(),
             });
-            cache.put_sni(CachedSni {
-                group: "g".into(),
-                domain,
-                network_id: "net".into(),
-                sni: None,
-                saved_at: now(),
-            });
         }
         cache.mark_skip_once((0..5000u32).map(|index| format!("host{index}.example.com")));
-        cache.flush_if_dirty();
-        let size = std::fs::metadata(cache.path())
-            .map(|meta| meta.len())
-            .unwrap_or(0);
-        assert!(
-            size < 900_000,
-            "the cache file must stay small, got {size} bytes"
+        cache.put_last_good(sample_entry("github.com", "20.205.243.166"));
+        assert!(cache.flush_if_dirty());
+
+        let bytes = std::fs::read(cache.path()).unwrap();
+        let routes: PersistedRoutes = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            routes.last_good.len(),
+            1,
+            "only remembered routes belong in the file"
         );
+        assert!(routes.last_good.contains_key("github.com"));
+        assert!(
+            bytes.len() < 4096,
+            "the routes file must stay tiny, got {} bytes",
+            bytes.len()
+        );
+        assert!(
+            !cache.sni_path.exists(),
+            "DoH and ECH traffic must not create a fake-sni file"
+        );
+
         // The newest entries survive, the oldest are dropped.
         assert!(cache.doh_answer("host4999.example.com", 1).is_some());
         assert!(cache.doh_answer("host0.example.com", 1).is_none());
         assert!(cache.ech("host4999.example.com", false).is_some());
-        assert!(cache.sni("g", "host4999.example.com", "net").is_some());
+    }
+
+    /// Fake-SNI choices have their own dirty flag and file: a learned SNI is
+    /// written without a route change, and the file stays bounded.
+    #[test]
+    fn fake_sni_choices_survive_a_reload_and_stay_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        {
+            let cache = CacheManager::load(&path).unwrap();
+            for index in 0..5000u32 {
+                cache.put_sni(CachedSni {
+                    group: "g".into(),
+                    domain: format!("host{index}.example.com"),
+                    network_id: "net".into(),
+                    sni: Some("www.baidu.com".into()),
+                    saved_at: now(),
+                });
+            }
+            assert!(cache.flush_if_dirty(), "a learned SNI is a change");
+            assert!(
+                !path.exists(),
+                "a fake-SNI flush must not create the routes file"
+            );
+            assert!(cache.sni_path.metadata().unwrap().len() < 64 * 1024);
+        }
+
+        let cache = CacheManager::load(&path).unwrap();
+        let newest = cache.sni("g", "host4999.example.com", "net").unwrap();
+        assert_eq!(newest.sni.as_deref(), Some("www.baidu.com"));
+        assert!(cache.sni("g", "host0.example.com", "net").is_none());
+    }
+
+    /// An aged choice cannot be used: the freshness window is the same on load
+    /// as it is in memory, so a stale sweep result is not replayed forever.
+    #[test]
+    fn aged_fake_sni_choices_are_dropped_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        {
+            let cache = CacheManager::load(&path).unwrap();
+            cache.put_sni(CachedSni {
+                group: "g".into(),
+                domain: "example.com".into(),
+                network_id: "net".into(),
+                sni: Some("www.baidu.com".into()),
+                saved_at: now() - Duration::days(MAX_SNI_AGE_DAYS + 1),
+            });
+            assert!(cache.flush_if_dirty());
+        }
+        let cache = CacheManager::load(&path).unwrap();
+        assert!(cache.sni("g", "example.com", "net").is_none());
+    }
+
+    /// The fake-SNI file is optional: a broken copy must not cost the routes.
+    #[test]
+    fn a_broken_fake_sni_file_only_costs_the_sni_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        {
+            let cache = CacheManager::load(&path).unwrap();
+            cache.put_last_good(sample_entry("github.com", "20.205.243.166"));
+            cache.put_sni(CachedSni {
+                group: "g".into(),
+                domain: "github.com".into(),
+                network_id: "net".into(),
+                sni: Some("www.baidu.com".into()),
+                saved_at: now(),
+            });
+            assert!(cache.flush_if_dirty());
+        }
+        std::fs::write(dir.path().join(FAKE_SNI_FILE), b"{not json").unwrap();
+
+        let cache = CacheManager::load(&path).unwrap();
+        assert!(cache.last_good("github.com", 30).is_some());
+        assert!(cache.sni("g", "github.com", "net").is_none());
+        assert!(dir.path().join("fake-sni.corrupt.json").exists());
     }
 
     /// A write that fails must stay scheduled: the change may not be lost
@@ -891,7 +1162,7 @@ mod tests {
         let cache = CacheManager::load(&path).unwrap();
         // A directory in place of the state file makes every write fail.
         std::fs::create_dir_all(&path).unwrap();
-        cache.mark_skip_once(["example.com"]);
+        cache.put_last_good(sample_entry("example.com", "203.0.113.9"));
         assert!(cache.flush_if_dirty(), "the first flush attempts the write");
         assert!(
             cache.flush_if_dirty(),
@@ -978,26 +1249,6 @@ mod tests {
     }
 
     #[test]
-    fn ip_scores_survive_a_reload() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.json");
-        {
-            let cache = CacheManager::load(&path).unwrap();
-            cache.put_ip_score("example.com", "203.0.113.10".parse().unwrap(), 120.0, 3, 1);
-            cache.put_ip_score("example.com", "203.0.113.11".parse().unwrap(), 90.0, 5, 0);
-            cache.flush_if_dirty();
-        }
-        let reloaded = CacheManager::load(&path).unwrap();
-        let mut scores = reloaded.ip_scores();
-        scores.sort_by(|a, b| (a.0.clone(), a.1).cmp(&(b.0.clone(), b.1)));
-        assert_eq!(scores.len(), 2);
-        assert_eq!(scores[0].0, "example.com");
-        assert_eq!(scores[0].1.to_string(), "203.0.113.10");
-        assert_eq!((scores[0].2.successes, scores[0].2.failures), (3, 1));
-        assert_eq!(scores[1].2.ewma_ms, 90.0);
-    }
-
-    #[test]
     fn ip_scores_are_capped() {
         let dir = tempfile::tempdir().unwrap();
         let cache = CacheManager::load(dir.path().join("state.json")).unwrap();
@@ -1020,12 +1271,15 @@ mod tests {
         cache.put_last_good(ancient);
         assert!(cache.last_good("old.example.com", 30).is_none());
 
-        for i in 0..520u32 {
+        for i in 0..(MAX_LAST_GOOD as u32 + 20) {
             let domain = format!("site{i}.example.com");
             let ip = format!("10.0.{}.{}", i / 250, i % 250);
             cache.put_last_good(sample_entry(&domain, &ip));
         }
-        assert!(cache.last_good_hosts().len() <= 512, "count cap must hold");
+        assert!(
+            cache.last_good_hosts().len() <= MAX_LAST_GOOD,
+            "count cap must hold"
+        );
         assert!(
             cache.last_good("old.example.com", 30).is_none(),
             "ancient entry pruned"
@@ -1037,35 +1291,81 @@ mod tests {
             domain: domain.into(),
             ip: ip.parse().unwrap(),
             source: IpSource::Remote,
-            network_id: "ip:test".into(),
             saved_at: now(),
             catalog_version: 1,
         }
     }
 
+    /// A restart costs a DoH lookup and one ECH fetch; routes and fake-SNI
+    /// choices are kept, one-shot flags are not.
     #[test]
-    fn persistence_survives_reload() {
+    fn routes_survive_a_reload_but_one_shot_flags_do_not() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         {
             let cache = CacheManager::load(&path).unwrap();
             cache.mark_skip_once(["example.com"]);
-            cache.put_sni(CachedSni {
-                group: "g".into(),
+            cache.put_doh_answer(CachedAnswer {
                 domain: "example.com".into(),
-                network_id: "net".into(),
-                sni: Some("www.baidu.com".into()),
-                saved_at: now(),
+                qtype: 1,
+                ips: vec!["1.1.1.1".parse().unwrap()],
+                hints: vec![],
+                ech_config: None,
+                ttl_secs: 300,
+                fetched_at: now(),
             });
+            cache.put_last_good(sample_entry("github.com", "20.205.243.166"));
             // Writes are deferred; flush them like the runtime does on exit.
-            cache.flush_if_dirty();
+            assert!(cache.flush_if_dirty());
         }
         let cache = CacheManager::load(&path).unwrap();
-        assert!(cache.has_skip_once("example.com"));
-        assert_eq!(
-            cache.sni("g", "example.com", "net").unwrap().sni.as_deref(),
-            Some("www.baidu.com")
-        );
+        let entry = cache.last_good("github.com", 30).unwrap();
+        assert_eq!(entry.ip.to_string(), "20.205.243.166");
+        assert!(!cache.has_skip_once("example.com"));
+        assert!(cache.doh_answer("example.com", 1).is_none());
+    }
+
+    /// A file written by an older build holds a different shape. It must be
+    /// moved aside instead of being half-read into the new maps.
+    #[test]
+    fn an_unusable_file_is_quarantined_and_the_cache_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "lastGood": {
+                    "github.com": {
+                        "ip": "20.205.243.166",
+                        "source": "remote",
+                        "savedAt": now(),
+                        "catalogVersion": 3
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let cache = CacheManager::load(&path).unwrap();
+        assert!(cache.last_good("github.com", 30).is_none());
+        assert!(!path.exists(), "the old file is moved aside");
+        assert!(dir.path().join("state.corrupt.json").exists());
+
+        // A future schema is handled the same way.
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schemaVersion": ROUTES_SCHEMA_VERSION + 1,
+                "savedAt": now(),
+                "lastGood": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cache = CacheManager::load(&path).unwrap();
+        assert!(cache.last_good("github.com", 30).is_none());
+        assert!(!path.exists());
     }
 
     #[test]

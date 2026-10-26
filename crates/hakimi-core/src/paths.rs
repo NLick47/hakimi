@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 /// config.json
 /// ca/ca.pem, ca/key.pem
 /// cache/state.json
+/// cache/fake-sni.json
 /// cache/catalog-ip.json, cache/catalog-ip.meta.json
 /// cache/catalog-doh.json, cache/catalog-doh.meta.json
 /// state/system-proxy.json

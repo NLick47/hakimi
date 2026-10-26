@@ -177,8 +177,8 @@ pub struct HakimiRuntime {
 }
 
 impl Drop for HakimiRuntime {
-    /// The cache holds hints, and every write is deferred.  One-shot commands
-    /// never start the background flusher, so the last flush happens here.
+    /// The routes file is a hint and writes are deferred. One-shot commands
+    /// never start the background checkpoint, so the last flush happens here.
     fn drop(&mut self) {
         self.cache.stop_auto_flush();
         self.cache.flush_if_dirty();
@@ -386,12 +386,12 @@ impl HakimiRuntime {
         if self.started.load(Ordering::SeqCst) {
             return Ok(());
         }
-        // Cache writes are hints, not state: the fsyncs stay off the request
-        // path and the flusher picks them up.  One-shot commands flush when
-        // the runtime is dropped.
+        // Only the remembered routes reach the disk, and only when they changed.
+        // The checkpoint bounds what a crash can lose; shutdown does a final
+        // flush, so the request path never touches the disk.
         self.cache
             .clone()
-            .start_auto_flush(std::time::Duration::from_secs(5));
+            .start_auto_flush(crate::cache::CHECKPOINT_INTERVAL);
         let config = self.config.snapshot();
         let (shutdown_tx, _) = watch::channel(false);
         *self.shutdown.write() = Some(shutdown_tx.clone());
@@ -487,7 +487,7 @@ impl HakimiRuntime {
         if let Err(error) = self.restore_system_proxy() {
             tracing::warn!(error = %error, "failed to restore the system proxy");
         }
-        // Final flush so the last few seconds of routes survive the shutdown.
+        // Final flush so the routes since the last checkpoint survive shutdown.
         self.cache.flush_if_dirty();
         tracing::info!("hakimi runtime stopped");
         Ok(())

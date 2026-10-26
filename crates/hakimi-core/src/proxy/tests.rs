@@ -216,7 +216,6 @@ fn engine_for_test(
         domain: "upstream.test".into(),
         ip: cached_ip,
         source: IpSource::Cache,
-        network_id: "test".into(),
         saved_at: now(),
         catalog_version: 0,
     });
