@@ -171,6 +171,8 @@ pub struct UpstreamPool {
     slow_hosts: RwLock<HashMap<String, Instant>>,
     http1_hosts: Arc<DomainMatcher>,
     http1_limit: usize,
+    /// Deadline for the upstream response headers, never for the streamed body
+    header_timeout: Duration,
     /// Read for every image-host request; written only when a new host appears.
     http1_slots: RwLock<HashMap<String, Arc<Semaphore>>>,
     stats: Arc<UpstreamStats>,
@@ -181,6 +183,17 @@ pub struct UpstreamPool {
 struct Discovery {
     inflight: Mutex<HashMap<String, Arc<Inflight>>>,
 }
+
+/// BDP-sized h2 windows: 8 MiB carries ~100 Mbps over a 300 ms RTT. The Android
+/// profile trades peak throughput for a smaller memory ceiling
+#[cfg(target_os = "android")]
+const H2_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
+#[cfg(target_os = "android")]
+const H2_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
+#[cfg(not(target_os = "android"))]
+const H2_STREAM_WINDOW: u32 = 8 * 1024 * 1024;
+#[cfg(not(target_os = "android"))]
+const H2_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
 
 fn build_client(
     config: &AppConfig,
@@ -194,13 +207,12 @@ fn build_client(
         .pool_idle_timeout(idle)
         .pool_max_idle_per_host(max_idle)
         .timer(TokioTimer::new())
-        // The effective upstream policy is a fixed 1 MiB stream / 4 MiB
-        // connection window: hyper's `initial_*_window_size` setters disable
-        // the adaptive window. Do not add `http2_adaptive_window(true)` here
-        // unless these fixed sizes are removed as well; otherwise the call
-        // order silently decides which policy wins.
-        .http2_initial_stream_window_size(1024 * 1024)
-        .http2_initial_connection_window_size(4 * 1024 * 1024)
+        // Fixed windows instead of the adaptive policy: the setters below
+        // disable it. Do not add `http2_adaptive_window(true)` unless these
+        // lines are removed as well; otherwise the call order silently
+        // decides which policy wins.
+        .http2_initial_stream_window_size(H2_STREAM_WINDOW)
+        .http2_initial_connection_window_size(H2_CONNECTION_WINDOW)
         // A half-open HTTP/2 connection used to stay in the pool for up to
         // 30s (next ping) + 10s (ping timeout). That matches the 38-39s
         // stalls seen on cached 304 revalidations: the request was checked
@@ -251,6 +263,8 @@ impl UpstreamPool {
         let stats = Arc::new(UpstreamStats::default());
         let max_idle = config.advanced.upstream_max_idle_per_host.max(1);
         let http1_limit = config.advanced.http1_max_concurrent.max(1);
+        let header_timeout =
+            Duration::from_secs(config.advanced.upstream_header_timeout_secs.max(1));
 
         let http1_hosts = DomainMatcher::from_patterns(
             config
@@ -309,6 +323,7 @@ impl UpstreamPool {
             slow_hosts: RwLock::new(HashMap::new()),
             http1_hosts,
             http1_limit,
+            header_timeout,
             http1_slots: RwLock::new(HashMap::new()),
             stats,
         })
@@ -359,8 +374,9 @@ impl UpstreamPool {
         let debug_host = host;
         let debug_path = uri.path();
         let started = std::time::Instant::now();
-        match client.request(request).await {
-            Ok(response) => {
+        // Only the header wait is bounded: the body keeps streaming afterwards
+        match tokio::time::timeout(self.header_timeout, client.request(request)).await {
+            Ok(Ok(response)) => {
                 // A completed TLS handshake does not prove the route is usable:
                 // a fake-SNI request can reach nginx and get a 403. Feed the
                 // status back so the next connection drops that route.
@@ -395,7 +411,7 @@ impl UpstreamPool {
                         request_id,
                         method = %method,
                         scheme,
-                        version = ?request_version,
+                        version = ?response.version(),
                         host = ?debug_host,
                         path = %debug_path,
                         status = response.status().as_u16(),
@@ -407,7 +423,7 @@ impl UpstreamPool {
                         request_id,
                         method = %method,
                         scheme,
-                        version = ?request_version,
+                        version = ?response.version(),
                         host = ?debug_host,
                         path = %debug_path,
                         status = response.status().as_u16(),
@@ -435,7 +451,7 @@ impl UpstreamPool {
                 };
                 Ok(Response::from_parts(parts, body))
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 self.stats.request_errors.fetch_add(1, Ordering::Relaxed);
                 if let Some(host) = debug_host {
                     self.mark_slow(host);
@@ -451,7 +467,27 @@ impl UpstreamPool {
                     error = %format!("{error:#}"),
                     "upstream request failed"
                 );
-                Err(format!("{error:?}"))
+                Err(error.to_string())
+            }
+            Err(_) => {
+                // The connection accepted the request but never answered: a
+                // half-dead hop. Drop it and let the next connection re-race
+                self.stats.request_errors.fetch_add(1, Ordering::Relaxed);
+                if let Some(host) = debug_host {
+                    self.mark_slow(host);
+                    self.engine.forget_plan(host, port, tls);
+                }
+                tracing::warn!(
+                    request_id,
+                    method = %method,
+                    scheme,
+                    version = ?request_version,
+                    host = debug_host.unwrap_or(""),
+                    path = %debug_path,
+                    timeout_secs = self.header_timeout.as_secs(),
+                    "upstream response header timeout"
+                );
+                Err("upstream response header timeout".into())
             }
         }
     }
@@ -992,13 +1028,15 @@ impl RouteConnector {
         // waiting for `SYSTEM_CONNECT_TIMEOUT` per batch.
         let deadline = tokio::time::Instant::now() + SYSTEM_CONNECT_TIMEOUT;
         let dns_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let resolved = tokio::time::timeout(
+            dns_timeout,
+            super::connect::lookup_host_cached(host, port),
+        )
+        .await
+        .map_err(|_| anyhow!("resolving {host}:{port} timed out"))?
+        .with_context(|| format!("resolving {host}:{port}"))?;
         let addresses: Vec<std::net::IpAddr> =
-            tokio::time::timeout(dns_timeout, tokio::net::lookup_host((host, port)))
-                .await
-                .map_err(|_| anyhow!("resolving {host}:{port} timed out"))?
-                .with_context(|| format!("resolving {host}:{port}"))?
-                .map(|address| address.ip())
-                .collect();
+            resolved.iter().map(|address| address.ip()).collect();
         // Staggered race across resolved addresses (Happy-Eyeballs style): a black-holed
         // IPv6 route no longer delays the IPv4 fallback by a full timeout.
         let mut index = 0;

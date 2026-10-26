@@ -194,6 +194,10 @@ pub struct AdvancedConfig {
     /// Maximum concurrent upstream requests (and therefore connections) per `http1Hosts`
     /// authority. Too many simultaneous TLS connections make image loading worse.
     pub http1_max_concurrent: usize,
+    /// Deadline for the upstream response headers. Covers only the header wait, never
+    /// the streamed body. Guards against half-dead connections that accept the request
+    /// but never answer.
+    pub upstream_header_timeout_secs: u64,
 }
 
 impl Default for AdvancedConfig {
@@ -220,6 +224,7 @@ impl Default for AdvancedConfig {
                 "cdn.poipiku.com".to_string(),
             ],
             http1_max_concurrent: 32,
+            upstream_header_timeout_secs: 60,
         }
     }
 }
@@ -760,6 +765,9 @@ impl AppConfig {
         }
         if !(1..=32).contains(&self.advanced.http1_max_concurrent) {
             bail!("advanced.http1MaxConcurrent must be between 1 and 32");
+        }
+        if !(5..=600).contains(&self.advanced.upstream_header_timeout_secs) {
+            bail!("advanced.upstreamHeaderTimeoutSecs must be between 5 and 600");
         }
         if self.advanced.fake_sni_candidates.len() > 16 {
             bail!("advanced.fakeSniCandidates supports at most 16 entries");

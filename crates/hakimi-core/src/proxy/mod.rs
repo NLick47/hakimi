@@ -6,7 +6,7 @@ mod upstream;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use connect::upstream_failure;
+pub(crate) use connect::{clear_dns_cache, upstream_failure};
 pub use pool::UpstreamPool;
 pub(crate) use response::{error_response, escape_html, full_body, json_response, text_response};
 

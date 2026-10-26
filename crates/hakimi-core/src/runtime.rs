@@ -917,6 +917,8 @@ impl HakimiRuntime {
                     // new connections to re-race routes while still testing the
                     // last-good IP first.
                     runtime.engine.on_network_change();
+                    // Cached resolver answers belong to the old network
+                    crate::proxy::clear_dns_cache();
                     let _ = runtime.resolver.health_check().await;
                     runtime.warm_groups().await;
                 }

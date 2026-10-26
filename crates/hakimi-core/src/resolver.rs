@@ -32,6 +32,12 @@ const STALE_WHILE_REVALIDATE_SECS: i64 = 60;
 /// the failure traffic; keep one attempt per domain per window instead.
 const STALE_REFRESH_BACKOFF: Duration = Duration::from_secs(5);
 const STALE_REFRESH_BACKOFF_MAX: usize = 1024;
+/// Negative-answer TTLs. An authoritative empty answer is trusted for a full
+/// DNS window; a total endpoint failure only backs off briefly so a flapping
+/// endpoint recovers on the next attempt.
+const NEGATIVE_NODATA_SECS: u32 = 60;
+const NEGATIVE_HTTPS_NODATA_SECS: u32 = 300;
+const NEGATIVE_FAILURE_SECS: u32 = 10;
 
 #[derive(Debug, Clone)]
 pub struct EffectiveEndpoint {
@@ -807,6 +813,11 @@ impl Resolver {
         if endpoints.is_empty() {
             bail!("no DoH endpoint is configured");
         }
+        // A remembered NODATA or total failure skips the full endpoint race for
+        // this window. Stale answers are still served by the callers above.
+        if self.cache.doh_negative(domain, qtype) {
+            bail!("cached negative answer for `{domain}` qtype {qtype}");
+        }
         let mut attempts = Vec::new();
         // A NOERROR response with no address records is a successful exchange
         // but not a usable route. A filtering resolver can return exactly that
@@ -957,6 +968,16 @@ impl Resolver {
         // reports that DoH had no records, not that DoH was unreachable.
         if let Some((index, answer)) = empty_answer {
             let endpoint = &endpoints[index];
+            // An authoritative empty answer repeats for every cold connection:
+            // remember it so the next query skips the endpoint race entirely
+            let ttl = if attempts.is_empty() && qtype == TYPE_HTTPS {
+                NEGATIVE_HTTPS_NODATA_SECS
+            } else if attempts.is_empty() {
+                NEGATIVE_NODATA_SECS
+            } else {
+                NEGATIVE_FAILURE_SECS
+            };
+            self.cache.put_doh_negative(domain, qtype, ttl);
             return Ok(TypeQuery {
                 answer,
                 source: endpoint.source,
@@ -971,11 +992,15 @@ impl Resolver {
             .map(|attempt| format!("{}: {}", attempt.endpoint, attempt.error))
             .collect::<Vec<_>>()
             .join("; ");
+        self.cache
+            .put_doh_negative(domain, qtype, NEGATIVE_FAILURE_SECS);
         bail!("all DoH endpoints failed: {detail}")
     }
 
     /// Persist a successful resolution into the answer/ECH caches.
     fn store_answer(&self, domain: &str, qtype: u16, answer: &ResolvedAnswer) {
+        // A real answer supersedes any remembered negative result
+        self.cache.clear_doh_negative(domain, qtype);
         if qtype == TYPE_A || qtype == TYPE_AAAA {
             self.cache.put_doh_answer(CachedAnswer {
                 domain: domain.to_string(),

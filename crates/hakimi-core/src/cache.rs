@@ -109,6 +109,10 @@ pub struct CachedSni {
 /// answer is simply looked up again; none of it is part of the routes file.
 const MAX_DOH_ANSWERS: usize = 1024;
 const DOH_PRUNE_TO: usize = MAX_DOH_ANSWERS * 3 / 4;
+/// Negative DoH results: NODATA answers and total endpoint failures. Runtime
+/// only; a domain that starts answering is re-queried after the TTL anyway.
+const MAX_DOH_NEGATIVE: usize = 512;
+const DOH_NEGATIVE_PRUNE_TO: usize = MAX_DOH_NEGATIVE * 3 / 4;
 /// ECH configurations. One per domain, and only for the groups that use ECH.
 const MAX_ECH_CONFIGS: usize = 256;
 const ECH_PRUNE_TO: usize = MAX_ECH_CONFIGS * 3 / 4;
@@ -125,8 +129,27 @@ struct CacheData {
     last_good: HashMap<String, LastGoodEntry>,
     skip_once: HashSet<String>,
     doh: HashMap<String, CachedAnswer>,
+    doh_negative: HashMap<String, CachedNegative>,
     ech: HashMap<String, CachedEch>,
     sni: HashMap<String, CachedSni>,
+}
+
+/// A remembered "this query has no useful answer". NODATA entries trust the
+/// DNS TTL; total endpoint failures only back off for a short window.
+#[derive(Debug, Clone)]
+struct CachedNegative {
+    ttl_secs: u32,
+    fetched_at: DateTime<Utc>,
+}
+
+impl CachedNegative {
+    fn is_fresh(&self, now: DateTime<Utc>) -> bool {
+        if self.ttl_secs == 0 {
+            return false;
+        }
+        let age = now.signed_duration_since(self.fetched_at).num_seconds();
+        age >= 0 && age < self.ttl_secs as i64
+    }
 }
 
 /// The only data that survives a restart: a small set of last working routes.
@@ -224,7 +247,7 @@ impl CacheManager {
             Err(error) if path.exists() => {
                 tracing::warn!(
                     path = %path.display(),
-                    error = %error,
+                    error = %format!("{error:#}"),
                     "routes file is unreadable; starting empty"
                 );
                 Self::quarantine(&path);
@@ -320,7 +343,7 @@ impl CacheManager {
         if let Err(error) = std::fs::rename(path, &corrupt) {
             tracing::warn!(
                 path = %path.display(),
-                error = %error,
+                error = %format!("{error:#}"),
                 "failed to quarantine an unreadable routes file"
             );
         }
@@ -685,6 +708,40 @@ impl CacheManager {
         Self::prune_by_age(&mut data.doh, MAX_DOH_ANSWERS, DOH_PRUNE_TO, |answer| {
             answer.fetched_at
         });
+    }
+
+    /// True while a fresh negative result for this domain/qtype exists.
+    pub fn doh_negative(&self, domain: &str, qtype: u16) -> bool {
+        let now = now();
+        self.data
+            .read()
+            .doh_negative
+            .get(&doh_key(domain, qtype))
+            .is_some_and(|entry| entry.is_fresh(now))
+    }
+
+    pub fn put_doh_negative(&self, domain: &str, qtype: u16, ttl_secs: u32) {
+        if ttl_secs == 0 {
+            return;
+        }
+        let mut data = self.data.write();
+        data.doh_negative.insert(
+            doh_key(domain, qtype),
+            CachedNegative {
+                ttl_secs,
+                fetched_at: now(),
+            },
+        );
+        Self::prune_by_age(
+            &mut data.doh_negative,
+            MAX_DOH_NEGATIVE,
+            DOH_NEGATIVE_PRUNE_TO,
+            |entry| entry.fetched_at,
+        );
+    }
+
+    pub fn clear_doh_negative(&self, domain: &str, qtype: u16) {
+        self.data.write().doh_negative.remove(&doh_key(domain, qtype));
     }
 
     // ---- ECH -------------------------------------------------------------

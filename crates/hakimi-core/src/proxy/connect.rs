@@ -30,6 +30,69 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RAW_RACE_SIZE: usize = 8;
 const RAW_RACE_STAGGER: Duration = Duration::from_millis(150);
 
+/// Short-TTL cache for system resolver answers. Bypass hosts otherwise pay a
+/// blocking `getaddrinfo` on every new connection. Cleared on network changes
+const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+const DNS_CACHE_MAX: usize = 512;
+
+#[derive(Debug, Clone)]
+struct DnsCacheEntry {
+    addresses: Vec<SocketAddr>,
+    fetched_at: Instant,
+}
+
+fn dns_cache() -> &'static parking_lot::Mutex<std::collections::HashMap<(String, u16), DnsCacheEntry>>
+{
+    static CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<(String, u16), DnsCacheEntry>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Forget every cached resolver answer; called when the network changes
+pub(crate) fn clear_dns_cache() {
+    dns_cache().lock().clear();
+}
+
+/// Cached wrapper over `tokio::net::lookup_host`. Only successful lookups are
+/// cached; failures stay uncached so a flapping resolver recovers immediately
+pub(super) async fn lookup_host_cached(
+    host: &str,
+    port: u16,
+) -> std::io::Result<Vec<SocketAddr>> {
+    let key = (host.to_ascii_lowercase(), port);
+    if let Some(entry) = dns_cache().lock().get(&key).cloned() {
+        if entry.fetched_at.elapsed() < DNS_CACHE_TTL {
+            return Ok(entry.addresses);
+        }
+    }
+    let resolved = tokio::net::lookup_host((host, port)).await?;
+    let mut addresses: Vec<SocketAddr> = Vec::new();
+    for address in resolved {
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    if !addresses.is_empty() {
+        let mut cache = dns_cache().lock();
+        if cache.len() >= DNS_CACHE_MAX {
+            let now = Instant::now();
+            cache.retain(|_, entry| now.duration_since(entry.fetched_at) < DNS_CACHE_TTL);
+            if cache.len() >= DNS_CACHE_MAX {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            key,
+            DnsCacheEntry {
+                addresses: addresses.clone(),
+                fetched_at: Instant::now(),
+            },
+        );
+    }
+    Ok(addresses)
+}
+
 /// Context attached to a raw CONNECT tunnel. Raw tunnels bypass the pooled HTTP
 /// client, so without this summary a stalled TLS handshake leaves no request-level
 /// trace in the logs.
@@ -440,8 +503,7 @@ pub(super) async fn connect_host_staggered(
     let started = tokio::time::Instant::now();
     // The system resolver runs in tokio's blocking pool; a stuck lookup must not
     // outlive the caller's connect deadline.
-    let resolved = match tokio::time::timeout(timeout, tokio::net::lookup_host((host, port))).await
-    {
+    let resolved = match tokio::time::timeout(timeout, lookup_host_cached(host, port)).await {
         Ok(Ok(resolved)) => resolved,
         Ok(Err(error)) => {
             return Err((false, format!("resolving {host}:{port} failed: {error}")));
@@ -450,12 +512,7 @@ pub(super) async fn connect_host_staggered(
             return Err((true, format!("resolving {host}:{port} timed out")));
         }
     };
-    let mut addresses: Vec<SocketAddr> = Vec::new();
-    for address in resolved {
-        if !addresses.contains(&address) {
-            addresses.push(address);
-        }
-    }
+    let addresses = resolved;
     if addresses.is_empty() {
         return Err((false, format!("no address found for {host}")));
     }
