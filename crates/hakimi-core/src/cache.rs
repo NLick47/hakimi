@@ -104,36 +104,6 @@ pub struct CachedSni {
     pub saved_at: DateTime<Utc>,
 }
 
-/// Measured quality of one (domain, ip) pair. This is intentionally in-memory
-/// only: a few connections relearn it, and persisting it would make every
-/// connection dirty the routes file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IpScoreEntry {
-    pub ewma_ms: f64,
-    pub successes: u32,
-    pub failures: u32,
-    pub updated_at: DateTime<Utc>,
-}
-
-/// One IP quality sample to update in memory.
-#[derive(Debug, Clone, Copy)]
-pub struct IpScoreUpdate<'a> {
-    pub domain: &'a str,
-    pub ip: IpAddr,
-    pub ewma_ms: f64,
-    pub successes: u32,
-    pub failures: u32,
-}
-
-/// How many (domain, ip) quality entries to keep at most. The active set of a
-/// heavy user stays well below this.
-const MAX_IP_SCORES: usize = 1024;
-/// Evict in bulk down to this size when the cap is crossed. Pruning back to
-/// exactly the cap would make every subsequent insert sort the whole map.
-const IP_SCORE_PRUNE_TO: usize = MAX_IP_SCORES * 3 / 4;
-/// Entries older than the widest freshness window can never be used again.
-const MAX_IP_SCORE_AGE_DAYS: i64 = 30;
 /// Resolved addresses, one A and one AAAA entry per domain. These maps grow
 /// with every visited domain, so they stay bounded and in memory. An evicted
 /// answer is simply looked up again; none of it is part of the routes file.
@@ -153,7 +123,6 @@ const MAX_SKIP_ONCE: usize = 4096;
 #[derive(Debug, Default)]
 struct CacheData {
     last_good: HashMap<String, LastGoodEntry>,
-    ip_scores: HashMap<String, IpScoreEntry>,
     skip_once: HashSet<String>,
     doh: HashMap<String, CachedAnswer>,
     ech: HashMap<String, CachedEch>,
@@ -203,10 +172,10 @@ pub struct CacheStats {
 
 /// Runtime hint cache plus two tiny persisted files.
 ///
-/// DoH answers, ECH configs, one-shot flags and IP scores live only for this
-/// process. The routes file holds `last_good` (128 rows), the fake-SNI file
-/// holds the SNI choices, and both are written on shutdown plus a five-minute
-/// dirty checkpoint.
+/// DoH answers, ECH configs and one-shot flags live only for this process.
+/// The routes file holds `last_good` (128 rows), the fake-SNI file holds the
+/// SNI choices, and both are written on shutdown plus a five-minute dirty
+/// checkpoint.
 pub struct CacheManager {
     path: PathBuf,
     sni_path: PathBuf,
@@ -513,11 +482,8 @@ impl CacheManager {
         data.sni.retain(|_, sni| {
             now.signed_duration_since(sni.saved_at) <= Duration::days(MAX_SNI_AGE_DAYS)
         });
-        // `last_good` is the only map that reaches disk. The others are
-        // runtime hints: drop aged entries here so a long session stays bounded.
-        data.ip_scores.retain(|_, entry| {
-            now.signed_duration_since(entry.updated_at) <= Duration::days(MAX_IP_SCORE_AGE_DAYS)
-        });
+        // The routes and SNI maps reach disk; the rest are runtime hints, so
+        // aged entries are dropped here to keep a long session bounded.
         data.last_good.retain(|_, entry| {
             now.signed_duration_since(entry.saved_at) <= Duration::days(MAX_LAST_GOOD_AGE_DAYS)
         });
@@ -583,113 +549,32 @@ impl CacheManager {
         (skip_once, last_good)
     }
 
-    /// In-memory quality entries, for seeding the decision engine on startup.
-    /// Entries beyond the widest freshness window are dropped on the way in.
-    pub fn ip_scores(&self) -> Vec<(String, IpAddr, IpScoreEntry)> {
-        let now = now();
-        let data = self.data.read();
-        data.ip_scores
-            .iter()
-            .filter_map(|(key, entry)| {
-                if now.signed_duration_since(entry.updated_at)
-                    > Duration::days(MAX_IP_SCORE_AGE_DAYS)
-                {
-                    return None;
-                }
-                let (domain, ip) = key.split_once('|')?;
-                let ip = ip.parse().ok()?;
-                Some((domain.to_string(), ip, entry.clone()))
-            })
-            .collect()
-    }
-
-    /// Update the remembered route and the in-memory IP quality sample. Only
-    /// the route change marks the routes file dirty; quality samples are
-    /// relearned and never touch the disk.
-    pub fn record_outcome(
-        &self,
-        last_good: Option<LastGoodEntry>,
-        score: Option<IpScoreUpdate<'_>>,
-    ) {
-        // Format the map key before taking the cache write lock; this runs on
-        // every successful connection and does not need the lock to allocate.
-        let score_key = score.map(|score| format!("{}|{}", score.domain, score.ip));
+    /// Update the remembered route and schedule a checkpoint.
+    pub fn put_last_good(&self, entry: LastGoodEntry) {
+        // The steady state is the same route on every connection; settle that
+        // under a read lock so concurrent dials do not queue on the writer.
+        if Self::route_is_fresh(&self.data.read(), &entry, now()) {
+            return;
+        }
         let mut data = self.data.write();
         let timestamp = now();
-        let mut route_changed = false;
-        if let Some(entry) = last_good {
-            let fresh = data.last_good.get(&entry.domain).is_some_and(|existing| {
-                existing.ip == entry.ip
-                    && existing.source == entry.source
-                    && existing.catalog_version == entry.catalog_version
-                    && timestamp.signed_duration_since(existing.saved_at) < Duration::seconds(60)
-            });
-            if !fresh {
-                data.last_good.insert(entry.domain.clone(), entry);
-                if data.last_good.len() > MAX_LAST_GOOD {
-                    Self::prune_last_good(&mut data);
-                }
-                route_changed = true;
-            }
+        if Self::route_is_fresh(&data, &entry, timestamp) {
+            return;
         }
-        if let (Some(score), Some(key)) = (score, score_key) {
-            data.ip_scores.insert(
-                key,
-                IpScoreEntry {
-                    ewma_ms: score.ewma_ms,
-                    successes: score.successes,
-                    failures: score.failures,
-                    updated_at: timestamp,
-                },
-            );
-            // Prune lazily: a full scan on every write (record_ip runs on every
-            // connection outcome) is wasted work; the map is bounded and the
-            // periodic checkpoint already drops aged entries via `expire`.
-            if data.ip_scores.len() > MAX_IP_SCORES {
-                let mut by_age: Vec<(String, DateTime<Utc>)> = data
-                    .ip_scores
-                    .iter()
-                    .map(|(key, entry)| (key.clone(), entry.updated_at))
-                    .collect();
-                by_age.sort_by_key(|(_, at)| *at);
-                let overflow = data.ip_scores.len() - IP_SCORE_PRUNE_TO;
-                for (key, _) in by_age.into_iter().take(overflow) {
-                    data.ip_scores.remove(&key);
-                }
-            }
+        data.last_good.insert(entry.domain.clone(), entry);
+        if data.last_good.len() > MAX_LAST_GOOD {
+            Self::prune_last_good(&mut data);
         }
-        if route_changed {
-            self.mark_routes_dirty();
-        }
+        self.mark_routes_dirty();
     }
 
-    /// Upsert one quality entry. Keeps the map bounded: entries past the widest
-    /// freshness window are dropped, then the oldest beyond the cap.
-    pub fn put_ip_score(
-        &self,
-        domain: &str,
-        ip: IpAddr,
-        ewma_ms: f64,
-        successes: u32,
-        failures: u32,
-    ) {
-        self.record_outcome(
-            None,
-            Some(IpScoreUpdate {
-                domain,
-                ip,
-                ewma_ms,
-                successes,
-                failures,
-            }),
-        );
-    }
-
-    /// Discard all in-memory quality samples. The decision engine calls this
-    /// after a network change: scores describe the old path and would otherwise
-    /// rank candidates for a network they never saw.
-    pub fn clear_ip_scores(&self) {
-        self.data.write().ip_scores.clear();
+    fn route_is_fresh(data: &CacheData, entry: &LastGoodEntry, timestamp: DateTime<Utc>) -> bool {
+        data.last_good.get(&entry.domain).is_some_and(|existing| {
+            existing.ip == entry.ip
+                && existing.source == entry.source
+                && existing.catalog_version == entry.catalog_version
+                && timestamp.signed_duration_since(existing.saved_at) < Duration::seconds(60)
+        })
     }
 
     /// Drop remembered routes that no freshness setting can use anymore, and cap
@@ -736,10 +621,6 @@ impl CacheManager {
             .collect();
         hosts.sort_by(|a, b| b.0.cmp(&a.0));
         hosts.into_iter().map(|(_, host)| host).collect()
-    }
-
-    pub fn put_last_good(&self, entry: LastGoodEntry) {
-        self.record_outcome(Some(entry), None);
     }
 
     pub fn remove_last_good(&self, domain: &str) {
@@ -933,25 +814,6 @@ mod tests {
         cache.stop_auto_flush();
     }
 
-    /// A quality sample is worth a few bytes of memory, not a disk write:
-    /// keeping it on disk made every connection dirty the whole file.
-    #[test]
-    fn ip_scores_stay_in_memory_and_never_schedule_a_write() {
-        let (_dir, cache) = manager();
-        let ip: IpAddr = "203.0.113.5".parse().unwrap();
-        cache.put_ip_score("example.com", ip, 120.0, 2, 0);
-        assert_eq!(cache.ip_scores().len(), 1);
-
-        assert!(
-            !cache.flush_if_dirty(),
-            "a quality sample alone must not schedule a write"
-        );
-        assert!(
-            !cache.path().exists(),
-            "nothing was written, so the routes file must not exist"
-        );
-    }
-
     #[test]
     fn last_good_roundtrip_and_expiry() {
         let (_dir, cache) = manager();
@@ -975,52 +837,27 @@ mod tests {
     }
 
     #[test]
-    fn record_outcome_writes_both_parts_and_keeps_the_freshness_rule() {
+    fn put_last_good_keeps_the_freshness_rule() {
         let (_dir, cache) = manager();
         let ip: IpAddr = "203.0.113.5".parse().unwrap();
         let entry = sample_entry("example.com", "203.0.113.5");
         let saved_at = entry.saved_at;
 
-        cache.record_outcome(
-            Some(entry),
-            Some(IpScoreUpdate {
-                domain: "example.com",
-                ip,
-                ewma_ms: 120.0,
-                successes: 2,
-                failures: 0,
-            }),
-        );
-        // Both parts are in the cache.
+        cache.put_last_good(entry);
         let stored = cache.last_good("example.com", 7).unwrap();
         assert_eq!(stored.ip, ip);
         assert_eq!(stored.saved_at, saved_at);
-        let scores = cache.ip_scores();
-        assert_eq!(scores.len(), 1);
-        assert_eq!(scores[0].2.successes, 2);
 
-        // The same route within 60 seconds keeps the original timestamp, but
-        // the quality sample is still updated.
+        // The same route within 60 seconds keeps the original timestamp so a
+        // busy domain does not churn the file.
         let mut again = sample_entry("example.com", "203.0.113.5");
         again.saved_at = now();
-        cache.record_outcome(
-            Some(again),
-            Some(IpScoreUpdate {
-                domain: "example.com",
-                ip,
-                ewma_ms: 90.0,
-                successes: 3,
-                failures: 0,
-            }),
-        );
+        cache.put_last_good(again);
         let stored = cache.last_good("example.com", 7).unwrap();
         assert_eq!(
             stored.saved_at, saved_at,
             "a fresh repeat must not restart the freshness window"
         );
-        let scores = cache.ip_scores();
-        assert_eq!(scores[0].2.successes, 3);
-        assert_eq!(scores[0].2.ewma_ms, 90.0);
     }
 
     /// The maps that grow with the number of visited domains stay bounded, and
@@ -1171,28 +1008,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_outcome_without_changes_does_not_schedule_a_flush() {
+    async fn an_unchanged_route_does_not_schedule_a_flush() {
         let dir = tempfile::tempdir().unwrap();
         let cache = std::sync::Arc::new(CacheManager::load(dir.path().join("state.json")).unwrap());
         // The background flusher has to be running, otherwise every write is
         // persisted eagerly and the dirty flag never shows up.
         cache.start_auto_flush(StdDuration::from_secs(3600));
-        let ip: IpAddr = "203.0.113.6".parse().unwrap();
         let entry = sample_entry("example.com", "203.0.113.6");
-        cache.record_outcome(
-            Some(entry.clone()),
-            Some(IpScoreUpdate {
-                domain: "example.com",
-                ip,
-                ewma_ms: 100.0,
-                successes: 1,
-                failures: 0,
-            }),
-        );
+        cache.put_last_good(entry.clone());
         assert!(cache.flush_if_dirty(), "the first outcome is a change");
 
         // The same route within the freshness window changes nothing.
-        cache.record_outcome(Some(entry), None);
+        cache.put_last_good(entry);
         assert!(
             !cache.flush_if_dirty(),
             "an unchanged route must not schedule a write"
@@ -1246,17 +1073,6 @@ mod tests {
         let answer = cache.doh_answer("example.com", 1).unwrap();
         assert!(!answer.is_fresh(now()));
         assert!(answer.is_usable(now()));
-    }
-
-    #[test]
-    fn ip_scores_are_capped() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = CacheManager::load(dir.path().join("state.json")).unwrap();
-        for i in 0..1100u32 {
-            let ip = format!("10.0.{}.{}", i / 250, i % 250);
-            cache.put_ip_score("example.com", ip.parse().unwrap(), 100.0, 1, 0);
-        }
-        assert!(cache.ip_scores().len() <= 1024, "cap must hold");
     }
 
     #[test]
@@ -1369,27 +1185,9 @@ mod tests {
     }
 
     #[test]
-    fn expire_drops_aged_ip_scores_and_routes() {
+    fn expire_drops_aged_routes() {
         let now = now();
         let mut data = CacheData::default();
-        data.ip_scores.insert(
-            "old.example|203.0.113.1".into(),
-            IpScoreEntry {
-                ewma_ms: 100.0,
-                successes: 1,
-                failures: 0,
-                updated_at: now - chrono::Duration::days(MAX_IP_SCORE_AGE_DAYS + 1),
-            },
-        );
-        data.ip_scores.insert(
-            "fresh.example|203.0.113.2".into(),
-            IpScoreEntry {
-                ewma_ms: 100.0,
-                successes: 1,
-                failures: 0,
-                updated_at: now,
-            },
-        );
         let mut old_route = sample_entry("old.example", "203.0.113.1");
         old_route.saved_at = now - chrono::Duration::days(MAX_LAST_GOOD_AGE_DAYS + 1);
         data.last_good.insert(old_route.domain.clone(), old_route);
@@ -1400,57 +1198,29 @@ mod tests {
 
         CacheManager::expire(&mut data, now);
 
-        assert!(
-            !data.ip_scores.contains_key("old.example|203.0.113.1"),
-            "an aged IP score must not survive a flush"
-        );
-        assert!(data.ip_scores.contains_key("fresh.example|203.0.113.2"));
         assert!(!data.last_good.contains_key("old.example"));
         assert!(data.last_good.contains_key("fresh.example"));
     }
 
-    /// The two writes a successful connection does to the cache.
+    /// A remembered-route write with the runtime checkpoint running.
     #[tokio::test]
     #[ignore = "micro benchmark"]
     async fn bench_cache_writes() {
         let (_dir, cache) = manager();
         let cache = Arc::new(cache);
-        // The runtime writes the cache in the background; without the flusher
-        // every write would serialize and fsync the whole file.
-        cache.start_auto_flush(std::time::Duration::from_secs(5));
-        let ip: IpAddr = "203.0.113.7".parse().unwrap();
-        crate::bench::measure("cache.record_outcome", 20_000, || {
-            cache.record_outcome(
-                Some(sample_entry("example.com", "203.0.113.7")),
-                Some(IpScoreUpdate {
-                    domain: "example.com",
-                    ip,
-                    ewma_ms: 100.0,
-                    successes: 1,
-                    failures: 0,
-                }),
-            );
+        cache.start_auto_flush(CHECKPOINT_INTERVAL);
+        crate::bench::measure("cache.put_last_good", 20_000, || {
+            cache.put_last_good(sample_entry("example.com", "203.0.113.7"));
         });
     }
 
-    /// The same writes without a background flusher, which is how the one-shot
-    /// commands run.  The write must still not touch the disk.
+    /// The same write without a checkpoint, which is how one-shot commands run.
     #[test]
     #[ignore = "micro benchmark"]
     fn bench_cache_writes_without_flusher() {
         let (_dir, cache) = manager();
-        let ip: IpAddr = "203.0.113.7".parse().unwrap();
-        crate::bench::measure("cache.write (no flusher)", 20_000, || {
-            cache.record_outcome(
-                Some(sample_entry("example.com", "203.0.113.7")),
-                Some(IpScoreUpdate {
-                    domain: "example.com",
-                    ip,
-                    ewma_ms: 100.0,
-                    successes: 1,
-                    failures: 0,
-                }),
-            );
+        crate::bench::measure("cache.put_last_good (no flusher)", 20_000, || {
+            cache.put_last_good(sample_entry("example.com", "203.0.113.7"));
         });
     }
 }

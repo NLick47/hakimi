@@ -169,29 +169,6 @@ async fn a_successful_reprobe_pays_down_the_failure_history() {
 }
 
 #[tokio::test]
-async fn a_fresh_engine_seeds_scores_from_the_cache() {
-    let h = harness(&["example.com"], RoutePolicy::auto());
-    let ip: std::net::IpAddr = "203.0.113.30".parse().unwrap();
-    h.engine.record_ip("example.com", ip, None, true);
-    let demoted = h.engine.score_ip("example.com", ip);
-
-    // A fresh engine over the same cache.
-    let restarted = DecisionEngine::new(
-        h.engine.config.clone(),
-        h.cache.clone(),
-        h.remote.clone(),
-        h.resolver.clone(),
-        h.prober.clone(),
-        Arc::new(StatusStore::new()),
-    );
-    assert_eq!(
-        restarted.score_ip("example.com", ip),
-        demoted,
-        "the fresh engine must remember that this ip was blocked"
-    );
-}
-
-#[tokio::test]
 async fn a_timed_out_candidate_sinks_behind_an_untested_one() {
     let h = harness(&["example.com"], RoutePolicy::direct());
     *h.remote.catalog.lock() = true;
@@ -611,7 +588,6 @@ fn network_change_clears_network_scoped_state() {
     h.engine.record_ip("example.com", ip, Some(25), false);
     assert!(h.engine.route_rejected("example.com", TlsMode::Direct));
     assert!(h.engine.ip_rejected("example.com", ip));
-    assert_eq!(h.cache.ip_scores().len(), 1);
 
     h.engine.on_network_change();
 
@@ -631,10 +607,6 @@ fn network_change_clears_network_scoped_state() {
     assert!(
         h.engine.ip_scores.read().is_empty(),
         "quality scores describe the old network"
-    );
-    assert!(
-        h.cache.ip_scores().is_empty(),
-        "cleared scores must disappear from the shared cache"
     );
 }
 

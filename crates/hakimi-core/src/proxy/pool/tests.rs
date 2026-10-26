@@ -217,12 +217,10 @@ async fn a_real_block_page_penalizes_the_candidate_ip() {
         engine.cached_plan("upstream.test", port, false).is_none(),
         "the blocked route must be dropped"
     );
-    let scores = engine.cache.ip_scores();
-    let (_, _, entry) = scores
-        .iter()
-        .find(|(domain, ip, _)| domain == "upstream.test" && ip.to_string() == "127.0.0.1")
-        .expect("the blocked address should have a failure score");
-    assert!(entry.failures > 0);
+    assert!(
+        engine.ip_failures("upstream.test", "127.0.0.1".parse().unwrap()) > 0,
+        "the blocked address should have a failure score"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

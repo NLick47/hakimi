@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use http::StatusCode;
 
-use crate::cache::{CacheManager, IpScoreUpdate, LastGoodEntry};
+use crate::cache::{CacheManager, LastGoodEntry};
 use crate::catalog::RemoteIpProvider;
 use crate::config::{AppConfig, ConfigManager, EchSource, GroupConfig, RoutePolicy};
 use crate::domain::normalize_hostname;
@@ -100,20 +100,8 @@ impl DecisionEngine {
         prober: Arc<dyn Prober>,
         status: Arc<StatusStore>,
     ) -> Arc<Self> {
-        // Scores live in memory only; seed from the cache so a second engine
-        // over the same cache sees the same table.
-        let mut seeded_scores: HashMap<String, HashMap<IpAddr, IpScore>> = HashMap::new();
-        for (domain, ip, entry) in cache.ip_scores() {
-            seeded_scores.entry(domain).or_default().insert(
-                ip,
-                IpScore {
-                    ewma_ms: entry.ewma_ms,
-                    successes: entry.successes,
-                    failures: entry.failures,
-                },
-            );
-        }
-        let ip_score_count = seeded_scores.values().map(|by_ip| by_ip.len()).sum();
+        // Quality scores are learned per process: they describe the path this
+        // run actually measured, so nothing is carried over from a restart.
         Arc::new(Self {
             config,
             cache,
@@ -122,8 +110,8 @@ impl DecisionEngine {
             prober,
             status,
             plan_cache: parking_lot::RwLock::new(HashMap::new()),
-            ip_scores: parking_lot::RwLock::new(seeded_scores),
-            ip_score_count: AtomicUsize::new(ip_score_count),
+            ip_scores: parking_lot::RwLock::new(HashMap::new()),
+            ip_score_count: AtomicUsize::new(0),
             plan_cache_count: AtomicUsize::new(0),
             route_rejections: parking_lot::RwLock::new(HashMap::new()),
             ip_rejections: parking_lot::RwLock::new(HashMap::new()),
@@ -659,7 +647,6 @@ impl DecisionEngine {
             scores.clear();
         }
         self.ip_score_count.store(0, Ordering::Relaxed);
-        self.cache.clear_ip_scores();
     }
 
     pub fn forget_plan(&self, domain: &str, port: u16, tls: bool) {
@@ -698,6 +685,16 @@ impl DecisionEngine {
             .unwrap_or(UNSEEN_RANK)
     }
 
+    #[cfg(test)]
+    pub(crate) fn ip_failures(&self, domain: &str, ip: IpAddr) -> u32 {
+        self.ip_scores
+            .read()
+            .get(domain)
+            .and_then(|by_ip| by_ip.get(&ip))
+            .map(|score| score.failures)
+            .unwrap_or(0)
+    }
+
     /// Score a cursor's candidate list under one read lock. A cold route can
     /// have several candidates; taking the score lock once per candidate adds
     /// avoidable synchronization to every new connection.
@@ -715,6 +712,9 @@ impl DecisionEngine {
             .collect()
     }
 
+    /// Update the in-memory quality table and report whether the proven route
+    /// degraded. Nothing here touches the cache: a sample is relearned in a few
+    /// connections and must never reach the disk.
     pub(super) fn record_ip(
         &self,
         domain: &str,
@@ -722,108 +722,78 @@ impl DecisionEngine {
         latency_ms: Option<u64>,
         failed: bool,
     ) -> bool {
-        let (degraded, score) = self.record_ip_in_memory(domain, ip, latency_ms, failed);
-        // The quality sample stays in memory; it is relearned in a few
-        // connections and must not schedule a disk write.
-        self.cache.record_outcome(None, score);
-        degraded
-    }
-
-    /// Update the in-memory quality table and hand the sample back so the
-    /// caller can store it together with the rest of the outcome.
-    pub(super) fn record_ip_in_memory<'a>(
-        &self,
-        domain: &'a str,
-        ip: IpAddr,
-        latency_ms: Option<u64>,
-        failed: bool,
-    ) -> (bool, Option<IpScoreUpdate<'a>>) {
-        let (snapshot, degraded) = {
-            let mut scores = self.ip_scores.write();
-            let (is_new, snapshot, degraded) = {
-                // Most outcomes update a domain that is already known; avoid
-                // allocating a fresh key until the entry is actually missing.
-                let by_ip = match scores.get_mut(domain) {
-                    Some(by_ip) => by_ip,
-                    None => scores.entry(domain.to_string()).or_default(),
-                };
-                let is_new = !by_ip.contains_key(&ip);
-                let entry = by_ip.entry(ip).or_default();
-                let degraded;
-                if failed {
-                    entry.failures += 1;
-                    entry.ewma_ms = if entry.ewma_ms == 0.0 {
-                        10_000.0
-                    } else {
-                        entry.ewma_ms * 0.7 + 10_000.0 * 0.3
-                    };
-                    degraded = false;
-                } else {
-                    entry.successes += 1;
-                    // Pay down the failure history with each real success. Without
-                    // this an IP that ever failed stays in `reprobe_failed_ips`
-                    // forever, so the same addresses get re-probed every minute for
-                    // the whole session even after they recovered.
-                    entry.failures = entry.failures.saturating_sub(1);
-                    let sample = latency_ms.unwrap_or(500) as f64;
-                    // A sample far worse than the established average means the proven route
-                    // degraded (network flap, congestion). Signal the caller to re-race.
-                    degraded = entry.successes > 2
-                        && sample > 800.0
-                        && entry.ewma_ms > 0.0
-                        && sample > entry.ewma_ms * 2.5;
-                    entry.ewma_ms = if entry.successes == 1 {
-                        sample
-                    } else {
-                        entry.ewma_ms * 0.7 + sample * 0.3
-                    };
-                }
-                (
-                    is_new,
-                    (entry.ewma_ms, entry.successes, entry.failures),
-                    degraded,
-                )
+        let mut scores = self.ip_scores.write();
+        let (is_new, degraded) = {
+            // Most outcomes update a domain that is already known; avoid
+            // allocating a fresh key until the entry is actually missing.
+            let by_ip = match scores.get_mut(domain) {
+                Some(by_ip) => by_ip,
+                None => scores.entry(domain.to_string()).or_default(),
             };
-            if is_new {
-                self.ip_score_count.fetch_add(1, Ordering::Relaxed);
+            let is_new = !by_ip.contains_key(&ip);
+            let entry = by_ip.entry(ip).or_default();
+            let degraded;
+            if failed {
+                entry.failures += 1;
+                entry.ewma_ms = if entry.ewma_ms == 0.0 {
+                    10_000.0
+                } else {
+                    entry.ewma_ms * 0.7 + 10_000.0 * 0.3
+                };
+                degraded = false;
+            } else {
+                entry.successes += 1;
+                // Pay down the failure history with each real success. Without
+                // this an IP that ever failed stays in `reprobe_failed_ips`
+                // forever, so the same addresses get re-probed every minute for
+                // the whole session even after they recovered.
+                entry.failures = entry.failures.saturating_sub(1);
+                let sample = latency_ms.unwrap_or(500) as f64;
+                // A sample far worse than the established average means the proven route
+                // degraded (network flap, congestion). Signal the caller to re-race.
+                degraded = entry.successes > 2
+                    && sample > 800.0
+                    && entry.ewma_ms > 0.0
+                    && sample > entry.ewma_ms * 2.5;
+                entry.ewma_ms = if entry.successes == 1 {
+                    sample
+                } else {
+                    entry.ewma_ms * 0.7 + sample * 0.3
+                };
             }
-            // Bounded map: when full, drop the least valuable entries — the ones
-            // with the worst measured quality — instead of wiping everything. A
-            // flood of dead IPs must never erase knowledge of a proven route.
-            let total = self.ip_score_count.load(Ordering::Relaxed);
-            if total > IP_SCORE_CAP {
-                let mut ranked: Vec<((String, IpAddr), f64)> = scores
-                    .iter()
-                    .flat_map(|(domain, by_ip)| {
-                        by_ip
-                            .iter()
-                            .map(|(ip, score)| ((domain.clone(), *ip), score.rank()))
-                    })
-                    .collect();
-                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let mut removed = 0usize;
-                for ((domain, ip), _) in ranked.into_iter().take(total - IP_SCORE_PRUNE_TO) {
-                    if let Some(by_ip) = scores.get_mut(&domain) {
-                        if by_ip.remove(&ip).is_some() {
-                            removed += 1;
-                        }
-                        if by_ip.is_empty() {
-                            scores.remove(&domain);
-                        }
+            (is_new, degraded)
+        };
+        if is_new {
+            self.ip_score_count.fetch_add(1, Ordering::Relaxed);
+        }
+        // Bounded map: when full, drop the least valuable entries — the ones
+        // with the worst measured quality — instead of wiping everything. A
+        // flood of dead IPs must never erase knowledge of a proven route.
+        let total = self.ip_score_count.load(Ordering::Relaxed);
+        if total > IP_SCORE_CAP {
+            let mut ranked: Vec<((String, IpAddr), f64)> = scores
+                .iter()
+                .flat_map(|(domain, by_ip)| {
+                    by_ip
+                        .iter()
+                        .map(|(ip, score)| ((domain.clone(), *ip), score.rank()))
+                })
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let mut removed = 0usize;
+            for ((domain, ip), _) in ranked.into_iter().take(total - IP_SCORE_PRUNE_TO) {
+                if let Some(by_ip) = scores.get_mut(&domain) {
+                    if by_ip.remove(&ip).is_some() {
+                        removed += 1;
+                    }
+                    if by_ip.is_empty() {
+                        scores.remove(&domain);
                     }
                 }
-                self.ip_score_count.fetch_sub(removed, Ordering::Relaxed);
             }
-            (snapshot, degraded)
-        };
-        let score = IpScoreUpdate {
-            domain,
-            ip,
-            ewma_ms: snapshot.0,
-            successes: snapshot.1,
-            failures: snapshot.2,
-        };
-        (degraded, Some(score))
+            self.ip_score_count.fetch_sub(removed, Ordering::Relaxed);
+        }
+        degraded
     }
 
     /// Store a plan that is already shared. The plan cache keeps the same
@@ -1024,19 +994,14 @@ impl DecisionEngine {
             attempts: Vec::new(),
             suggestions: Vec::new(),
         });
-        let (degraded, score) =
-            self.record_ip_in_memory(&plan.domain, plan.ip, Some(latency_ms), false);
-        // One cache write for the route and the quality sample.
-        self.cache.record_outcome(
-            Some(LastGoodEntry {
-                domain: plan.domain.clone(),
-                ip: plan.ip,
-                source: plan.source,
-                saved_at: now(),
-                catalog_version: config.catalog_version,
-            }),
-            score,
-        );
+        let degraded = self.record_ip(&plan.domain, plan.ip, Some(latency_ms), false);
+        self.cache.put_last_good(LastGoodEntry {
+            domain: plan.domain.clone(),
+            ip: plan.ip,
+            source: plan.source,
+            saved_at: now(),
+            catalog_version: config.catalog_version,
+        });
         self.remember_plan_arc(plan.clone());
         if degraded {
             // The proven route suddenly got slow: drop the cached plan so the next
