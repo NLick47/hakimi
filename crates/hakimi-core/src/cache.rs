@@ -78,7 +78,7 @@ impl CachedAnswer {
 #[serde(rename_all = "camelCase")]
 pub struct CachedEch {
     pub domain: String,
-    pub ech_config: String,
+    pub ech_config: Vec<u8>,
     pub ttl_secs: u32,
     pub fetched_at: DateTime<Utc>,
 }

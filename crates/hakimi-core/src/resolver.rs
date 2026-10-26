@@ -354,11 +354,8 @@ impl Resolver {
 
     fn fresh_ech(&self, domain: &str) -> Result<Option<EchOutcome>> {
         if let Some(cached) = self.cache.ech(domain, true) {
-            let config = base64::engine::general_purpose::STANDARD
-                .decode(&cached.ech_config)
-                .context("decoding cached ECH config")?;
             return Ok(Some(EchOutcome {
-                config,
+                config: cached.ech_config,
                 source: DohSource::Cache,
                 endpoint: None,
                 stale: false,
@@ -607,7 +604,7 @@ impl Resolver {
                 if let Some(ech) = query.answer.ech {
                     self.cache.put_ech(CachedEch {
                         domain: domain.clone(),
-                        ech_config: base64::engine::general_purpose::STANDARD.encode(&ech),
+                        ech_config: ech.clone(),
                         ttl_secs: query.answer.ttl,
                         fetched_at: now(),
                     });
@@ -632,8 +629,7 @@ impl Resolver {
                     // decisions for this host skip the (always empty) HTTPS RR query.
                     self.cache.put_ech(CachedEch {
                         domain: domain.clone(),
-                        ech_config: base64::engine::general_purpose::STANDARD
-                            .encode(&outcome.config),
+                        ech_config: outcome.config.clone(),
                         ttl_secs: SHARED_ECH_TTL_SECS,
                         fetched_at: now(),
                     });
@@ -655,9 +651,7 @@ impl Resolver {
         // last resort when the live query (or one endpoint in the pair) failed.
         if live_failed {
             if let Some(cached) = self.cache.ech(&domain, false) {
-                let config = base64::engine::general_purpose::STANDARD
-                    .decode(&cached.ech_config)
-                    .context("decoding cached ECH config")?;
+                let config = cached.ech_config;
                 tracing::warn!(
                     domain = %domain,
                     error = ?live_error,
@@ -684,9 +678,7 @@ impl Resolver {
     async fn shared_cloudflare_ech(&self) -> Result<EchOutcome> {
         let _guard = self.shared_ech_lock.lock().await;
         if let Some(cached) = self.cache.ech(SHARED_ECH_DOMAIN, true) {
-            let config = base64::engine::general_purpose::STANDARD
-                .decode(&cached.ech_config)
-                .context("decoding cached shared ECH config")?;
+            let config = cached.ech_config;
             return Ok(EchOutcome {
                 config,
                 source: DohSource::Cache,
@@ -702,7 +694,7 @@ impl Resolver {
                 if let Some(ech) = query.answer.ech {
                     self.cache.put_ech(CachedEch {
                         domain: SHARED_ECH_DOMAIN.to_string(),
-                        ech_config: base64::engine::general_purpose::STANDARD.encode(&ech),
+                        ech_config: ech.clone(),
                         ttl_secs: query.answer.ttl.max(SHARED_ECH_TTL_SECS),
                         fetched_at: now(),
                     });
@@ -735,7 +727,7 @@ impl Resolver {
                 if let Some(ech) = answer.ech {
                     self.cache.put_ech(CachedEch {
                         domain: SHARED_ECH_DOMAIN.to_string(),
-                        ech_config: base64::engine::general_purpose::STANDARD.encode(&ech),
+                        ech_config: ech.clone(),
                         ttl_secs: answer.ttl.max(SHARED_ECH_TTL_SECS),
                         fetched_at: now(),
                     });
@@ -1022,7 +1014,7 @@ impl Resolver {
             if let Some(ech) = &answer.ech {
                 self.cache.put_ech(CachedEch {
                     domain: domain.to_string(),
-                    ech_config: base64::engine::general_purpose::STANDARD.encode(ech),
+                    ech_config: ech.clone(),
                     ttl_secs: answer.ttl,
                     fetched_at: now(),
                 });

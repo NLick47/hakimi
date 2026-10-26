@@ -343,9 +343,10 @@ pub(super) async fn race_tcp_plans(
     cached_plan: Option<Arc<ConnectPlan>>,
     timeout: Duration,
 ) -> Option<(Arc<ConnectPlan>, TcpStream, u64)> {
-    type RaceResult = Result<(ConnectPlan, TcpStream, u64), (ConnectPlan, FailureReason, String)>;
+    type RaceResult =
+        Result<(Arc<ConnectPlan>, TcpStream, u64), (Arc<ConnectPlan>, FailureReason, String)>;
     enum Event {
-        Plan(Option<ConnectPlan>),
+        Plan(Option<Arc<ConnectPlan>>),
         Result(RaceResult),
     }
 
@@ -363,7 +364,7 @@ pub(super) async fn race_tcp_plans(
     // per-candidate timeout before even starting the fallback.
     if let Some(plan) = cached_plan {
         let address = SocketAddr::new(plan.ip, plan.port);
-        let failed_plan = plan.clone();
+        let failed_plan = Arc::clone(&plan);
         pending.push(Box::pin(async move {
             let started = Instant::now();
             match tokio::time::timeout(timeout, TcpStream::connect(address)).await {
@@ -371,18 +372,18 @@ pub(super) async fn race_tcp_plans(
                     let _ = stream.set_nodelay(true);
                     crate::util::apply_tcp_keepalive(&stream);
                     Ok((
-                        (*plan).clone(),
+                        plan,
                         stream,
                         started.elapsed().as_millis() as u64,
                     ))
                 }
                 Ok(Err(error)) => Err((
-                    (*failed_plan).clone(),
+                    failed_plan,
                     FailureReason::TcpRefused,
                     format!("connecting to {address} failed: {error}"),
                 )),
                 Err(_) => Err((
-                    (*failed_plan).clone(),
+                    failed_plan,
                     FailureReason::TcpTimeout,
                     format!("connecting to {address} timed out"),
                 )),
@@ -394,7 +395,7 @@ pub(super) async fn race_tcp_plans(
     loop {
         let event = if !exhausted && pending.len() < RAW_RACE_SIZE {
             tokio::select! {
-                plan = cursor.next_plan() => Event::Plan(plan),
+                plan = cursor.next_plan() => Event::Plan(plan.map(Arc::new)),
                 Some(result) = pending.next(), if !pending.is_empty() => Event::Result(result),
             }
         } else if !pending.is_empty() {
@@ -452,7 +453,7 @@ pub(super) async fn race_tcp_plans(
             }
             Event::Plan(None) => exhausted = true,
             Event::Result(result) => match result {
-                Ok((plan, stream, latency)) => return Some((Arc::new(plan), stream, latency)),
+                Ok((plan, stream, latency)) => return Some((plan, stream, latency)),
                 Err((plan, reason, detail)) => {
                     cursor.forget_plan(&plan);
                     cursor.note_failure(&plan, reason, detail);
@@ -491,6 +492,44 @@ pub(super) async fn connect_tcp_upstream(
     }
 }
 
+/// RFC 8305: 首选地址族保持首位, 两族交替排布
+/// 黑洞的 AAAA 不会挡住排在后面的全部 IPv4
+pub(super) fn interleave_by_family<T, F>(items: Vec<T>, is_preferred_family: F) -> Vec<T>
+where
+    F: Fn(&T) -> bool,
+{
+    if items.len() < 3 {
+        return items;
+    }
+    let preferred_first = is_preferred_family(&items[0]);
+    let mut preferred = Vec::new();
+    let mut other = Vec::new();
+    for item in items {
+        if is_preferred_family(&item) == preferred_first {
+            preferred.push(item);
+        } else {
+            other.push(item);
+        }
+    }
+    let mut preferred = preferred.into_iter();
+    let mut other = other.into_iter();
+    let mut out = Vec::new();
+    out.extend(preferred.next());
+    loop {
+        match other.next() {
+            Some(item) => out.push(item),
+            None => break,
+        }
+        match preferred.next() {
+            Some(item) => out.push(item),
+            None => break,
+        }
+    }
+    out.extend(preferred);
+    out.extend(other);
+    out
+}
+
 /// Race the addresses `host` resolves to with a Happy-Eyeballs-style staggered start.
 /// `TcpStream::connect((host, port))` walks the addresses one at a time, so a black-holed
 /// IPv6 route can stall a direct tunnel for the whole connect timeout before IPv4 is tried.
@@ -512,7 +551,7 @@ pub(super) async fn connect_host_staggered(
             return Err((true, format!("resolving {host}:{port} timed out")));
         }
     };
-    let addresses = resolved;
+    let addresses = interleave_by_family(resolved, |address| address.is_ipv4());
     if addresses.is_empty() {
         return Err((false, format!("no address found for {host}")));
     }

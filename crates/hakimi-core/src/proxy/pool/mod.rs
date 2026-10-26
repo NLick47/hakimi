@@ -1035,8 +1035,10 @@ impl RouteConnector {
         .await
         .map_err(|_| anyhow!("resolving {host}:{port} timed out"))?
         .with_context(|| format!("resolving {host}:{port}"))?;
-        let addresses: Vec<std::net::IpAddr> =
-            resolved.iter().map(|address| address.ip()).collect();
+        let addresses: Vec<std::net::IpAddr> = super::connect::interleave_by_family(
+            resolved.iter().map(|address| address.ip()).collect(),
+            std::net::IpAddr::is_ipv4,
+        );
         // Staggered race across resolved addresses (Happy-Eyeballs style): a black-holed
         // IPv6 route no longer delays the IPv4 fallback by a full timeout.
         let mut index = 0;
