@@ -217,9 +217,10 @@ impl Default for AdvancedConfig {
             upstream_idle_secs: 120,
             upstream_max_idle_per_host: 8,
             http1_hosts: vec![
-                // pximg origins advertise h2 but throttle per connection; parallel h1
-                // connections each get their own TCP window and are faster in aggregate.
-                "*.pximg.net".to_string(),
+                // i.pximg.net 与 booth.pximg.net 是图片 CDN 并行 h1 聚合带宽
+                // s.pximg.net 承载 JS/CSS 走 h2 多路复用省掉握手风暴
+                "i.pximg.net".to_string(),
+                "booth.pximg.net".to_string(),
                 "img.poipiku.com".to_string(),
                 "cdn.poipiku.com".to_string(),
             ],
@@ -1238,7 +1239,13 @@ mod tests {
             .advanced
             .http1_hosts
             .iter()
-            .any(|pattern| pattern == "*.pximg.net"));
+            .any(|pattern| pattern == "i.pximg.net"));
+        // s.pximg.net 承载 JS/CSS 必须留在 h2 池
+        assert!(config
+            .advanced
+            .http1_hosts
+            .iter()
+            .all(|pattern| pattern != "s.pximg.net" && pattern != "*.pximg.net"));
         assert_eq!(
             config.group("github").unwrap().primary_domain(),
             Some("github.com")
