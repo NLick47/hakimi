@@ -35,14 +35,12 @@ rand = "0.9"
 rcgen = { version = "0.13", default-features = false, features = [
     "aws_lc_rs",
     "pem",
-    "x509-parser",
 ] }
 # `no-provider` keeps rustls on the single aws-lc-rs provider instead of also
 # compiling ring; hakimi-core installs aws-lc-rs as the process default.
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls-webpki-roots-no-provider",
     "http2",
-    "json",
 ] }
 rustls = { version = "0.23", default-features = false, features = [
     "aws_lc_rs",

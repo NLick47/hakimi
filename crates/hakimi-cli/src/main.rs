@@ -357,7 +357,8 @@ async fn try_live_status(runtime: &HakimiRuntime) -> Option<Value> {
         .build()
         .ok()?;
     let value: Value = tokio::time::timeout(Duration::from_millis(800), async {
-        client.get(url).send().await.ok()?.json().await.ok()
+        let text = client.get(url).send().await.ok()?.text().await.ok()?;
+        serde_json::from_str(&text).ok()
     })
     .await
     .ok()??;

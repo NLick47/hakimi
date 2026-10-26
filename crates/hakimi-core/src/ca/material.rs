@@ -114,17 +114,17 @@ pub(super) fn load_material(
     let key_pem = decode_key_file(&key_bytes)?;
     let key = KeyPair::from_pem(&key_pem)
         .with_context(|| format!("parsing CA key {}", key_path.display()))?;
-    let params = CertificateParams::from_ca_cert_pem(&pem)
-        .with_context(|| format!("parsing CA certificate {}", cert_path.display()))?;
-    let not_before = params.not_before.to_string();
-    let not_after = params.not_after.to_string();
-    // `signed_by` needs a Certificate for issuer parameters. Re-signing with the same key and
-    // loaded parameters reproduces the issuer DN / key identifier used by the installed CA.
+    let original_der = pem_to_der(&pem)?;
+    let (_, certificate) = x509_parser::parse_x509_certificate(&original_der)
+        .map_err(|error| anyhow::anyhow!("parsing CA certificate: {error}"))?;
+    let subject = parse_subject(&original_der)?;
+    let params = issuer_params_from(&certificate)?;
+    // `self_signed` 用同一把 CA 私钥重签解析出的参数，得到签名 leaf 时的 issuer 模板
     let issuer = params
         .self_signed(&key)
         .context("reconstructing CA issuer parameters")?;
-    let original_der = pem_to_der(&pem)?;
-    let subject = parse_subject(&original_der)?;
+    let not_before = certificate.validity().not_before.to_datetime().to_string();
+    let not_after = certificate.validity().not_after.to_datetime().to_string();
     Ok(CaMaterial {
         issuer,
         key,
@@ -136,6 +136,36 @@ pub(super) fn load_material(
         not_before,
         not_after,
     })
+}
+
+/// 从解析出的 CA 证书重建自签参数
+/// hakimi 签发的 CA 只含 CN，重建时同样只取 CN，有效期沿用原证书
+fn issuer_params_from(
+    certificate: &x509_parser::certificate::X509Certificate<'_>,
+) -> Result<CertificateParams> {
+    let mut params = CertificateParams::default();
+    let mut cn_count = 0;
+    for attr in certificate.subject().iter_common_name() {
+        let value = attr
+            .attr_value()
+            .as_str()
+            .context("CA subject CN is not a string")?;
+        params.distinguished_name.push(DnType::CommonName, value);
+        cn_count += 1;
+    }
+    if cn_count == 0 {
+        bail!("CA certificate has no common name");
+    }
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    params.use_authority_key_identifier_extension = true;
+    params.not_before = certificate.validity().not_before.to_datetime();
+    params.not_after = certificate.validity().not_after.to_datetime();
+    Ok(params)
 }
 
 fn material_from_parts(issuer: Certificate, key: KeyPair) -> CaMaterial {

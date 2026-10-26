@@ -57,10 +57,12 @@ pub async fn check() -> Result<CheckOutcome> {
     if !status.is_success() {
         bail!("GitHub returned HTTP {}", status.as_u16());
     }
-    let body: Value = response
-        .json()
+    let text = response
+        .text()
         .await
-        .context("decoding the update manifest")?;
+        .context("reading the update manifest")?;
+    let body: Value =
+        serde_json::from_str(&text).context("decoding the update manifest")?;
     parse_manifest(&body, current_version())
 }
 

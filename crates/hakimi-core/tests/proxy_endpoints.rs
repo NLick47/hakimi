@@ -86,8 +86,10 @@ async fn serves_pac_and_status_endpoints() {
         .send()
         .await
         .unwrap()
-        .json()
+        .text()
         .await
+        .map(|text| serde_json::from_str(&text))
+        .unwrap()
         .unwrap();
     assert_eq!(status["test"], true);
     assert!(
@@ -100,8 +102,10 @@ async fn serves_pac_and_status_endpoints() {
         .send()
         .await
         .unwrap()
-        .json()
+        .text()
         .await
+        .map(|text| serde_json::from_str(&text))
+        .unwrap()
         .unwrap();
     assert_eq!(status["test"], true);
     assert!(

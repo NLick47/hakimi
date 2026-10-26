@@ -545,7 +545,7 @@ async fn authoritative_https_nodata_does_not_reuse_stale_ech() {
     let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
     cache.put_ech(CachedEch {
         domain: "example.com".into(),
-        ech_config: base64::engine::general_purpose::STANDARD.encode([1, 2, 3]),
+        ech_config: vec![1, 2, 3],
         ttl_secs: 1,
         fetched_at: now() - chrono::Duration::hours(2),
     });
