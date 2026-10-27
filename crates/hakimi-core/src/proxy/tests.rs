@@ -564,3 +564,40 @@ fn only_direct_groups_may_use_the_cached_direct_tunnel() {
         TlsMode::Ech
     ));
 }
+
+#[test]
+#[ignore = "micro benchmark"]
+fn bench_proxy_body_construction() {
+    use http_body_util::{BodyExt, Full};
+    use std::hint::black_box;
+
+    let data = Bytes::from_static(b"ok");
+    let uri: http::Uri = "https://example.com/assets/app.js?v=2".parse().unwrap();
+    crate::bench::measure("proxy.uri.clone", 5_000_000, || {
+        black_box(uri.clone());
+    });
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("https://example.com/assets/app.js?v=2")
+        .header("user-agent", "Mozilla/5.0")
+        .header("accept", "*/*")
+        .header("accept-encoding", "gzip, deflate, br")
+        .header("cookie", "session=0123456789abcdef")
+        .header("referer", "https://example.com/")
+        .header("connection", "keep-alive")
+        .body(())
+        .unwrap();
+    let parts = request.into_parts().0;
+    crate::bench::measure("proxy.parts.clone", 2_000_000, || {
+        black_box(parts.clone());
+    });
+    crate::bench::measure("proxy.body.enum", 2_000_000, || {
+        black_box(ProxyBody::full(data.clone()));
+    });
+    crate::bench::measure("proxy.body.boxed", 2_000_000, || {
+        let body = Full::new(data.clone())
+            .map_err(|never| -> BoxError { match never {} })
+            .boxed_unsync();
+        black_box(body);
+    });
+}

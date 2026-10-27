@@ -364,6 +364,83 @@ async fn a_stalled_pooled_connection_is_hedged_on_a_fresh_one() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hedged_request_still_obeys_the_header_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_task = accepted.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let index = accepted_task.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 8192];
+                if socket.read(&mut buffer).await.is_err() {
+                    return;
+                }
+                if index == 0 {
+                    // The first request on the pooled connection succeeds, so
+                    // the next send goes through the hedge path. From then on
+                    // this connection and every fresh one stay silent.
+                    if socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\
+                              Connection: keep-alive\r\n\r\nok",
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                let _ = socket.read(&mut buffer).await;
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            });
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, config) = engine_for(dir.path());
+    // The manager validates 5..600s; bypass the manager for a fast test of the
+    // timer itself. The pool only consumes the snapshot.
+    let mut snapshot = (*config.snapshot()).clone();
+    snapshot.advanced.upstream_header_timeout_secs = 1;
+    let tls = TlsContext::new().unwrap();
+    let pool = UpstreamPool::new(engine, tls, &snapshot);
+
+    let request = |path: &str| {
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("http://upstream.test:{port}{path}"))
+            .body(Either::Right(Full::new(Bytes::new())))
+            .unwrap()
+    };
+    let first = pool.send(request("/one"), false).await.unwrap();
+    let body = first.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"ok");
+
+    let started = std::time::Instant::now();
+    let result = pool.send(request("/two"), false).await;
+    let elapsed = started.elapsed();
+    assert!(
+        result.is_err(),
+        "both the original and the hedged connection stalled"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "the single hedge/timeout timer did not fire: {elapsed:?}"
+    );
+    assert_eq!(pool.stats_json()["hedgedRetries"], 1);
+    assert_eq!(pool.stats_json()["requestErrors"], 1);
+    assert!(
+        accepted.load(Ordering::SeqCst) >= 2,
+        "the hedge must open a fresh connection before timing out"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http1_connections_are_reused() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

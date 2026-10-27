@@ -4,7 +4,6 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use http::uri::{Authority, PathAndQuery, Scheme, Uri};
 use http::{header, HeaderMap, HeaderName, Request, Response, StatusCode};
-use http_body_util::BodyExt;
 use http_body_util::Either;
 use hyper::body::Incoming;
 use hyper::upgrade::{self, OnUpgrade};
@@ -242,12 +241,7 @@ pub(crate) async fn handle_mitm_request(
         .path_and_query()
         .cloned()
         .unwrap_or_else(|| PathAndQuery::from_static("/"));
-    let upstream_uri = match Uri::builder()
-        .scheme(Scheme::HTTPS)
-        .authority(target.authority.clone())
-        .path_and_query(path_and_query)
-        .build()
-    {
+    let upstream_uri = match build_mitm_uri(&target, path_and_query) {
         Ok(uri) => uri,
         Err(error) => {
             return super::error_response(
@@ -422,7 +416,7 @@ async fn forward_with_uri(
 
     let mut response = ctx
         .upstream
-        .send(upstream_request, upgrade_requested)
+        .send_with_uri(upstream_request, upgrade_requested, &response_uri)
         .await
         .map_err(|error| format!("upstream request to {host}:{port} failed: {error}"))?;
 
@@ -466,18 +460,7 @@ fn into_proxy_response(
     let status = response.status();
     sanitize_response_headers(response.headers_mut(), upgrade);
     let (parts, body) = response.into_parts();
-    let body = body
-        .map_err(move |error| -> super::BoxError {
-            tracing::warn!(
-                host = uri.host().unwrap_or(""),
-                status = status.as_u16(),
-                error = %error,
-                "upstream response body failed"
-            );
-            Box::new(error)
-        })
-        .boxed_unsync();
-    Response::from_parts(parts, body)
+    Response::from_parts(parts, ProxyBody::upstream(body, uri, status))
 }
 
 /// `HeaderName::from_static` does not allocate, while removing a header by
@@ -485,41 +468,75 @@ fn into_proxy_response(
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 
-fn sanitize_request_headers(headers: &mut HeaderMap, upgrade: bool) {
-    for name in [
-        header::CONNECTION,
-        header::PROXY_AUTHENTICATE,
-        header::PROXY_AUTHORIZATION,
-        header::TE,
-        header::TRAILER,
-        header::TRANSFER_ENCODING,
-        header::UPGRADE,
-        header::HOST,
-    ] {
-        if !(upgrade && (name == header::CONNECTION || name == header::UPGRADE)) {
-            headers.remove(name);
-        }
+const HOP_CONNECTION: u16 = 1 << 0;
+const HOP_PROXY_AUTHENTICATE: u16 = 1 << 1;
+const HOP_PROXY_AUTHORIZATION: u16 = 1 << 2;
+const HOP_TE: u16 = 1 << 3;
+const HOP_TRAILER: u16 = 1 << 4;
+const HOP_TRANSFER_ENCODING: u16 = 1 << 5;
+const HOP_UPGRADE: u16 = 1 << 6;
+const HOP_HOST: u16 = 1 << 7;
+const HOP_KEEP_ALIVE: u16 = 1 << 8;
+const HOP_PROXY_CONNECTION: u16 = 1 << 9;
+
+/// Remove hop-by-hop headers in one pass over the existing names. The old
+/// implementation issued ten hash lookups per request even when none of these
+/// headers were present, which is the normal browser case.
+fn sanitize_hop_by_hop(headers: &mut HeaderMap, upgrade: bool, remove_host: bool) {
+    let mut present = 0u16;
+    for name in headers.keys() {
+        present |= match name.as_str() {
+            "connection" => HOP_CONNECTION,
+            "proxy-authenticate" => HOP_PROXY_AUTHENTICATE,
+            "proxy-authorization" => HOP_PROXY_AUTHORIZATION,
+            "te" => HOP_TE,
+            "trailer" => HOP_TRAILER,
+            "transfer-encoding" => HOP_TRANSFER_ENCODING,
+            "upgrade" => HOP_UPGRADE,
+            "host" => HOP_HOST,
+            "keep-alive" => HOP_KEEP_ALIVE,
+            "proxy-connection" => HOP_PROXY_CONNECTION,
+            _ => 0,
+        };
     }
-    headers.remove(&KEEP_ALIVE);
-    headers.remove(&PROXY_CONNECTION);
+    if present & HOP_CONNECTION != 0 && !upgrade {
+        headers.remove(header::CONNECTION);
+    }
+    if present & HOP_PROXY_AUTHENTICATE != 0 {
+        headers.remove(header::PROXY_AUTHENTICATE);
+    }
+    if present & HOP_PROXY_AUTHORIZATION != 0 {
+        headers.remove(header::PROXY_AUTHORIZATION);
+    }
+    if present & HOP_TE != 0 {
+        headers.remove(header::TE);
+    }
+    if present & HOP_TRAILER != 0 {
+        headers.remove(header::TRAILER);
+    }
+    if present & HOP_TRANSFER_ENCODING != 0 {
+        headers.remove(header::TRANSFER_ENCODING);
+    }
+    if present & HOP_UPGRADE != 0 && !upgrade {
+        headers.remove(header::UPGRADE);
+    }
+    if remove_host && present & HOP_HOST != 0 {
+        headers.remove(header::HOST);
+    }
+    if present & HOP_KEEP_ALIVE != 0 {
+        headers.remove(&KEEP_ALIVE);
+    }
+    if present & HOP_PROXY_CONNECTION != 0 {
+        headers.remove(&PROXY_CONNECTION);
+    }
+}
+
+fn sanitize_request_headers(headers: &mut HeaderMap, upgrade: bool) {
+    sanitize_hop_by_hop(headers, upgrade, true);
 }
 
 fn sanitize_response_headers(headers: &mut HeaderMap, upgrade: bool) {
-    for name in [
-        header::CONNECTION,
-        header::PROXY_AUTHENTICATE,
-        header::PROXY_AUTHORIZATION,
-        header::TE,
-        header::TRAILER,
-        header::TRANSFER_ENCODING,
-        header::UPGRADE,
-    ] {
-        if !(upgrade && (name == header::CONNECTION || name == header::UPGRADE)) {
-            headers.remove(name);
-        }
-    }
-    headers.remove(&KEEP_ALIVE);
-    headers.remove(&PROXY_CONNECTION);
+    sanitize_hop_by_hop(headers, upgrade, false);
 }
 
 fn authority(host: &str, port: u16, https: bool) -> Cow<'_, str> {
@@ -552,6 +569,19 @@ fn build_upstream_uri(
         .authority(authority(host, port, https).as_ref())
         .path_and_query(path_and_query.clone())
         .build()
+}
+
+/// MITM requests reuse the connection's parsed authority; assembling the
+/// `Uri` from parts skips re-validating the host on every request.
+fn build_mitm_uri(
+    target: &MitmTarget,
+    path_and_query: PathAndQuery,
+) -> std::result::Result<Uri, http::uri::InvalidUriParts> {
+    let mut parts = http::uri::Parts::default();
+    parts.scheme = Some(Scheme::HTTPS);
+    parts.authority = Some(target.authority.clone());
+    parts.path_and_query = Some(path_and_query);
+    Uri::from_parts(parts)
 }
 
 pub(crate) fn diagnostics_error_page(
@@ -664,10 +694,11 @@ fn attempt_row(attempt: &AttemptRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        authority, build_upstream_uri, host_header_name, is_upgrade, same_host,
-        sanitize_request_headers, target_host, target_of, MitmTarget, Target,
+        authority, build_mitm_uri, build_upstream_uri, host_header_name, is_upgrade, same_host,
+        sanitize_request_headers, sanitize_response_headers, target_host, target_of, MitmTarget,
+        Target,
     };
-    use http::uri::PathAndQuery;
+    use http::uri::{PathAndQuery, Scheme};
     use http::{HeaderMap, Request, Uri};
 
     fn host_of(target: &Target) -> &str {
@@ -694,11 +725,115 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_keeps_only_the_headers_needed_for_an_upgrade() {
+        let mut headers = HeaderMap::new();
+        for name in [
+            "connection",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "host",
+            "keep-alive",
+            "proxy-connection",
+            "content-type",
+        ] {
+            headers.insert(name, "x".parse().unwrap());
+        }
+        sanitize_request_headers(&mut headers, false);
+        for name in [
+            "connection",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "host",
+            "keep-alive",
+            "proxy-connection",
+        ] {
+            assert!(!headers.contains_key(name), "{name} must be removed");
+        }
+        assert_eq!(headers.get("content-type").unwrap(), "x");
+
+        let mut headers = HeaderMap::new();
+        for name in [
+            "connection",
+            "upgrade",
+            "host",
+            "keep-alive",
+            "proxy-connection",
+        ] {
+            headers.insert(name, "x".parse().unwrap());
+        }
+        sanitize_request_headers(&mut headers, true);
+        assert!(headers.contains_key("connection"));
+        assert!(headers.contains_key("upgrade"));
+        assert!(!headers.contains_key("host"));
+        assert!(!headers.contains_key("keep-alive"));
+        assert!(!headers.contains_key("proxy-connection"));
+
+        let mut response = HeaderMap::new();
+        response.insert("host", "origin.example".parse().unwrap());
+        response.insert("connection", "close".parse().unwrap());
+        sanitize_response_headers(&mut response, false);
+        assert!(!response.contains_key("connection"));
+        assert_eq!(response.get("host").unwrap(), "origin.example");
+
+        let mut response = HeaderMap::new();
+        response.insert("connection", "upgrade".parse().unwrap());
+        response.insert("upgrade", "websocket".parse().unwrap());
+        sanitize_response_headers(&mut response, true);
+        assert!(response.contains_key("connection"));
+        assert!(response.contains_key("upgrade"));
+    }
+
+    #[test]
     fn mitm_target_reuses_a_valid_authority() {
         let target = MitmTarget::new("example.com", 443).unwrap();
         assert_eq!(target.authority.as_str(), "example.com");
         let target = MitmTarget::new("example.com", 8443).unwrap();
         assert_eq!(target.authority.as_str(), "example.com:8443");
+    }
+
+    #[test]
+    #[ignore = "micro benchmark"]
+    fn bench_mitm_uri_build() {
+        let target = MitmTarget::new("example.com", 443).unwrap();
+        let path = PathAndQuery::from_static("/a/b?q=1");
+        crate::bench::measure("mitm.uri.from_parts", 500_000, || {
+            let _ = build_mitm_uri(&target, path.clone()).unwrap();
+        });
+        crate::bench::measure("mitm.uri.builder", 500_000, || {
+            let _ = Uri::builder()
+                .scheme(Scheme::HTTPS)
+                .authority(target.authority.clone())
+                .path_and_query(path.clone())
+                .build()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn mitm_uri_from_parts_matches_the_builder() {
+        let target = MitmTarget::new("example.com", 8443).unwrap();
+        let path = PathAndQuery::from_static("/a/b?q=1");
+        let built = build_mitm_uri(&target, path.clone()).unwrap();
+        let expected = Uri::builder()
+            .scheme(Scheme::HTTPS)
+            .authority("example.com:8443")
+            .path_and_query(path)
+            .build()
+            .unwrap();
+        assert_eq!(built, expected);
+        assert_eq!(built.scheme_str(), Some("https"));
+        assert_eq!(
+            built.authority().map(|value| value.as_str()),
+            Some("example.com:8443")
+        );
     }
 
     fn headers(upgrade: bool, connection: Option<&str>) -> HeaderMap {

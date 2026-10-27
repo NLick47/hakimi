@@ -12,14 +12,16 @@ pub(crate) use response::{error_response, escape_html, full_body, json_response,
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use http::{header, Method, Request, Response, StatusCode};
-use http_body_util::combinators::UnsyncBoxBody;
-use hyper::body::Incoming;
+use http_body_util::Full;
+use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -38,9 +40,98 @@ use crate::status::StatusStore;
 use crate::util::host_header_name;
 
 use self::connect::handle_connect;
+use self::pool::UpstreamResponseBody;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
-pub type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
+
+/// Response body returned by the proxy.
+///
+/// Keeping the three shapes in an enum avoids the per-response boxed body that
+/// the previous `UnsyncBoxBody` alias needed. Upstream bodies still stream
+/// directly and keep their per-host semaphore permit alive.
+pub struct ProxyBody {
+    kind: ProxyBodyKind,
+}
+
+enum ProxyBodyKind {
+    Upstream {
+        body: UpstreamResponseBody,
+        uri: http::Uri,
+        status: StatusCode,
+    },
+    Full(Full<Bytes>),
+    Empty,
+}
+
+impl ProxyBody {
+    pub(crate) fn empty() -> Self {
+        Self {
+            kind: ProxyBodyKind::Empty,
+        }
+    }
+
+    pub(crate) fn full(data: impl Into<Bytes>) -> Self {
+        Self {
+            kind: ProxyBodyKind::Full(Full::new(data.into())),
+        }
+    }
+
+    pub(crate) fn upstream(body: UpstreamResponseBody, uri: http::Uri, status: StatusCode) -> Self {
+        Self {
+            kind: ProxyBodyKind::Upstream { body, uri, status },
+        }
+    }
+}
+
+impl Body for ProxyBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match &mut self.get_mut().kind {
+            ProxyBodyKind::Upstream { body, uri, status } => match Pin::new(body).poll_frame(cx) {
+                Poll::Ready(Some(Err(error))) => {
+                    tracing::warn!(
+                        host = uri.host().unwrap_or(""),
+                        status = status.as_u16(),
+                        error = %error,
+                        "upstream response body failed"
+                    );
+                    Poll::Ready(Some(Err(Box::new(error))))
+                }
+                Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            },
+            ProxyBodyKind::Full(body) => match Pin::new(body).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+                Poll::Ready(Some(Err(never))) => match never {},
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            },
+            ProxyBodyKind::Empty => Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match &self.kind {
+            ProxyBodyKind::Upstream { body, .. } => body.is_end_stream(),
+            ProxyBodyKind::Full(body) => body.is_end_stream(),
+            ProxyBodyKind::Empty => true,
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match &self.kind {
+            ProxyBodyKind::Upstream { body, .. } => body.size_hint(),
+            ProxyBodyKind::Full(body) => body.size_hint(),
+            ProxyBodyKind::Empty => SizeHint::with_exact(0),
+        }
+    }
+}
 
 /// Per-direction buffer for upgraded/TCP tunnels. 64 KiB moves large responses
 /// with far fewer read/write syscalls than tokio's 8 KiB default while keeping

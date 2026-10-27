@@ -1,20 +1,15 @@
 use bytes::Bytes;
 use http::{header, Response, StatusCode};
-use http_body_util::{BodyExt, Empty, Full};
 
 use super::upstream;
-use super::{BoxError, ProxyBody};
+use super::ProxyBody;
 
 pub(crate) fn empty_body() -> ProxyBody {
-    Empty::<Bytes>::new()
-        .map_err(|never| -> BoxError { match never {} })
-        .boxed_unsync()
+    ProxyBody::empty()
 }
 
 pub(crate) fn full_body(data: impl Into<Bytes>) -> ProxyBody {
-    Full::new(data.into())
-        .map_err(|never| -> BoxError { match never {} })
-        .boxed_unsync()
+    ProxyBody::full(data)
 }
 
 pub(super) fn empty_response(status: StatusCode) -> Response<ProxyBody> {

@@ -17,7 +17,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -67,6 +67,13 @@ const HEDGE_AFTER: Duration = Duration::from_secs(5);
 pub(crate) type UpstreamResponse = Response<UpstreamResponseBody>;
 
 type ClientResult = std::result::Result<Response<Incoming>, hyper_util::client::legacy::Error>;
+
+/// Result of a hedged send. The timer that fires the hedge also becomes the
+/// header deadline, so there is only one timer per replayed request.
+enum SendOutcome {
+    Response(ClientResult),
+    HeaderTimeout,
+}
 
 /// Response body either streams the upstream `Incoming` directly or holds a per-host
 /// concurrency permit until the last byte/frame is dropped.
@@ -196,6 +203,8 @@ pub struct UpstreamPool {
     engine: Arc<DecisionEngine>,
     /// Read on every request, written only after a slow/failed response.
     slow_hosts: RwLock<HashMap<String, Instant>>,
+    /// Fast path for the common case where no host has ever been marked slow.
+    slow_hosts_seen: AtomicBool,
     /// How long a host stays on the recovery pool. Kept at least as long as
     /// the client idle timeout: otherwise the normal pool could hand the same
     /// half-dead connection back after the marker expired but before hyper
@@ -353,6 +362,7 @@ impl UpstreamPool {
             recovery: build_client(config, auto_connector, max_idle),
             engine,
             slow_hosts: RwLock::new(HashMap::new()),
+            slow_hosts_seen: AtomicBool::new(false),
             // Keep the marker a little past the client's idle eviction, so a
             // request that arrives exactly at the idle boundary cannot pick
             // the bad connection out of the normal pool again.
@@ -369,24 +379,34 @@ impl UpstreamPool {
 
     /// Send an upstream request through the pool. `upgrade` selects the HTTP/1.1-only
     /// client so WebSocket handshakes cannot be routed over HTTP/2.
+    #[cfg(test)]
     pub(crate) async fn send(
+        &self,
+        request: Request<UpstreamBody>,
+        upgrade: bool,
+    ) -> std::result::Result<UpstreamResponse, String> {
+        // Tests and non-hot callers can borrow the request's URI. The hot path
+        // passes the URI it already keeps for the response body, saving this
+        // clone per forwarded request.
+        let uri = request.uri().clone();
+        self.send_with_uri(request, upgrade, &uri).await
+    }
+
+    pub(crate) async fn send_with_uri(
         &self,
         mut request: Request<UpstreamBody>,
         upgrade: bool,
+        uri: &Uri,
     ) -> std::result::Result<UpstreamResponse, String> {
         let request_id = self.stats.requests.fetch_add(1, Ordering::Relaxed) + 1;
-        // `http::Uri` clones its components as cheap `Bytes` handles. Keeping one
-        // around lets the logging paths borrow host/path after the request is moved,
-        // instead of allocating a new String for every forwarded request.
-        let uri = request.uri().clone();
         let method = request.method().clone();
         let request_version = request.version();
         let scheme = uri.scheme_str().unwrap_or("");
         let host = uri.host();
         // Forwarded URIs are built from an already-normalized host, so the
         // per-request image-host check does not need to normalize again.
-        let is_http1_host =
-            host.is_some_and(|host| self.http1_hosts.match_normalized(host).is_some());
+        let is_http1_host = !self.http1_hosts.is_empty()
+            && host.is_some_and(|host| self.http1_hosts.match_normalized(host).is_some());
         let permit = if !upgrade && is_http1_host {
             let host = host.expect("is_http1_host requires a host");
             let semaphore = self.host_slots(host);
@@ -425,27 +445,43 @@ impl UpstreamPool {
         // Only hedge when there is time left for the retry to be useful.
         let hedge_after = HEDGE_AFTER.min(self.header_timeout / 2);
         let started = std::time::Instant::now();
-        // Only the header wait is bounded: the body keeps streaming afterwards
-        let result = tokio::time::timeout(self.header_timeout, async {
-            match retry_parts {
-                Some(parts) => {
-                    self.request_hedged(client, request, parts, hedge_after, debug_host)
-                        .await
-                }
-                None => client.request(request).await,
+        // Only the header wait is bounded: the body keeps streaming afterwards.
+        // Hedged requests use one timer for both the hedge delay and the header
+        // deadline instead of nesting a second `Timeout` future.
+        let outcome = match retry_parts {
+            Some(parts) => {
+                self.request_hedged(
+                    client,
+                    request,
+                    parts,
+                    hedge_after,
+                    self.header_timeout,
+                    debug_host,
+                )
+                .await
             }
-        })
-        .await;
-        match result {
-            Ok(Ok(response)) => {
+            None => {
+                match tokio::time::timeout(self.header_timeout, client.request(request)).await {
+                    Ok(result) => SendOutcome::Response(result),
+                    Err(_) => SendOutcome::HeaderTimeout,
+                }
+            }
+        };
+        match outcome {
+            SendOutcome::Response(Ok(response)) => {
                 // A completed TLS handshake does not prove the route is usable:
                 // a fake-SNI request can reach nginx and get a 403. Feed the
                 // status back so the next connection drops that route.
-                if let Some(host) = debug_host {
-                    self.engine
-                        .note_upstream_response(host, port, tls, response.status());
+                let status = response.status();
+                let status_code = status.as_u16();
+                let version = response.version();
+                let error_status = status.is_client_error() || status.is_server_error();
+                if matches!(status_code, 400 | 403 | 421 | 429 | 451) {
+                    if let Some(host) = debug_host {
+                        self.engine.note_upstream_response(host, port, tls, status);
+                    }
                 }
-                if response.version() == http::Version::HTTP_2 {
+                if version == http::Version::HTTP_2 {
                     self.stats.responses_h2.fetch_add(1, Ordering::Relaxed);
                 } else {
                     self.stats.responses_h1.fetch_add(1, Ordering::Relaxed);
@@ -472,10 +508,10 @@ impl UpstreamPool {
                         request_id,
                         method = %method,
                         scheme,
-                        version = ?response.version(),
+                        version = ?version,
                         host = ?debug_host,
                         path = %debug_path,
-                        status = response.status().as_u16(),
+                        status = status_code,
                         elapsed_ms,
                         "slow upstream response"
                     );
@@ -484,21 +520,19 @@ impl UpstreamPool {
                         request_id,
                         method = %method,
                         scheme,
-                        version = ?response.version(),
+                        version = ?version,
                         host = ?debug_host,
                         path = %debug_path,
-                        status = response.status().as_u16(),
+                        status = status_code,
                         elapsed_ms,
                         "upstream response"
                     );
                 }
-                if (response.status().is_client_error() || response.status().is_server_error())
-                    && is_http1_host
-                {
+                if error_status && is_http1_host {
                     tracing::warn!(
                         host = debug_host.unwrap_or(""),
                         path = %debug_path,
-                        status = response.status().as_u16(),
+                        status = status_code,
                         "image upstream returned an HTTP error"
                     );
                 }
@@ -512,7 +546,7 @@ impl UpstreamPool {
                 };
                 Ok(Response::from_parts(parts, body))
             }
-            Ok(Err(error)) => {
+            SendOutcome::Response(Err(error)) => {
                 self.stats.request_errors.fetch_add(1, Ordering::Relaxed);
                 if let Some(host) = debug_host {
                     self.mark_slow(host);
@@ -530,7 +564,7 @@ impl UpstreamPool {
                 );
                 Err(error.to_string())
             }
-            Err(_) => {
+            SendOutcome::HeaderTimeout => {
                 // The connection accepted the request but never answered: a
                 // half-dead hop. Drop it and let the next connection re-race
                 self.stats.request_errors.fetch_add(1, Ordering::Relaxed);
@@ -567,17 +601,22 @@ impl UpstreamPool {
         request: Request<UpstreamBody>,
         retry_parts: http::request::Parts,
         hedge_after: Duration,
+        header_timeout: Duration,
         host: Option<&str>,
-    ) -> ClientResult {
+    ) -> SendOutcome {
         enum Event {
             First(ClientResult),
             Retry(ClientResult),
             Hedge,
+            HeaderTimeout,
         }
 
-        let mut first = Box::pin(client.request(request));
+        let first = client.request(request);
+        tokio::pin!(first);
         let mut retry: Option<Pin<Box<dyn Future<Output = ClientResult> + Send + '_>>> = None;
-        let mut hedge_at = Box::pin(tokio::time::sleep(hedge_after));
+        let deadline = tokio::time::Instant::now() + header_timeout;
+        let timer = tokio::time::sleep(hedge_after.min(header_timeout));
+        tokio::pin!(timer);
         let mut retry_parts = Some(retry_parts);
         let mut hedged = false;
 
@@ -586,17 +625,23 @@ impl UpstreamPool {
                 tokio::select! {
                     result = &mut first => Event::First(result),
                     result = retry_future.as_mut() => Event::Retry(result),
+                    _ = &mut timer => Event::HeaderTimeout,
+                }
+            } else if !hedged {
+                tokio::select! {
+                    result = &mut first => Event::First(result),
+                    _ = &mut timer => Event::Hedge,
                 }
             } else {
                 tokio::select! {
                     result = &mut first => Event::First(result),
-                    _ = &mut hedge_at, if !hedged => Event::Hedge,
+                    _ = &mut timer => Event::HeaderTimeout,
                 }
             };
 
             match event {
-                Event::First(result) => return result,
-                Event::Retry(Ok(response)) => return Ok(response),
+                Event::First(result) => return SendOutcome::Response(result),
+                Event::Retry(Ok(response)) => return SendOutcome::Response(Ok(response)),
                 Event::Retry(Err(error)) => {
                     // The fresh connection failed as well. Keep waiting for
                     // the original instead of turning a possible late success
@@ -626,12 +671,20 @@ impl UpstreamPool {
                         Either::Right(Full::new(Bytes::new())),
                     );
                     retry = Some(Box::pin(self.recovery.request(retry_request)));
+                    // The hedge window is over; the same timer now guards the
+                    // header wait for both attempts.
+                    timer.as_mut().reset(deadline);
                 }
+                Event::HeaderTimeout => return SendOutcome::HeaderTimeout,
             }
         }
     }
 
     fn is_slow(&self, host: &str) -> bool {
+        // Nearly all requests run before any slow host has ever been observed.
+        if !self.slow_hosts_seen.load(Ordering::Relaxed) {
+            return false;
+        }
         // Expired entries are harmless until the next write; leaving them in
         // place keeps this read path from needing a write lock or an upgrade.
         self.slow_hosts
@@ -650,6 +703,9 @@ impl UpstreamPool {
             }
         }
         hosts.insert(host.to_owned(), now);
+        // Publish the fast-path flag while holding the write lock: a reader
+        // that sees `true` will wait for this lock and then observe the entry.
+        self.slow_hosts_seen.store(true, Ordering::Relaxed);
     }
 
     fn host_slots(&self, host: &str) -> Arc<Semaphore> {
@@ -820,7 +876,8 @@ impl RouteConnector {
             Cow::Borrowed(host)
         };
         let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
-        let force_http1 = self.http1_only || self.http1_hosts.match_normalized(&host).is_some();
+        let force_http1 = self.http1_only
+            || (!self.http1_hosts.is_empty() && self.http1_hosts.match_normalized(&host).is_some());
         let result = if https {
             self.connect_tls(&host, port, force_http1).await
         } else {
