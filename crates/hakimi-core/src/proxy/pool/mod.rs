@@ -55,8 +55,18 @@ pub(crate) type UpstreamBody = Either<Incoming, Full<Bytes>>;
 const SLOW_ROUTE_MARK_MS: u64 = 5_000;
 const SLOW_ROUTE_TTL: Duration = Duration::from_secs(60);
 
+/// A safe request that has waited this long for response headers is hedged
+/// with a second attempt on the recovery pool. Idle/half-dead pooled
+/// connections can otherwise hold a page load for the full header timeout
+/// (the production log showed 13-39 s JavaScript stalls while every other
+/// request for the same host was healthy). Capped at half the configured
+/// header timeout so a retry always has time to complete.
+const HEDGE_AFTER: Duration = Duration::from_secs(5);
+
 /// Browser response bodies stay streaming; the pool only owns the upstream connection.
 pub(crate) type UpstreamResponse = Response<UpstreamResponseBody>;
+
+type ClientResult = std::result::Result<Response<Incoming>, hyper_util::client::legacy::Error>;
 
 /// Response body either streams the upstream `Incoming` directly or holds a per-host
 /// concurrency permit until the last byte/frame is dropped.
@@ -122,6 +132,21 @@ impl Body for LimitedBody {
 const SYSTEM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WARM_TIMEOUT: Duration = Duration::from_secs(12);
 
+/// A request may be sent twice only when it is safe and has no body to
+/// replay. Image hosts are excluded: their per-host concurrency permit makes
+/// a second in-flight connection undesirable, and their short-lived requests
+/// have not shown the stall this hedge targets.
+fn hedge_eligible(request: &Request<UpstreamBody>, upgrade: bool, is_http1_host: bool) -> bool {
+    !upgrade
+        && !is_http1_host
+        && (request.method() == Method::GET || request.method() == Method::HEAD)
+        && request.body().is_end_stream()
+        && request
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .is_none_or(|value| value.as_bytes() == b"0")
+}
+
 /// Candidates raced in parallel per batch while a cold connection hunts for a route.
 const RACE_SIZE: usize = 8;
 /// Delay between race batch member starts, so the first candidate usually wins on a
@@ -139,6 +164,7 @@ pub(crate) struct UpstreamStats {
     responses_h1: AtomicU64,
     request_errors: AtomicU64,
     slow_responses: AtomicU64,
+    hedged_retries: AtomicU64,
     warm_success: AtomicU64,
     warm_failures: AtomicU64,
 }
@@ -155,6 +181,7 @@ impl UpstreamStats {
             "responsesH1": self.responses_h1.load(Ordering::Relaxed),
             "requestErrors": self.request_errors.load(Ordering::Relaxed),
             "slowResponses": self.slow_responses.load(Ordering::Relaxed),
+            "hedgedRetries": self.hedged_retries.load(Ordering::Relaxed),
             "warmSuccess": self.warm_success.load(Ordering::Relaxed),
             "warmFailures": self.warm_failures.load(Ordering::Relaxed),
         })
@@ -169,6 +196,11 @@ pub struct UpstreamPool {
     engine: Arc<DecisionEngine>,
     /// Read on every request, written only after a slow/failed response.
     slow_hosts: RwLock<HashMap<String, Instant>>,
+    /// How long a host stays on the recovery pool. Kept at least as long as
+    /// the client idle timeout: otherwise the normal pool could hand the same
+    /// half-dead connection back after the marker expired but before hyper
+    /// had closed it.
+    slow_route_ttl: Duration,
     http1_hosts: Arc<DomainMatcher>,
     http1_limit: usize,
     /// Deadline for the upstream response headers, never for the streamed body
@@ -321,6 +353,12 @@ impl UpstreamPool {
             recovery: build_client(config, auto_connector, max_idle),
             engine,
             slow_hosts: RwLock::new(HashMap::new()),
+            // Keep the marker a little past the client's idle eviction, so a
+            // request that arrives exactly at the idle boundary cannot pick
+            // the bad connection out of the normal pool again.
+            slow_route_ttl: Duration::from_secs(config.advanced.upstream_idle_secs.max(10))
+                .max(SLOW_ROUTE_TTL)
+                + Duration::from_secs(5),
             http1_hosts,
             http1_limit,
             header_timeout,
@@ -333,7 +371,7 @@ impl UpstreamPool {
     /// client so WebSocket handshakes cannot be routed over HTTP/2.
     pub(crate) async fn send(
         &self,
-        request: Request<UpstreamBody>,
+        mut request: Request<UpstreamBody>,
         upgrade: bool,
     ) -> std::result::Result<UpstreamResponse, String> {
         let request_id = self.stats.requests.fetch_add(1, Ordering::Relaxed) + 1;
@@ -373,9 +411,32 @@ impl UpstreamPool {
         };
         let debug_host = host;
         let debug_path = uri.path();
+        let retry_parts = if hedge_eligible(&request, upgrade, is_http1_host) {
+            // GET/HEAD without a body can be replayed. The clone is only
+            // needed to keep a second, independent request available; a POST
+            // or a streaming body must never be sent twice.
+            let (parts, body) = request.into_parts();
+            let retry = parts.clone();
+            request = Request::from_parts(parts, body);
+            Some(retry)
+        } else {
+            None
+        };
+        // Only hedge when there is time left for the retry to be useful.
+        let hedge_after = HEDGE_AFTER.min(self.header_timeout / 2);
         let started = std::time::Instant::now();
         // Only the header wait is bounded: the body keeps streaming afterwards
-        match tokio::time::timeout(self.header_timeout, client.request(request)).await {
+        let result = tokio::time::timeout(self.header_timeout, async {
+            match retry_parts {
+                Some(parts) => {
+                    self.request_hedged(client, request, parts, hedge_after, debug_host)
+                        .await
+                }
+                None => client.request(request).await,
+            }
+        })
+        .await;
+        match result {
             Ok(Ok(response)) => {
                 // A completed TLS handshake does not prove the route is usable:
                 // a fake-SNI request can reach nginx and get a 403. Feed the
@@ -492,20 +553,98 @@ impl UpstreamPool {
         }
     }
 
+    /// Send `request`, and after `hedge_after` also send a copy on the
+    /// recovery pool. The first response wins; a failed retry leaves the
+    /// original attempt in place.
+    ///
+    /// This targets the failure mode a header timeout cannot cover well: a
+    /// pooled connection that is still open but no longer answers. A 60 s
+    /// header deadline would otherwise leave the page waiting for the whole
+    /// budget even though a fresh connection succeeds immediately.
+    async fn request_hedged(
+        &self,
+        client: &Client<RouteConnector, UpstreamBody>,
+        request: Request<UpstreamBody>,
+        retry_parts: http::request::Parts,
+        hedge_after: Duration,
+        host: Option<&str>,
+    ) -> ClientResult {
+        enum Event {
+            First(ClientResult),
+            Retry(ClientResult),
+            Hedge,
+        }
+
+        let mut first = Box::pin(client.request(request));
+        let mut retry: Option<Pin<Box<dyn Future<Output = ClientResult> + Send + '_>>> = None;
+        let mut hedge_at = Box::pin(tokio::time::sleep(hedge_after));
+        let mut retry_parts = Some(retry_parts);
+        let mut hedged = false;
+
+        loop {
+            let event = if let Some(retry_future) = retry.as_mut() {
+                tokio::select! {
+                    result = &mut first => Event::First(result),
+                    result = retry_future.as_mut() => Event::Retry(result),
+                }
+            } else {
+                tokio::select! {
+                    result = &mut first => Event::First(result),
+                    _ = &mut hedge_at, if !hedged => Event::Hedge,
+                }
+            };
+
+            match event {
+                Event::First(result) => return result,
+                Event::Retry(Ok(response)) => return Ok(response),
+                Event::Retry(Err(error)) => {
+                    // The fresh connection failed as well. Keep waiting for
+                    // the original instead of turning a possible late success
+                    // into an error.
+                    tracing::debug!(
+                        host = host.unwrap_or(""),
+                        error = %format!("{error:#}"),
+                        "hedged retry failed; waiting for the original request"
+                    );
+                    retry = None;
+                }
+                Event::Hedge => {
+                    hedged = true;
+                    self.stats.hedged_retries.fetch_add(1, Ordering::Relaxed);
+                    if let Some(host) = host {
+                        // Keep later requests off the pool that produced the
+                        // stall. The retry itself runs on the recovery pool.
+                        self.mark_slow(host);
+                        tracing::warn!(
+                            host,
+                            hedge_after_ms = hedge_after.as_millis() as u64,
+                            "upstream response is stalled; hedging on a fresh connection"
+                        );
+                    }
+                    let retry_request = Request::from_parts(
+                        retry_parts.take().expect("the hedge fires once"),
+                        Either::Right(Full::new(Bytes::new())),
+                    );
+                    retry = Some(Box::pin(self.recovery.request(retry_request)));
+                }
+            }
+        }
+    }
+
     fn is_slow(&self, host: &str) -> bool {
         // Expired entries are harmless until the next write; leaving them in
         // place keeps this read path from needing a write lock or an upgrade.
         self.slow_hosts
             .read()
             .get(host)
-            .is_some_and(|at| at.elapsed() < SLOW_ROUTE_TTL)
+            .is_some_and(|at| at.elapsed() < self.slow_route_ttl)
     }
 
     fn mark_slow(&self, host: &str) {
         let now = Instant::now();
         let mut hosts = self.slow_hosts.write();
         if hosts.len() >= 256 {
-            hosts.retain(|_, at| now.duration_since(*at) < SLOW_ROUTE_TTL);
+            hosts.retain(|_, at| now.duration_since(*at) < self.slow_route_ttl);
             if hosts.len() >= 256 {
                 hosts.clear();
             }

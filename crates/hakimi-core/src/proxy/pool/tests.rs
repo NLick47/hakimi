@@ -98,6 +98,47 @@ fn engine_for_with_resolver(
 }
 
 #[test]
+fn only_safe_empty_requests_are_hedged() {
+    let request = |method: Method, body: &[u8]| {
+        Request::builder()
+            .method(method)
+            .uri("https://upstream.test/")
+            .body(Either::Right(Full::new(Bytes::copy_from_slice(body))))
+            .unwrap()
+    };
+
+    let get = request(Method::GET, b"");
+    assert!(hedge_eligible(&get, false, false));
+    assert!(
+        !hedge_eligible(&get, true, false),
+        "upgrade requests must not be replayed"
+    );
+    assert!(
+        !hedge_eligible(&get, false, true),
+        "image hosts keep their per-host concurrency permit"
+    );
+    assert!(
+        !hedge_eligible(&request(Method::POST, b""), false, false),
+        "only safe methods may be sent twice"
+    );
+    assert!(
+        !hedge_eligible(&request(Method::GET, b"body"), false, false),
+        "a request with a body cannot be replayed"
+    );
+
+    let declared_body = Request::builder()
+        .method(Method::GET)
+        .uri("https://upstream.test/")
+        .header(http::header::CONTENT_LENGTH, "3")
+        .body(Either::Right(Full::new(Bytes::new())))
+        .unwrap();
+    assert!(
+        !hedge_eligible(&declared_body, false, false),
+        "a declared body must be respected even when the body stream is empty"
+    );
+}
+
+#[test]
 fn discovery_failure_detail_does_not_leak_the_state_name() {
     let mut diagnostics =
         DomainDiagnostics::checking(Some("github".into()), "github.com", Vec::new(), 0);
@@ -220,6 +261,105 @@ async fn a_real_block_page_penalizes_the_candidate_ip() {
     assert!(
         engine.ip_failures("upstream.test", "127.0.0.1".parse().unwrap()) > 0,
         "the blocked address should have a failure score"
+    );
+}
+
+/// A pooled connection that accepts a request and then goes silent must not
+/// hold the page for the full header timeout. After the hedge delay the same
+/// safe request is sent on the recovery pool, and the fresh answer wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_pooled_connection_is_hedged_on_a_fresh_one() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepted = accepts.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let index = accepted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 8192];
+                if socket.read(&mut buffer).await.is_err() {
+                    return;
+                }
+                if socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if index == 0 {
+                    // The pooled connection accepts the next request and then
+                    // never answers: exactly the half-dead hop this hedge is for.
+                    let _ = socket.read(&mut buffer).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    return;
+                }
+                // Every fresh connection answers normally.
+                loop {
+                    match socket.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\
+                                      Connection: keep-alive\r\n\r\nok",
+                                )
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, config) = engine_for(dir.path());
+    config
+        .mutate(|config| {
+            config.advanced.upstream_header_timeout_secs = 5;
+            Ok(())
+        })
+        .unwrap();
+    let tls = TlsContext::new().unwrap();
+    let pool = UpstreamPool::new(engine, tls, &config.snapshot());
+
+    let request = |path: &str| {
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("http://upstream.test:{port}{path}"))
+            .body(Either::Right(Full::new(Bytes::new())))
+            .unwrap()
+    };
+    let first = pool.send(request("/one"), false).await.unwrap();
+    let body = first.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"ok");
+
+    let started = std::time::Instant::now();
+    let second = pool.send(request("/two"), false).await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(second.status(), http::StatusCode::OK);
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "the stalled pooled connection held the request for {elapsed:?}"
+    );
+    assert_eq!(
+        pool.stats_json()["hedgedRetries"],
+        1,
+        "the request must be hedged exactly once"
+    );
+    assert!(
+        accepts.load(Ordering::SeqCst) >= 2,
+        "the hedge must open a fresh connection"
     );
 }
 
