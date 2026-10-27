@@ -82,13 +82,7 @@
         { "pattern": "*.poipiku.com" }
       ],
       "enabled": true,
-      "defaultRoute": {
-        "attempts": [
-          { "mode": "direct" },
-          { "mode": "ech", "ech": "own" },
-          { "mode": "sni" }
-        ]
-      }
+      "defaultRoute": { "attempts": [{ "mode": "direct" }] }
     },
     {
       "id": "steam",

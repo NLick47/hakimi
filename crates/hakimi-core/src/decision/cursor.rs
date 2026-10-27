@@ -62,11 +62,15 @@ pub struct RouteCursor {
     /// Ordered attempts of the matched domain rule.
     route_attempts: Vec<RouteAttempt>,
     attempt_index: usize,
+    ech_primary: bool,
     current: Option<Candidate>,
     /// ECHConfigList cache per source (own / shared).
     ech_configs: [Option<Vec<u8>>; 2],
     ech_checked: [bool; 2],
     ech_errors: [Option<String>; 2],
+    /// A deferred ECH lookup is not a connection failure; it must not replace
+    /// the real reason from a direct/SNI attempt.
+    ech_deferred: [bool; 2],
     /// Fake SNI candidates for the current SNI attempt.
     sni_candidates: Vec<Option<String>>,
     sni_attempt: Option<usize>,
@@ -197,6 +201,13 @@ impl RouteCursor {
         } else {
             vec![RouteAttempt::Direct]
         };
+        // Keep the configured priority before the cold-route hedge below moves
+        // Direct in front of ECH. Only a route that *chose* ECH first may make
+        // the cursor wait for the HTTPS RR; ECH in the second position is a
+        // fallback and can be looked up in the background.
+        let ech_primary = route_attempts
+            .first()
+            .is_some_and(|attempt| attempt.ech_source().is_some());
         // A cold ECH-first route used to block the whole cursor on the HTTPS RR
         // lookup even when the route explicitly allows Direct fallback. In the
         // connection race, move that fallback ahead of the lookup so the first
@@ -237,10 +248,12 @@ impl RouteCursor {
             remote_available,
             route_attempts,
             attempt_index: 0,
+            ech_primary,
             current: None,
             ech_configs: [None, None],
             ech_checked: [false, false],
             ech_errors: [None, None],
+            ech_deferred: [false, false],
             sni_candidates: Vec::new(),
             sni_attempt: None,
             sni_index: 0,
@@ -453,6 +466,10 @@ impl RouteCursor {
                 RouteAttempt::Ech { ech } => {
                     let slot = ech_slot(ech);
                     if !self.ech_checked[slot] {
+                        if self.defer_ech(ech) {
+                            self.attempt_index += 1;
+                            continue;
+                        }
                         match self
                             .engine
                             .resolver
@@ -482,17 +499,22 @@ impl RouteCursor {
                     }
                     self.attempt_index += 1;
                     let Some(config) = self.ech_configs[slot].clone() else {
-                        self.last_reason = Some(FailureReason::EchUnavailable);
-                        self.last_detail = self.ech_errors[slot].clone().or_else(|| {
-                            Some(format!(
-                                "no ECHConfig available ({})",
-                                if ech == EchSource::Shared {
-                                    "own + shared"
-                                } else {
-                                    "own"
-                                }
-                            ))
-                        });
+                        // A deferred lookup is a scheduling decision, not a
+                        // connection failure. Leave the reason from the real
+                        // direct/SNI attempt in place.
+                        if !self.ech_deferred[slot] {
+                            self.last_reason = Some(FailureReason::EchUnavailable);
+                            self.last_detail = self.ech_errors[slot].clone().or_else(|| {
+                                Some(format!(
+                                    "no ECHConfig available ({})",
+                                    if ech == EchSource::Shared {
+                                        "own + shared"
+                                    } else {
+                                        "own"
+                                    }
+                                ))
+                            });
+                        }
                         continue;
                     };
                     let plan = self.build_plan(candidate, TlsMode::Ech, None, Some(config));
@@ -535,6 +557,50 @@ impl RouteCursor {
                 }
             }
         }
+    }
+
+    /// Start a non-primary ECH lookup without putting it on the connection's
+    /// critical path.
+    ///
+    /// `auto` routes put Direct first and ECH second. Waiting for the HTTPS RR
+    /// before the next plan made a cold connection pay 200-700 ms even when the
+    /// first direct attempt had already failed and the SNI fallback was ready.
+    /// If a later non-ECH attempt exists, spawn the lookup and let the cursor
+    /// produce that plan now; the lookup still populates the cache for the next
+    /// cold connection. A route whose configured first attempt is ECH keeps the
+    /// old blocking behavior, and ECH is still awaited when it is the only
+    /// remaining fallback.
+    fn defer_ech(&mut self, ech: EchSource) -> bool {
+        if self.ech_primary || self.engine.cache.ech(&self.domain, true).is_some() {
+            return false;
+        }
+        let has_later_non_ech = self
+            .route_attempts
+            .iter()
+            .skip(self.attempt_index + 1)
+            .any(|attempt| attempt.ech_source().is_none());
+        if !has_later_non_ech {
+            return false;
+        }
+
+        let slot = ech_slot(ech);
+        self.ech_checked[slot] = true;
+        self.ech_deferred[slot] = true;
+        self.ech_errors[slot] =
+            Some("config lookup deferred; a later direct/SNI attempt is available".into());
+        let resolver = self.engine.resolver.clone();
+        let domain = self.domain.clone();
+        let allow_shared = ech == EchSource::Shared;
+        tokio::spawn(async move {
+            if let Err(error) = resolver.doh_ech_config(&domain, allow_shared).await {
+                tracing::debug!(
+                    domain = %domain,
+                    error = %error,
+                    "deferred ECH lookup failed"
+                );
+            }
+        });
+        true
     }
 
     fn build_plan(

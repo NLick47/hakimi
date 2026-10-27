@@ -691,7 +691,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
                 plain("cdn.poipiku.com"),
                 plain("*.poipiku.com"),
             ],
-            RoutePolicy::auto(),
+            RoutePolicy::direct(),
             true,
             "https://poipiku.com/",
         ),
@@ -1026,6 +1026,17 @@ fn strip_legacy_materialized_defaults(config: &mut AppConfig) {
     if pinned {
         config.advanced.http1_hosts = AdvancedConfig::default().http1_hosts;
     }
+
+    // Older builds materialized the generic `auto` route for Poipiku. That
+    // route spends a DoH HTTPS-RR lookup on ECH and five fake-SNI handshakes
+    // per address even though CloudFront supports neither. Treat the exact old
+    // default as unset so the new direct-only default reaches existing installs;
+    // a user-customized Poipiku route is left untouched.
+    if let Some(group) = config.groups.iter_mut().find(|group| group.id == "poipiku") {
+        if group.default_route == RoutePolicy::auto() {
+            group.default_route = RoutePolicy::direct();
+        }
+    }
 }
 
 /// 落盘文件只保留用户改过的值
@@ -1246,8 +1257,9 @@ mod tests {
         assert!(eh.enabled);
         assert!(config.groups.iter().all(|group| group.enabled));
         assert_eq!(
-            config.group("poipiku").unwrap().default_route.attempts[0].mode(),
-            TlsMode::Direct
+            config.group("poipiku").unwrap().default_route,
+            RoutePolicy::direct(),
+            "CloudFront publishes no ECHConfig and rejects foreign SNI"
         );
         // The adult sites ship enabled with their own CDN domains.
         let hitomi = config.group("hitomi").unwrap();
@@ -1666,6 +1678,55 @@ mod tests {
         manager.update(manager.snapshot().as_ref().clone()).unwrap();
         let text = std::fs::read_to_string(paths.config_file()).unwrap();
         assert!(text.contains("\"http1Hosts\""));
+    }
+
+    #[test]
+    fn legacy_materialized_poipiku_route_adopts_direct_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let mut legacy = AppConfig::default();
+        legacy
+            .groups
+            .iter_mut()
+            .find(|group| group.id == "poipiku")
+            .unwrap()
+            .default_route = RoutePolicy::auto();
+        std::fs::write(
+            paths.config_file(),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let manager = ConfigManager::load(paths.config_file()).unwrap();
+        assert_eq!(
+            manager.snapshot().group("poipiku").unwrap().default_route,
+            RoutePolicy::direct()
+        );
+    }
+
+    #[test]
+    fn customized_poipiku_route_survives_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let mut custom = AppConfig::default();
+        let route = RoutePolicy::sni(vec!["www.example.com".to_string()]);
+        custom
+            .groups
+            .iter_mut()
+            .find(|group| group.id == "poipiku")
+            .unwrap()
+            .default_route = route.clone();
+        std::fs::write(
+            paths.config_file(),
+            serde_json::to_string(&custom).unwrap(),
+        )
+        .unwrap();
+
+        let manager = ConfigManager::load(paths.config_file()).unwrap();
+        assert_eq!(
+            manager.snapshot().group("poipiku").unwrap().default_route,
+            route
+        );
     }
 
     #[test]

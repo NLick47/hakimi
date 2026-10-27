@@ -191,6 +191,60 @@ async fn cold_ech_route_hedges_direct_before_doh_finishes() {
     );
 }
 
+/// An `auto` route puts Direct first and ECH second. When the first direct
+/// attempt fails, the SNI fallback must not wait for the ECH HTTPS-RR lookup:
+/// the lookup is opportunistic and belongs in the background.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_primary_ech_lookup_does_not_hold_the_next_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let resolver = Arc::new(SlowEchResolver::default());
+    let engine = engine_for_test(
+        dir.path(),
+        RoutePolicy::auto(),
+        "203.0.113.10".parse().unwrap(),
+        Vec::new(),
+        resolver.clone(),
+    );
+    let mut cursor = match engine.route("upstream.test", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+
+    let first = cursor.next_plan().await.expect("a direct plan");
+    assert_eq!(first.mode, TlsMode::Direct);
+
+    let started = Instant::now();
+    let second = tokio::time::timeout(Duration::from_millis(500), cursor.next_plan())
+        .await
+        .expect("the non-primary ECH lookup blocked the SNI fallback")
+        .expect("an SNI fallback plan");
+    assert_eq!(second.mode, TlsMode::FakeSni);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the SNI fallback was held behind the ECH lookup"
+    );
+
+    // The lookup still runs in the background and fills the cache for the
+    // next cold connection.
+    for _ in 0..50 {
+        if resolver
+            .ech_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        resolver
+            .ech_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the deferred ECH lookup must still start"
+    );
+}
+
 fn engine_for_test(
     dir: &std::path::Path,
     route: RoutePolicy,
