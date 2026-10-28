@@ -477,38 +477,23 @@ impl Resolver {
         let mut source = DohSource::Primary;
         let mut endpoint = String::new();
 
-        match self.query_one_type(domain, TYPE_A).await {
-            Ok(query) => {
-                source = query.source;
-                endpoint = query.endpoint;
-                fallback_used |= query.fallback_used;
-                attempts.extend(query.attempts);
-                ttl = ttl.min(if query.answer.ttl == 0 {
-                    u32::MAX
-                } else {
-                    query.answer.ttl
-                });
-                for ip in query.answer.ips {
-                    if !ips.contains(&ip) {
-                        ips.push(ip);
-                    }
-                }
-                for hint in query.answer.hints {
-                    if !hints.contains(&hint) {
-                        hints.push(hint);
-                    }
-                }
-            }
-            Err(error) => {
-                last_error = Some(error);
-            }
-        }
-
-        if ips.is_empty() && last_error.is_none() {
-            match self.query_one_type(domain, TYPE_AAAA).await {
+        // A and AAAA are independent lookups. Asking for both together keeps the cold
+        // path at one round trip, and it is the only way a dual-stack host gets an IPv6
+        // candidate: the old "AAAA only when A came back empty" rule quietly made every
+        // host with an A record IPv4-only, even when IPv4 was the filtered family.
+        let (a_result, aaaa_result) = tokio::join!(
+            self.query_one_type(domain, TYPE_A),
+            self.query_one_type(domain, TYPE_AAAA)
+        );
+        // IPv4 answers stay first: they are still the better path on networks without
+        // working IPv6, and the engine reorders candidates by history anyway.
+        for result in [a_result, aaaa_result] {
+            match result {
                 Ok(query) => {
-                    source = query.source;
-                    endpoint = query.endpoint;
+                    if endpoint.is_empty() {
+                        source = query.source;
+                        endpoint = query.endpoint;
+                    }
                     fallback_used |= query.fallback_used;
                     attempts.extend(query.attempts);
                     ttl = ttl.min(if query.answer.ttl == 0 {
@@ -528,7 +513,9 @@ impl Resolver {
                     }
                 }
                 Err(error) => {
-                    last_error = Some(error);
+                    if last_error.is_none() {
+                        last_error = Some(error);
+                    }
                 }
             }
         }

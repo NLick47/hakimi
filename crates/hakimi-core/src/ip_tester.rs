@@ -314,7 +314,12 @@ impl ServerCertVerifier for RealDomainVerifier {
 }
 
 fn dns_name(host: &str) -> Result<ServerName<'static>, ConnectError> {
-    ServerName::try_from(host.trim().trim_end_matches('.').to_ascii_lowercase())
+    // The trailing root label is preserved: `host.` resolves to the same server while
+    // a filter matching the bare name lets it through. rustls carries it verbatim, so
+    // stripping it here would silently turn the only working spelling back into the
+    // blocked one. Normalized config domains never end in a dot, so direct/ECH are
+    // unaffected.
+    ServerName::try_from(host.trim().to_ascii_lowercase())
         .map_err(|error| ConnectError::Name(error.to_string()))
 }
 
@@ -456,5 +461,35 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.reason(), FailureReason::EchUnavailable);
+    }
+
+    #[test]
+    fn fake_sni_keeps_the_trailing_root_label() {
+        // 尾部根标签是绕过按字符串匹配的 SNI 过滤的唯一写法
+        let name = dns_name("huggingface.co.").unwrap();
+        assert_eq!(name.to_str(), "huggingface.co.");
+    }
+
+    #[test]
+    fn fake_sni_client_hello_carries_the_trailing_root_label() {
+        // vendor/rustls 保留尾部根标签；上游 rustls 会在这里把它裁掉，
+        // 那样配置里的 `host.` 会悄悄变回被过滤的裸名字
+        let context = TlsContext::new().unwrap();
+        let config = context
+            .client_config(
+                "huggingface.co",
+                TlsMode::FakeSni,
+                Some("huggingface.co."),
+                None,
+            )
+            .unwrap();
+        let name = dns_name("huggingface.co.").unwrap();
+        let mut conn = rustls::ClientConnection::new(config, name).unwrap();
+        let mut hello: Vec<u8> = Vec::new();
+        conn.write_tls(&mut hello).unwrap();
+        assert!(
+            hello.windows(15).any(|w| w == b"huggingface.co."),
+            "SNI must keep the trailing root label"
+        );
     }
 }

@@ -120,3 +120,7 @@ debug = 0
 
 [profile.test]
 debug = 0
+
+# SNI 保留尾部根标签：上游按 RFC6066 裁掉末尾点（rustls#421），而按名字匹配的
+[patch.crates-io]
+rustls = { git = "ssh://git@github.com/NLick47/rustls.git", rev = "fe420096" }

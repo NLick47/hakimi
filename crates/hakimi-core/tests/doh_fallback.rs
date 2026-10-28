@@ -257,12 +257,14 @@ async fn the_primary_endpoint_wins_and_the_answer_is_cached() {
     );
     assert_eq!(resolution.source, DohSource::Primary);
     assert!(!resolution.fallback_used);
-    assert_eq!(primary.requests.load(Ordering::Relaxed), 1);
+    // One query per record type: the resolver asks A and AAAA together so a
+    // dual-stack host still gets an IPv6 candidate when IPv4 is filtered.
+    assert_eq!(primary.requests.load(Ordering::Relaxed), 2);
     // The resolver deliberately races the two endpoints, so the losing
     // fallback request may already be in flight before the primary wins.
     // What matters is that the primary answer is the one returned and cached.
     assert!(
-        fallback.requests.load(Ordering::Relaxed) <= 1,
+        fallback.requests.load(Ordering::Relaxed) <= 2,
         "the fallback must not be retried while the primary answers"
     );
 
@@ -273,7 +275,8 @@ async fn the_primary_endpoint_wins_and_the_answer_is_cached() {
         vec!["93.184.216.34".parse::<std::net::IpAddr>().unwrap()]
     );
     assert_eq!(again.source, DohSource::Cache);
-    assert_eq!(primary.requests.load(Ordering::Relaxed), 1);
+    // Still the two cold queries (A + AAAA); the cached answer is not refetched.
+    assert_eq!(primary.requests.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -315,10 +318,11 @@ async fn an_empty_primary_answer_falls_back_to_a_real_address() {
     assert_eq!(resolution.source, DohSource::Fallback);
     assert!(resolution.fallback_used);
 
-    // Both endpoints are queried once: the empty answer is not retried and the
-    // winner is the fallback, not a second lookup against the primary.
-    assert_eq!(primary.requests.load(Ordering::Relaxed), 1);
-    assert_eq!(fallback.requests.load(Ordering::Relaxed), 1);
+    // Both endpoints are queried once per record type (A and AAAA): the empty
+    // answer is not retried and the winner is the fallback, not a second lookup
+    // against the primary.
+    assert_eq!(primary.requests.load(Ordering::Relaxed), 2);
+    assert_eq!(fallback.requests.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
