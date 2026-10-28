@@ -836,3 +836,120 @@ async fn concurrent_cold_connections_share_one_discovery() {
         started.elapsed()
     );
 }
+
+#[test]
+fn slow_host_markers_are_lock_free_and_bounded() {
+    let hosts = SlowHosts::new();
+    let ttl = Duration::from_secs(60);
+    assert!(!hosts.is_slow("slow.example"));
+    hosts.mark("slow.example", ttl);
+    assert!(hosts.is_slow("slow.example"));
+    assert!(!hosts.is_slow("healthy.example"));
+
+    // A different host in the same slot replaces the marker: the table is a
+    // bounded hint, and a forgotten host is re-marked by its next slow reply.
+    let first = "slot-a.example";
+    let first_hash = SlowHosts::hash(first);
+    let second = (0..10_000)
+        .map(|index| format!("slot-b-{index}.example"))
+        .find(|host| {
+            let hash = SlowHosts::hash(host);
+            hash != first_hash
+                && hash & (SLOW_HOST_SLOTS as u32 - 1) == first_hash & (SLOW_HOST_SLOTS as u32 - 1)
+        })
+        .expect("a colliding slot");
+    hosts.mark(first, ttl);
+    hosts.mark(&second, ttl);
+    assert!(hosts.is_slow(&second));
+    assert!(!hosts.is_slow(first));
+}
+
+#[inline(never)]
+fn bench_slow_lookup(hosts: &SlowHosts, host: &str) -> bool {
+    hosts.is_slow(host)
+}
+
+#[test]
+#[ignore = "micro benchmark"]
+fn bench_slow_host_lookup() {
+    use std::collections::HashMap;
+    use std::hint::black_box;
+    use std::sync::RwLock;
+
+    let ttl = Duration::from_secs(60);
+    let hosts = SlowHosts::new();
+    hosts.mark("slow.example", ttl);
+    crate::bench::measure("pool.slow_host.table", 5_000_000, || {
+        black_box(bench_slow_lookup(&hosts, "slow.example"));
+    });
+
+    let mut map = HashMap::new();
+    for index in 0..8 {
+        map.insert(format!("slow{index}.example"), Instant::now());
+    }
+    crate::bench::measure("pool.slow_host.table.miss", 5_000_000, || {
+        black_box(bench_slow_lookup(&hosts, "healthy.example"));
+    });
+
+    let map = RwLock::new(map);
+    crate::bench::measure("pool.slow_host.rwlock", 5_000_000, || {
+        let hit = map
+            .read()
+            .unwrap()
+            .get("slow3.example")
+            .is_some_and(|at| at.elapsed() < ttl);
+        black_box(hit);
+    });
+    crate::bench::measure("pool.slow_host.rwlock.miss", 5_000_000, || {
+        let hit = map.read().unwrap().get("healthy.example").is_some();
+        black_box(hit);
+    });
+
+    // Ten workers read the marker concurrently, like the proxy's runtime. The
+    // table only needs shared read-only cache lines; every `RwLock::read`
+    // performs an atomic read-modify-write on the same word.
+    let per_thread = 2_000_000;
+    let host_storage: Vec<String> = (0..4096).map(|index| format!("h{index}.example")).collect();
+    let host_names: Vec<&str> = host_storage.iter().map(String::as_str).collect();
+    let lookup: fn(&SlowHosts, &str) -> bool = black_box(bench_slow_lookup);
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..10 {
+            scope.spawn(|| {
+                let mut acc = 0usize;
+                for _ in 0..per_thread {
+                    let host = host_names[acc & (host_names.len() - 1)];
+                    acc = acc.wrapping_add(hosts.is_slow(host) as usize + 1);
+                }
+                black_box(acc);
+            });
+        }
+    });
+    let elapsed = started.elapsed();
+    println!(
+        "{:<28} {:>10.1} ns/op ({:?} total)",
+        "pool.slow_host.table.10t",
+        elapsed.as_nanos() as f64 / (per_thread * 10) as f64,
+        elapsed
+    );
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..10 {
+            scope.spawn(|| {
+                let mut acc = 0usize;
+                for _ in 0..per_thread {
+                    let host = host_names[acc & (host_names.len() - 1)];
+                    acc = acc.wrapping_add(map.read().unwrap().get(host).is_some() as usize + 1);
+                }
+                black_box(acc);
+            });
+        }
+    });
+    let elapsed = started.elapsed();
+    println!(
+        "{:<28} {:>10.1} ns/op ({:?} total)",
+        "pool.slow_host.rwlock.10t",
+        elapsed.as_nanos() as f64 / (per_thread * 10) as f64,
+        elapsed
+    );
+}

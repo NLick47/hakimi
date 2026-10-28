@@ -85,13 +85,7 @@ pub fn normalize_hostname(input: &str) -> Result<String> {
 /// through to the existing slow path.
 pub fn normalize_hostname_cow(input: &str) -> Result<Cow<'_, str>> {
     let trimmed = input.trim();
-    if !trimmed.is_empty()
-        && trimmed.is_ascii()
-        && !trimmed.ends_with('.')
-        && !trimmed.contains(':')
-        && !trimmed.bytes().any(|byte| byte.is_ascii_uppercase())
-    {
-        validate_ascii_hostname(trimmed)?;
+    if is_canonical_ascii_hostname(trimmed) {
         return Ok(Cow::Borrowed(trimmed));
     }
 
@@ -115,6 +109,36 @@ pub fn normalize_hostname_cow(input: &str) -> Result<Cow<'_, str>> {
     };
     validate_ascii_hostname(&ascii)?;
     Ok(Cow::Owned(ascii))
+}
+
+/// True when `host` is already a lowercase ASCII DNS name that passes the
+/// same label checks as [`validate_ascii_hostname`].
+///
+/// One pass over the bytes replaces the previous ascii/trailing-dot/colon/
+/// uppercase scans plus the per-label validation walk. Anything unusual
+/// (uppercase, IDNA, trailing dot, colon, invalid label) falls through to the
+/// existing slow path so its error messages and normalization stay unchanged.
+fn is_canonical_ascii_hostname(host: &str) -> bool {
+    let bytes = host.as_bytes();
+    if bytes.is_empty() || bytes.len() > 253 {
+        return false;
+    }
+    let mut label_start = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'a'..=b'z' | b'0'..=b'9' | b'-' => {}
+            b'.' => {
+                let len = index - label_start;
+                if len == 0 || len > 63 || bytes[label_start] == b'-' || bytes[index - 1] == b'-' {
+                    return false;
+                }
+                label_start = index + 1;
+            }
+            _ => return false,
+        }
+    }
+    let len = bytes.len() - label_start;
+    len > 0 && len <= 63 && bytes[label_start] != b'-' && bytes[bytes.len() - 1] != b'-'
 }
 
 fn validate_ascii_hostname(ascii: &str) -> Result<()> {
@@ -530,6 +554,47 @@ mod tests {
             Ok(Cow::Owned(host)) if host == "xn--bcher-kva.example"
         ));
         assert!(normalize_hostname_cow("bad domain.example").is_err());
+    }
+
+    #[test]
+    fn canonical_fast_path_accepts_exactly_the_old_fast_path() {
+        let mut cases: Vec<String> = [
+            "example.com",
+            "a",
+            "a-b.c",
+            "a.b-c",
+            "a..b",
+            "-a.com",
+            "a-.com",
+            "a_b.com",
+            "a b.com",
+            "A.com",
+            "a.com.",
+            "a:b",
+            "",
+            "127.0.0.1",
+            "example.test",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        cases.push("a".repeat(63));
+        cases.push("a".repeat(64));
+        cases.push(format!("{}.com", "a".repeat(63)));
+        cases.push(format!("{}.com", "a".repeat(64)));
+        for host in &cases {
+            let old_fast_path = !host.is_empty()
+                && host.is_ascii()
+                && !host.ends_with('.')
+                && !host.contains(':')
+                && !host.bytes().any(|byte| byte.is_ascii_uppercase())
+                && validate_ascii_hostname(host).is_ok();
+            assert_eq!(
+                is_canonical_ascii_hostname(host),
+                old_fast_path,
+                "fast path changed for {host:?}"
+            );
+        }
     }
 
     #[test]

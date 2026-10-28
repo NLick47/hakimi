@@ -195,6 +195,69 @@ impl UpstreamStats {
     }
 }
 
+/// Bounded, lock-free markers for authorities that recently produced a slow
+/// response.
+///
+/// The previous `RwLock<HashMap>` was read on every request once any host had
+/// been marked slow (the fast-path flag never returns to `false`). That turned
+/// one stalled response into a shared lock on the hot path for the rest of the
+/// process lifetime. A direct-mapped table reduces the read to one short hash
+/// and one atomic load. A slot collision only forgets an older marker; the
+/// next slow response for that host marks it again.
+struct SlowHosts {
+    epoch: Instant,
+    slots: Box<[AtomicU64]>,
+}
+
+const SLOW_HOST_SLOTS: usize = 256;
+
+impl SlowHosts {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            slots: (0..SLOW_HOST_SLOTS)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+
+    /// FNV-1a: short authority names hash in a few nanoseconds, and the table
+    /// only needs a well-spread 32-bit value, not collision resistance.
+    fn hash(host: &str) -> u32 {
+        let mut hash = 0x811c_9dc5u32;
+        for &byte in host.as_bytes() {
+            hash ^= u32::from(byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        hash
+    }
+
+    fn slot(&self, hash: u32) -> &AtomicU64 {
+        &self.slots[(hash as usize) & (SLOW_HOST_SLOTS - 1)]
+    }
+
+    fn is_slow(&self, host: &str) -> bool {
+        let hash = Self::hash(host);
+        let packed = self.slot(hash).load(Ordering::Acquire);
+        if (packed >> 32) as u32 != hash {
+            return false;
+        }
+        let now = self.epoch.elapsed().as_secs() as u32;
+        (packed as u32) > now
+    }
+
+    fn mark(&self, host: &str, ttl: Duration) {
+        let hash = Self::hash(host);
+        let now = self.epoch.elapsed().as_secs() as u32;
+        let deadline = now.saturating_add(ttl.as_secs() as u32).max(1);
+        self.slot(hash).store(
+            (u64::from(hash) << 32) | u64::from(deadline),
+            Ordering::Release,
+        );
+    }
+}
+
 pub struct UpstreamPool {
     auto: Client<RouteConnector, UpstreamBody>,
     http1: Client<RouteConnector, UpstreamBody>,
@@ -202,7 +265,7 @@ pub struct UpstreamPool {
     recovery: Client<RouteConnector, UpstreamBody>,
     engine: Arc<DecisionEngine>,
     /// Read on every request, written only after a slow/failed response.
-    slow_hosts: RwLock<HashMap<String, Instant>>,
+    slow_hosts: SlowHosts,
     /// Fast path for the common case where no host has ever been marked slow.
     slow_hosts_seen: AtomicBool,
     /// How long a host stays on the recovery pool. Kept at least as long as
@@ -361,7 +424,7 @@ impl UpstreamPool {
             // handshake, which is exactly the cost the recovery avoids.
             recovery: build_client(config, auto_connector, max_idle),
             engine,
-            slow_hosts: RwLock::new(HashMap::new()),
+            slow_hosts: SlowHosts::new(),
             slow_hosts_seen: AtomicBool::new(false),
             // Keep the marker a little past the client's idle eviction, so a
             // request that arrives exactly at the idle boundary cannot pick
@@ -417,7 +480,7 @@ impl UpstreamPool {
         } else {
             None
         };
-        let tls = uri.scheme_str() != Some("http");
+        let tls = scheme != "http";
         let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
         let recovery = !upgrade && host.is_some_and(|host| self.is_slow(host));
         let client = if upgrade {
@@ -682,30 +745,17 @@ impl UpstreamPool {
 
     fn is_slow(&self, host: &str) -> bool {
         // Nearly all requests run before any slow host has ever been observed.
-        if !self.slow_hosts_seen.load(Ordering::Relaxed) {
+        if !self.slow_hosts_seen.load(Ordering::Acquire) {
             return false;
         }
-        // Expired entries are harmless until the next write; leaving them in
-        // place keeps this read path from needing a write lock or an upgrade.
-        self.slow_hosts
-            .read()
-            .get(host)
-            .is_some_and(|at| at.elapsed() < self.slow_route_ttl)
+        self.slow_hosts.is_slow(host)
     }
 
     fn mark_slow(&self, host: &str) {
-        let now = Instant::now();
-        let mut hosts = self.slow_hosts.write();
-        if hosts.len() >= 256 {
-            hosts.retain(|_, at| now.duration_since(*at) < self.slow_route_ttl);
-            if hosts.len() >= 256 {
-                hosts.clear();
-            }
-        }
-        hosts.insert(host.to_owned(), now);
-        // Publish the fast-path flag while holding the write lock: a reader
-        // that sees `true` will wait for this lock and then observe the entry.
-        self.slow_hosts_seen.store(true, Ordering::Relaxed);
+        self.slow_hosts.mark(host, self.slow_route_ttl);
+        // Publish the fast-path flag after the marker: a reader that sees
+        // `true` with acquire ordering observes this store's marker.
+        self.slow_hosts_seen.store(true, Ordering::Release);
     }
 
     fn host_slots(&self, host: &str) -> Arc<Semaphore> {

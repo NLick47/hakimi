@@ -456,8 +456,8 @@ fn into_proxy_response(
     mut response: Response<UpstreamResponseBody>,
     uri: http::Uri,
 ) -> Response<ProxyBody> {
-    let upgrade = response.status() == StatusCode::SWITCHING_PROTOCOLS;
     let status = response.status();
+    let upgrade = status == StatusCode::SWITCHING_PROTOCOLS;
     sanitize_response_headers(response.headers_mut(), upgrade);
     let (parts, body) = response.into_parts();
     Response::from_parts(parts, ProxyBody::upstream(body, uri, status))

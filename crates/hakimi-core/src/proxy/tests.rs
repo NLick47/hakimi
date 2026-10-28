@@ -601,3 +601,23 @@ fn bench_proxy_body_construction() {
         black_box(body);
     });
 }
+
+#[test]
+#[ignore = "micro benchmark"]
+fn bench_request_target_checks() {
+    use std::hint::black_box;
+
+    crate::bench::measure("domain.normalize_host", 5_000_000, || {
+        black_box(crate::domain::normalize_hostname_cow("example.test").unwrap());
+    });
+    let matcher = crate::domain::DomainMatcher::from_patterns([
+        ("http1", "i.pximg.net"),
+        ("http1", "booth.pximg.net"),
+        ("http1", "img.poipiku.com"),
+        ("http1", "cdn.poipiku.com"),
+    ])
+    .unwrap();
+    crate::bench::measure("domain.match_miss", 5_000_000, || {
+        black_box(matcher.match_normalized("example.test"));
+    });
+}
