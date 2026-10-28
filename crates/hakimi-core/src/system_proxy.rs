@@ -93,7 +93,7 @@ impl SystemProxyManager {
     }
 
     pub fn apply_pac(&self, pac_url: &str) -> Result<SystemProxyStatus> {
-        self.save_original(ProxyMode::Pac)?;
+        self.save_original(ProxyMode::Pac, Some(pac_url))?;
         let failed = platform_apply_pac(&self.state_path, pac_url)?;
         let mut status = self.verify(ProxyMode::Pac, pac_url.to_string())?;
         attach_apply_warnings(&mut status, &failed);
@@ -101,7 +101,7 @@ impl SystemProxyManager {
     }
 
     pub fn apply_http(&self, proxy: SocketAddr) -> Result<SystemProxyStatus> {
-        self.save_original(ProxyMode::Http)?;
+        self.save_original(ProxyMode::Http, None)?;
         let failed = platform_apply_http(&self.state_path, proxy)?;
         let mut status = self.verify(ProxyMode::Http, proxy.to_string())?;
         attach_apply_warnings(&mut status, &failed);
@@ -178,11 +178,27 @@ impl SystemProxyManager {
         self.state_path.exists()
     }
 
-    fn save_original(&self, mode: ProxyMode) -> Result<()> {
+    fn save_original(&self, mode: ProxyMode, own_pac: Option<&str>) -> Result<()> {
         if self.state_path.exists() {
             return Ok(());
         }
         let mut state = platform_snapshot(mode)?;
+        // A killed previous run can leave *our* PAC enabled. Recording that as
+        // the user's original state would make restore put the takeover back —
+        // the "pause does not switch the proxy off" bug.
+        if let Some(own) = own_pac {
+            // Windows keeps the same value in the registry; clearing it keeps a
+            // killed run's PAC out of the "original" state there too.
+            if state.auto_config_url.as_deref() == Some(own) {
+                state.auto_config_url = None;
+            }
+            for pac in &mut state.mac_pac {
+                if pac.url.as_deref() == Some(own) {
+                    pac.enabled = false;
+                    pac.url = None;
+                }
+            }
+        }
         state.mode = Some(mode);
         if let Some(parent) = self.state_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -896,11 +912,16 @@ fn platform_restore(state: &SavedState) -> Result<()> {
                 }
             } else {
                 for pac in &state.mac_pac {
-                    let url = pac.url.as_deref().unwrap_or("");
-                    if let Err(error) =
-                        run_networksetup(&["-setautoproxyurl", &pac.service, url])
-                    {
-                        failed.push(format!("{}: {error:#}", pac.service));
+                    // No original URL: leave the field alone and just switch
+                    // the protocol off. Writing "" would be a needless write,
+                    // and `-setautoproxyurl` enables the protocol as a side
+                    // effect.
+                    if let Some(url) = pac.url.as_deref().filter(|url| !url.is_empty()) {
+                        if let Err(error) =
+                            run_networksetup(&["-setautoproxyurl", &pac.service, url])
+                        {
+                            failed.push(format!("{}: {error:#}", pac.service));
+                        }
                     }
                     let enable = pac.enabled && pac.url.is_some();
                     if let Err(error) = run_networksetup(&[

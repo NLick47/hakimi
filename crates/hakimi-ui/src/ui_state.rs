@@ -57,7 +57,9 @@ pub struct Effects {
     pub resume: bool,
     pub pause: bool,
     pub apply_proxy: bool,
-    pub disable_proxy: bool,
+    /// Hand the OS proxy back: restore the snapshot taken before the takeover,
+    /// or at least switch off a PAC that still points at this instance.
+    pub release_proxy: bool,
 }
 
 impl Effects {
@@ -71,13 +73,14 @@ impl Effects {
     fn stopped() -> Self {
         Self {
             pause: true,
+            release_proxy: true,
             ..Default::default()
         }
     }
     fn awaiting() -> Self {
         Self {
             pause: true,
-            disable_proxy: true,
+            release_proxy: true,
             ..Default::default()
         }
     }
@@ -258,8 +261,8 @@ pub fn execute(effects: &Effects, runtime: &Arc<HakimiRuntime>) {
     if effects.apply_proxy {
         runtime.apply_system_proxy_async();
     }
-    if effects.disable_proxy {
-        runtime.disable_system_proxy_async();
+    if effects.release_proxy {
+        runtime.release_system_proxy_async();
     }
 }
 
@@ -409,7 +412,7 @@ mod tests {
                 !model.fix_page(),
                 "launch must not hijack the window; the banner is enough"
             );
-            assert!(effects.pause && effects.disable_proxy && !effects.resume);
+            assert!(effects.pause && effects.release_proxy && !effects.resume);
             assert_eq!(start_mode(&effects), StartMode::Deferred);
         }
     }
@@ -513,6 +516,18 @@ mod tests {
             effects.apply_proxy,
             "entering Running must write/verify the proxy instead of trusting a PAC from an earlier run"
         );
+    }
+
+    #[test]
+    fn turning_off_releases_the_os_proxy() {
+        let mut model = running_model();
+        let effects = model.toggle(env(true)); // → Stopped
+        assert_eq!(model.accel(), AccelState::Stopped);
+        assert!(
+            effects.pause && effects.release_proxy,
+            "stopping must hand the OS proxy back instead of leaving a PAC that points at us"
+        );
+        assert!(!effects.apply_proxy);
     }
 
     #[test]

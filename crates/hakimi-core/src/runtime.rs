@@ -434,7 +434,7 @@ impl HakimiRuntime {
             // thing handled here is a stale takeover of ours from a previous
             // run — this is the first moment `pac_url()` is known (post-bind).
             tracing::info!("started without applying the system proxy");
-            self.disable_system_proxy();
+            self.release_system_proxy();
         } else if config.proxy.takeover {
             // The apply records `proxy_applied`/`proxy_error` itself.
             if let Err(error) = self.apply_system_proxy() {
@@ -530,13 +530,36 @@ impl HakimiRuntime {
 
     /// Apply the OS proxy on a worker thread: the write runs several OS
     /// commands and must never block the UI thread.
+    ///
+    /// The switch can be flipped before the listener has bound, and the PAC URL
+    /// only exists after that. Waiting for it here keeps a fast toggle from
+    /// returning silently with acceleration "on" and the OS proxy still off.
     pub fn apply_system_proxy_async(self: &Arc<Self>) {
         let runtime = self.clone();
         std::thread::spawn(move || {
+            if !runtime.wait_for_listener(Duration::from_secs(3)) {
+                tracing::warn!("system proxy not applied: the local proxy is not listening");
+                *runtime.proxy_error.write() =
+                    Some("the local proxy was not listening when the proxy was applied".into());
+                return;
+            }
             if let Err(error) = runtime.apply_system_proxy_inner() {
                 tracing::error!(error = %error, "failed to apply the system proxy");
             }
         });
+    }
+
+    fn wait_for_listener(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.proxy_listen.read().is_some() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     pub fn disable_system_proxy_async(self: &Arc<Self>) {
@@ -544,6 +567,38 @@ impl HakimiRuntime {
         std::thread::spawn(move || {
             runtime.disable_system_proxy_inner();
         });
+    }
+
+    /// Hand the OS proxy back while the process keeps running.
+    ///
+    /// Pausing only flips the PAC to DIRECT; the system still points at this
+    /// instance and the user's own proxy never comes back. Stopping
+    /// acceleration has to put the pre-takeover snapshot back, and fall back to
+    /// switching our PAC off when no snapshot exists (a snapshot written by an
+    /// older build, or a takeover whose state file is gone).
+    pub fn release_system_proxy(&self) {
+        if !self.system_proxy.saved_state_exists() {
+            self.disable_system_proxy_inner();
+            return;
+        }
+        match self.restore_system_proxy() {
+            Ok(_) => {
+                // A snapshot written before the sanitizer (or by a killed run)
+                // can still put our own PAC back; never leave the system
+                // pointing at a proxy that is no longer accelerating.
+                self.disable_system_proxy_inner();
+                tracing::info!("system proxy released");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to release the system proxy");
+                self.disable_system_proxy_inner();
+            }
+        }
+    }
+
+    pub fn release_system_proxy_async(self: &Arc<Self>) {
+        let runtime = self.clone();
+        std::thread::spawn(move || runtime.release_system_proxy());
     }
 
     /// Restore OS proxy settings saved by a previous `serve` (also usable from a separate
@@ -563,6 +618,13 @@ impl HakimiRuntime {
         tracing::info!("applying the system proxy");
         let config = self.config.snapshot();
         if !config.proxy.takeover || config.proxy.mode == ProxyMode::Off {
+            // Silent no-ops here are indistinguishable from a broken switch, so
+            // say out loud why nothing was written.
+            tracing::warn!(
+                takeover = config.proxy.takeover,
+                mode = ?config.proxy.mode,
+                "system proxy takeover is off; nothing to apply"
+            );
             *self.proxy_applied.write() = None;
             *self.proxy_error.write() = None;
             return self.system_proxy.status(Some(config.proxy.mode), None);
