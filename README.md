@@ -23,7 +23,7 @@ hakimi 运行在本机，通过 PAC 或系统代理接管目录内域名的流�
                        上游连接池 ──> 真实站点
 ```
 
-目录内站点：GitHub、Pixiv、AO3、E-Hentai、Hitomi、nhentai、Hanime、Steam、Poipiku。
+目录内站点：GitHub、Pixiv、AO3、E-Hentai、Hitomi、Hanime、Steam、Poipiku、Hugging Face
 
 ## 为什么需要信任一个本地证书
 
