@@ -1210,7 +1210,9 @@ export component AppWindow inherits Window {
                     spacing: 12px;
 
                     Text {
-                        text: root.fix-blocked ? "无法开启加速：环境检查未通过" : "环境检查未通过";
+                        text: root.fix-blocked
+                            ? "无法开启加速：环境检查未通过"
+                            : (root.ca-installed && root.proxy-ok ? "环境检查通过" : "环境检查未通过");
                         font-size: 17px;
                         font-weight: 600;
                         color: #1B1F24;
@@ -1219,7 +1221,7 @@ export component AppWindow inherits Window {
                     Text {
                         text: root.fix-blocked
                             ? "为避免「看似加速实则无效」，已暂停开启。\n修复以下问题后将自动开启加速。"
-                            : "修复以下问题后即可正常加速。";
+                            : (root.ca-installed && root.proxy-ok ? "加速环境已就绪。" : "修复以下问题后即可正常加速。");
                         font-size: 12.5px;
                         color: #5C6670;
                         horizontal-alignment: center;
@@ -1341,10 +1343,14 @@ export component AppWindow inherits Window {
                             color: #1B7F4D;
                             horizontal-alignment: center;
                         }
-                        ActionButton {
-                            width: 200px;
-                            label: root.fix-blocked ? "返回加速" : "完成";
-                            clicked => { root.finish-onboarding(); }
+                        HorizontalLayout {
+                            Rectangle { horizontal-stretch: 1; }
+                            ActionButton {
+                                width: 200px;
+                                label: root.fix-blocked ? "返回加速" : "完成";
+                                clicked => { root.finish-onboarding(); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
                         }
                     }
 
