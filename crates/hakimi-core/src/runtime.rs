@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -184,6 +184,9 @@ pub struct HakimiRuntime {
     /// Bounds concurrent diagnostic probes so one sweep does not open dozens
     /// of TLS connections at once.
     probe_gate: Arc<Semaphore>,
+    /// Per-domain warm-up backoff: domains whose last warm-up failed are
+    /// re-tried on a growing interval instead of on every warm trigger.
+    warm_backoff: Mutex<HashMap<String, (u32, Instant)>>,
     started_at: DateTime<Utc>,
 }
 
@@ -304,6 +307,7 @@ impl HakimiRuntime {
             tasks: Mutex::new(Vec::new()),
             started: AtomicBool::new(false),
             probe_gate: Arc::new(Semaphore::new(8)),
+            warm_backoff: Mutex::new(HashMap::new()),
             started_at,
         });
         // A previous crash may have left the OS proxy pointing at us.
@@ -1083,6 +1087,7 @@ impl HakimiRuntime {
                     // Cached resolver answers belong to the old network
                     crate::proxy::clear_dns_cache();
                     let _ = runtime.resolver.health_check().await;
+                    runtime.warm_backoff.lock().clear();
                     runtime.warm_groups().await;
                 }
             }
@@ -1113,6 +1118,28 @@ impl HakimiRuntime {
             .unwrap_or(false)
     }
 
+    /// Cap for the warm-up backoff of domains whose warm-up keeps failing.
+    const WARM_BACKOFF_MAX_SECS: u64 = 1800;
+
+    /// Whether `domain` is due for another warm attempt.
+    fn warm_backoff_ready(&self, domain: &str) -> bool {
+        let map = self.warm_backoff.lock();
+        map.get(domain)
+            .is_none_or(|(_, next)| *next <= Instant::now())
+    }
+
+    fn note_warm_failure(&self, domain: &str) {
+        let mut map = self.warm_backoff.lock();
+        let consecutive = map.get(domain).map_or(0, |(n, _)| *n) + 1;
+        let delay = 300u64.saturating_mul(1u64 << (consecutive - 1).min(4));
+        let next = Instant::now() + Duration::from_secs(delay.min(Self::WARM_BACKOFF_MAX_SECS));
+        map.insert(domain.to_string(), (consecutive, next));
+    }
+
+    fn note_warm_success(&self, domain: &str) {
+        self.warm_backoff.lock().remove(domain);
+    }
+
     async fn warm_groups(self: &Arc<Self>) {
         // A harness that needs a cold connection can turn the warm-up off.
         if crate::hooks::skip_warmup() {
@@ -1125,10 +1152,19 @@ impl HakimiRuntime {
         let mut seen = HashSet::new();
         let mut primaries = Vec::new();
         let mut rest = Vec::new();
+        let mut deferred = 0usize;
         for group in config.enabled_groups() {
             let primary = group.primary_domain().map(ToOwned::to_owned);
             for domain in group.exact_domains() {
                 if !seen.insert(domain.to_string()) {
+                    continue;
+                }
+                // A domain whose last warm-up failed is re-tried on a
+                // backoff schedule instead of every trigger: a walled
+                // address will not recover within seconds, and retrying
+                // means a full timeout round per warm-up for nothing.
+                if !self.warm_backoff_ready(domain) {
+                    deferred += 1;
                     continue;
                 }
                 if primary.as_deref() == Some(domain) {
@@ -1137,6 +1173,9 @@ impl HakimiRuntime {
                     rest.push(domain.to_string());
                 }
             }
+        }
+        if deferred > 0 {
+            tracing::debug!(deferred, "warm-up deferred by the failure backoff");
         }
         // Wildcard-matched hosts never appear in `exact_domains`, but the catalog
         // names concrete subdomains (github.githubassets.com, ...) and lastGood
@@ -1197,14 +1236,22 @@ impl HakimiRuntime {
                 Err(_) => return,
             };
             let upstream = self.upstream.clone();
+            let runtime = self.clone();
+            let domain_for_result = domain.clone();
             let retry_semaphore = semaphore.clone();
             handles.push(tokio::spawn(async move {
-                warm_with_retry(permit, retry_semaphore, WARM_RETRY_DELAY, move || {
+                let ok = warm_with_retry(permit, retry_semaphore, WARM_RETRY_DELAY, move || {
                     let upstream = upstream.clone();
                     let domain = domain.clone();
                     async move { upstream.warm(&domain, 443).await }
                 })
-                .await
+                .await;
+                if ok {
+                    runtime.note_warm_success(&domain_for_result);
+                } else {
+                    runtime.note_warm_failure(&domain_for_result);
+                }
+                ok
             }));
         }
         // Give primary checks a head start so group state becomes useful earlier.
@@ -1215,14 +1262,22 @@ impl HakimiRuntime {
                 Err(_) => return,
             };
             let upstream = self.upstream.clone();
+            let runtime = self.clone();
+            let domain_for_result = domain.clone();
             let retry_semaphore = semaphore.clone();
             handles.push(tokio::spawn(async move {
-                warm_with_retry(permit, retry_semaphore, WARM_RETRY_DELAY, move || {
+                let ok = warm_with_retry(permit, retry_semaphore, WARM_RETRY_DELAY, move || {
                     let upstream = upstream.clone();
                     let domain = domain.clone();
                     async move { upstream.warm(&domain, 443).await }
                 })
-                .await
+                .await;
+                if ok {
+                    runtime.note_warm_success(&domain_for_result);
+                } else {
+                    runtime.note_warm_failure(&domain_for_result);
+                }
+                ok
             }));
         }
         // Summarize the warmup: how many routes are hot before the user opens
@@ -1255,6 +1310,7 @@ impl HakimiRuntime {
 #[cfg(test)]
 mod status_snapshot_tests {
     use super::*;
+    use crate::cache::LastGoodEntry;
     use crate::config::{DomainRule, GroupConfig, RoutePolicy};
     use crate::status::DomainDiagnostics;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1429,5 +1485,107 @@ mod status_snapshot_tests {
         crate::bench::measure("status.json(2k)", 200, || {
             let _ = runtime.status_json();
         });
+    }
+
+    /// A domain whose warm-up failed is retried on a growing interval instead
+    /// of on every warm trigger; one success clears the whole backoff.
+    #[tokio::test]
+    async fn warm_backoff_defers_failing_domains_until_the_interval_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = HakimiRuntime::new(Some(dir.path().to_path_buf())).unwrap();
+        assert!(runtime.warm_backoff_ready("steamcommunity.com"));
+
+        runtime.note_warm_failure("steamcommunity.com");
+        assert!(!runtime.warm_backoff_ready("steamcommunity.com"));
+
+        runtime.note_warm_success("steamcommunity.com");
+        assert!(runtime.warm_backoff_ready("steamcommunity.com"));
+
+        // Repeated failures keep growing the consecutive counter, which is
+        // what drives the interval in note_warm_failure.
+        runtime.note_warm_failure("steamcommunity.com");
+        runtime.note_warm_failure("steamcommunity.com");
+        let consecutive = runtime
+            .warm_backoff
+            .lock()
+            .get("steamcommunity.com")
+            .map(|(count, _)| *count)
+            .unwrap();
+        assert_eq!(consecutive, 2);
+        assert!(!runtime.warm_backoff_ready("steamcommunity.com"));
+    }
+
+    /// The real warm_groups run against a walled address: the first trigger
+    /// warms it and records the failure, the second trigger defers it instead
+    /// of burning another full timeout round on an address that cannot have
+    /// recovered within seconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warm_groups_defers_domains_that_keep_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = HakimiRuntime::new(Some(dir.path().to_path_buf())).unwrap();
+        runtime
+            .config
+            .mutate(|config| {
+                config.groups.retain(|group| group.id == "github");
+                config.groups.push(GroupConfig {
+                    id: "dead".into(),
+                    name: "Dead".into(),
+                    domains: vec![DomainRule::new("dead.test")],
+                    enabled: true,
+                    homepage: None,
+                    default_route: RoutePolicy::direct(),
+                });
+                config.advanced.ip_timeout_ms = 500;
+                Ok(())
+            })
+            .unwrap();
+        // The last-good address is an RFC 5737 documentation address: TCP to
+        // it black-holes, so the warm-up can only fail.
+        runtime.cache.put_last_good(LastGoodEntry {
+            domain: "dead.test".into(),
+            ip: "192.0.2.1".parse().unwrap(),
+            source: crate::strategy::IpSource::Cache,
+            saved_at: crate::util::now(),
+            catalog_version: 0,
+        });
+
+        runtime.warm_groups().await;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if runtime
+                .warm_backoff
+                .lock()
+                .get("dead.test")
+                .is_some_and(|(count, _)| *count >= 1)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the failed warm-up must enter the backoff table"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let after_first = runtime
+            .warm_backoff
+            .lock()
+            .get("dead.test")
+            .map(|(count, _)| *count)
+            .unwrap();
+
+        // The second trigger must skip the deferred domain entirely: no new
+        // warm attempt means the consecutive counter stays put.
+        runtime.warm_groups().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let after_second = runtime
+            .warm_backoff
+            .lock()
+            .get("dead.test")
+            .map(|(count, _)| *count)
+            .unwrap();
+        assert_eq!(
+            after_second, after_first,
+            "a deferred domain must not be warmed again while backed off"
+        );
     }
 }

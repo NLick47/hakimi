@@ -65,6 +65,7 @@ struct FakeProber {
     working: Mutex<HashSet<IpAddr>>,
     working_fake_sni: Mutex<HashSet<(IpAddr, Option<String>)>>,
     calls: Mutex<Vec<(IpAddr, TlsMode, Option<String>)>>,
+    tcp_calls: AtomicUsize,
 }
 
 #[async_trait]
@@ -105,12 +106,45 @@ impl Prober for FakeProber {
         _port: u16,
         _timeout: Duration,
     ) -> std::result::Result<u64, ConnectError> {
+        self.tcp_calls.fetch_add(1, Ordering::SeqCst);
         if self.working.lock().contains(&ip) {
             Ok(5)
         } else {
             Err(ConnectError::TcpRefused)
         }
     }
+}
+
+#[tokio::test]
+async fn reprobe_backs_off_addresses_that_keep_failing() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let ip: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+    h.engine.record_ip("example.com", ip, None, true);
+
+    // First re-probe runs and fails: the address enters its backoff window.
+    assert_eq!(h.engine.reprobe_failed_ips(8).await, 0);
+    assert_eq!(h.prober.tcp_calls.load(Ordering::SeqCst), 1);
+    assert!(!h.engine.probe_backoff_ready("example.com", ip));
+
+    // Inside the window the address is not probed again.
+    h.engine.reprobe_failed_ips(8).await;
+    assert_eq!(h.prober.tcp_calls.load(Ordering::SeqCst), 1);
+
+    // Once the window passes, the probe runs again; success clears the
+    // backoff and the recovered address leaves the re-probe set entirely.
+    {
+        let mut map = h.engine.probe_backoff.lock();
+        for (_, next) in map.values_mut() {
+            *next = Instant::now() - Duration::from_secs(1);
+        }
+    }
+    h.prober.working.lock().insert(ip);
+    assert_eq!(h.engine.reprobe_failed_ips(8).await, 1);
+    assert_eq!(h.prober.tcp_calls.load(Ordering::SeqCst), 2);
+    assert!(h.engine.probe_backoff_ready("example.com", ip));
+
+    h.engine.reprobe_failed_ips(8).await;
+    assert_eq!(h.prober.tcp_calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -166,6 +200,46 @@ async fn a_successful_reprobe_pays_down_the_failure_history() {
         0,
         "a recovered ip must leave the re-probe set instead of being probed every minute"
     );
+}
+
+#[test]
+fn masked_sni_block_status_does_not_penalize_the_ip() {
+    // api.github.com answers warm-ups on the masked-SNI route with a steady
+    // 403/429: that is the CDN rejecting the name mismatch, not a walled
+    // address. Only the same status on the real SNI (direct) is a signal.
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let mut masked = test_plan(TlsMode::FakeSni, Some("www.bing.com"));
+    masked.domain = "api.github.com".into();
+    masked.group_id = "github".into();
+    h.engine.remember_plan_arc(Arc::new(masked));
+    assert!(h.engine.cached_plan("api.github.com", 443, true).is_some());
+
+    assert!(!h.engine.note_blocked_candidate(
+        "api.github.com",
+        443,
+        true,
+        http::StatusCode::FORBIDDEN,
+    ));
+    assert!(!h
+        .engine
+        .ip_rejected("api.github.com", "1.1.1.1".parse().unwrap()));
+    assert!(h.engine.cached_plan("api.github.com", 443, true).is_some());
+
+    // The same status on the real SNI is a block page: penalize the IP.
+    let mut direct = test_plan(TlsMode::Direct, None);
+    direct.domain = "api.github.com".into();
+    direct.group_id = "github".into();
+    h.engine.remember_plan_arc(Arc::new(direct));
+    assert!(h.engine.note_blocked_candidate(
+        "api.github.com",
+        443,
+        true,
+        http::StatusCode::FORBIDDEN,
+    ));
+    assert!(h
+        .engine
+        .ip_rejected("api.github.com", "1.1.1.1".parse().unwrap()));
+    assert!(h.engine.cached_plan("api.github.com", 443, true).is_none());
 }
 
 #[tokio::test]

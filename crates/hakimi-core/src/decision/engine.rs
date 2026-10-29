@@ -64,6 +64,10 @@ pub struct DecisionEngine {
     /// Checking instead of Failed so the first probe's retry does not flash
     /// red; the runtime settles the remaining ones after warmup.
     warming: AtomicBool,
+    /// Exponential backoff for re-probing addresses that keep failing. A
+    /// permanently walled address otherwise tops the failure ranking and is
+    /// re-probed every minute forever.
+    pub(super) probe_backoff: parking_lot::Mutex<HashMap<(String, IpAddr), (u32, Instant)>>,
 }
 
 pub(super) const PLAN_CACHE_MAX: usize = 2048;
@@ -79,6 +83,8 @@ const LOGGED_ROUTE_TTL: Duration = Duration::from_secs(600);
 const ROUTE_REJECTION_TTL: Duration = Duration::from_secs(300);
 /// How long a block-page IP stays out of a domain's candidate set.
 const IP_REJECTION_TTL: Duration = Duration::from_secs(300);
+/// Cap for the re-probe backoff of continuously failing addresses.
+const PROBE_BACKOFF_MAX: Duration = Duration::from_secs(1800);
 
 /// The key a plan is stored under.  Hot-path callers already pass a
 /// normalized host, so the common case borrows.
@@ -116,6 +122,7 @@ impl DecisionEngine {
             route_rejections: parking_lot::RwLock::new(HashMap::new()),
             ip_rejections: parking_lot::RwLock::new(HashMap::new()),
             logged_routes: parking_lot::RwLock::new(HashMap::new()),
+            probe_backoff: parking_lot::Mutex::new(HashMap::new()),
             warming: AtomicBool::new(false),
         })
     }
@@ -611,6 +618,20 @@ impl DecisionEngine {
         let Some(plan) = self.cached_plan(domain, port, tls) else {
             return false;
         };
+        if plan.mode != TlsMode::Direct {
+            // A masked-SNI request is rejected by the origin for the name
+            // mismatch itself: api.github.com answers such warm-ups with a
+            // steady 403/429, which says nothing about the address. Only a
+            // block page on the real SNI proves the IP serves one.
+            tracing::debug!(
+                domain = %plan.domain,
+                ip = %plan.ip,
+                mode = %plan.mode,
+                status = status.as_u16(),
+                "block-page status on a masked-SNI route; not penalizing"
+            );
+            return false;
+        }
         let config = self.config.snapshot();
         let Some(group) = config.group(&plan.group_id) else {
             return false;
@@ -652,6 +673,32 @@ impl DecisionEngine {
             .is_some_and(|at| at.elapsed() < IP_REJECTION_TTL)
     }
 
+    /// Whether a failed address is due for another re-probe attempt.
+    pub(super) fn probe_backoff_ready(&self, domain: &str, ip: IpAddr) -> bool {
+        let map = self.probe_backoff.lock();
+        map.get(&(domain.to_string(), ip))
+            .is_none_or(|(_, next)| *next <= Instant::now())
+    }
+
+    fn note_probe_failure(&self, domain: &str, ip: IpAddr) {
+        let mut map = self.probe_backoff.lock();
+        let consecutive = map.get(&(domain.to_string(), ip)).map_or(0, |(n, _)| *n) + 1;
+        let delay_secs = 60u64
+            .saturating_mul(1u64 << (consecutive - 1).min(5))
+            .min(PROBE_BACKOFF_MAX.as_secs());
+        map.insert(
+            (domain.to_string(), ip),
+            (
+                consecutive,
+                Instant::now() + Duration::from_secs(delay_secs),
+            ),
+        );
+    }
+
+    fn note_probe_success(&self, domain: &str, ip: IpAddr) {
+        self.probe_backoff.lock().remove(&(domain.to_string(), ip));
+    }
+
     /// Configuration edits can change the route a rejection belonged to.
     pub fn clear_route_rejections(&self) {
         self.route_rejections.write().clear();
@@ -665,6 +712,7 @@ impl DecisionEngine {
         self.forget_all_plans();
         self.clear_route_rejections();
         self.ip_rejections.write().clear();
+        self.probe_backoff.lock().clear();
         {
             let mut scores = self.ip_scores.write();
             scores.clear();
@@ -901,6 +949,7 @@ impl DecisionEngine {
                         .filter(|(_, score)| score.failures > 0)
                         .map(|(ip, score)| (domain.as_str(), *ip, score.failures))
                 })
+                .filter(|(domain, ip, _)| self.probe_backoff_ready(domain, *ip))
                 .collect();
             list.sort_by(|a, b| b.2.cmp(&a.2));
             list.truncate(limit);
@@ -925,9 +974,13 @@ impl DecisionEngine {
                         // A successful probe is a real sample: the success count
                         // rises, so the fail rate — and the rank — recover.
                         engine.record_ip(&domain, ip, Some(latency), false);
+                        engine.note_probe_success(&domain, ip);
                         true
                     }
-                    Err(_) => false,
+                    Err(_) => {
+                        engine.note_probe_failure(&domain, ip);
+                        false
+                    }
                 }
             });
         }
@@ -1330,10 +1383,7 @@ fn format_candidates(candidates: &[Candidate]) -> String {
 /// The error is the part that decides what to do next (a black hole, a
 /// filtered SNI, a bad certificate), so it has to be visible per attempt.
 fn format_attempt(attempt: &AttemptRecord) -> String {
-    let error = attempt
-        .error
-        .map(|reason| reason.as_str())
-        .unwrap_or("-");
+    let error = attempt.error.map(|reason| reason.as_str()).unwrap_or("-");
     let sni = attempt
         .sni
         .as_deref()
