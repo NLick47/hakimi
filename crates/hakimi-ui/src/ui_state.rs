@@ -19,6 +19,7 @@
 //!   itself.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use hakimi_core::runtime::HakimiRuntime;
 
@@ -30,6 +31,9 @@ pub struct EnvState {
     pub ca_ok: bool,
     pub ca_error: String,
     pub proxy_ok: bool,
+    /// The takeover we installed is no longer in the OS: another program (or
+    /// the user) changed the system proxy while acceleration was running.
+    pub proxy_lost: bool,
 }
 
 impl EnvState {
@@ -47,6 +51,9 @@ pub enum AccelState {
     Running,
     Stopped,
     AwaitingEnvironment,
+    /// Acceleration stopped because the system proxy no longer points here.
+    /// Waiting for the user to decide: re-apply, or leave it alone.
+    Interrupted,
 }
 
 /// Side effects a transition demands. Keeping them declarative (instead of
@@ -60,6 +67,9 @@ pub struct Effects {
     /// Hand the OS proxy back: restore the snapshot taken before the takeover,
     /// or at least switch off a PAC that still points at this instance.
     pub release_proxy: bool,
+    /// Give the takeover up without writing anything back: someone else owns
+    /// the setting now, so the snapshot has to be dropped, not restored.
+    pub forget_proxy: bool,
 }
 
 impl Effects {
@@ -84,6 +94,14 @@ impl Effects {
             ..Default::default()
         }
     }
+    /// The system proxy was changed by someone else: stop accelerating and
+    /// leave their settings alone.
+    fn interrupted() -> Self {
+        Self {
+            forget_proxy: true,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -95,6 +113,14 @@ pub struct AppModel {
     /// once-a-second environment sync, which recomputes the page from state and
     /// would otherwise bounce the user back to the home page immediately.
     fix_page_open: bool,
+    /// When acceleration was last entered. A takeover loss inside the grace
+    /// window is our own asynchronous apply still publishing through configd,
+    /// not someone else taking over.
+    running_since: Option<Instant>,
+    /// How long [`Self::running_since`] is trusted over an OS read-back.
+    drift_grace: Duration,
+    /// The user saw the interruption banner and told the app to leave it alone.
+    interrupt_dismissed: bool,
 }
 
 impl Default for AppModel {
@@ -105,8 +131,12 @@ impl Default for AppModel {
                 ca_ok: true,
                 ca_error: String::new(),
                 proxy_ok: true,
+                proxy_lost: false,
             },
             fix_page_open: false,
+            running_since: None,
+            drift_grace: Duration::from_secs(3),
+            interrupt_dismissed: false,
         }
     }
 }
@@ -119,19 +149,28 @@ impl AppModel {
     pub fn startup(&mut self, env: EnvState) -> Effects {
         self.env = env;
         self.accel = AccelState::Stopped;
+        self.running_since = None;
+        self.interrupt_dismissed = false;
         Effects::awaiting()
     }
 
     /// The master switch. Turning acceleration ON with a broken environment
     /// does not accelerate: it parks in [`AccelState::AwaitingEnvironment`].
+    /// From [`AccelState::Interrupted`] it re-applies the takeover once.
     pub fn toggle(&mut self, env: EnvState) -> Effects {
         self.env = env;
         self.accel = match self.accel {
-            AccelState::Running => AccelState::Stopped,
-            AccelState::Stopped | AccelState::AwaitingEnvironment => {
+            AccelState::Running => {
+                self.running_since = None;
+                AccelState::Stopped
+            }
+            AccelState::Stopped | AccelState::AwaitingEnvironment | AccelState::Interrupted => {
                 if self.env.allows_acceleration() {
+                    self.accel = AccelState::Running;
+                    self.note_running();
                     AccelState::Running
                 } else {
+                    self.running_since = None;
                     AccelState::AwaitingEnvironment
                 }
             }
@@ -146,6 +185,7 @@ impl AppModel {
     pub fn stop(&mut self) -> Effects {
         let was_active = self.accel != AccelState::Stopped;
         self.accel = AccelState::Stopped;
+        self.running_since = None;
         if was_active {
             Effects::stopped()
         } else {
@@ -155,14 +195,54 @@ impl AppModel {
 
     /// Periodic environment probe. A pending resume completes itself the
     /// moment the environment passes. A failed proxy write only updates the
-    /// warning state; it never pauses a running acceleration.
+    /// warning state; it never pauses a running acceleration — but a proxy
+    /// that *used to be* ours and no longer is does: someone else took the
+    /// system settings over, and pretending to accelerate would be a lie.
+    ///
+    /// The caller debounces the OS read-back (two consecutive reads must
+    /// agree); the grace window here covers our own asynchronous apply, which
+    /// macOS publishes a moment later.
     pub fn env_changed(&mut self, env: EnvState) -> Effects {
         self.env = env;
+        if self.accel == AccelState::Running && self.env.proxy_lost && !self.in_grace() {
+            self.running_since = None;
+            self.accel = AccelState::Interrupted;
+            return Effects::interrupted();
+        }
         if self.accel == AccelState::AwaitingEnvironment && self.env.allows_acceleration() {
             self.accel = AccelState::Running;
+            self.note_running();
             return self.effects();
         }
         Effects::default()
+    }
+
+    /// True when the switch has to show the interrupted state.
+    pub fn proxy_lost(&self) -> bool {
+        if self.interrupt_dismissed {
+            return false;
+        }
+        self.accel == AccelState::Interrupted
+            || (self.accel == AccelState::Running && self.env.proxy_lost)
+    }
+
+    /// The user acknowledged the interruption banner: hide it, stay stopped.
+    pub fn dismiss_interrupt(&mut self) {
+        self.interrupt_dismissed = true;
+    }
+
+    fn note_running(&mut self) {
+        self.interrupt_dismissed = false;
+        if self.accel == AccelState::Running {
+            self.running_since = Some(Instant::now());
+        }
+    }
+
+    fn in_grace(&self) -> bool {
+        match self.running_since {
+            Some(entered) => entered.elapsed() < self.drift_grace,
+            None => true,
+        }
     }
 
     /// The user asked to see the fix page from the warning banner. Does not
@@ -209,6 +289,9 @@ impl AppModel {
             AccelState::Running => running(),
             AccelState::Stopped => Effects::stopped(),
             AccelState::AwaitingEnvironment => Effects::awaiting(),
+            // The interruption already ran its effects; anything else only
+            // needs to leave the runtime alone.
+            AccelState::Interrupted => Effects::default(),
         }
     }
 }
@@ -264,6 +347,9 @@ pub fn execute(effects: &Effects, runtime: &Arc<HakimiRuntime>) {
     if effects.release_proxy {
         runtime.release_system_proxy_async();
     }
+    if effects.forget_proxy {
+        runtime.abandon_takeover();
+    }
 }
 
 /// Mirror the model onto the window. The only place that writes UI state.
@@ -274,6 +360,7 @@ pub fn sync_window(model: &AppModel, app: &AppWindow) {
     app.set_ca_installed(env.ca_ok);
     app.set_ca_error(SharedString::from(env.ca_error.clone()));
     app.set_proxy_ok(env.proxy_ok);
+    app.set_proxy_interrupted(model.proxy_lost());
     if env.ca_ok || !env.ca_error.is_empty() {
         // Install finished (or failed loudly): the wait-for-dialog state can go.
         app.set_ob_installing(false);
@@ -289,13 +376,15 @@ pub fn sync_window(model: &AppModel, app: &AppWindow) {
 /// Probe the environment. Spawns subprocesses (the CA status, and `security`
 /// on macOS), so it must run OFF the UI thread — callers post the result back
 /// through the event loop. The system-proxy result is the last write recorded
-/// by the runtime; no OS proxy process is spawned here.
-pub fn probe_env(runtime: &HakimiRuntime) -> EnvState {
+/// by the runtime; the OS is only read back when `check_proxy_os` is set,
+/// which costs a `scutil` run on macOS and is therefore throttled by callers.
+pub fn probe_env(runtime: &HakimiRuntime, check_proxy_os: bool) -> EnvState {
     let ca = runtime.ca().status();
     EnvState {
         ca_ok: ca.installed,
         ca_error: ca.error.unwrap_or_default(),
         proxy_ok: runtime.system_proxy_applied(),
+        proxy_lost: check_proxy_os && runtime.takeover_lost() == Some(true),
     }
 }
 
@@ -391,7 +480,14 @@ mod tests {
                 "not trusted".into()
             },
             proxy_ok: healthy,
+            proxy_lost: false,
         }
+    }
+
+    fn env_lost() -> EnvState {
+        let mut env = env(true);
+        env.proxy_lost = true;
+        env
     }
 
     /// The state right after the user flips acceleration on at launch.
@@ -399,6 +495,9 @@ mod tests {
         let mut model = AppModel::default();
         model.startup(env(true));
         model.toggle(env(true));
+        // Tests cannot wait out the grace window; the suppression test below
+        // uses the real window instead.
+        model.drift_grace = Duration::ZERO;
         model
     }
 
@@ -454,6 +553,69 @@ mod tests {
         let effects = model.env_changed(fixed);
         assert_eq!(model.accel(), AccelState::Running);
         assert!(effects.resume && effects.apply_proxy);
+    }
+
+    #[test]
+    fn proxy_taken_over_by_another_program_interrupts_acceleration() {
+        let mut model = running_model();
+        assert!(!model.proxy_lost());
+
+        let effects = model.env_changed(env_lost());
+        assert_eq!(model.accel(), AccelState::Interrupted);
+        assert!(model.proxy_lost());
+        // Not release_proxy: restoring the snapshot would overwrite the
+        // program that took the proxy over. The snapshot is dropped instead.
+        assert!(effects.forget_proxy);
+        assert!(!effects.release_proxy && !effects.apply_proxy && !effects.resume);
+    }
+
+    #[test]
+    fn interrupted_state_waits_for_the_user_instead_of_fighting_back() {
+        let mut model = running_model();
+        model.env_changed(env_lost());
+        assert_eq!(model.accel(), AccelState::Interrupted);
+
+        // A tick that no longer reports the loss must not silently resume.
+        let effects = model.env_changed(env(true));
+        assert_eq!(effects, Effects::default());
+        assert_eq!(model.accel(), AccelState::Interrupted);
+    }
+
+    #[test]
+    fn re_enabling_after_an_interruption_reapplies_the_takeover() {
+        let mut model = running_model();
+        model.env_changed(env_lost());
+        assert_eq!(model.accel(), AccelState::Interrupted);
+
+        let effects = model.toggle(env(true));
+        assert_eq!(model.accel(), AccelState::Running);
+        assert!(effects.resume && effects.apply_proxy && !effects.forget_proxy);
+        assert!(!model.proxy_lost());
+    }
+
+    #[test]
+    fn tick_without_an_os_read_never_reports_a_loss() {
+        let mut model = running_model();
+        // Ticks that skip the OS read-back carry `proxy_lost: false`; they
+        // must not be mistaken for "the proxy came back".
+        let effects = model.env_changed(env(true));
+        assert_eq!(effects, Effects::default());
+        assert_eq!(model.accel(), AccelState::Running);
+    }
+
+    #[test]
+    fn apply_lag_right_after_enabling_is_not_a_takeover_loss() {
+        // The default grace window covers the asynchronous apply: macOS needs
+        // a moment to publish the PAC, so an immediate read-back that does not
+        // see it yet is our own lag, not another program.
+        let mut model = AppModel::default();
+        model.startup(env(true));
+        model.toggle(env(true));
+
+        let effects = model.env_changed(env_lost());
+        assert_eq!(effects, Effects::default());
+        assert_eq!(model.accel(), AccelState::Running);
+        assert!(model.proxy_lost(), "the UI still shows the drift hint");
     }
 
     #[test]
@@ -557,6 +719,7 @@ mod tests {
             ca_ok: true,
             ca_error: String::new(),
             proxy_ok: false,
+            proxy_lost: false,
         };
         let effects = model.env_changed(failed);
         assert_eq!(effects, Effects::default());
@@ -574,6 +737,7 @@ mod tests {
             ca_ok: true,
             ca_error: String::new(),
             proxy_ok: false,
+            proxy_lost: false,
         };
         model.env_changed(failed);
         model.toggle(env(true)); // running → stopped
@@ -582,6 +746,7 @@ mod tests {
             ca_ok: true,
             ca_error: String::new(),
             proxy_ok: false,
+            proxy_lost: false,
         });
         assert_eq!(model.accel(), AccelState::Running);
         assert!(effects.resume);

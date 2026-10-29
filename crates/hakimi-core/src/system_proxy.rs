@@ -125,6 +125,31 @@ impl SystemProxyManager {
         Ok(true)
     }
 
+    /// Drop the snapshot without touching the system settings.
+    ///
+    /// Used when the setting no longer belongs to us — another client took the
+    /// system proxy over. Restoring the snapshot then would put *our* captured
+    /// state back on top of theirs, so the only safe move is to forget it.
+    pub fn forget(&self) {
+        match std::fs::remove_file(&self.state_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(error = %error, path = %self.state_path.display(), "could not delete the system proxy snapshot")
+            }
+        }
+    }
+
+    /// Read the OS back and report whether it still matches `expected`.
+    ///
+    /// `None` means the OS could not be read at all, which is not evidence of
+    /// a takeover loss — callers must not treat it as one.
+    pub fn still_ours(&self, mode: ProxyMode, expected: &str) -> Option<bool> {
+        self.status(Some(mode), Some(expected.to_string()))
+            .ok()
+            .map(|status| status.applied)
+    }
+
     pub fn status(
         &self,
         mode: Option<ProxyMode>,
@@ -765,8 +790,7 @@ fn platform_snapshot(mode: ProxyMode) -> Result<SavedState> {
                     NETWORKSETUP_TIMEOUT_SECS,
                 )?;
                 let (web_enabled, web_server, web_port) = parse_mac_http_proxy(&web);
-                let (secure_enabled, secure_server, secure_port) =
-                    parse_mac_http_proxy(&secure);
+                let (secure_enabled, secure_server, secure_port) = parse_mac_http_proxy(&secure);
                 mac_http.push(MacHttpState {
                     service: service.clone(),
                     web_enabled,
@@ -791,7 +815,8 @@ fn platform_snapshot(mode: ProxyMode) -> Result<SavedState> {
 
 #[cfg(target_os = "macos")]
 fn list_network_services() -> Result<Vec<String>> {
-    let text = run_networksetup_with_timeout(&["-listallnetworkservices"], NETWORKSETUP_TIMEOUT_SECS)?;
+    let text =
+        run_networksetup_with_timeout(&["-listallnetworkservices"], NETWORKSETUP_TIMEOUT_SECS)?;
     let text = text.as_str();
     Ok(text
         .lines()
@@ -911,9 +936,7 @@ fn platform_restore(state: &SavedState) -> Result<()> {
             // a proxy the user had configured before hakimi.
             if state.mac_pac.is_empty() {
                 for service in &state.mac_services {
-                    if let Err(error) =
-                        run_networksetup(&["-setautoproxystate", service, "off"])
-                    {
+                    if let Err(error) = run_networksetup(&["-setautoproxystate", service, "off"]) {
                         failed.push(format!("{service}: {error:#}"));
                     }
                 }
@@ -958,7 +981,11 @@ fn platform_restore(state: &SavedState) -> Result<()> {
     if failed.is_empty() {
         Ok(())
     } else {
-        bail!("failed to restore {} proxy setting(s): {}", failed.len(), failed.join("; "))
+        bail!(
+            "failed to restore {} proxy setting(s): {}",
+            failed.len(),
+            failed.join("; ")
+        )
     }
 }
 
@@ -1174,7 +1201,11 @@ mod tests {
         );
         // Unrelated bits such as auto-detect survive the reconciliation.
         assert_eq!(
-            restore_flags(Some(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_DETECT), false, false),
+            restore_flags(
+                Some(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_DETECT),
+                false,
+                false
+            ),
             PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_DETECT
         );
     }
@@ -1215,10 +1246,7 @@ mod verification_tests {
     #[test]
     fn http_requires_both_web_and_secure_proxies() {
         let both = "<dictionary> {\n  HTTPEnable : 1\n  HTTPProxy : 127.0.0.1\n  HTTPPort : 8443\n  HTTPSEnable : 1\n  HTTPSProxy : 127.0.0.1\n  HTTPSPort : 8443\n}\n";
-        assert_eq!(
-            scutil_http_current(both).as_deref(),
-            Some("127.0.0.1:8443")
-        );
+        assert_eq!(scutil_http_current(both).as_deref(), Some("127.0.0.1:8443"));
 
         let web_only = both.replace("HTTPSEnable : 1", "HTTPSEnable : 0");
         assert_eq!(scutil_http_current(&web_only), None);

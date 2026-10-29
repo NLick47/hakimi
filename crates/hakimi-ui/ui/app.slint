@@ -695,6 +695,10 @@ export component AppWindow inherits Window {
     in property <string> ca-action-error;
     in property <bool> ca-busy: false;
     in property <bool> proxy-ok: true;
+    // The takeover we installed is no longer in the OS: another program (or
+    // the user) changed the system proxy. Acceleration is paused, waiting for
+    // the user to decide — the banner on the home page explains it.
+    in property <bool> proxy-interrupted: false;
     in-out property <bool> ob-installing: false;
 
     // Sidebar counters, pre-formatted by the host.
@@ -747,6 +751,7 @@ export component AppWindow inherits Window {
 
     callback toggle-master();
     callback open-fix();
+    callback dismiss-interrupt();
     callback finish-onboarding();
     callback reapply-proxy();
     callback toggle-group(string, bool);
@@ -923,6 +928,43 @@ export component AppWindow inherits Window {
                                 TextButton {
                                     label: "去修复";
                                     clicked => { root.open-fix(); }
+                                }
+                            }
+                        }
+                    }
+
+                    if root.proxy-interrupted: Rectangle {
+                        background: #FDECEA;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: #F2C8C2;
+
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 6px;
+
+                            Text {
+                                text: "加速已中断";
+                                font-size: 11.5px;
+                                font-weight: 600;
+                                color: #A32D2D;
+                            }
+                            Text {
+                                text: "系统代理被其他程序修改，已自动暂停加速。";
+                                font-size: 11px;
+                                color: #7A4B45;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                alignment: end;
+                                spacing: 8px;
+                                TextButton {
+                                    label: "知道了";
+                                    clicked => { root.dismiss-interrupt(); }
+                                }
+                                TextButton {
+                                    label: "重新开启";
+                                    clicked => { root.toggle-master(); }
                                 }
                             }
                         }

@@ -555,6 +555,49 @@ impl HakimiRuntime {
         self.proxy_applied.read().unwrap_or(true)
     }
 
+    /// Read the OS back to see whether the takeover we installed is still in
+    /// place. `Some(true)` means it was changed or switched off by someone
+    /// else; `None` means there is nothing to check or the OS could not be
+    /// read, which callers must treat as "unknown", never as "lost".
+    ///
+    /// This queries the OS (macOS spawns `scutil --proxy`), so it belongs on
+    /// the environment probe thread, not on the UI thread.
+    pub fn takeover_lost(&self) -> Option<bool> {
+        if *self.proxy_applied.read() != Some(true) {
+            return None;
+        }
+        match self.config.snapshot().proxy.mode {
+            ProxyMode::Pac => {
+                let url = self.pac_url()?;
+                self.system_proxy
+                    .still_ours(ProxyMode::Pac, &url)
+                    .map(|ours| !ours)
+            }
+            ProxyMode::Http => {
+                let listen = (*self.proxy_listen.read())?;
+                self.system_proxy
+                    .still_ours(ProxyMode::Http, &listen.to_string())
+                    .map(|ours| !ours)
+            }
+            ProxyMode::Off => None,
+        }
+    }
+
+    /// Give the takeover up because someone else changed the system proxy.
+    ///
+    /// The core is paused, any service that still points at us is switched
+    /// off, and the snapshot is dropped: restoring it later would put our
+    /// captured state on top of the settings the new owner just wrote.
+    pub fn abandon_takeover(&self) {
+        self.pause();
+        self.disable_system_proxy_inner();
+        self.system_proxy.forget();
+        *self.proxy_error.write() = Some("system proxy was changed by another program".to_string());
+        tracing::warn!(
+            "acceleration interrupted: the system proxy no longer points at this instance"
+        );
+    }
+
     /// Disable a PAC takeover that points at this instance. Only this
     /// instance's own PAC is touched; a user-configured proxy is left alone.
     pub fn disable_system_proxy(&self) {
