@@ -203,10 +203,11 @@ pub struct AdvancedConfig {
 impl Default for AdvancedConfig {
     fn default() -> Self {
         Self {
-            fake_sni_candidates: vec![
-                String::new(),
-                "www.bing.com".to_string(),
-            ],
+            // No empty candidate here: a ClientHello without SNI fails twice
+            // over (GFW reset, plus a default certificate that cannot match
+            // the target domain). Routes that benefit from it list it
+            // explicitly, e.g. the ao3 group on Cloudflare's default zone.
+            fake_sni_candidates: vec!["www.bing.com".to_string()],
             max_candidates_per_domain: 8,
             ip_timeout_ms: 2_000,
             last_good_days: 7,
@@ -621,7 +622,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
                 plain("www.archiveofourown.org"),
                 plain("*.archiveofourown.org"),
             ],
-            RoutePolicy::sni(Vec::new()),
+            RoutePolicy::sni(vec!["".to_string(), "archiveofourown.org.".to_string()]),
             true,
             "https://archiveofourown.org/",
         ),
@@ -701,19 +702,31 @@ pub fn default_groups() -> Vec<GroupConfig> {
             vec![
                 DomainRule::routed(
                     "huggingface.co",
-                    RoutePolicy::sni(vec!["huggingface.co.".to_string()]),
+                    RoutePolicy::sni(vec![
+                        "huggingface.co.".to_string(),
+                        "www.huggingface.co.".to_string(),
+                    ]),
                 ),
                 DomainRule::routed(
                     "www.huggingface.co",
-                    RoutePolicy::sni(vec!["huggingface.co.".to_string()]),
+                    RoutePolicy::sni(vec![
+                        "huggingface.co.".to_string(),
+                        "www.huggingface.co.".to_string(),
+                    ]),
                 ),
                 DomainRule::routed(
                     "*.huggingface.co",
-                    RoutePolicy::sni(vec!["huggingface.co.".to_string()]),
+                    RoutePolicy::sni(vec![
+                        "huggingface.co.".to_string(),
+                        "www.huggingface.co.".to_string(),
+                    ]),
                 ),
                 DomainRule::routed("*.hf.co", RoutePolicy::direct()),
             ],
-            RoutePolicy::sni(vec!["huggingface.co.".to_string()]),
+            RoutePolicy::sni(vec![
+                "huggingface.co.".to_string(),
+                "www.huggingface.co.".to_string(),
+            ]),
             true,
             "https://huggingface.co/",
         ),
@@ -1032,11 +1045,7 @@ struct Inner {
 }
 
 fn strip_legacy_materialized_defaults(config: &mut AppConfig) {
-    const LEGACY_HTTP1_HOSTS: [&str; 3] = [
-        "*.pximg.net",
-        "img.poipiku.com",
-        "cdn.poipiku.com",
-    ];
+    const LEGACY_HTTP1_HOSTS: [&str; 3] = ["*.pximg.net", "img.poipiku.com", "cdn.poipiku.com"];
     let pinned = config
         .advanced
         .http1_hosts
@@ -1386,7 +1395,10 @@ mod tests {
         assert!(hf.enabled);
         assert_eq!(
             hf.route_for("huggingface.co"),
-            &RoutePolicy::sni(vec!["huggingface.co.".to_string()])
+            &RoutePolicy::sni(vec![
+                "huggingface.co.".to_string(),
+                "www.huggingface.co.".to_string()
+            ])
         );
         assert_eq!(hf.route_for("us.aws.cdn.hf.co"), &RoutePolicy::direct());
         let matcher = config.matcher().unwrap();
@@ -1618,9 +1630,7 @@ mod tests {
     fn only_github_recovers_blocked_ips() {
         let config = AppConfig::default();
         assert!(config.group("github").unwrap().recovers_blocked_ips());
-        for id in [
-            "pixiv", "ao3", "eh", "hitomi", "hanime", "steam", "poipiku",
-        ] {
+        for id in ["pixiv", "ao3", "eh", "hitomi", "hanime", "steam", "poipiku"] {
             assert!(
                 !config.group(id).unwrap().recovers_blocked_ips(),
                 "{id} must keep the normal warm-up behavior"
@@ -1815,11 +1825,7 @@ mod tests {
             "img.poipiku.com".to_string(),
             "cdn.poipiku.com".to_string(),
         ];
-        std::fs::write(
-            paths.config_file(),
-            serde_json::to_string(&legacy).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(paths.config_file(), serde_json::to_string(&legacy).unwrap()).unwrap();
 
         let manager = ConfigManager::load(paths.config_file()).unwrap();
         assert_eq!(
@@ -1837,12 +1843,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path());
         let mut custom = AppConfig::default();
-        custom.advanced.http1_hosts = vec!["i.pximg.net".to_string(), "origin.example.net".to_string()];
-        std::fs::write(
-            paths.config_file(),
-            serde_json::to_string(&custom).unwrap(),
-        )
-        .unwrap();
+        custom.advanced.http1_hosts =
+            vec!["i.pximg.net".to_string(), "origin.example.net".to_string()];
+        std::fs::write(paths.config_file(), serde_json::to_string(&custom).unwrap()).unwrap();
 
         let manager = ConfigManager::load(paths.config_file()).unwrap();
         assert_eq!(
@@ -1865,11 +1868,7 @@ mod tests {
             .find(|group| group.id == "poipiku")
             .unwrap()
             .default_route = RoutePolicy::auto();
-        std::fs::write(
-            paths.config_file(),
-            serde_json::to_string(&legacy).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(paths.config_file(), serde_json::to_string(&legacy).unwrap()).unwrap();
 
         let manager = ConfigManager::load(paths.config_file()).unwrap();
         assert_eq!(
@@ -1890,11 +1889,7 @@ mod tests {
             .find(|group| group.id == "poipiku")
             .unwrap()
             .default_route = route.clone();
-        std::fs::write(
-            paths.config_file(),
-            serde_json::to_string(&custom).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(paths.config_file(), serde_json::to_string(&custom).unwrap()).unwrap();
 
         let manager = ConfigManager::load(paths.config_file()).unwrap();
         assert_eq!(

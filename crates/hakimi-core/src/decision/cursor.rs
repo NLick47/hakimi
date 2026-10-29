@@ -384,7 +384,9 @@ impl RouteCursor {
         if out.is_empty() {
             out.push(None);
         }
-        // A `None` entry sends no SNI and is effectively a duplicate of Direct.
+        // A `None` entry sends no SNI and is effectively a duplicate of Direct:
+        // keep it last so an explicit empty-SNI route still tries named
+        // candidates first.
         out.sort_by_key(|entry| entry.is_none());
         out
     }
