@@ -290,66 +290,148 @@ impl Resolver {
         values
     }
 
+    /// Merge every fresh cached A/AAAA answer into one resolution.
+    ///
+    /// The two record types have independent TTLs. Returning the first family
+    /// that happened to be fresh dropped the other one: a dual-stack host lost
+    /// its IPv6 candidate for the whole A TTL, and once the shorter-lived A
+    /// answer expired the resolver served the still-fresh AAAA alone without
+    /// ever re-querying A.
     fn fresh_ip_resolution(
         &self,
         domain: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Option<DohResolution> {
+        let mut ips = Vec::new();
+        let mut hints = Vec::new();
+        let mut ttl = u32::MAX;
         for qtype in [TYPE_A, TYPE_AAAA] {
-            if let Some(answer) = self.cache.doh_answer(domain, qtype) {
-                if answer.is_fresh(now) && !answer.ips.is_empty() {
-                    let ttl = remaining_ttl(&answer, now);
-                    return Some(DohResolution {
-                        ips: answer.ips,
-                        hints: answer.hints,
-                        source: DohSource::Cache,
-                        endpoint: "cache".to_string(),
-                        stale: false,
-                        ttl,
-                        fallback_used: false,
-                    });
+            let Some(answer) = self.cache.doh_answer(domain, qtype) else {
+                continue;
+            };
+            if !answer.is_fresh(now) || answer.ips.is_empty() {
+                continue;
+            }
+            ttl = ttl.min(remaining_ttl(&answer, now));
+            for ip in answer.ips {
+                if !ips.contains(&ip) {
+                    ips.push(ip);
+                }
+            }
+            for hint in answer.hints {
+                if !hints.contains(&hint) {
+                    hints.push(hint);
                 }
             }
         }
-        None
+        if ips.is_empty() {
+            return None;
+        }
+        Some(DohResolution {
+            ips,
+            hints,
+            source: DohSource::Cache,
+            endpoint: "cache".to_string(),
+            stale: false,
+            ttl: if ttl == u32::MAX { 0 } else { ttl },
+            fallback_used: false,
+        })
     }
 
-    /// Select a cached IP answer without waiting for DoH. `extra_secs` bounds
-    /// how far past the DNS TTL the answer may be served in the background
+    /// Select cached IP answers without waiting for DoH. `extra_secs` bounds
+    /// how far past the DNS TTL the answers may be served in the background
     /// refresh path; `None` is the last-resort fallback used after a live
-    /// failure.
+    /// failure. Both address families are merged for the same reason as in
+    /// [`Self::fresh_ip_resolution`].
     fn stale_ip_resolution(
         &self,
         domain: &str,
         at: chrono::DateTime<chrono::Utc>,
         extra_secs: Option<i64>,
     ) -> Option<DohResolution> {
+        let mut ips = Vec::new();
+        let mut hints = Vec::new();
         for qtype in [TYPE_A, TYPE_AAAA] {
-            if let Some(answer) = self.cache.doh_answer(domain, qtype) {
-                if answer.ips.is_empty() || answer.is_fresh(at) {
+            let Some(answer) = self.cache.doh_answer(domain, qtype) else {
+                continue;
+            };
+            if answer.ips.is_empty() || answer.is_fresh(at) {
+                continue;
+            }
+            if let Some(extra) = extra_secs {
+                if answer.ttl_secs == 0 {
                     continue;
                 }
-                if let Some(extra) = extra_secs {
-                    if answer.ttl_secs == 0 {
-                        continue;
-                    }
-                    let age = at.signed_duration_since(answer.fetched_at).num_seconds();
-                    if age > answer.ttl_secs as i64 + extra {
-                        continue;
-                    }
+                let age = at.signed_duration_since(answer.fetched_at).num_seconds();
+                if age > answer.ttl_secs as i64 + extra {
+                    continue;
                 }
-                return Some(DohResolution {
-                    ips: answer.ips,
-                    hints: answer.hints,
-                    source: DohSource::Cache,
-                    endpoint: "stale-cache".to_string(),
-                    stale: true,
-                    ttl: 0,
-                    fallback_used: false,
-                });
+            }
+            for ip in answer.ips {
+                if !ips.contains(&ip) {
+                    ips.push(ip);
+                }
+            }
+            for hint in answer.hints {
+                if !hints.contains(&hint) {
+                    hints.push(hint);
+                }
             }
         }
-        None
+        if ips.is_empty() {
+            return None;
+        }
+        Some(DohResolution {
+            ips,
+            hints,
+            source: DohSource::Cache,
+            endpoint: "stale-cache".to_string(),
+            stale: true,
+            ttl: 0,
+            fallback_used: false,
+        })
+    }
+
+    /// True when one of the cached A/AAAA answers has expired.
+    ///
+    /// A fresh answer from one family must not keep the other family's expired
+    /// answer out of the refresh path: the two TTLs are independent, so
+    /// returning early on the fresh one would leave the expired family
+    /// unqueried for up to the longer TTL. Only an entry that actually had
+    /// addresses counts, so an IPv4-only domain (which never caches AAAA) does
+    /// not trigger a background lookup every few seconds.
+    fn cached_family_expired(&self, domain: &str, at: chrono::DateTime<chrono::Utc>) -> bool {
+        [TYPE_A, TYPE_AAAA].into_iter().any(|qtype| {
+            self.cache
+                .doh_answer(domain, qtype)
+                .is_some_and(|answer| !answer.ips.is_empty() && !answer.is_fresh(at))
+        })
+    }
+
+    /// Serve the cached answer for `domain`, merging both address families and
+    /// renewing anything that is stale or expired in the background.
+    fn cached_resolution(
+        &self,
+        domain: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Option<DohResolution> {
+        let fresh = self.fresh_ip_resolution(domain, at);
+        let stale = self.stale_ip_resolution(domain, at, Some(STALE_WHILE_REVALIDATE_SECS));
+        let resolution = merge_cached_resolutions(fresh, stale)?;
+        if resolution.stale || self.cached_family_expired(domain, at) {
+            self.spawn_ip_refresh(domain.to_owned());
+        }
+        Some(resolution)
+    }
+
+    /// True when the background IP refresh still has work to do.
+    ///
+    /// A fresh answer from one family is not enough: the other family's TTL
+    /// may have expired while the first one is still valid. Stopping at the
+    /// first fresh family here would leave the expired one unqueried until the
+    /// fresh family expires as well.
+    fn ip_cache_needs_refresh(&self, domain: &str, at: chrono::DateTime<chrono::Utc>) -> bool {
+        self.fresh_ip_resolution(domain, at).is_none() || self.cached_family_expired(domain, at)
     }
 
     fn fresh_ech(&self, domain: &str) -> Result<Option<EchOutcome>> {
@@ -422,7 +504,7 @@ impl Resolver {
             let Some(_guard) = resolver.try_query_lock(format!("ip|{domain}")) else {
                 return;
             };
-            if resolver.fresh_ip_resolution(&domain, now()).is_some() {
+            if !resolver.ip_cache_needs_refresh(&domain, now()) {
                 return;
             }
             if let Err(error) = resolver.resolve_live_ips(&domain).await {
@@ -435,24 +517,18 @@ impl Resolver {
         });
     }
 
-    /// Resolve A/AAAA candidates. IPv4 answers come first; AAAA is queried when A yields no
-    /// addresses (the design keeps IPv6 as a later-phase feature).
+    /// Resolve A/AAAA candidates. IPv4 answers come first; both families are
+    /// queried together so a dual-stack host gets IPv6 candidates even when
+    /// IPv4 answers (the better default path) exist.
     pub async fn resolve_ips(&self, domain: &str) -> Result<DohResolution> {
         let domain = normalize_query_name(domain);
         let at = now();
 
-        if let Some(resolution) = self.fresh_ip_resolution(&domain, at) {
-            return Ok(resolution);
-        }
-
-        // A just-expired answer is still a useful route. Return it immediately
-        // and let a background query renew the cache, instead of putting the
-        // first request after the TTL behind a potentially multi-second DoH
-        // timeout. The grace window is intentionally short.
-        if let Some(resolution) =
-            self.stale_ip_resolution(&domain, at, Some(STALE_WHILE_REVALIDATE_SECS))
-        {
-            self.spawn_ip_refresh(domain.clone());
+        // Cached answers from both families are merged. A just-expired answer
+        // is still a useful route, so it stays in the list as a fallback while
+        // a background query renews it, instead of hiding it behind the other
+        // family's still-fresh answer.
+        if let Some(resolution) = self.cached_resolution(&domain, at) {
             return Ok(resolution);
         }
 
@@ -460,7 +536,7 @@ impl Resolver {
         // the same name at the same time.
         let _guard = self.query_lock(format!("ip|{domain}")).await;
         let at = now();
-        if let Some(resolution) = self.fresh_ip_resolution(&domain, at) {
+        if let Some(resolution) = self.cached_resolution(&domain, at) {
             return Ok(resolution);
         }
 
@@ -1231,6 +1307,43 @@ fn normalize_query_name(domain: &str) -> String {
     domain.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// Combine a fresh cached answer with a just-expired one. The fresh answer
+/// (if any) keeps its TTL and ordering; the stale addresses are appended as
+/// fallback candidates and the result is marked stale.
+fn merge_cached_resolutions(
+    fresh: Option<DohResolution>,
+    stale: Option<DohResolution>,
+) -> Option<DohResolution> {
+    match (fresh, stale) {
+        (None, None) => None,
+        (Some(fresh), None) => Some(fresh),
+        (None, Some(stale)) => Some(stale),
+        (Some(mut fresh), Some(stale)) => {
+            // Keep the documented IPv4-first order while placing the fresh
+            // addresses of each family before its stale fallback.
+            let mut v4 = Vec::new();
+            let mut v6 = Vec::new();
+            for ips in [&fresh.ips, &stale.ips] {
+                for ip in ips {
+                    let target = if ip.is_ipv4() { &mut v4 } else { &mut v6 };
+                    if !target.contains(ip) {
+                        target.push(*ip);
+                    }
+                }
+            }
+            v4.extend(v6);
+            fresh.ips = v4;
+            for hint in stale.hints {
+                if !fresh.hints.contains(&hint) {
+                    fresh.hints.push(hint);
+                }
+            }
+            fresh.stale = true;
+            Some(fresh)
+        }
+    }
+}
+
 fn remaining_ttl(answer: &CachedAnswer, now: chrono::DateTime<chrono::Utc>) -> u32 {
     let age = now
         .signed_duration_since(answer.fetched_at)
@@ -1383,6 +1496,146 @@ mod tests {
         let resolution = resolver.resolve_ips("github.com").await.unwrap();
         assert_eq!(resolution.source, DohSource::Cache);
         assert_eq!(resolution.ips.len(), 1);
+    }
+
+    /// A cached answer must not drop one address family just because the
+    /// other family happens to be cached too. The live query always merges
+    /// A and AAAA; the cache path used to return the first fresh family and
+    /// silently lose the IPv6 candidates for the rest of the A TTL.
+    #[tokio::test]
+    async fn cached_answers_from_both_address_families_are_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, cache, resolver) = resolver(dir.path());
+        let v4: IpAddr = "20.205.243.166".parse().unwrap();
+        let v6: IpAddr = "2606:50c0:8000::153".parse().unwrap();
+        cache.put_doh_answer(CachedAnswer {
+            domain: "github.com".into(),
+            qtype: TYPE_A,
+            ips: vec![v4],
+            hints: Vec::new(),
+            ech_config: None,
+            ttl_secs: 60,
+            fetched_at: now(),
+        });
+        cache.put_doh_answer(CachedAnswer {
+            domain: "github.com".into(),
+            qtype: TYPE_AAAA,
+            ips: vec![v6],
+            hints: Vec::new(),
+            ech_config: None,
+            ttl_secs: 300,
+            fetched_at: now(),
+        });
+
+        let resolution = resolver.resolve_ips("github.com").await.unwrap();
+        assert_eq!(resolution.source, DohSource::Cache);
+        assert_eq!(
+            resolution.ips,
+            vec![v4, v6],
+            "a fresh AAAA answer must not be dropped because A is cached"
+        );
+        assert_eq!(resolution.ttl, 60, "the earliest expiry wins");
+    }
+
+    /// A and AAAA have independent TTLs. When the shorter-lived A answer
+    /// expires while AAAA is still fresh, the old code returned the IPv6
+    /// answer alone and never re-queried A until AAAA expired too. The stale
+    /// IPv4 fallback must stay in the candidate list and a refresh must be
+    /// started.
+    #[tokio::test]
+    async fn an_expired_family_is_kept_beside_a_fresh_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, cache, resolver) = resolver(dir.path());
+        config
+            .mutate(|config| {
+                // Keep the background refresh offline and deterministic.
+                config.doh.primary = "https://127.0.0.1:1/dns-query".into();
+                config.doh.fallback = config.doh.primary.clone();
+                config.doh.custom.clear();
+                Ok(())
+            })
+            .unwrap();
+        let v4: IpAddr = "20.205.243.166".parse().unwrap();
+        let v6: IpAddr = "2606:50c0:8000::153".parse().unwrap();
+        cache.put_doh_answer(CachedAnswer {
+            domain: "github.com".into(),
+            qtype: TYPE_A,
+            ips: vec![v4],
+            hints: Vec::new(),
+            ech_config: None,
+            ttl_secs: 60,
+            fetched_at: now() - chrono::Duration::seconds(90),
+        });
+        cache.put_doh_answer(CachedAnswer {
+            domain: "github.com".into(),
+            qtype: TYPE_AAAA,
+            ips: vec![v6],
+            hints: Vec::new(),
+            ech_config: None,
+            ttl_secs: 300,
+            fetched_at: now(),
+        });
+
+        let resolution = resolver.resolve_ips("github.com").await.unwrap();
+        assert!(resolution.stale, "the merged answer carries a stale entry");
+        assert_eq!(
+            resolution.ips,
+            vec![v4, v6],
+            "the expired IPv4 fallback must survive while AAAA is fresh"
+        );
+        assert!(
+            resolver.cached_family_expired("github.com", now()),
+            "the expired family has to be refreshed in the background"
+        );
+        // Let the background refresh observe the closed endpoint and exit.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    /// The refresh worker used to stop as soon as *any* family was fresh, so
+    /// an expired family behind a fresh one was never re-queried. The check
+    /// must consider every cached family, but not invent work for a domain
+    /// that only ever had one family.
+    #[test]
+    fn a_fresh_family_does_not_stop_refreshing_an_expired_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, cache, resolver) = resolver(dir.path());
+        let at = now();
+        let v4: IpAddr = "20.205.243.166".parse().unwrap();
+        let v6: IpAddr = "2606:50c0:8000::153".parse().unwrap();
+        let answer = |domain: &str, qtype: u16, ip: IpAddr, fetched_at| CachedAnswer {
+            domain: domain.into(),
+            qtype,
+            ips: vec![ip],
+            hints: Vec::new(),
+            ech_config: None,
+            ttl_secs: 60,
+            fetched_at,
+        };
+
+        // A is fresh while AAAA has expired.
+        cache.put_doh_answer(answer("dual.example", TYPE_A, v4, at));
+        cache.put_doh_answer(answer(
+            "dual.example",
+            TYPE_AAAA,
+            v6,
+            at - chrono::Duration::seconds(90),
+        ));
+        assert!(
+            resolver.ip_cache_needs_refresh("dual.example", at),
+            "the expired AAAA family must still be refreshed"
+        );
+
+        // An IPv4-only domain has no AAAA entry to fetch.
+        cache.put_doh_answer(answer("v4.example", TYPE_A, v4, at));
+        assert!(!resolver.ip_cache_needs_refresh("v4.example", at));
+
+        // Both families fresh: nothing to do.
+        cache.put_doh_answer(answer("fresh.example", TYPE_A, v4, at));
+        cache.put_doh_answer(answer("fresh.example", TYPE_AAAA, v6, at));
+        assert!(!resolver.ip_cache_needs_refresh("fresh.example", at));
+
+        // A cold domain still needs a live lookup.
+        assert!(resolver.ip_cache_needs_refresh("cold.example", at));
     }
 
     #[tokio::test]
