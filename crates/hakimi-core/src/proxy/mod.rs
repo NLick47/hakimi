@@ -329,6 +329,11 @@ async fn handle_request(mut req: Request<Incoming>, ctx: Arc<ProxyContext>) -> R
             }
             "/hakimi/resume" if req.method() == Method::POST => {
                 ctx.status.set_paused(false);
+                // Same contract as runtime.resume(): sockets pooled before
+                // the pause are commonly dead once traffic is intercepted
+                // again, so the first requests after the resume must not
+                // touch them.
+                ctx.upstream.retire_pools();
                 return json_response(serde_json::json!({ "paused": false }));
             }
             "/hakimi/stop" if req.method() == Method::POST => {

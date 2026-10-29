@@ -778,6 +778,10 @@ impl HakimiRuntime {
 
     pub fn resume(&self) {
         self.status.set_paused(false);
+        // Connections pooled before the pause usually die while traffic is
+        // not being intercepted; the first requests after the resume would
+        // fail on them. Swap the pools so everything reopens fresh.
+        self.upstream.retire_pools();
         tracing::info!("hakimi resumed");
     }
 
