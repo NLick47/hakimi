@@ -2,6 +2,7 @@
 /data/
 /.cargo/
 /.zcode/
+/.idea/
 
 # Local browser/netlog artifacts used during performance testing
 /chrome-*.html
