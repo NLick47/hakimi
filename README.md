@@ -68,6 +68,8 @@ hakimi 运行在本机，通过 PAC 或系统代理接管目录内域名的流�
 
 ### Linux（命令行）
 
+> 验证状态：目前只在 Ubuntu 24.04（GitHub Actions）上做过自动化冒烟——CA 安装与卸载、系统信任库确实生效、代理真正终结 TLS、core 与 CLI 单测；Debian / Fedora / Arch 的信任库路径、systemd 单元、真实浏览器都还没实测
+
 Linux 上没有统一的系统代理，因此 hakimi 只提供代理端口，**不接管系统设置**，由你自己决定谁走它。目前需要从源码构建：`cargo build --release -p hakimi-cli`。
 
 1. 启动：`hakimi serve --log-stdout`（前台运行；`packaging/hakimi.service` 是现成的 systemd user unit）
