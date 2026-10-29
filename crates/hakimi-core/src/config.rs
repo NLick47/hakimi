@@ -1031,8 +1031,6 @@ struct Inner {
     matcher: Arc<DomainMatcher>,
 }
 
-/// 旧版本把默认值物化进了 config.json
-/// 文件值与旧默认完全一致时视为未设置，让新默认随升级生效
 fn strip_legacy_materialized_defaults(config: &mut AppConfig) {
     const LEGACY_HTTP1_HOSTS: [&str; 3] = [
         "*.pximg.net",
@@ -1061,13 +1059,64 @@ fn strip_legacy_materialized_defaults(config: &mut AppConfig) {
     }
 }
 
-/// 落盘文件只保留用户改过的值
-/// 与当前默认相等的 advanced 字段不写入，升级后新默认才能传播到老安装
+/// `groups` is persisted as one whole array, so builtin sites added in a new
+/// version never reach an existing install — clearing the data was the only
+/// way to see them. Append the builtin groups that are missing here.
+///
+/// Only missing ids are appended: a group the user edited, disabled, or
+/// re-added by hand is kept as-is. Builtin groups cannot be removed in the
+/// UI, so no tombstones are needed.
+fn merge_missing_builtin_groups(config: &mut AppConfig) {
+    let present: std::collections::HashSet<String> =
+        config.groups.iter().map(|group| group.id.clone()).collect();
+    for group in default_groups() {
+        if !present.contains(group.id.as_str()) {
+            config.groups.push(group);
+        }
+    }
+}
+
+/// The persisted file keeps only values the user changed.
+/// `advanced` fields equal to the current defaults are left out so new
+/// defaults reach existing installs. Builtin groups follow the same rule:
+/// one that still matches its default is not persisted (the load path
+/// appends missing builtins), while a group the user edited, disabled or
+/// created is kept verbatim.
 fn sanitized_persisted_value(config: &AppConfig) -> serde_json::Value {
     let mut value = serde_json::to_value(config).unwrap_or(serde_json::Value::Null);
     let defaults =
         serde_json::to_value(AdvancedConfig::default()).unwrap_or(serde_json::Value::Null);
+    let default_groups: std::collections::HashMap<String, serde_json::Value> =
+        serde_json::to_value(default_groups())
+            .ok()
+            .and_then(|value| value.as_array().cloned())
+            .map(|groups| {
+                groups
+                    .into_iter()
+                    .filter_map(|group| {
+                        let id = group.get("id")?.as_str()?.to_string();
+                        Some((id, group))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
     if let Some(object) = value.as_object_mut() {
+        if let Some(groups) = object
+            .get_mut("groups")
+            .and_then(|value| value.as_array_mut())
+        {
+            groups.retain(|group| {
+                let id = group.get("id").and_then(|value| value.as_str());
+                match id.and_then(|id| default_groups.get(id)) {
+                    // A builtin group that still matches its default is a
+                    // default value: keep it out of the file so future
+                    // defaults propagate.
+                    Some(builtin) => builtin != group,
+                    // A user-created group: always persisted.
+                    None => true,
+                }
+            });
+        }
         if let Some(advanced) = object.get_mut("advanced").and_then(|v| v.as_object_mut()) {
             advanced.retain(|key, current| defaults.get(key) != Some(current));
         }
@@ -1123,6 +1172,7 @@ impl ConfigManager {
 
     fn new(path: PathBuf, mut config: AppConfig) -> Result<Self> {
         strip_legacy_materialized_defaults(&mut config);
+        merge_missing_builtin_groups(&mut config);
         config.canonicalize();
         config.validate()?;
         let matcher = Arc::new(config.matcher()?);
@@ -1628,6 +1678,95 @@ mod tests {
     }
 
     #[test]
+    fn missing_builtin_groups_are_merged_into_existing_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        // A pre-upgrade config: only github, without the hf group added later.
+        std::fs::write(
+            paths.config_file(),
+            br#"{"groups":[{"id":"github","name":"GitHub","enabled":true,"domains":[{"pattern":"github.com"}]}]}"#,
+        )
+        .unwrap();
+
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        let snapshot = manager.snapshot();
+        assert!(
+            snapshot.group("hf").is_some(),
+            "new builtin sites must reach existing installs without clearing data"
+        );
+        assert!(snapshot.group("pixiv").is_some());
+        // The user's own github entry stays as written.
+        assert!(snapshot
+            .group("github")
+            .unwrap()
+            .domains
+            .iter()
+            .all(|rule| rule.pattern == "github.com"));
+    }
+
+    #[test]
+    fn user_modified_builtin_groups_survive_the_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        // The user disabled hf and added a domain: the merge must not
+        // overwrite it.
+        std::fs::write(
+            paths.config_file(),
+            br#"{"groups":[
+                {"id":"hf","name":"Hugging Face","enabled":false,"domains":[{"pattern":"huggingface.co"},{"pattern":"extra.example"}]},
+                {"id":"github","name":"GitHub","enabled":true,"domains":[{"pattern":"github.com"}]}
+            ]}"#,
+        )
+        .unwrap();
+
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        let snapshot = manager.snapshot();
+        let hf = snapshot.group("hf").unwrap();
+        assert!(!hf.enabled);
+        assert!(hf
+            .domains
+            .iter()
+            .any(|rule| rule.pattern == "extra.example"));
+        assert!(
+            hf.domains.len() == 2,
+            "user domains must not be re-defaulted"
+        );
+    }
+
+    #[test]
+    fn an_empty_groups_list_gets_every_builtin_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(paths.config_file(), br#"{"groups":[]}"#).unwrap();
+
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        assert_eq!(manager.snapshot().groups.len(), default_groups().len());
+    }
+
+    #[test]
+    fn persisted_file_drops_builtin_groups_that_match_defaults() {
+        let mut config = AppConfig::default();
+        // The user disabled hf: this entry has to be persisted.
+        if let Some(hf) = config.groups.iter_mut().find(|group| group.id == "hf") {
+            hf.enabled = false;
+        }
+        let value = sanitized_persisted_value(&config);
+        let groups = value.get("groups").and_then(|v| v.as_array()).unwrap();
+        let ids: Vec<&str> = groups
+            .iter()
+            .filter_map(|group| group.get("id").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            !ids.contains(&"github"),
+            "default-identical groups stay out of the file so future defaults propagate"
+        );
+        assert!(ids.contains(&"hf"), "user-modified groups are persisted");
+    }
+
+    #[test]
     fn rejects_external_bind() {
         let mut config = AppConfig::default();
         config.proxy.bind = "0.0.0.0".parse().unwrap();
@@ -1656,7 +1795,6 @@ mod tests {
         let manager = ConfigManager::load_or_create(&paths).unwrap();
         let text = std::fs::read_to_string(paths.config_file()).unwrap();
         assert!(text.contains("\"catalogVersion\""));
-        // 默认值不落盘，升级后新默认才能传播到老安装
         assert!(!text.contains("\"maxCandidatesPerDomain\""));
         assert!(!text.contains("\"advanced\""));
         let manager2 = ConfigManager::load(paths.config_file()).unwrap();
