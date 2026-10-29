@@ -263,16 +263,40 @@ pub struct UpstreamPool {
     http1: Client<RouteConnector, UpstreamBody>,
     upgrade: Client<RouteConnector, UpstreamBody>,
     recovery: Client<RouteConnector, UpstreamBody>,
+    /// Per-host replacement pools used after the engine rejects a route or IP.
+    ///
+    /// A rejected route must not keep serving from the connection that
+    /// produced the rejection: hyper would hand its pooled socket back for the
+    /// next request, bypassing the connector and therefore the new plan. The
+    /// replacement starts empty; its first request opens a freshly planned
+    /// connection, then normal pooling resumes for that host. Rejecting again
+    /// replaces the entry, retiring every socket in the old pool.
+    rejected_clients: Mutex<HashMap<String, RejectedClient>>,
+    /// Connectors reused when a replacement pool is created.
+    auto_connector: RouteConnector,
+    http1_connector: RouteConnector,
+    /// Idle timeout and per-host idle limits for replacement pools.
+    client_idle: Duration,
+    max_idle: usize,
+    http1_idle: usize,
     engine: Arc<DecisionEngine>,
     /// Read on every request, written only after a slow/failed response.
     slow_hosts: SlowHosts,
     /// Fast path for the common case where no host has ever been marked slow.
     slow_hosts_seen: AtomicBool,
+    /// Authorities whose selected route was rejected by the upstream. Kept
+    /// separate from `slow_hosts` because the response was fast and healthy at
+    /// the transport level; only the route/IP behind it is unusable.
+    rejected_hosts: SlowHosts,
+    rejected_hosts_seen: AtomicBool,
     /// How long a host stays on the recovery pool. Kept at least as long as
     /// the client idle timeout: otherwise the normal pool could hand the same
     /// half-dead connection back after the marker expired but before hyper
     /// had closed it.
     slow_route_ttl: Duration,
+    /// Lifetime of a rejection marker. It must outlive the idle timeout of the
+    /// normal pool so the rejected socket is evicted before the host returns.
+    rejection_ttl: Duration,
     http1_hosts: Arc<DomainMatcher>,
     http1_limit: usize,
     /// Deadline for the upstream response headers, never for the streamed body
@@ -281,6 +305,17 @@ pub struct UpstreamPool {
     http1_slots: RwLock<HashMap<String, Arc<Semaphore>>>,
     stats: Arc<UpstreamStats>,
 }
+
+/// Replacement pools for one authority after its route was rejected.
+struct RejectedClient {
+    auto: Client<RouteConnector, UpstreamBody>,
+    http1: Client<RouteConnector, UpstreamBody>,
+    expires: Instant,
+}
+
+/// Keep the rejection-pool map bounded. Each entry holds idle sockets, so a
+/// large burst of rejected hosts must not retain them indefinitely.
+const REJECTED_CLIENT_CAP: usize = 32;
 
 /// One route discovery per domain at a time: concurrent cold connections for the same host
 /// share a single probe instead of each racing its own candidate batch.
@@ -300,11 +335,10 @@ const H2_STREAM_WINDOW: u32 = 8 * 1024 * 1024;
 const H2_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
 
 fn build_client(
-    config: &AppConfig,
+    idle: Duration,
     connector: RouteConnector,
     max_idle: usize,
 ) -> Client<RouteConnector, UpstreamBody> {
-    let idle = Duration::from_secs(config.advanced.upstream_idle_secs.max(10));
     let mut builder = Client::builder(TokioExecutor::new());
     builder
         .pool_timer(TokioTimer::new())
@@ -369,6 +403,7 @@ impl UpstreamPool {
         let http1_limit = config.advanced.http1_max_concurrent.max(1);
         let header_timeout =
             Duration::from_secs(config.advanced.upstream_header_timeout_secs.max(1));
+        let client_idle = Duration::from_secs(config.advanced.upstream_idle_secs.max(10));
 
         let http1_hosts = DomainMatcher::from_patterns(
             config
@@ -407,7 +442,7 @@ impl UpstreamPool {
             stats: stats.clone(),
         };
         Arc::new(Self {
-            auto: build_client(config, auto_connector.clone(), max_idle),
+            auto: build_client(client_idle, auto_connector.clone(), max_idle),
             // Image hosts are HTTP/1.1-only because a burst should spread over
             // independent TCP connections. Their idle budget therefore has to
             // track the burst concurrency, not the global small-idle profile:
@@ -415,23 +450,34 @@ impl UpstreamPool {
             // burst reopen most of them (and pay the TLS handshakes again).
             // This pool is only selected for `http1_hosts`, so the extra idle
             // sockets do not apply to ordinary h2 origins.
-            http1: build_client(config, http1_connector, max_idle.max(http1_limit)),
-            upgrade: build_client(config, upgrade_connector, max_idle),
+            http1: build_client(
+                client_idle,
+                http1_connector.clone(),
+                max_idle.max(http1_limit),
+            ),
+            upgrade: build_client(client_idle, upgrade_connector, max_idle),
             // The recovery pool starts empty, so the first request after a
             // slow response opens a fresh connection instead of reusing the
             // stalled one.  It keeps that connection afterwards: without idle
             // reuse every request in the recovery window would pay for a
             // handshake, which is exactly the cost the recovery avoids.
-            recovery: build_client(config, auto_connector, max_idle),
+            recovery: build_client(client_idle, auto_connector.clone(), max_idle),
+            rejected_clients: Mutex::new(HashMap::new()),
+            auto_connector,
+            http1_connector,
+            client_idle,
+            max_idle,
+            http1_idle: max_idle.max(http1_limit),
             engine,
             slow_hosts: SlowHosts::new(),
             slow_hosts_seen: AtomicBool::new(false),
+            rejected_hosts: SlowHosts::new(),
+            rejected_hosts_seen: AtomicBool::new(false),
             // Keep the marker a little past the client's idle eviction, so a
             // request that arrives exactly at the idle boundary cannot pick
             // the bad connection out of the normal pool again.
-            slow_route_ttl: Duration::from_secs(config.advanced.upstream_idle_secs.max(10))
-                .max(SLOW_ROUTE_TTL)
-                + Duration::from_secs(5),
+            slow_route_ttl: client_idle.max(SLOW_ROUTE_TTL) + Duration::from_secs(5),
+            rejection_ttl: client_idle + Duration::from_secs(5),
             http1_hosts,
             http1_limit,
             header_timeout,
@@ -482,8 +528,19 @@ impl UpstreamPool {
         };
         let tls = scheme != "http";
         let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
-        let recovery = !upgrade && host.is_some_and(|host| self.is_slow(host));
-        let client = if upgrade {
+        let rejected = host.is_some_and(|host| self.is_rejected(host));
+        let recovery = !upgrade && !rejected && host.is_some_and(|host| self.is_slow(host));
+        let rejected_client = if rejected {
+            Some(self.rejected_client(
+                host.expect("a rejected route requires a host"),
+                upgrade || is_http1_host,
+            ))
+        } else {
+            None
+        };
+        let client = if let Some(client) = rejected_client.as_ref() {
+            client
+        } else if upgrade {
             &self.upgrade
         } else if recovery {
             &self.recovery
@@ -541,7 +598,14 @@ impl UpstreamPool {
                 let error_status = status.is_client_error() || status.is_server_error();
                 if matches!(status_code, 400 | 403 | 421 | 429 | 451) {
                     if let Some(host) = debug_host {
-                        self.engine.note_upstream_response(host, port, tls, status);
+                        if self.engine.note_upstream_response(host, port, tls, status) {
+                            // The route/IP behind this response is unusable.
+                            // Retire the pooled connection as well: otherwise
+                            // hyper would hand it to the next request, which
+                            // would then bypass the connector and the freshly
+                            // re-planned route.
+                            self.mark_rejected(host);
+                        }
                     }
                 }
                 if version == http::Version::HTTP_2 {
@@ -758,6 +822,71 @@ impl UpstreamPool {
         self.slow_hosts_seen.store(true, Ordering::Release);
     }
 
+    fn is_rejected(&self, host: &str) -> bool {
+        if !self.rejected_hosts_seen.load(Ordering::Acquire) {
+            return false;
+        }
+        self.rejected_hosts.is_slow(host)
+    }
+
+    /// Replacement pool for a host whose route was rejected.
+    ///
+    /// The pool is created on first use so the rejected route's socket is
+    /// never available to it, then kept for the rejection window so the new,
+    /// healthy route is not paid for with a handshake on every request.
+    fn rejected_client(&self, host: &str, http1: bool) -> Client<RouteConnector, UpstreamBody> {
+        let now = Instant::now();
+        let mut clients = self.rejected_clients.lock();
+        if clients
+            .get(host)
+            .is_some_and(|client| client.expires <= now)
+        {
+            clients.remove(host);
+        }
+        if clients.len() >= REJECTED_CLIENT_CAP {
+            clients.retain(|_, client| client.expires > now);
+            // A churn of rejected hosts must stay bounded. Dropping the entry
+            // closest to expiry costs at most one extra handshake later.
+            while clients.len() >= REJECTED_CLIENT_CAP {
+                let Some(host) = clients
+                    .iter()
+                    .min_by_key(|(_, client)| client.expires)
+                    .map(|(host, _)| host.clone())
+                else {
+                    break;
+                };
+                clients.remove(&host);
+            }
+        }
+        let entry = clients
+            .entry(host.to_owned())
+            .or_insert_with(|| RejectedClient {
+                auto: build_client(self.client_idle, self.auto_connector.clone(), self.max_idle),
+                http1: build_client(
+                    self.client_idle,
+                    self.http1_connector.clone(),
+                    self.http1_idle,
+                ),
+                expires: now + self.rejection_ttl,
+            });
+        if http1 {
+            entry.http1.clone()
+        } else {
+            entry.auto.clone()
+        }
+    }
+
+    fn mark_rejected(&self, host: &str) {
+        // The marker must outlive the idle timeout of the pool that still
+        // holds the rejected connection, so that socket is evicted before the
+        // host returns to the normal pool.
+        self.rejected_hosts.mark(host, self.rejection_ttl);
+        self.rejected_hosts_seen.store(true, Ordering::Release);
+        // Retire the previous replacement pool: it may already hold a
+        // connection to the route that just got rejected.
+        self.rejected_clients.lock().remove(host);
+    }
+
     fn host_slots(&self, host: &str) -> Arc<Semaphore> {
         // Hot path: every image request already has a slot after the first
         // one. Read it without taking the write lock or allocating a key.
@@ -807,7 +936,13 @@ impl UpstreamPool {
                 return false;
             }
         };
-        let client = if self.http1_hosts.match_host(host).is_some() {
+        let http1 = self.http1_hosts.match_host(host).is_some();
+        let rejected_client = self
+            .is_rejected(host)
+            .then(|| self.rejected_client(host, http1));
+        let client = if let Some(client) = rejected_client.as_ref() {
+            client
+        } else if http1 {
             &self.http1
         } else {
             &self.auto
@@ -816,13 +951,12 @@ impl UpstreamPool {
             Ok(Ok(response)) => {
                 let status = response.status();
                 if matches!(status.as_u16(), 400 | 403 | 429 | 451)
-                    && self
-                        .engine
-                        .note_blocked_candidate(host, port, true, status)
+                    && self.engine.note_blocked_candidate(host, port, true, status)
                 {
                     // Only opted-in groups (GitHub) treat this as a route
                     // failure; other sites keep the previous warm-up behavior.
                     self.stats.warm_failures.fetch_add(1, Ordering::Relaxed);
+                    self.mark_rejected(host);
                     tracing::warn!(
                         host,
                         status = status.as_u16(),
@@ -1274,13 +1408,11 @@ impl RouteConnector {
         // waiting for `SYSTEM_CONNECT_TIMEOUT` per batch.
         let deadline = tokio::time::Instant::now() + SYSTEM_CONNECT_TIMEOUT;
         let dns_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let resolved = tokio::time::timeout(
-            dns_timeout,
-            super::connect::lookup_host_cached(host, port),
-        )
-        .await
-        .map_err(|_| anyhow!("resolving {host}:{port} timed out"))?
-        .with_context(|| format!("resolving {host}:{port}"))?;
+        let resolved =
+            tokio::time::timeout(dns_timeout, super::connect::lookup_host_cached(host, port))
+                .await
+                .map_err(|_| anyhow!("resolving {host}:{port} timed out"))?
+                .with_context(|| format!("resolving {host}:{port}"))?;
         let addresses: Vec<std::net::IpAddr> = super::connect::interleave_by_family(
             resolved.iter().map(|address| address.ip()).collect(),
             std::net::IpAddr::is_ipv4,

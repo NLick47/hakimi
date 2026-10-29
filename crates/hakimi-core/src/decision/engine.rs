@@ -530,15 +530,26 @@ impl DecisionEngine {
     /// itself was rejected. A TLS handshake is not enough: Pixiv's fake-SNI
     /// route completes TLS and then returns 403 from nginx. Drop that route and
     /// let the next connection try the next configured attempt.
-    pub fn note_http_rejection(&self, domain: &str, port: u16, tls: bool, status: StatusCode) {
+    ///
+    /// Returns true when the plan (route or candidate IP) was actually
+    /// rejected, so the pool can retire the connection that produced the
+    /// response instead of handing it to the next request.
+    #[must_use]
+    pub fn note_http_rejection(
+        &self,
+        domain: &str,
+        port: u16,
+        tls: bool,
+        status: StatusCode,
+    ) -> bool {
         if !matches!(status.as_u16(), 403 | 421 | 451) {
-            return;
+            return false;
         }
         let Some(plan) = self.cached_plan(domain, port, tls) else {
-            return;
+            return false;
         };
         if plan.mode == TlsMode::Direct {
-            return;
+            return false;
         }
         tracing::warn!(
             domain = %plan.domain,
@@ -558,19 +569,31 @@ impl DecisionEngine {
             format!("{}|{}", plan.domain, plan.mode.as_str()),
             Instant::now(),
         );
+        true
     }
 
     /// Apply the status policy shared by real upstream traffic. Candidate-level
     /// block pages take precedence for groups that opt in, so one abusive IP
     /// does not discard an otherwise healthy route mode. Everything else falls
     /// back to the route-level rejection policy.
-    pub fn note_upstream_response(&self, domain: &str, port: u16, tls: bool, status: StatusCode) {
+    ///
+    /// The return value says whether the response invalidated the selected
+    /// route/IP; only then must the pooled connection that produced it stop
+    /// serving later requests.
+    #[must_use]
+    pub fn note_upstream_response(
+        &self,
+        domain: &str,
+        port: u16,
+        tls: bool,
+        status: StatusCode,
+    ) -> bool {
         if matches!(status.as_u16(), 400 | 403 | 429 | 451)
             && self.note_blocked_candidate(domain, port, tls, status)
         {
-            return;
+            return true;
         }
-        self.note_http_rejection(domain, port, tls, status);
+        self.note_http_rejection(domain, port, tls, status)
     }
 
     /// A block or rate-limit page is tied to the candidate IP, not necessarily

@@ -30,6 +30,21 @@ impl crate::catalog::RemoteIpProvider for StubRemote {
     }
 }
 
+/// A remote catalog that offers a second loopback address, so a rejected
+/// candidate still has a fallback.
+struct DualRemote;
+
+#[async_trait::async_trait]
+impl crate::catalog::RemoteIpProvider for DualRemote {
+    fn remote_ips(&self, _domain: &str) -> Option<Vec<std::net::IpAddr>> {
+        Some(vec!["::1".parse().unwrap()])
+    }
+
+    fn has_ip_catalog(&self) -> bool {
+        true
+    }
+}
+
 struct SlowResolver {
     delay: std::time::Duration,
 }
@@ -261,6 +276,115 @@ async fn a_real_block_page_penalizes_the_candidate_ip() {
     assert!(
         engine.ip_failures("upstream.test", "127.0.0.1".parse().unwrap()) > 0,
         "the blocked address should have a failure score"
+    );
+}
+
+/// A route rejected by the upstream must not keep serving from the socket
+/// that produced the rejection. Without retiring the pooled connection, the
+/// next request bypasses the connector (and therefore the re-planned route)
+/// and lands on the same rejected IP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_route_does_not_reuse_the_pooled_connection() {
+    // The rejected candidate: last-good 127.0.0.1 answers 429 forever.
+    let bad = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = bad.local_addr().unwrap().port();
+    // The fallback candidate: remote ::1 answers 200.
+    let good = TcpListener::bind(("::1", port)).await.unwrap();
+    let accepts = Arc::new(AtomicUsize::new(0));
+
+    async fn serve(listener: TcpListener, response: &'static [u8], accepts: Arc<AtomicUsize>) {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            accepts.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 8192];
+                while let Ok(read) = socket.read(&mut buffer).await {
+                    if read == 0 {
+                        break;
+                    }
+                    if socket.write_all(response).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    tokio::spawn(serve(
+        bad,
+        b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\
+          Connection: keep-alive\r\n\r\n",
+        accepts.clone(),
+    ));
+    tokio::spawn(serve(
+        good,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\
+          Connection: keep-alive\r\n\r\nok",
+        accepts.clone(),
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, config) = engine_for(dir.path());
+    config
+        .mutate(|config| {
+            // GitHub opts in to candidate-level block-page recovery.
+            config.groups[0].id = "github".into();
+            Ok(())
+        })
+        .unwrap();
+    // Offer a second address so re-planning can leave the blocked candidate.
+    let engine = DecisionEngine::new(
+        engine.config.clone(),
+        engine.cache.clone(),
+        Arc::new(DualRemote),
+        engine.resolver.clone(),
+        engine.prober.clone(),
+        engine.status.clone(),
+    );
+    let tls = TlsContext::new().unwrap();
+    let pool = UpstreamPool::new(engine.clone(), tls, &config.snapshot());
+    let uri = format!("http://upstream.test:{port}/");
+
+    let request = || {
+        Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(Either::Right(Full::new(Bytes::new())))
+            .unwrap()
+    };
+    let first = pool.send(request(), false).await.unwrap();
+    assert_eq!(first.status(), http::StatusCode::TOO_MANY_REQUESTS);
+    let _ = first.into_body().collect().await.unwrap();
+    // Let hyper check the rejected connection back into the pool; the test is
+    // about refusing it, not about winning a race with the release path.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let second = pool.send(request(), false).await.unwrap();
+    assert_eq!(
+        second.status(),
+        http::StatusCode::OK,
+        "the rejected connection served the next request"
+    );
+    let body = second.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"ok");
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        2,
+        "the rejected connection must not be reused"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // The replacement pool keeps the new, healthy connection: while the
+    // rejection marker is active, later requests reuse it instead of paying a
+    // handshake per request.
+    let third = pool.send(request(), false).await.unwrap();
+    assert_eq!(third.status(), http::StatusCode::OK);
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        2,
+        "the replacement connection should be reused"
     );
 }
 

@@ -713,8 +713,11 @@ fn http_rejection_drops_the_cached_route() {
         .remember_plan_arc(Arc::new(test_plan(TlsMode::FakeSni, Some("www.baidu.com"))));
     assert!(h.engine.cached_plan("example.com", 443, true).is_some());
 
-    h.engine
-        .note_http_rejection("example.com", 443, true, http::StatusCode::FORBIDDEN);
+    assert!(
+        h.engine
+            .note_http_rejection("example.com", 443, true, http::StatusCode::FORBIDDEN),
+        "the cached fake-SNI route must be rejected"
+    );
 
     assert!(h.engine.cached_plan("example.com", 443, true).is_none());
     assert!(h.engine.route_rejected("example.com", TlsMode::FakeSni));
@@ -787,8 +790,11 @@ fn real_traffic_block_pages_use_candidate_recovery_for_opted_groups() {
     );
     h.engine
         .remember_plan_arc(Arc::new(test_plan(TlsMode::FakeSni, Some("www.baidu.com"))));
-    h.engine
-        .note_upstream_response("example.com", 443, true, http::StatusCode::FORBIDDEN);
+    assert!(
+        h.engine
+            .note_upstream_response("example.com", 443, true, http::StatusCode::FORBIDDEN),
+        "the route-level rejection must be reported to the pool"
+    );
     assert!(h.engine.route_rejected("example.com", TlsMode::FakeSni));
 
     let bad: IpAddr = "1.1.1.1".parse().unwrap();
@@ -796,8 +802,15 @@ fn real_traffic_block_pages_use_candidate_recovery_for_opted_groups() {
     github_plan.domain = "github.com".into();
     github_plan.group_id = "github".into();
     h.engine.remember_plan_arc(Arc::new(github_plan));
-    h.engine
-        .note_upstream_response("github.com", 443, true, http::StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        h.engine.note_upstream_response(
+            "github.com",
+            443,
+            true,
+            http::StatusCode::TOO_MANY_REQUESTS
+        ),
+        "the blocked IP must be reported to the pool"
+    );
     assert!(
         !h.engine.route_rejected("github.com", TlsMode::Direct),
         "a block page for one opted-in candidate must not discard the whole mode"
