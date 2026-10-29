@@ -1,19 +1,40 @@
-use std::path::PathBuf;
-use std::time::Duration;
+mod ca;
+mod catalog;
+mod config_cmd;
+mod control;
+mod doctor;
+mod doh;
+mod env;
+mod export;
+mod group;
+mod output;
+mod pac;
+mod serve;
+mod status;
 
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
-use hakimi_core::cache::CacheStats;
-use hakimi_core::config::RoutePolicy;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
 use hakimi_core::runtime::HakimiRuntime;
-use serde_json::Value;
+
+use crate::output::Output;
 
 #[derive(Parser)]
-#[command(name = "hakimi", version, about = "hakimi acceleration core")]
+#[command(
+    name = "hakimi",
+    version = hakimi_core::VERSION,
+    about = "local acceleration proxy for the configured sites"
+)]
 struct Cli {
     /// Override the data directory (defaults to the platform data dir).
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_name = "DIR", env = "HAKIMI_DATA_DIR")]
     data_dir: Option<PathBuf>,
+
+    /// Print machine-readable JSON instead of tables.
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -22,312 +43,80 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Start the local proxy and apply the system proxy/PAC.
-    Serve {
-        /// Do not change the OS proxy setting.
-        #[arg(long)]
-        no_takeover: bool,
-        /// Start in the paused state (PAC returns DIRECT).
-        #[arg(long)]
-        paused: bool,
-    },
-    /// Print runtime status.
-    Status {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Diagnose one domain end-to-end.
-    Doctor {
-        domain: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Refresh remote catalogs.
-    Catalog {
-        #[command(subcommand)]
-        command: CatalogCommand,
-    },
-    /// Local CA management.
+    Serve(serve::ServeArgs),
+    /// Stop the running instance.
+    Stop,
+    /// Pause acceleration; the PAC returns DIRECT.
+    Pause,
+    /// Resume acceleration.
+    Resume,
+    /// Print the runtime status.
+    Status,
+    /// Diagnose one domain, or every domain of the enabled groups.
+    Doctor(doctor::DoctorArgs),
+    /// List or change groups.
+    Group(group::GroupArgs),
+    /// Print or change the configuration.
+    Config(config_cmd::ConfigArgs),
+    /// Manage the local CA.
     Ca {
         #[command(subcommand)]
-        command: CaCommand,
+        command: ca::CaArgs,
     },
-    /// Print the generated PAC script.
-    Pac,
-    /// List configured groups.
-    Groups {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Change a group setting.
-    Group {
+    /// Refresh the remote catalogs.
+    Catalog {
         #[command(subcommand)]
-        command: GroupCommand,
+        command: catalog::CatalogCommand,
     },
-    /// Print the effective configuration.
-    Config,
-    /// Run a manual DoH health check.
+    /// Check the DoH endpoints.
     Doh {
         #[command(subcommand)]
-        command: DohCommand,
+        command: doh::DohCommand,
     },
+    /// Print the proxy environment variables for this shell.
+    Env(env::EnvArgs),
+    /// Print the PAC script.
+    Pac,
+    /// Export a sanitized diagnostics bundle.
+    Export(export::ExportArgs),
     /// Restore the OS proxy settings saved by a previous `serve` run.
     RestoreProxy,
-    /// Export a sanitized diagnostics bundle.
-    Export,
 }
 
-#[derive(Subcommand)]
-enum CatalogCommand {
-    Refresh {
-        #[arg(long, value_enum, default_value_t = CatalogKind::All)]
-        kind: CatalogKind,
-        #[arg(long)]
-        force: bool,
-    },
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum CatalogKind {
-    Ip,
-    Doh,
-    All,
-}
-
-#[derive(Subcommand)]
-enum CaCommand {
-    Status,
-    Install,
-    Uninstall,
-    Repair,
-    Regenerate,
-}
-
-#[derive(Subcommand)]
-enum DohCommand {
-    Health,
-}
-
-#[derive(Subcommand)]
-enum GroupCommand {
-    Set {
-        id: String,
-        #[arg(long)]
-        enabled: Option<bool>,
-        /// Replace the group's default route preset.
-        #[arg(long, value_enum)]
-        route: Option<RoutePresetArg>,
-    },
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum RoutePresetArg {
-    Auto,
-    Direct,
-    Ech,
-    Sni,
-}
-
-impl From<RoutePresetArg> for RoutePolicy {
-    fn from(value: RoutePresetArg) -> Self {
-        match value {
-            RoutePresetArg::Auto => RoutePolicy::auto(),
-            RoutePresetArg::Direct => RoutePolicy::direct(),
-            RoutePresetArg::Ech => RoutePolicy::ech_shared(),
-            RoutePresetArg::Sni => RoutePolicy::sni(Vec::new()),
+#[tokio::main]
+async fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(cli).await {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("hakimi: {error:#}");
+            ExitCode::FAILURE
         }
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+async fn run(cli: Cli) -> Result<ExitCode> {
+    let out = Output::new(cli.json);
+    // `serve` owns the log sink: its flags decide where the first line goes.
+    if let Command::Serve(args) = &cli.command {
+        serve::init_logging(cli.data_dir.as_deref(), args)?;
+    }
     let runtime = HakimiRuntime::new(cli.data_dir.clone())?;
     match cli.command {
-        Command::Serve {
-            no_takeover,
-            paused,
-        } => {
-            // Long-running instance: take the single-instance lock for the whole
-            // lifetime, so a second serve (or the UI) cannot fight over the port.
-            let _instance_lock =
-                hakimi_core::instance::InstanceLock::acquire(runtime.paths().root())?;
-            if no_takeover {
-                runtime.config().mutate(|config| {
-                    config.proxy.takeover = false;
-                    Ok(())
-                })?;
-            }
-            runtime.start().await?;
-            if paused {
-                runtime.pause();
-            }
-            if let Some(url) = runtime.pac_url() {
-                println!("proxy listening; PAC: {url}");
-            }
-            println!("data dir: {}", runtime.paths().root().display());
-            println!("press Ctrl+C to stop");
-            tokio::signal::ctrl_c()
-                .await
-                .context("waiting for Ctrl+C")?;
-            runtime.stop().await?;
-        }
-        Command::Status { json } => {
-            // An explicit data directory names one instance: a running proxy
-            // on the same port may well be a different one.
-            let live = if cli.data_dir.is_none() {
-                try_live_status(&runtime).await
-            } else {
-                None
-            };
-            if let Some(value) = live {
-                print_status(&value, json)?;
-            } else {
-                print_status(&runtime.status_json(), json)?;
-            }
-        }
-        Command::Doctor { domain, json } => {
-            let diagnostics = runtime.diagnose(&domain).await;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&diagnostics)?);
-            } else {
-                println!("domain:        {}", diagnostics.domain);
-                println!("state:         {:?}", diagnostics.state);
-                println!(
-                    "strategy:      {}",
-                    diagnostics
-                        .strategy
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "none".into())
-                );
-                println!(
-                    "ip:            {}",
-                    diagnostics
-                        .ip
-                        .map(|ip| ip.to_string())
-                        .unwrap_or_else(|| "none".into())
-                );
-                println!(
-                    "ip source:     {}",
-                    diagnostics
-                        .ip_source
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "none".into())
-                );
-                println!(
-                    "doh source:    {}",
-                    diagnostics
-                        .doh_source
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "none".into())
-                );
-                println!(
-                    "error:         {}",
-                    diagnostics
-                        .error
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "none".into())
-                );
-                if let Some(detail) = &diagnostics.detail {
-                    println!("detail:        {detail}");
-                }
-                for suggestion in &diagnostics.suggestions {
-                    println!("suggestion:    {suggestion}");
-                }
-            }
-        }
-        Command::Catalog { command } => match command {
-            CatalogCommand::Refresh { kind, force } => {
-                let results = match kind {
-                    CatalogKind::All => runtime.refresh_catalogs(force).await,
-                    CatalogKind::Ip => vec![runtime.refresh_catalog("ip", force).await],
-                    CatalogKind::Doh => vec![runtime.refresh_catalog("doh", force).await],
-                };
-                for result in results {
-                    match result {
-                        Ok(report) => println!("{}", serde_json::to_string_pretty(&report)?),
-                        Err(error) => eprintln!("refresh failed: {error:#}"),
-                    }
-                }
-            }
-        },
-        Command::Ca { command } => match command {
-            CaCommand::Status => println!(
-                "{}",
-                serde_json::to_string_pretty(&runtime.ca_status().await)?
-            ),
-            CaCommand::Install => {
-                println!("{}", serde_json::to_string_pretty(&runtime.ca_install()?)?)
-            }
-            CaCommand::Uninstall => println!(
-                "{}",
-                serde_json::to_string_pretty(&runtime.ca_uninstall()?)?
-            ),
-            CaCommand::Repair => {
-                println!("{}", serde_json::to_string_pretty(&runtime.ca_repair()?)?)
-            }
-            CaCommand::Regenerate => println!(
-                "{}",
-                serde_json::to_string_pretty(&runtime.ca_regenerate()?)?
-            ),
-        },
-        Command::Pac => {
-            let config = runtime.config().snapshot();
-            println!(
-                "{}",
-                hakimi_core::pac::generate(
-                    &config,
-                    std::net::SocketAddr::new(config.proxy.bind, config.proxy.port),
-                    false
-                )
-            );
-        }
-        Command::Groups { json } => {
-            let config = runtime.config().snapshot();
-            if json {
-                println!("{}", serde_json::to_string_pretty(&config.groups)?);
-            } else {
-                for group in &config.groups {
-                    let modes: Vec<&str> = group
-                        .default_route
-                        .attempts
-                        .iter()
-                        .map(|attempt| attempt.mode().as_str())
-                        .collect();
-                    println!(
-                        "{:<10} {:<20} default={:<20} enabled={:<5} domains={}",
-                        group.id,
-                        group.name,
-                        modes.join(">"),
-                        group.enabled,
-                        group.domains.len()
-                    );
-                }
-            }
-        }
-        Command::Group { command } => match command {
-            GroupCommand::Set { id, enabled, route } => {
-                if let Some(enabled) = enabled {
-                    runtime.set_group_enabled(&id, enabled)?;
-                }
-                if let Some(route) = route {
-                    runtime.set_group_default_route(&id, route.into())?;
-                }
-                let group = runtime
-                    .config()
-                    .snapshot()
-                    .group(&id)
-                    .cloned()
-                    .with_context(|| format!("unknown group `{id}`"))?;
-                println!("{}", serde_json::to_string_pretty(&group)?);
-            }
-        },
-        Command::Config => println!("{}", serde_json::to_string_pretty(&runtime.config_json())?),
-        Command::Doh { command } => match command {
-            DohCommand::Health => {
-                let health = runtime.doh_health().await;
-                println!("{}", serde_json::to_string_pretty(&health)?);
-            }
-        },
+        Command::Serve(args) => serve::run(&runtime, args).await?,
+        Command::Stop => control::stop(&runtime).await?,
+        Command::Pause => control::set_paused(&runtime, true).await?,
+        Command::Resume => control::set_paused(&runtime, false).await?,
+        Command::Status => status::run(&runtime, out).await?,
+        Command::Doctor(args) => return doctor::run(&runtime, args, out).await,
+        Command::Group(args) => group::run(&runtime, args, out).await?,
+        Command::Config(args) => config_cmd::run(&runtime, args, out).await?,
+        Command::Ca { command } => return ca::run(&runtime, command, out).await,
+        Command::Catalog { command } => return catalog::run(&runtime, command, out).await,
+        Command::Doh { command } => doh::run(&runtime, command, out).await?,
+        Command::Env(args) => env::run(&runtime, args, out)?,
+        Command::Pac => pac::run(&runtime).await?,
+        Command::Export(args) => export::run(&runtime, args)?,
         Command::RestoreProxy => {
             let restored = runtime.restore_system_proxy()?;
             if restored {
@@ -336,84 +125,6 @@ async fn main() -> Result<()> {
                 println!("no saved system proxy state found");
             }
         }
-        Command::Export => {
-            let path = runtime.export_diagnostics()?;
-            println!("{}", path.display());
-        }
     }
-    Ok(())
-}
-
-async fn try_live_status(runtime: &HakimiRuntime) -> Option<Value> {
-    let config = runtime.config().snapshot();
-    let url = format!(
-        "http://{}:{}/hakimi/status",
-        config.proxy.bind, config.proxy.port
-    );
-    hakimi_core::util::install_crypto_provider();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(600))
-        .no_proxy()
-        .build()
-        .ok()?;
-    let value: Value = tokio::time::timeout(Duration::from_millis(800), async {
-        let text = client.get(url).send().await.ok()?.text().await.ok()?;
-        serde_json::from_str(&text).ok()
-    })
-    .await
-    .ok()??;
-    // Something else may listen on the proxy port. Only a hakimi answer is a
-    // status; anything else falls back to this runtime's own snapshot.
-    (value["app"].as_str() == Some("hakimi")).then_some(value)
-}
-
-fn print_status(value: &Value, json: bool) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(value)?);
-        return Ok(());
-    }
-    let paused = value["paused"].as_bool().unwrap_or(false);
-    println!(
-        "hakimi {} — {}",
-        value["version"].as_str().unwrap_or("?"),
-        if paused { "paused" } else { "running" }
-    );
-    if let Some(listen) = value["proxy"]["listen"].as_str() {
-        println!("proxy: {}", listen);
-    }
-    if let Some(pac) = value["proxy"]["pacUrl"].as_str() {
-        println!("pac:   {}", pac);
-    }
-    let ca = &value["ca"];
-    println!(
-        "ca:    trusted={} fingerprint={}",
-        ca["installed"].as_bool().unwrap_or(false),
-        ca["fingerprintSha1"].as_str().unwrap_or("-")
-    );
-    if let Some(groups) = value["groups"].as_array() {
-        for group in groups {
-            let state = group["state"].as_str().unwrap_or("?");
-            // Nothing has been tested yet: nothing is being checked either.
-            let state = if state == "checking" && group["testedDomains"].as_u64().unwrap_or(0) == 0
-            {
-                "untested"
-            } else {
-                state
-            };
-            println!(
-                "{:<10} {:<10} {:<20} tested={} failed={}",
-                group["id"].as_str().unwrap_or("?"),
-                state,
-                group["name"].as_str().unwrap_or(""),
-                group["testedDomains"].as_u64().unwrap_or(0),
-                group["failedDomains"].as_u64().unwrap_or(0),
-            );
-        }
-    }
-    let cache: CacheStats = serde_json::from_value(value["cache"].clone()).unwrap_or_default();
-    println!(
-        "cache: lastGood={} doh={} ech={} sni={}",
-        cache.last_good, cache.doh_answers, cache.ech_configs, cache.fake_sni
-    );
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }

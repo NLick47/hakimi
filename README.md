@@ -51,6 +51,7 @@ hakimi 运行在本机，通过 PAC 或系统代理接管目录内域名的流�
 | Windows x64 | 桌面应用 | 引导自动安装与信任 |
 | macOS arm64 | 桌面应用 | 引导自动安装与信任 |
 | Android 13+ | 应用（JNI 壳） | 手动导出并导入用户 CA |
+| Linux x64 | 命令行 | 安装到发行版信任库（需 root） |
 
 ## 快速开始
 
@@ -64,6 +65,20 @@ hakimi 运行在本机，通过 PAC 或系统代理接管目录内域名的流�
 1. 手动导出 CA 证书，导入到系统"用户凭据"中
 2. 将设备代理指向本机地址与端口
 3. 建议使用 Edge、Via 等第三方浏览器访问。Android 7 以后应用可以选择不信任用户 CA，部分系统浏览器有内置的代理与证书策略，行为不可控
+
+### Linux（命令行）
+
+Linux 上没有统一的系统代理，因此 hakimi 只提供代理端口，**不接管系统设置**，由你自己决定谁走它。目前需要从源码构建：`cargo build --release -p hakimi-cli`。
+
+1. 启动：`hakimi serve --log-stdout`（前台运行；`packaging/hakimi.service` 是现成的 systemd user unit）
+2. 信任本地 CA（一次性，需要 root）：
+   `sudo hakimi --data-dir "$HOME/.local/share/hakimi" ca install`
+   Debian/Ubuntu 走 `update-ca-certificates`，Fedora/RHEL 走 `update-ca-trust extract`，Arch/p11-kit 走 `trust extract-compat`
+   不想改动系统信任库时，用 `hakimi ca export --out hakimi-ca.pem` 导出后自己导入；Firefox 等 NSS 程序必须单独导入（`certutil -d sql:$HOME/.pki/nssdb -A …`）
+3. 让命令行走代理：`eval "$(hakimi env)"`；浏览器可以用 `hakimi pac` 输出的脚本
+4. 停止：`hakimi stop`
+
+不装 CA 时，hakimi 对所有站点都只做原样转发（浏览器看到的就是站点自己的证书），只有直连能通的站点可用；需要伪装 SNI 或 ECH 的站点（例如 Pixiv）必须信任 CA。
 
 ## 配置
 
@@ -84,6 +99,7 @@ hakimi 运行在本机，通过 PAC 或系统代理接管目录内域名的流�
 - `/hakimi/status`：运行状态、各域名当前策略（`?all=1` 查看全部域名）
 - `/hakimi/health`：存活探针
 - `/hakimi/pause`、`/hakimi/resume`：暂停 / 恢复加速
+- `/hakimi/stop`：停止进程，需带 `x-hakimi-control: 1` 请求头（浏览器页面无法伪造该头）
 - `/proxy.pac`：PAC 脚本
 
 日志写入数据目录 `logs/hakimi.log`，仅存本地，URL 与目录源脱敏，超限自动轮转。
@@ -107,6 +123,7 @@ hakimi 运行在本机，通过 PAC 或系统代理接管目录内域名的流�
 
 - 不支持 QUIC / HTTP/3，浏览器会回退到 HTTP/2 或 HTTP/1.1
 - 只加速目录内站点；不支持作为全局代理，也不支持转发到上游代理
+- Linux 不接管系统代理：`proxy.takeover` 在该平台被忽略，改用 `hakimi env` 或 PAC 自行配置
 - 依赖对本地 CA 的信任，卸载前请知悉其含义
 - 目录来自远程源（可配镜像），源不可达时依赖本地缓存与 DoH 继续工作
 - 站点 CDN 架构变化时，需要目录更新才能恢复最佳路由

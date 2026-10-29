@@ -1740,7 +1740,9 @@ dependencies = [
  "clap",
  "hakimi-core",
  "reqwest",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -4364,7 +4366,7 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.46"
-source = "git+ssh://git@github.com/NLick47/rustls.git?rev=fe420096#fe4200963169bf26a577187894c800abda14076e"
+source = "git+https://github.com/NLick47/rustls.git?rev=fe420096#fe4200963169bf26a577187894c800abda14076e"
 dependencies = [
  "aws-lc-rs",
  "once_cell",

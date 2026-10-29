@@ -153,6 +153,9 @@ pub struct ProxyContext {
     /// The status snapshot. The flag asks for every known domain instead of
     /// the ones the groups show; the polled view is the small one.
     pub status_json: Arc<dyn Fn(bool) -> serde_json::Value + Send + Sync>,
+    /// Raised by `/hakimi/stop`. Only the owner of the runtime knows what a
+    /// shutdown involves, so the endpoint signals instead of shutting down.
+    pub on_stop: Arc<dyn Fn() + Send + Sync>,
     proxy_addr: OnceLock<SocketAddr>,
 }
 
@@ -169,6 +172,7 @@ impl ProxyContext {
         tls: Arc<TlsContext>,
         upstream: Arc<UpstreamPool>,
         status_json: Arc<dyn Fn(bool) -> serde_json::Value + Send + Sync>,
+        on_stop: Arc<dyn Fn() + Send + Sync>,
     ) -> Arc<Self> {
         Arc::new(Self {
             engine,
@@ -181,6 +185,7 @@ impl ProxyContext {
             tls,
             upstream,
             status_json,
+            on_stop,
             proxy_addr: OnceLock::new(),
         })
     }
@@ -325,6 +330,24 @@ async fn handle_request(mut req: Request<Incoming>, ctx: Arc<ProxyContext>) -> R
             "/hakimi/resume" if req.method() == Method::POST => {
                 ctx.status.set_paused(false);
                 return json_response(serde_json::json!({ "paused": false }));
+            }
+            "/hakimi/stop" if req.method() == Method::POST => {
+                // A custom header forces a CORS preflight, so a page in a
+                // browser cannot stop the proxy with a drive-by POST.
+                if req
+                    .headers()
+                    .get("x-hakimi-control")
+                    .and_then(|value| value.to_str().ok())
+                    != Some("1")
+                {
+                    return text_response(
+                        StatusCode::UNAUTHORIZED,
+                        "text/plain; charset=utf-8",
+                        "missing x-hakimi-control header",
+                    );
+                }
+                (ctx.on_stop)();
+                return json_response(serde_json::json!({ "stopping": true }));
             }
             _ => {}
         }

@@ -187,6 +187,7 @@ async fn spawn_proxy(
         tls,
         upstream,
         status_json,
+        Arc::new(|| {}),
     );
     let handle = proxy::start(ctx, "127.0.0.1:0".parse().unwrap())
         .await
