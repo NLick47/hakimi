@@ -695,6 +695,28 @@ pub fn default_groups() -> Vec<GroupConfig> {
             true,
             "https://poipiku.com/",
         ),
+        group(
+            "hf",
+            "Hugging Face",
+            vec![
+                DomainRule::routed(
+                    "huggingface.co",
+                    RoutePolicy::sni(vec!["huggingface.co.".to_string()]),
+                ),
+                DomainRule::routed(
+                    "www.huggingface.co",
+                    RoutePolicy::sni(vec!["huggingface.co.".to_string()]),
+                ),
+                DomainRule::routed(
+                    "*.huggingface.co",
+                    RoutePolicy::sni(vec!["huggingface.co.".to_string()]),
+                ),
+                DomainRule::routed("*.hf.co", RoutePolicy::direct()),
+            ],
+            RoutePolicy::sni(vec!["huggingface.co.".to_string()]),
+            true,
+            "https://huggingface.co/",
+        ),
     ]
 }
 
@@ -1252,7 +1274,7 @@ mod tests {
     fn defaults_validate_and_match_document() {
         let config = AppConfig::default();
         config.validate().unwrap();
-        assert_eq!(config.groups.len(), 8);
+        assert_eq!(config.groups.len(), 9);
         let eh = config.group("eh").unwrap();
         assert!(eh.enabled);
         assert!(config.groups.iter().all(|group| group.enabled));
@@ -1307,12 +1329,26 @@ mod tests {
             config.group("pixiv").unwrap().probe_domains(3),
             vec!["pixiv.net", "www.pixiv.net", "i.pximg.net"]
         );
+        // Hugging Face: the apex needs the trailing root label to survive the
+        // SNI filter, while the download edges under `*.hf.co` are untouched
+        // and must stay on a direct route so downloads need no CA.
+        let hf = config.group("hf").unwrap();
+        assert!(hf.enabled);
+        assert_eq!(
+            hf.route_for("huggingface.co"),
+            &RoutePolicy::sni(vec!["huggingface.co.".to_string()])
+        );
+        assert_eq!(hf.route_for("us.aws.cdn.hf.co"), &RoutePolicy::direct());
         let matcher = config.matcher().unwrap();
         assert_eq!(
             matcher.match_host("raw.githubusercontent.com"),
             Some("github")
         );
         assert_eq!(matcher.match_host("i.pximg.net"), Some("pixiv"));
+        // Every Hugging Face download edge is a `*.hf.co` subdomain; the bare
+        // apex is never fetched, so it stays out of the group.
+        assert_eq!(matcher.match_host("hf.co"), None);
+        assert_eq!(matcher.match_host("us.aws.cdn.hf.co"), Some("hf"));
     }
 
     #[test]
