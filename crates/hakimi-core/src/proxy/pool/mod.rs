@@ -139,19 +139,25 @@ impl Body for LimitedBody {
 const SYSTEM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WARM_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// A request may be sent twice only when it is safe and has no body to
-/// replay. Image hosts are excluded: their per-host concurrency permit makes
-/// a second in-flight connection undesirable, and their short-lived requests
-/// have not shown the stall this hedge targets.
-fn hedge_eligible(request: &Request<UpstreamBody>, upgrade: bool, is_http1_host: bool) -> bool {
+/// A request that may be replayed once after a hard failure. Unlike the
+/// stall hedge, image hosts are included: their permit is held across the
+/// replay, so the concurrency bound still holds, and a dead pooled socket
+/// would otherwise surface as a broken image even though a fresh connection
+/// succeeds immediately.
+fn retry_eligible(request: &Request<UpstreamBody>, upgrade: bool) -> bool {
     !upgrade
-        && !is_http1_host
         && (request.method() == Method::GET || request.method() == Method::HEAD)
         && request.body().is_end_stream()
         && request
             .headers()
             .get(http::header::CONTENT_LENGTH)
             .is_none_or(|value| value.as_bytes() == b"0")
+}
+
+/// Rebuild a replayed request: replayable requests carry no body, so the
+/// clone ships an empty one.
+fn replayed(parts: http::request::Parts) -> Request<UpstreamBody> {
+    Request::from_parts(parts, Either::Right(Full::new(Bytes::new())))
 }
 
 /// Candidates raced in parallel per batch while a cold connection hunts for a route.
@@ -172,6 +178,7 @@ pub(crate) struct UpstreamStats {
     request_errors: AtomicU64,
     slow_responses: AtomicU64,
     hedged_retries: AtomicU64,
+    error_retries: AtomicU64,
     warm_success: AtomicU64,
     warm_failures: AtomicU64,
 }
@@ -189,6 +196,7 @@ impl UpstreamStats {
             "requestErrors": self.request_errors.load(Ordering::Relaxed),
             "slowResponses": self.slow_responses.load(Ordering::Relaxed),
             "hedgedRetries": self.hedged_retries.load(Ordering::Relaxed),
+            "errorRetries": self.error_retries.load(Ordering::Relaxed),
             "warmSuccess": self.warm_success.load(Ordering::Relaxed),
             "warmFailures": self.warm_failures.load(Ordering::Relaxed),
         })
@@ -258,11 +266,18 @@ impl SlowHosts {
     }
 }
 
-pub struct UpstreamPool {
+/// One generation of pooled clients. Swapped wholesale by
+/// [`UpstreamPool::retire_pools`]; hyper's `Client` is a cheap `Arc` clone,
+/// so callers copy the handles out and never hold the lock across an await.
+struct PoolClients {
     auto: Client<RouteConnector, UpstreamBody>,
     http1: Client<RouteConnector, UpstreamBody>,
     upgrade: Client<RouteConnector, UpstreamBody>,
     recovery: Client<RouteConnector, UpstreamBody>,
+}
+
+pub struct UpstreamPool {
+    clients: RwLock<PoolClients>,
     /// Per-host replacement pools used after the engine rejects a route or IP.
     ///
     /// A rejected route must not keep serving from the connection that
@@ -425,14 +440,6 @@ impl UpstreamPool {
             discovery: discovery.clone(),
             stats: stats.clone(),
         };
-        let upgrade_connector = RouteConnector {
-            engine: engine.clone(),
-            tls: tls.clone(),
-            http1_only: true,
-            http1_hosts: http1_hosts.clone(),
-            discovery: discovery.clone(),
-            stats: stats.clone(),
-        };
         let http1_connector = RouteConnector {
             engine: engine.clone(),
             tls,
@@ -442,26 +449,30 @@ impl UpstreamPool {
             stats: stats.clone(),
         };
         Arc::new(Self {
-            auto: build_client(client_idle, auto_connector.clone(), max_idle),
-            // Image hosts are HTTP/1.1-only because a burst should spread over
-            // independent TCP connections. Their idle budget therefore has to
-            // track the burst concurrency, not the global small-idle profile:
-            // keeping only `max_idle` connections would make the next image
-            // burst reopen most of them (and pay the TLS handshakes again).
-            // This pool is only selected for `http1_hosts`, so the extra idle
-            // sockets do not apply to ordinary h2 origins.
-            http1: build_client(
-                client_idle,
-                http1_connector.clone(),
-                max_idle.max(http1_limit),
-            ),
-            upgrade: build_client(client_idle, upgrade_connector, max_idle),
-            // The recovery pool starts empty, so the first request after a
-            // slow response opens a fresh connection instead of reusing the
-            // stalled one.  It keeps that connection afterwards: without idle
-            // reuse every request in the recovery window would pay for a
-            // handshake, which is exactly the cost the recovery avoids.
-            recovery: build_client(client_idle, auto_connector.clone(), max_idle),
+            clients: RwLock::new(PoolClients {
+                auto: build_client(client_idle, auto_connector.clone(), max_idle),
+                // Image hosts are HTTP/1.1-only because a burst should spread over
+                // independent TCP connections. Their idle budget therefore has to
+                // track the burst concurrency, not the global small-idle profile:
+                // keeping only `max_idle` connections would make the next image
+                // burst reopen most of them (and pay the TLS handshakes again).
+                // This pool is only selected for `http1_hosts`, so the extra idle
+                // sockets do not apply to ordinary h2 origins.
+                http1: build_client(
+                    client_idle,
+                    http1_connector.clone(),
+                    max_idle.max(http1_limit),
+                ),
+                // The upgrade pool shares the HTTP/1.1-only connector: a
+                // WebSocket handshake must never be routed over HTTP/2.
+                upgrade: build_client(client_idle, http1_connector.clone(), max_idle),
+                // The recovery pool starts empty, so the first request after a
+                // slow response opens a fresh connection instead of reusing the
+                // stalled one.  It keeps that connection afterwards: without idle
+                // reuse every request in the recovery window would pay for a
+                // handshake, which is exactly the cost the recovery avoids.
+                recovery: build_client(client_idle, auto_connector.clone(), max_idle),
+            }),
             rejected_clients: Mutex::new(HashMap::new()),
             auto_connector,
             http1_connector,
@@ -538,20 +549,27 @@ impl UpstreamPool {
         } else {
             None
         };
-        let client = if let Some(client) = rejected_client.as_ref() {
-            client
-        } else if upgrade {
-            &self.upgrade
-        } else if recovery {
-            &self.recovery
-        } else if is_http1_host {
-            &self.http1
-        } else {
-            &self.auto
+        // The guard must be out of scope at the await below: a generator
+        // captures every in-scope value with a destructor, which would make
+        // this future `!Send` even though the guard is dropped here.
+        let (client, recovery_client) = {
+            let clients = self.clients.read();
+            let client = if let Some(client) = rejected_client.as_ref() {
+                client.clone()
+            } else if upgrade {
+                clients.upgrade.clone()
+            } else if recovery {
+                clients.recovery.clone()
+            } else if is_http1_host {
+                clients.http1.clone()
+            } else {
+                clients.auto.clone()
+            };
+            (client, clients.recovery.clone())
         };
         let debug_host = host;
         let debug_path = uri.path();
-        let retry_parts = if hedge_eligible(&request, upgrade, is_http1_host) {
+        let retry_parts = if retry_eligible(&request, upgrade) {
             // GET/HEAD without a body can be replayed. The clone is only
             // needed to keep a second, independent request available; a POST
             // or a streaming body must never be sent twice.
@@ -562,6 +580,10 @@ impl UpstreamPool {
         } else {
             None
         };
+        // The stall hedge stays disabled for image hosts: their permit makes
+        // a speculative second connection undesirable, and their requests are
+        // short. The hard-failure replay below covers them instead.
+        let hedge_enabled = retry_parts.is_some() && !is_http1_host;
         // Only hedge when there is time left for the retry to be useful.
         let hedge_after = HEDGE_AFTER.min(self.header_timeout / 2);
         let started = std::time::Instant::now();
@@ -570,13 +592,15 @@ impl UpstreamPool {
         // deadline instead of nesting a second `Timeout` future.
         let outcome = match retry_parts {
             Some(parts) => {
-                self.request_hedged(
-                    client,
+                self.request_with_retry(
+                    &client,
+                    &recovery_client,
                     request,
-                    parts,
+                    Some(parts),
                     hedge_after,
                     self.header_timeout,
                     debug_host,
+                    hedge_enabled,
                 )
                 .await
             }
@@ -714,22 +738,31 @@ impl UpstreamPool {
         }
     }
 
-    /// Send `request`, and after `hedge_after` also send a copy on the
-    /// recovery pool. The first response wins; a failed retry leaves the
-    /// original attempt in place.
+    /// Send `request` with one replay on the `recovery` pool. The first
+    /// response wins; a failed retry leaves the original attempt in place.
     ///
-    /// This targets the failure mode a header timeout cannot cover well: a
-    /// pooled connection that is still open but no longer answers. A 60 s
-    /// header deadline would otherwise leave the page waiting for the whole
-    /// budget even though a fresh connection succeeds immediately.
-    async fn request_hedged(
+    /// Two failure modes are covered:
+    /// - a pooled connection that is still open but no longer answers. When
+    ///   hedging is enabled the replay fires after `hedge_after`, so a 60 s
+    ///   header deadline does not hold the page for the whole budget while a
+    ///   fresh connection succeeds immediately.
+    /// - a pooled connection that fails outright (reset, closed before the
+    ///   response). A safe request replays immediately instead of handing
+    ///   the error to the browser.
+    ///
+    /// A request is replayed at most once: `retry_parts` is consumed by
+    /// whichever path fires first.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_with_retry(
         &self,
         client: &Client<RouteConnector, UpstreamBody>,
+        recovery: &Client<RouteConnector, UpstreamBody>,
         request: Request<UpstreamBody>,
-        retry_parts: http::request::Parts,
+        retry_parts: Option<http::request::Parts>,
         hedge_after: Duration,
         header_timeout: Duration,
         host: Option<&str>,
+        hedge_enabled: bool,
     ) -> SendOutcome {
         enum Event {
             First(ClientResult),
@@ -741,35 +774,81 @@ impl UpstreamPool {
         let first = client.request(request);
         tokio::pin!(first);
         let mut retry: Option<Pin<Box<dyn Future<Output = ClientResult> + Send + '_>>> = None;
-        let deadline = tokio::time::Instant::now() + header_timeout;
-        let timer = tokio::time::sleep(hedge_after.min(header_timeout));
-        tokio::pin!(timer);
-        let mut retry_parts = Some(retry_parts);
+        let mut retry_parts = retry_parts;
+        // `first` must not be polled again once it resolved, so the loop
+        // tracks whether it is still a live branch of the select.
+        let mut first_done = false;
+        let mut first_error: Option<hyper_util::client::legacy::Error> = None;
         let mut hedged = false;
+        let deadline = tokio::time::Instant::now() + header_timeout;
+        // With the hedge disabled the timer is a plain header deadline.
+        let timer = tokio::time::sleep(if hedge_enabled {
+            hedge_after.min(header_timeout)
+        } else {
+            header_timeout
+        });
+        tokio::pin!(timer);
 
         loop {
             let event = if let Some(retry_future) = retry.as_mut() {
-                tokio::select! {
-                    result = &mut first => Event::First(result),
-                    result = retry_future.as_mut() => Event::Retry(result),
-                    _ = &mut timer => Event::HeaderTimeout,
-                }
-            } else if !hedged {
-                tokio::select! {
-                    result = &mut first => Event::First(result),
-                    _ = &mut timer => Event::Hedge,
+                if first_done {
+                    tokio::select! {
+                        result = retry_future.as_mut() => Event::Retry(result),
+                        _ = &mut timer => Event::HeaderTimeout,
+                    }
+                } else {
+                    tokio::select! {
+                        result = &mut first => Event::First(result),
+                        result = retry_future.as_mut() => Event::Retry(result),
+                        _ = &mut timer => Event::HeaderTimeout,
+                    }
                 }
             } else {
                 tokio::select! {
                     result = &mut first => Event::First(result),
-                    _ = &mut timer => Event::HeaderTimeout,
+                    _ = &mut timer => if hedge_enabled && !hedged {
+                        Event::Hedge
+                    } else {
+                        Event::HeaderTimeout
+                    },
                 }
             };
 
             match event {
-                Event::First(result) => return SendOutcome::Response(result),
+                Event::First(Ok(response)) => return SendOutcome::Response(Ok(response)),
+                Event::First(Err(error)) => {
+                    first_done = true;
+                    if retry.is_some() {
+                        // A replay is already in flight; its answer is the one
+                        // the browser sees. Keep the original error for the
+                        // case where the replay fails as well.
+                        first_error = Some(error);
+                        continue;
+                    }
+                    if let Some(parts) = retry_parts.take() {
+                        self.stats.error_retries.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(
+                            host = host.unwrap_or(""),
+                            error = %format!("{error:#}"),
+                            "upstream request failed; replaying once on a fresh connection"
+                        );
+                        // The original attempt is over, so the replay runs on
+                        // its own: a plain header deadline, no hedge window.
+                        let replay = recovery.request(replayed(parts));
+                        return match tokio::time::timeout(header_timeout, replay).await {
+                            Ok(result) => SendOutcome::Response(result),
+                            Err(_) => SendOutcome::HeaderTimeout,
+                        };
+                    }
+                    return SendOutcome::Response(Err(error));
+                }
                 Event::Retry(Ok(response)) => return SendOutcome::Response(Ok(response)),
                 Event::Retry(Err(error)) => {
+                    retry = None;
+                    if first_done {
+                        // The original already failed; this was the last chance.
+                        return SendOutcome::Response(Err(first_error.take().unwrap_or(error)));
+                    }
                     // The fresh connection failed as well. Keep waiting for
                     // the original instead of turning a possible late success
                     // into an error.
@@ -778,11 +857,15 @@ impl UpstreamPool {
                         error = %format!("{error:#}"),
                         "hedged retry failed; waiting for the original request"
                     );
-                    retry = None;
                 }
                 Event::Hedge => {
                     hedged = true;
                     self.stats.hedged_retries.fetch_add(1, Ordering::Relaxed);
+                    let Some(parts) = retry_parts.take() else {
+                        // The hedge can only fire while a replay is still
+                        // available; the error replay would have taken it.
+                        return SendOutcome::HeaderTimeout;
+                    };
                     if let Some(host) = host {
                         // Keep later requests off the pool that produced the
                         // stall. The retry itself runs on the recovery pool.
@@ -793,11 +876,7 @@ impl UpstreamPool {
                             "upstream response is stalled; hedging on a fresh connection"
                         );
                     }
-                    let retry_request = Request::from_parts(
-                        retry_parts.take().expect("the hedge fires once"),
-                        Either::Right(Full::new(Bytes::new())),
-                    );
-                    retry = Some(Box::pin(self.recovery.request(retry_request)));
+                    retry = Some(Box::pin(recovery.request(replayed(parts))));
                     // The hedge window is over; the same timer now guards the
                     // header wait for both attempts.
                     timer.as_mut().reset(deadline);
@@ -940,12 +1019,17 @@ impl UpstreamPool {
         let rejected_client = self
             .is_rejected(host)
             .then(|| self.rejected_client(host, http1));
-        let client = if let Some(client) = rejected_client.as_ref() {
-            client
-        } else if http1 {
-            &self.http1
-        } else {
-            &self.auto
+        // Same scope rule as `send_with_uri`: the guard cannot outlive the
+        // await below.
+        let client = {
+            let clients = self.clients.read();
+            if let Some(client) = rejected_client.as_ref() {
+                client.clone()
+            } else if http1 {
+                clients.http1.clone()
+            } else {
+                clients.auto.clone()
+            }
         };
         match tokio::time::timeout(WARM_TIMEOUT, client.request(request)).await {
             Ok(Ok(response)) => {
@@ -987,6 +1071,38 @@ impl UpstreamPool {
             }
         }
         false
+    }
+
+    /// Swap in a fresh client generation, dropping every pooled upstream socket.
+    ///
+    /// A pause/resume cycle (or a takeover interruption) leaves previously
+    /// pooled connections behind a network path that may no longer exist; the
+    /// first requests after the resume would otherwise fail on those dead
+    /// sockets. In-flight requests hold their own client references and finish
+    /// on the old sockets; idle ones close when the dropped generation does.
+    pub(crate) fn retire_pools(&self) {
+        {
+            let mut clients = self.clients.write();
+            clients.auto =
+                build_client(self.client_idle, self.auto_connector.clone(), self.max_idle);
+            clients.http1 = build_client(
+                self.client_idle,
+                self.http1_connector.clone(),
+                self.http1_idle,
+            );
+            clients.upgrade = build_client(
+                self.client_idle,
+                self.http1_connector.clone(),
+                self.max_idle,
+            );
+            clients.recovery =
+                build_client(self.client_idle, self.auto_connector.clone(), self.max_idle);
+        }
+        // Replacement pools for rejected hosts carry sockets from the same
+        // pre-interruption era; the markers themselves are harmless and can
+        // simply age out.
+        self.rejected_clients.lock().clear();
+        tracing::info!("upstream connection pools retired");
     }
 
     pub(crate) fn stats_json(&self) -> serde_json::Value {
