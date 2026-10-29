@@ -477,6 +477,13 @@ fn wire_window(app: &AppWindow, ctx: &UiContext) {
                 MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
             }
         });
+        let weak = app.as_weak();
+        app.on_dismiss_interrupt(move || {
+            MODEL.with(|m| m.borrow_mut().dismiss_interrupt());
+            if let Some(app) = weak.upgrade() {
+                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
+            }
+        });
     }
     {
         let runtime = runtime.clone();
@@ -1177,7 +1184,7 @@ fn release_ui_caches(app: &AppWindow) {
 /// Site logos are embedded in the executable. `CARGO_MANIFEST_DIR` is an
 /// absolute path on the build machine, so loading them from disk would fail
 /// once the binary is copied to another machine.
-const ICON_ASSETS: [(&str, &[u8]); 9] = [
+const ICON_ASSETS: [(&str, &[u8]); 12] = [
     ("pixiv", include_bytes!("../assets/pixiv.png")),
     ("hitomi", include_bytes!("../assets/hitomi.png")),
     ("poipiku", include_bytes!("../assets/poipiku.png")),
@@ -1187,7 +1194,14 @@ const ICON_ASSETS: [(&str, &[u8]); 9] = [
     ("ao3", include_bytes!("../assets/ao3.png")),
     ("eh", include_bytes!("../assets/eh.png")),
     ("hanime", include_bytes!("../assets/hanime.png")),
+    ("nhentai", include_bytes!("../assets/nhentai.png")),
+    // The catalog calls the site `hf`; a group created from its homepage gets
+    // the `huggingface-co` slug instead, so both spellings share one image.
+    ("hf", HF_LOGO),
+    ("huggingface", HF_LOGO),
 ];
+
+const HF_LOGO: &[u8] = include_bytes!("../assets/hf.png");
 
 pub(crate) fn load_assets() {
     ASSETS.with(|assets| {
@@ -1996,7 +2010,8 @@ fn main() -> Result<()> {
     // probe is the only environment check on the UI thread; after this, the
     // probe thread streams results in. The proxy effects map onto the start
     // mode because they need the PAC URL, which only exists post-bind.
-    let startup_effects = MODEL.with(|m| m.borrow_mut().startup(ui_state::probe_env(&runtime)));
+    let startup_effects =
+        MODEL.with(|m| m.borrow_mut().startup(ui_state::probe_env(&runtime, false)));
     let start_mode = ui_state::execute_startup(&startup_effects, &runtime);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2095,12 +2110,19 @@ fn main() -> Result<()> {
         let probe_stop = probe_stop.clone();
         let probe_runtime = runtime.clone();
         std::thread::spawn(move || {
+            // One OS-proxy read-back every 3 s on every platform: a `scutil
+            // --proxy` run on macOS (≈5 ms) and a registry read on Windows
+            // (µs) are both negligible, and a shared cadence keeps the
+            // interrupt behavior identical everywhere.
+            let proxy_check_every: u32 = 3;
+            let mut tick: u32 = 0;
             while !probe_stop.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(1000));
                 if probe_stop.load(Ordering::SeqCst) {
                     break;
                 }
-                let env = ui_state::probe_env(&probe_runtime);
+                tick = tick.wrapping_add(1);
+                let env = ui_state::probe_env(&probe_runtime, tick % proxy_check_every == 0);
                 let runtime = probe_runtime.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     MODEL.with(|m| {

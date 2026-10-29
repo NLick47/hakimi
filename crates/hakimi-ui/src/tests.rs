@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::SITE_ICONS;
 use crate::ui_state::{BAD_COLOR, IDLE_COLOR, OK_COLOR, SLOW_COLOR};
 use hakimi_core::config::{DomainRule, RouteAttempt, RoutePolicy};
 
@@ -193,6 +194,68 @@ fn icon_keys_match_whole_ids_and_slugs_only() {
     assert_eq!(icon_key_for("mehta-com"), "");
     // Sites that ship their own logo match by id.
     assert_eq!(icon_key_for("hanime"), "hanime");
+    assert_eq!(icon_key_for("nhentai"), "nhentai");
+    // The catalog id and the homepage slug must reach the same logo.
+    assert_eq!(icon_key_for("hf"), "hf");
+    assert_eq!(icon_key_for("huggingface-co"), "huggingface");
+}
+
+/// A logo that ships as an asset but no group id can reach it is dead weight;
+/// one that groups can reach but has no asset leaves a letter tile behind.
+#[test]
+fn bundled_logos_and_group_lookups_stay_in_sync() {
+    let assets: std::collections::HashSet<&str> = ICON_ASSETS.iter().map(|(key, _)| *key).collect();
+    for key in SITE_ICONS {
+        assert!(assets.contains(key), "{key} is matched but not embedded");
+    }
+    for key in &assets {
+        assert_eq!(
+            icon_key_for(key),
+            *key,
+            "{key} is embedded but never matched"
+        );
+    }
+}
+
+/// Decoding happens once at startup and failures are silent, so a broken PNG
+/// would quietly turn every tile of that site back into a letter.
+#[test]
+fn every_bundled_logo_decodes() {
+    load_assets();
+    ASSETS.with(|assets| {
+        let images = assets.borrow();
+        for (key, _) in ICON_ASSETS {
+            let image = images
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} did not decode"));
+            assert!(image.size().width > 0, "{key} decoded to an empty image");
+        }
+    });
+}
+
+/// The Android shell keeps its own copy of every logo. Both trees have drifted
+/// before (a fully transparent booth.png sat on each side), so an asset has to
+/// land in both places. Skipped when only the desktop crate is checked out.
+#[test]
+fn android_drawables_match_the_desktop_assets() {
+    let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let android = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../android/probe/res/drawable-nodpi");
+    if !android.is_dir() {
+        return;
+    }
+    for entry in std::fs::read_dir(&assets).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        // Window and tray icons belong to the app shell, not to a site.
+        if !name.ends_with(".png") || name == "app-icon.png" || name == "tray.png" {
+            continue;
+        }
+        let mirror = android.join(format!("site_{name}"));
+        let other = std::fs::read(&mirror)
+            .unwrap_or_else(|_| panic!("{name} has no Android copy at {}", mirror.display()));
+        let here = std::fs::read(assets.join(&name)).unwrap();
+        assert_eq!(here, other, "{name} differs between desktop and Android");
+    }
 }
 
 fn draft_with(id: &str, is_new: bool, rows: Vec<DomainDraft>, preset: i32) -> SiteDraft {

@@ -273,6 +273,11 @@ private val SITE_ICONS = mapOf(
     "ao3" to R.drawable.site_ao3,
     "eh" to R.drawable.site_eh,
     "hanime" to R.drawable.site_hanime,
+    "nhentai" to R.drawable.site_nhentai,
+    // The catalog id is `hf`; a site added from its homepage gets the
+    // `huggingface-co` slug. Both spellings share one drawable.
+    "hf" to R.drawable.site_hf,
+    "huggingface" to R.drawable.site_hf,
 )
 
 fun siteIconRes(id: String): Int {
