@@ -1,0 +1,25 @@
+[Unit]
+# User unit: the proxy binds 127.0.0.1, so it does not need root.
+# Install:
+#   cp packaging/hakimi.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now hakimi
+# To start it at boot without logging in:
+#   loginctl enable-linger "$USER"
+#
+# Trusting the CA is a separate, root-only step (once per machine):
+#   sudo hakimi --data-dir "$HOME/.local/share/hakimi" ca install
+Description=hakimi local acceleration proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --log-stdout puts the log in the journal; it is also written to
+# ~/.local/share/hakimi/logs/hakimi.log.
+ExecStart=/usr/local/bin/hakimi serve --log-stdout
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

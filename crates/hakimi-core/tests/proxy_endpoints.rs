@@ -48,6 +48,8 @@ async fn serves_pac_and_status_endpoints() {
         json!({"app": "hakimi", "test": true})
     });
     let upstream = UpstreamPool::new(engine.clone(), tls.clone(), &config.snapshot());
+    let stop_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = stop_requests.clone();
     let ctx = ProxyContext::new(
         engine,
         ca,
@@ -59,6 +61,9 @@ async fn serves_pac_and_status_endpoints() {
         tls,
         upstream,
         status_json,
+        Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }),
     );
     let handle = proxy::start(ctx, "127.0.0.1:0".parse().unwrap())
         .await
@@ -111,6 +116,29 @@ async fn serves_pac_and_status_endpoints() {
     assert!(
         asked_for_every.load(std::sync::atomic::Ordering::SeqCst),
         "the diagnostics ask for every known domain"
+    );
+
+    // A drive-by page cannot stop the proxy: a custom header is mandatory, and
+    // a cross-origin request cannot send one without a CORS preflight.
+    let response = client
+        .post(format!("{base}/hakimi/stop"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(stop_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let response = client
+        .post(format!("{base}/hakimi/stop"))
+        .header("x-hakimi-control", "1")
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(
+        stop_requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the stop request must reach the runtime"
     );
 
     handle.stop().await;

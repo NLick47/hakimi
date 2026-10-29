@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::Arc;
 
@@ -25,14 +25,43 @@ const LOG_QUEUE_CAPACITY: usize = 2048;
 /// Events that were dropped because the writer could not keep up.
 static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
 
+/// Set once a subscriber is installed, so a host that owns its own logging
+/// (the CLI) can install it first and keep the runtime from doing it again.
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
 /// How many log events were dropped because the queue was full.
 pub fn dropped_events() -> u64 {
     DROPPED_EVENTS.load(Ordering::Relaxed)
 }
 
+/// Whether a log subscriber has already been installed.
+pub fn initialized() -> bool {
+    INITIALIZED.load(Ordering::Relaxed)
+}
+
+/// Optional behaviour for [`init_with`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoggingOptions {
+    /// Write the same events to stderr as well, for a foreground process
+    /// whose service manager collects stdout/stderr.
+    pub stderr: bool,
+    /// The `level` argument wins over `RUST_LOG` instead of being the fallback.
+    pub explicit_level: bool,
+}
+
 /// Initialize local-only logging. Logs never leave the machine; catalog/DoH URLs are redacted
 /// before they are written by callers.
 pub fn init(paths: &Paths, level: &str, format: LogFormat) -> Result<()> {
+    init_with(paths, level, format, LoggingOptions::default())
+}
+
+/// [`init`] with an explicit sink policy.
+pub fn init_with(
+    paths: &Paths,
+    level: &str,
+    format: LogFormat,
+    options: LoggingOptions,
+) -> Result<()> {
     paths.ensure()?;
     let log_path = paths.log_file();
     if let Ok(metadata) = fs::metadata(&log_path) {
@@ -42,18 +71,26 @@ pub fn init(paths: &Paths, level: &str, format: LogFormat) -> Result<()> {
     }
     let file = open_log_file(&log_path);
     match spawn_log_writer(file, log_path.clone()) {
-        Ok(sink) => install(NonBlockingMakeWriter::new(sink), level, format),
+        Ok(sink) => {
+            let writer = NonBlockingMakeWriter::new(sink);
+            let _ = if options.stderr {
+                install(TeeMakeWriter { file: writer }, level, format, options)
+            } else {
+                install(writer, level, format, options)
+            };
+        }
         Err(error) => {
             // Thread creation is the only fallible part; if it fails, keep the
             // previous synchronous behavior rather than losing logging entirely.
             eprintln!(
                 "hakimi: could not start asynchronous log writer ({error}); using synchronous writes"
             );
-            install(
-                std::sync::Mutex::new(open_log_file(&log_path)),
-                level,
-                format,
-            );
+            let writer = std::sync::Mutex::new(open_log_file(&log_path));
+            let _ = if options.stderr {
+                install(TeeMakeWriter { file: writer }, level, format, options)
+            } else {
+                install(writer, level, format, options)
+            };
         }
     }
     Ok(())
@@ -77,20 +114,24 @@ fn open_log_file(path: &Path) -> File {
 /// Desktop keeps `RUST_LOG`-style filtering; the regex machinery behind
 /// `EnvFilter` is too large for the Android binary.
 #[cfg(not(target_os = "android"))]
-fn install<W>(writer: W, level: &str, format: LogFormat)
+fn install<W>(writer: W, level: &str, format: LogFormat, options: LoggingOptions) -> bool
 where
     W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
 {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level.to_ascii_lowercase()));
-    match format {
+    let filter = if options.explicit_level {
+        tracing_subscriber::EnvFilter::new(level.to_ascii_lowercase())
+    } else {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level.to_ascii_lowercase()))
+    };
+    let installed = match format {
         LogFormat::Text => {
             let subscriber = tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_writer(writer)
                 .with_ansi(false)
                 .with_target(true);
-            let _ = subscriber.try_init();
+            subscriber.try_init().is_ok()
         }
         LogFormat::Json => {
             // JSONL is append-only and self-describing, which makes it suitable
@@ -104,26 +145,32 @@ where
                 .flatten_event(true)
                 .with_current_span(false)
                 .with_span_list(false);
-            let _ = subscriber.try_init();
+            subscriber.try_init().is_ok()
         }
+    };
+    if installed {
+        INITIALIZED.store(true, Ordering::Relaxed);
     }
+    installed
 }
 
 #[cfg(target_os = "android")]
-fn install<W>(writer: W, level: &str, format: LogFormat)
+fn install<W>(writer: W, level: &str, format: LogFormat, _options: LoggingOptions) -> bool
 where
     W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
 {
-    let filter: tracing::level_filters::LevelFilter =
-        level.trim().parse().unwrap_or(tracing::level_filters::LevelFilter::INFO);
-    match format {
+    let filter: tracing::level_filters::LevelFilter = level
+        .trim()
+        .parse()
+        .unwrap_or(tracing::level_filters::LevelFilter::INFO);
+    let installed = match format {
         LogFormat::Text => {
             let subscriber = tracing_subscriber::fmt()
                 .with_max_level(filter)
                 .with_writer(writer)
                 .with_ansi(false)
                 .with_target(true);
-            let _ = subscriber.try_init();
+            subscriber.try_init().is_ok()
         }
         LogFormat::Json => {
             let subscriber = tracing_subscriber::fmt()
@@ -135,9 +182,13 @@ where
                 .flatten_event(true)
                 .with_current_span(false)
                 .with_span_list(false);
-            let _ = subscriber.try_init();
+            subscriber.try_init().is_ok()
         }
+    };
+    if installed {
+        INITIALIZED.store(true, Ordering::Relaxed);
     }
+    installed
 }
 
 #[derive(Clone)]
@@ -205,6 +256,46 @@ impl Drop for NonBlockingWriter {
             self.sink.dropped.fetch_add(1, Ordering::Relaxed);
             DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// Copies every log line to stderr as well as to the file sink, for a
+/// foreground process whose service manager collects stderr.
+struct TeeMakeWriter<A> {
+    file: A,
+}
+
+impl<'a, A> MakeWriter<'a> for TeeMakeWriter<A>
+where
+    A: MakeWriter<'a>,
+{
+    type Writer = TeeWriter<A::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TeeWriter {
+            file: self.file.make_writer(),
+            stderr: io::stderr(),
+        }
+    }
+}
+
+struct TeeWriter<W> {
+    file: W,
+    stderr: io::Stderr,
+}
+
+impl<W: Write> Write for TeeWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file.write_all(buf)?;
+        // stderr is best effort: a closed console must not break logging.
+        let _ = self.stderr.write_all(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()?;
+        let _ = self.stderr.flush();
+        Ok(())
     }
 }
 

@@ -1,0 +1,58 @@
+name: CI
+
+# The release pipeline only builds Windows, macOS and Android. This job exists
+# so the Linux code paths (CA trust store, `hakimi env`) are compiled and
+# tested on every push, which is the only place they run before a release.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux check & test
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-core
+
+      # Only the CLI and the core: hakimi-ui needs webkit2gtk, and Linux ships
+      # the CLI without a desktop shell.
+      - name: Build the CLI
+        run: cargo build -p hakimi-cli --locked
+
+      - name: Test the core
+        run: cargo test -p hakimi-core --lib --locked
+
+      - name: Test the CLI
+        run: cargo test -p hakimi-cli --locked
+
+  linux-ca:
+    name: Linux CA install + TLS termination
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-ca
+
+      - name: Build the CLI
+        run: cargo build -p hakimi-cli --locked
+
+      # Installs the CA into the runner's system store (passwordless sudo),
+      # checks that the proxy really terminates TLS for a live site, then
+      # removes it again. This is the only place the trust-store code runs.
+      - name: CA install, proxy TLS, uninstall
+        run: bash scripts/ci/ca-smoke.sh

@@ -79,6 +79,13 @@ struct MacHttpState {
     secure_port: Option<u16>,
 }
 
+/// Whether this platform has a system-wide proxy setting this process can
+/// change. Linux has no single one: callers point tools at the proxy through
+/// environment variables instead.
+pub fn takeover_supported() -> bool {
+    cfg!(any(windows, target_os = "macos"))
+}
+
 /// Applies/restores the OS proxy setting. The original state is persisted before the first
 /// change, so a crash still allows the next start to restore it.
 pub struct SystemProxyManager {
@@ -1091,12 +1098,18 @@ fn platform_snapshot(_mode: ProxyMode) -> Result<SavedState> {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn platform_apply_pac(_state_path: &Path, _pac_url: &str) -> Result<Vec<String>> {
-    anyhow::bail!("system proxy takeover is only implemented on Windows and macOS")
+    anyhow::bail!(
+        "this platform has no system proxy to take over; point your own tools at the proxy \
+         (`hakimi env` for a shell, `hakimi pac` for a PAC file)"
+    )
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn platform_apply_http(_state_path: &Path, _proxy: SocketAddr) -> Result<Vec<String>> {
-    anyhow::bail!("system proxy takeover is only implemented on Windows and macOS")
+    anyhow::bail!(
+        "this platform has no system proxy to take over; point your own tools at the proxy \
+         (`hakimi env` for a shell, `hakimi pac` for a PAC file)"
+    )
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]

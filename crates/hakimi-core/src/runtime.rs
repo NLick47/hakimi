@@ -148,6 +148,17 @@ impl StatusProvider {
     }
 }
 
+/// What `start` does with the OS proxy setting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartPolicy {
+    /// Apply it when the config asks for it.
+    Apply,
+    /// Roll back a stale takeover of ours, apply nothing.
+    Release,
+    /// Read and write nothing; the flag belongs to this run only.
+    Skip,
+}
+
 /// Top-level core runtime. The desktop shell (C ABI) and CLI share this object.
 pub struct HakimiRuntime {
     paths: Paths,
@@ -224,11 +235,15 @@ impl HakimiRuntime {
         };
         paths.ensure()?;
         let config = Arc::new(ConfigManager::load_or_create(&paths)?);
-        logging::init(
-            &paths,
-            &config.snapshot().log.level,
-            config.snapshot().log.format,
-        )?;
+        // A host that installs its own subscriber (the CLI, to add stderr
+        // output) keeps it; the runtime only fills the default.
+        if !logging::initialized() {
+            logging::init(
+                &paths,
+                &config.snapshot().log.level,
+                config.snapshot().log.format,
+            )?;
+        }
         let cache = Arc::new(CacheManager::load(paths.state_file())?);
         let catalogs = CatalogManager::load(&paths, config.clone(), cache.clone())?;
         let ca = CertificateAuthority::load_or_create(&paths)?;
@@ -355,8 +370,20 @@ impl HakimiRuntime {
         self.started.load(Ordering::SeqCst)
     }
 
+    /// Watches the shutdown signal raised by `stop()` or by `/hakimi/stop`.
+    /// `None` before the runtime is started, which is also when there is no
+    /// proxy to signal it.
+    pub fn shutdown_receiver(&self) -> Option<watch::Receiver<bool>> {
+        self.shutdown.read().as_ref().map(watch::Sender::subscribe)
+    }
+
     pub fn pac_url(&self) -> Option<String> {
         (*self.proxy_listen.read()).map(|addr| format!("http://{addr}/proxy.pac"))
+    }
+
+    /// Base URL of the local proxy, once it is listening.
+    pub fn proxy_url(&self) -> Option<String> {
+        (*self.proxy_listen.read()).map(|addr| format!("http://{addr}"))
     }
 
     pub fn pac_script(&self) -> String {
@@ -371,7 +398,7 @@ impl HakimiRuntime {
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<()> {
-        self.start_inner(true).await
+        self.start_inner(StartPolicy::Apply).await
     }
 
     /// Like [`Self::start`], but leaves the OS proxy untouched: used when the
@@ -379,10 +406,17 @@ impl HakimiRuntime {
     /// the user's network. A stale takeover from a previous run is still rolled
     /// back, so browsing keeps working (direct) while the environment is fixed.
     pub async fn start_deferring_proxy(self: &Arc<Self>) -> Result<()> {
-        self.start_inner(false).await
+        self.start_inner(StartPolicy::Release).await
     }
 
-    async fn start_inner(self: &Arc<Self>, apply_proxy: bool) -> Result<()> {
+    /// Start without reading or writing the OS proxy setting at all. The CLI's
+    /// `serve --no-takeover` uses it, so a one-off flag never ends up in the
+    /// config and never disables a proxy the user configured themselves.
+    pub async fn start_without_takeover(self: &Arc<Self>) -> Result<()> {
+        self.start_inner(StartPolicy::Skip).await
+    }
+
+    async fn start_inner(self: &Arc<Self>, policy: StartPolicy) -> Result<()> {
         if self.started.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -405,6 +439,14 @@ impl HakimiRuntime {
                     status_provider.snapshot_json()
                 }
             });
+            // `/hakimi/stop` only raises the shutdown signal; the caller of
+            // `stop()` still performs the flush and the OS-proxy restore.
+            let on_stop = {
+                let shutdown = shutdown_tx.clone();
+                Arc::new(move || {
+                    let _ = shutdown.send(true);
+                }) as Arc<dyn Fn() + Send + Sync>
+            };
             let ctx = ProxyContext::new(
                 self.engine.clone(),
                 self.ca.clone(),
@@ -416,6 +458,7 @@ impl HakimiRuntime {
                 self.tls.clone(),
                 self.upstream.clone(),
                 status_json,
+                on_stop,
             );
             let bind = SocketAddr::new(config.proxy.bind, config.proxy.port);
             let handle = proxy::start(ctx, bind)
@@ -429,19 +472,31 @@ impl HakimiRuntime {
 
         if config.proxy.mode == ProxyMode::Off {
             let _ = self.restore_system_proxy();
-        } else if !apply_proxy {
-            // The caller (the UI state machine) owns OS-proxy policy; the only
-            // thing handled here is a stale takeover of ours from a previous
-            // run — this is the first moment `pac_url()` is known (post-bind).
-            tracing::info!("started without applying the system proxy");
-            self.release_system_proxy();
-        } else if config.proxy.takeover {
-            // The apply records `proxy_applied`/`proxy_error` itself.
-            if let Err(error) = self.apply_system_proxy() {
-                tracing::error!(error = %error, "failed to apply the system proxy");
-            }
         } else {
-            *self.proxy_applied.write() = None;
+            match policy {
+                // The caller (the UI state machine) owns OS-proxy policy; the
+                // only thing handled here is a stale takeover of ours from a
+                // previous run — this is the first moment `pac_url()` is known
+                // (post-bind).
+                StartPolicy::Release => {
+                    tracing::info!("started without applying the system proxy");
+                    self.release_system_proxy();
+                }
+                StartPolicy::Skip => {
+                    tracing::info!("started without touching the system proxy");
+                    *self.proxy_applied.write() = None;
+                }
+                StartPolicy::Apply => {
+                    if config.proxy.takeover {
+                        // The apply records `proxy_applied`/`proxy_error` itself.
+                        if let Err(error) = self.apply_system_proxy() {
+                            tracing::error!(error = %error, "failed to apply the system proxy");
+                        }
+                    } else {
+                        *self.proxy_applied.write() = None;
+                    }
+                }
+            }
         }
 
         let ca_status = self.ca.status();
@@ -891,8 +946,7 @@ impl HakimiRuntime {
             // seconds later. Wait briefly for that first refresh instead.
             let catalog_configured = {
                 let config = runtime.config.snapshot();
-                !config.catalogs.ip.trim().is_empty()
-                    || !config.catalogs.ip_mirrors.is_empty()
+                !config.catalogs.ip.trim().is_empty() || !config.catalogs.ip_mirrors.is_empty()
             };
             if catalog_configured && !runtime.catalogs.has_ip_catalog() {
                 let deadline = Instant::now() + Duration::from_secs(5);

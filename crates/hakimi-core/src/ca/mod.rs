@@ -20,7 +20,9 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 use crate::paths::Paths;
 
 use self::material::{build_leaf_config, generate_and_save, load_material, CaMaterial};
-use self::trust::{install_cert, trust_note, trust_status, trust_supported, uninstall_by_sha1};
+use self::trust::{
+    install_cert, install_target, trust_note, trust_status, trust_supported, uninstall_by_sha1,
+};
 
 pub use self::trust::set_android_ca_trusted;
 
@@ -40,6 +42,21 @@ const LEAF_ROTATE_HOURS: i64 = 24;
 const LEAF_CACHE_MAX: usize = 512;
 const LEAF_CACHE_PRUNE_TO: usize = LEAF_CACHE_MAX * 3 / 4;
 const CA_STATUS_TTL: Duration = Duration::from_secs(10);
+
+/// The trust store is only writable as root (Linux). The CLI downcasts to this
+/// instead of matching on error text, so the message can change freely.
+#[derive(Debug)]
+pub struct NeedsRoot {
+    pub path: String,
+}
+
+impl std::fmt::Display for NeedsRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "修改 {} 需要 root 权限，请在命令前加 sudo", self.path)
+    }
+}
+
+impl std::error::Error for NeedsRoot {}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -238,6 +255,13 @@ impl CertificateAuthority {
                 status
             }
         }
+    }
+
+    /// What [`Self::install`] is about to change: the file it writes and the
+    /// command that rebuilds the bundle. `None` on platforms that install
+    /// through an OS API (Windows, macOS) or cannot install at all.
+    pub fn install_target(&self) -> Option<(String, String)> {
+        install_target()
     }
 
     /// Queue a trust probe for the blocking pool instead of running it here.
