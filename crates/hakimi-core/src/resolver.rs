@@ -808,11 +808,8 @@ impl Resolver {
 
         if live_failed {
             if let Some(cached) = self.cache.ech(SHARED_ECH_DOMAIN, false) {
-                let config = base64::engine::general_purpose::STANDARD
-                    .decode(&cached.ech_config)
-                    .context("decoding stale shared ECH config")?;
                 return Ok(EchOutcome {
-                    config,
+                    config: cached.ech_config,
                     source: DohSource::Cache,
                     endpoint: None,
                     stale: true,
@@ -1809,5 +1806,72 @@ mod tests {
             "an HTTPS RR has no addresses; caching it only evicts real A/AAAA answers"
         );
         assert_eq!(cache.stats().ech_configs, 1);
+    }
+
+    /// `CachedEch` stores the raw ECHConfigList. The stale shared-config
+    /// fallback used to base64-decode it, which either fails on the binary
+    /// version byte or silently returns different bytes. When DoH is down the
+    /// last-resort shared config must be handed to rustls verbatim.
+    #[tokio::test]
+    async fn stale_shared_ech_config_is_returned_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, cache, resolver) = resolver(dir.path());
+        config
+            .mutate(|config| {
+                // Both raced endpoints are offline, so the live lookup fails
+                // immediately instead of waiting for a timeout.
+                config.doh.primary = "https://127.0.0.1:1/dns-query".into();
+                config.doh.fallback = config.doh.primary.clone();
+                config.doh.custom.clear();
+                Ok(())
+            })
+            .unwrap();
+
+        // `shared_cloudflare_ech` tries AliDNS directly after the configured
+        // endpoints. Pin that client to a closed local port so the test never
+        // depends on the real network.
+        let timeout = Duration::from_secs(config.snapshot().catalogs.timeout_secs.max(1));
+        let key = format!("https://dns.alidns.com/dns-query||{}", timeout.as_secs());
+        let alidns = reqwest::Client::builder()
+            .no_proxy()
+            .https_only(true)
+            .resolve("dns.alidns.com", SocketAddr::from(([127, 0, 0, 1], 1)))
+            .build()
+            .unwrap();
+        resolver.clients.write().insert(
+            key,
+            CachedDohClient {
+                client: alidns,
+                source: DohSource::Custom,
+                created_at: Instant::now(),
+            },
+        );
+
+        let ech_config = vec![0xfe, 0x0d, 0x00, 0x01, 0x00, 0x00];
+        cache.put_ech(CachedEch {
+            domain: SHARED_ECH_DOMAIN.into(),
+            ech_config: ech_config.clone(),
+            ttl_secs: 60,
+            fetched_at: now() - chrono::Duration::seconds(120),
+        });
+
+        let shared = resolver
+            .shared_cloudflare_ech()
+            .await
+            .expect("a stale shared config is the last resort when DoH is down");
+        assert_eq!(
+            shared.config, ech_config,
+            "the raw ECHConfigList must not be base64-decoded"
+        );
+        assert!(shared.stale);
+
+        // The public ECH path must use the same stale fallback for the
+        // requesting host instead of surfacing the DoH failure.
+        let outcome = resolver
+            .ech_config("pixiv.net", true)
+            .await
+            .expect("the stale shared config must reach the requesting host");
+        assert_eq!(outcome.config, ech_config);
+        assert!(outcome.stale);
     }
 }
