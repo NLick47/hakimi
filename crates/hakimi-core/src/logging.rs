@@ -329,22 +329,34 @@ fn spawn_log_writer(mut file: File, path: PathBuf) -> io::Result<LogSink> {
     Ok(sink)
 }
 
-/// Rotate to `hakimi.1.log` ... `hakimi.5.log`. Text logs are cheap to keep,
-/// but JSON/debug logs grow quickly; a single 5 MB backup loses the history
-/// needed to compare a regression with the previous day.
+/// Rotate to `<stem>.1.<ext>` ... `<stem>.5.<ext>`, derived from the live log
+/// path. Text logs are cheap to keep, but JSON/debug logs grow quickly; a single
+/// 5 MB backup loses the history needed to compare a regression with the
+/// previous day.
+///
+/// The names come from the path rather than a hardcoded `hakimi.N.log`: with a
+/// fixed prefix, pointing the data directory at a different file name silently
+/// rotated an unrelated series and left the real backups unmanaged.
 fn rotate_logs(log_path: &Path) {
     let Some(dir) = log_path.parent() else {
         return;
     };
-    let _ = fs::remove_file(dir.join(format!("hakimi.{MAX_LOG_BACKUPS}.log")));
+    let Some(stem) = log_path.file_stem().and_then(|stem| stem.to_str()) else {
+        return;
+    };
+    let extension = log_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("log");
+    let backup = |index: usize| dir.join(format!("{stem}.{index}.{extension}"));
+    let _ = fs::remove_file(backup(MAX_LOG_BACKUPS));
     for index in (1..MAX_LOG_BACKUPS).rev() {
-        let from = dir.join(format!("hakimi.{index}.log"));
-        let to = dir.join(format!("hakimi.{}.log", index + 1));
+        let from = backup(index);
         if from.exists() {
-            let _ = fs::rename(from, to);
+            let _ = fs::rename(from, backup(index + 1));
         }
     }
-    let _ = fs::rename(log_path, dir.join("hakimi.1.log"));
+    let _ = fs::rename(log_path, backup(1));
 }
 
 pub fn log_file_tail(path: &Path, max_lines: usize) -> Vec<String> {
@@ -530,6 +542,39 @@ mod tests {
         let path = dir.path().join("hakimi.log");
         std::fs::write(&path, "a\nb\nc\nd\n").unwrap();
         assert_eq!(log_file_tail(&path, 2), vec!["c", "d"]);
+    }
+
+    /// The backup series is named after the live file, not after a hardcoded
+    /// `hakimi.N.log`. The two are identical for the default data directory,
+    /// so nothing migrates; a different file name now rotates its own series.
+    #[test]
+    fn rotation_numbers_the_backups_next_to_the_live_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "newest\n").unwrap();
+        std::fs::write(dir.path().join("app.1.log"), "older\n").unwrap();
+        std::fs::write(dir.path().join("app.2.log"), "oldest\n").unwrap();
+
+        rotate_logs(&path);
+
+        assert!(!path.exists(), "the live file must move to .1");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("app.1.log")).unwrap(),
+            "newest\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("app.2.log")).unwrap(),
+            "older\n",
+            "the existing backups must shift by one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("app.3.log")).unwrap(),
+            "oldest\n"
+        );
+        assert!(
+            !dir.path().join("hakimi.1.log").exists(),
+            "the backup name must be derived from the log path"
+        );
     }
 
     #[test]
