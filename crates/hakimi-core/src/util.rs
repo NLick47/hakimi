@@ -338,7 +338,14 @@ pub fn parse_authority(authority: &str, default_port: u16) -> Option<(String, u1
         return Some((ip.to_string(), default_port));
     }
     match authority.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() && !port.is_empty() => {
+        // `example.com:` is a host with an empty port, not a host that
+        // contains a colon. Keeping the colon made the caller build an
+        // authority that no URI parser accepts, while `host_header_name`
+        // already dropped it for the same input.
+        Some((host, port)) if !host.is_empty() && port.is_empty() => {
+            Some((host.to_ascii_lowercase(), default_port))
+        }
+        Some((host, port)) if !host.is_empty() => {
             let port = port.parse().ok()?;
             Some((host.to_ascii_lowercase(), port))
         }
@@ -426,6 +433,18 @@ mod tests {
             parse_authority("127.0.0.1:49761", 80),
             Some(("127.0.0.1".into(), 49761))
         );
+        // An empty port is "no port", the same answer `host_header_name`
+        // gives for the same input.
+        assert_eq!(
+            parse_authority("example.com:", 443),
+            Some(("example.com".into(), 443))
+        );
+        assert_eq!(
+            host_header_name("example.com:"),
+            parse_authority("example.com:", 443).unwrap().0
+        );
+        // A port that is not a number is still a malformed authority.
+        assert_eq!(parse_authority("example.com:abc", 443), None);
     }
 
     #[test]
