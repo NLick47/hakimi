@@ -68,6 +68,8 @@ struct FakeProber {
     dead_tcp: Mutex<HashSet<IpAddr>>,
     /// Variants whose TCP leg connects but whose handshake never completes.
     stalled_tls: Mutex<Vec<(IpAddr, TlsMode)>>,
+    /// Variants that answer with a certificate which cannot cover the domain.
+    bad_cert: Mutex<Vec<(IpAddr, Option<String>)>>,
     calls: Mutex<Vec<(IpAddr, TlsMode, Option<String>)>>,
     tcp_calls: AtomicUsize,
 }
@@ -90,13 +92,19 @@ impl Prober for FakeProber {
         if self.dead_tcp.lock().contains(&ip) {
             return Err(ConnectError::TcpTimeout);
         }
-        if self
-            .stalled_tls
-            .lock()
-            .iter()
-            .any(|(stalled_ip, stalled_mode)| *stalled_ip == ip && *stalled_mode == mode)
+        if self.stalled_tls.lock().iter().any(|(stalled_ip, stalled_mode)| *stalled_ip == ip && *stalled_mode == mode)
         {
             return Err(ConnectError::TlsTimeout);
+        }
+        if self
+            .bad_cert
+            .lock()
+            .iter()
+            .any(|(bad_ip, bad_sni)| *bad_ip == ip && bad_sni.as_deref() == sni)
+        {
+            return Err(ConnectError::CertInvalid(
+                "certificate does not cover the domain".into(),
+            ));
         }
         let works = match mode {
             TlsMode::FakeSni => self
@@ -1306,7 +1314,14 @@ async fn auto_interleaves_the_accelerated_route_after_direct() {
             let second = cursor.next_plan().await.unwrap();
             assert_eq!(second.mode, TlsMode::FakeSni);
             assert_eq!(second.ip, ip);
-            assert_eq!(second.sni.as_deref(), Some("www.bing.com"));
+            assert_eq!(
+                second.sni, None,
+                "the global ladder starts with a ClientHello that carries no SNI"
+            );
+            let third = cursor.next_plan().await.unwrap();
+            assert_eq!(third.sni.as_deref(), Some("example.com."));
+            let fourth = cursor.next_plan().await.unwrap();
+            assert_eq!(fourth.sni.as_deref(), Some("www.bing.com"));
         }
         _ => panic!("expected a group cursor"),
     }
@@ -1383,24 +1398,209 @@ async fn a_timed_out_fake_sni_still_allows_the_direct_fallback() {
         Route::Group(cursor) => cursor,
         _ => panic!("expected a group cursor"),
     };
-    let sni = cursor.next_plan().await.expect("a fake-SNI plan");
-    assert_eq!(sni.mode, TlsMode::FakeSni);
+    // Every rung of the ladder fails after TCP came up. The collected names
+    // also pin the ladder: no SNI, the domain's root-dot name, then the
+    // configured name.
+    let mut dialled = Vec::new();
+    let mut address = None;
+    loop {
+        let plan = cursor
+            .next_plan()
+            .await
+            .expect("the direct fallback for the same address must still be planned");
+        if plan.mode == TlsMode::Direct {
+            assert_eq!(Some(plan.ip), address);
+            break;
+        }
+        if address.is_none() {
+            address = Some(plan.ip);
+        }
+        dialled.push(plan.sni.clone());
+        cursor.note_failure(
+            &plan,
+            FailureReason::TlsTimeout,
+            "TLS handshake with 1.1.1.1:443 timed out".into(),
+        );
+    }
+    assert_eq!(
+        dialled,
+        vec![
+            None,
+            Some("example.com.".to_string()),
+            Some("www.bing.com".to_string())
+        ],
+        "no SNI, then the domain's root-dot name, then the configured name"
+    );
+}
 
-    // The fake-SNI handshake timed out after TCP came up: an address-level
-    // verdict would be wrong, and the direct fallback on the same address must
-    // still be planned.
-    cursor.note_failure(
-        &sni,
-        FailureReason::TlsTimeout,
-        "TLS handshake with 1.1.1.1:443 timed out".into(),
+/// A no-SNI handshake is a learned route like any other. If `cached_plan` did
+/// not accept it, every later connection would re-walk the whole ladder even
+/// though the first rung already works.
+#[tokio::test]
+async fn a_learned_no_sni_route_is_reused_from_the_plan_cache() {
+    let harness = harness(&["example.com"], RoutePolicy::sni(Vec::new()));
+    *harness.remote.catalog.lock() = true;
+    let ip: IpAddr = "1.1.1.1".parse().unwrap();
+    *harness.remote.ips.lock() = Some(vec![ip]);
+    harness
+        .prober
+        .working_fake_sni
+        .lock()
+        .insert((ip, None));
+
+    let outcome = harness.engine.decide_https("example.com").await;
+    let plan = outcome.plan.expect("the no-SNI rung must work");
+    assert_eq!(plan.mode, TlsMode::FakeSni);
+    assert_eq!(plan.sni, None);
+
+    let cached = harness
+        .engine
+        .cached_plan("example.com", 443, true)
+        .expect("a learned no-SNI route must stay in the plan cache");
+    assert_eq!(cached.sni, None);
+    assert_eq!(cached.ip, ip);
+
+    // The root-dot rung is a ladder entry too, so a route that only works with
+    // it must be reusable instead of re-walking the ladder every connection.
+    let dotted = ConnectPlan {
+        sni: Some("example.com.".to_string()),
+        ..(*plan).clone()
+    };
+    harness.engine.remember_plan_arc(Arc::new(dotted));
+    let cached = harness
+        .engine
+        .cached_plan("example.com", 443, true)
+        .expect("the root-dot name must be accepted by the plan cache");
+    assert_eq!(cached.sni.as_deref(), Some("example.com."));
+}
+
+/// A name whose certificate cannot cover the domain is wrong for that domain on
+/// every address, so redialling it on the next cold connection is pure waste.
+#[tokio::test]
+async fn a_certificate_mismatch_retires_the_name_for_that_domain() {
+    let harness = harness(
+        &["example.com", "other.test"],
+        RoutePolicy::sni(Vec::new()),
+    );
+    *harness.remote.catalog.lock() = true;
+    let ip: IpAddr = "1.1.1.1".parse().unwrap();
+    *harness.remote.ips.lock() = Some(vec![ip]);
+    // The no-SNI handshake gets a foreign certificate.
+    harness.prober.bad_cert.lock().push((ip, None));
+
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group cursor"),
+    };
+    let first = cursor.next_plan().await.expect("a fake-SNI plan");
+    assert_eq!(first.sni, None);
+    cursor.note_failure(&first, FailureReason::CertInvalid, "foreign cert".into());
+
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group cursor"),
+    };
+    let next = cursor.next_plan().await.expect("a fake-SNI plan");
+    assert_eq!(
+        next.sni.as_deref(),
+        Some("example.com."),
+        "the rejected name must not be dialled again"
     );
 
-    let direct = cursor
-        .next_plan()
-        .await
-        .expect("the direct fallback for the same address must still be planned");
-    assert_eq!(direct.mode, TlsMode::Direct);
-    assert_eq!(direct.ip, sni.ip);
+    // The rejection is per domain: another host keeps the full ladder.
+    let mut cursor = match harness.engine.route("other.test", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group cursor"),
+    };
+    let other = cursor.next_plan().await.expect("a fake-SNI plan");
+    assert_eq!(other.sni, None);
+
+    // A success (a concurrent attempt on another edge, a changed certificate)
+    // puts the name back without waiting for the TTL.
+    harness.engine.clear_sni_rejection("example.com", None);
+    assert!(!harness.engine.sni_rejected("example.com", None));
+}
+
+/// Only a certificate mismatch is a verdict about the name. A reset or a stalled
+/// handshake may be about the address, so the name keeps its turn.
+#[tokio::test]
+async fn a_handshake_failure_keeps_the_name_in_the_sweep() {
+    let harness = harness(&["example.com"], RoutePolicy::sni(Vec::new()));
+    *harness.remote.catalog.lock() = true;
+    let ip: IpAddr = "1.1.1.1".parse().unwrap();
+    *harness.remote.ips.lock() = Some(vec![ip]);
+    harness
+        .prober
+        .stalled_tls
+        .lock()
+        .push((ip, TlsMode::FakeSni));
+
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group cursor"),
+    };
+    let first = cursor.next_plan().await.expect("a fake-SNI plan");
+    cursor.note_failure(&first, FailureReason::TlsTimeout, "handshake stalled".into());
+
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group cursor"),
+    };
+    let next = cursor.next_plan().await.expect("a fake-SNI plan");
+    assert_eq!(next.sni, None, "a stalled handshake must not retire the name");
+}
+
+/// A long configured list is not a longer sweep: three names is the budget.
+#[tokio::test]
+async fn the_sni_sweep_stops_at_three_names() {
+    let route = RoutePolicy::sni(vec![
+        "a.example".into(),
+        "b.example".into(),
+        "c.example".into(),
+        "d.example".into(),
+    ]);
+    let harness = harness(&["example.com"], route);
+    *harness.remote.catalog.lock() = true;
+    let ip: IpAddr = "1.1.1.1".parse().unwrap();
+    *harness.remote.ips.lock() = Some(vec![ip]);
+    harness.prober.bad_cert.lock().push((ip, None));
+
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group cursor"),
+    };
+    let mut dialled = Vec::new();
+    while let Some(plan) = cursor.next_plan().await {
+        if plan.mode != TlsMode::FakeSni {
+            break;
+        }
+        dialled.push(plan.sni.clone().unwrap_or_default());
+    }
+    assert_eq!(dialled, vec!["a.example", "b.example", "c.example"]);
+}
+
+/// An explicit list is dialled exactly as written, including an empty entry
+/// first. The old code sorted "no SNI" to the end, which silently reversed the
+/// order the user configured.
+#[tokio::test]
+async fn an_explicit_sni_list_keeps_the_written_order() {
+    let route = RoutePolicy::sni(vec![
+        String::new(),
+        "example.com.".into(),
+        "www.bing.com".into(),
+    ]);
+    let harness = harness(&["example.com"], route);
+    *harness.remote.catalog.lock() = true;
+    *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group cursor"),
+    };
+    let first = cursor.next_plan().await.expect("a fake-SNI plan");
+    assert_eq!(first.sni, None);
+    let second = cursor.next_plan().await.expect("a fake-SNI plan");
+    assert_eq!(second.sni.as_deref(), Some("example.com."));
 }
 
 #[tokio::test]

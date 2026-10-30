@@ -52,6 +52,13 @@ pub struct DecisionEngine {
     /// `route_rejections`, only the address is dropped; other IPs on the same
     /// route mode may still work.
     pub(super) ip_rejections: parking_lot::RwLock<HashMap<String, HashMap<IpAddr, Instant>>>,
+    /// Fake-SNI names that answered with a certificate which cannot cover the
+    /// domain. This is the one failure that is a property of the *name*: the
+    /// same CDN edge serves the same foreign certificate on every address, so
+    /// redialling the name on the next cold connection only burns a handshake.
+    /// Keyed by domain (the cert has to cover that name), then by the name
+    /// (`None` is "no SNI"); entries expire after [`SNI_REJECTION_TTL`].
+    pub(super) sni_rejections: parking_lot::RwLock<HashMap<String, HashMap<Option<String>, Instant>>>,
     /// The route that was last logged for a domain.
     ///
     /// The resolution line is by far the most frequent line in the log: a
@@ -83,6 +90,10 @@ const LOGGED_ROUTE_TTL: Duration = Duration::from_secs(600);
 const ROUTE_REJECTION_TTL: Duration = Duration::from_secs(300);
 /// How long a block-page IP stays out of a domain's candidate set.
 const IP_REJECTION_TTL: Duration = Duration::from_secs(300);
+/// How long a fake-SNI name stays out after answering with a foreign
+/// certificate. Long enough to stop the repeat on every cold connection, short
+/// enough that a changed CDN edge or a config fix recovers on its own.
+const SNI_REJECTION_TTL: Duration = Duration::from_secs(600);
 /// Cap for the re-probe backoff of continuously failing addresses.
 const PROBE_BACKOFF_MAX: Duration = Duration::from_secs(1800);
 
@@ -145,6 +156,7 @@ impl DecisionEngine {
             plan_cache_count: AtomicUsize::new(0),
             route_rejections: parking_lot::RwLock::new(HashMap::new()),
             ip_rejections: parking_lot::RwLock::new(HashMap::new()),
+            sni_rejections: parking_lot::RwLock::new(HashMap::new()),
             logged_routes: parking_lot::RwLock::new(HashMap::new()),
             probe_backoff: parking_lot::Mutex::new(HashMap::new()),
             warming: AtomicBool::new(false),
@@ -454,19 +466,24 @@ impl DecisionEngine {
             // keep using an old name for the rest of the plan-cache lifetime.
             if plan.mode == TlsMode::FakeSni {
                 let allowed = route.attempts.iter().any(|attempt| {
-                    attempt
-                        .sni_hosts()
-                        .is_some_and(|hosts| match plan.sni.as_deref() {
-                            Some(sni) if hosts.is_empty() => config
-                                .advanced
-                                .fake_sni_candidates
-                                .iter()
-                                .any(|host| host.eq_ignore_ascii_case(sni)),
-                            Some(sni) => hosts.iter().any(|host| host.eq_ignore_ascii_case(sni)),
-                            None => {
-                                hosts.is_empty() || hosts.iter().any(|host| host.trim().is_empty())
+                    attempt.sni_hosts().is_some_and(|hosts| {
+                        if hosts.is_empty() {
+                            // A global-list route may dial anything the ladder
+                            // contains, including the two implicit entries.
+                            crate::config::global_sni_allowed(
+                                &plan.domain,
+                                plan.sni.as_deref(),
+                                &config.advanced.fake_sni_candidates,
+                            )
+                        } else {
+                            match plan.sni.as_deref() {
+                                Some(sni) => {
+                                    hosts.iter().any(|host| host.eq_ignore_ascii_case(sni))
+                                }
+                                None => hosts.iter().any(|host| host.trim().is_empty()),
                             }
-                        })
+                        }
+                    })
                 });
                 if !allowed {
                     return None;
@@ -723,6 +740,51 @@ impl DecisionEngine {
             .is_some_and(|at| at.elapsed() < IP_REJECTION_TTL)
     }
 
+    /// True while this fake-SNI name is not worth dialling for `domain`.
+    ///
+    /// Only a certificate mismatch lands here: the name is what the server
+    /// answered with, not the address, so another IP of the same origin would
+    /// answer the same way. A reset or a stalled handshake says nothing about
+    /// the name and must keep its turn.
+    pub(super) fn sni_rejected(&self, domain: &str, name: Option<&str>) -> bool {
+        let key = name.map(str::to_owned);
+        let rejected = self.sni_rejections.read();
+        rejected
+            .get(domain)
+            .and_then(|by_name| by_name.get(&key))
+            .is_some_and(|at| at.elapsed() < SNI_REJECTION_TTL)
+    }
+
+    /// Remember that `name` got a certificate that cannot cover `domain`.
+    pub(super) fn note_sni_rejection(&self, domain: &str, name: Option<String>) {
+        let mut rejected = self.sni_rejections.write();
+        if rejected.len() > 1024 {
+            let now = Instant::now();
+            for by_name in rejected.values_mut() {
+                by_name.retain(|_, at| now.duration_since(*at) < SNI_REJECTION_TTL);
+            }
+            rejected.retain(|_, by_name| !by_name.is_empty());
+        }
+        rejected
+            .entry(domain.to_string())
+            .or_default()
+            .insert(name, Instant::now());
+    }
+
+    /// A name that just validated is no longer rejected.
+    pub(super) fn clear_sni_rejection(&self, domain: &str, name: Option<&str>) {
+        if self.sni_rejections.read().is_empty() {
+            return;
+        }
+        let mut rejected = self.sni_rejections.write();
+        if let Some(by_name) = rejected.get_mut(domain) {
+            by_name.remove(&name.map(str::to_owned));
+            if by_name.is_empty() {
+                rejected.remove(domain);
+            }
+        }
+    }
+
     /// Whether a failed address is due for another re-probe attempt.
     pub(super) fn probe_backoff_ready(&self, domain: &str, ip: IpAddr) -> bool {
         let map = self.probe_backoff.lock();
@@ -762,6 +824,7 @@ impl DecisionEngine {
         self.forget_all_plans();
         self.clear_route_rejections();
         self.ip_rejections.write().clear();
+        self.sni_rejections.write().clear();
         self.probe_backoff.lock().clear();
         {
             let mut scores = self.ip_scores.write();

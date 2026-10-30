@@ -12,6 +12,13 @@ use super::engine::DecisionEngine;
 use super::plan::{ConnectPlan, DecisionOutcome};
 use super::types::{Candidate, DohExpansion, EARLY_DOH_AFTER};
 
+/// How many fake-SNI names one discovery may dial per address.
+///
+/// The first three cover the filter classes; a longer sweep only adds handshakes
+/// to the race window, and names that cannot work are dropped by the rejection
+/// list anyway.
+const MAX_SNI_CANDIDATES: usize = 3;
+
 /// Result of matching a host against the configured groups.
 pub enum Route {
     /// No interception: the caller should connect directly.
@@ -345,41 +352,56 @@ impl RouteCursor {
     }
 
     fn sni_candidates_for(&self, hosts: &[String]) -> Vec<Option<String>> {
+        let configured = self.config.advanced.fake_sni_candidates.as_slice();
         let mut out: Vec<Option<String>> = Vec::new();
         let mut push = |candidate: Option<String>| {
             if !out.contains(&candidate) {
                 out.push(candidate);
             }
         };
+        // A learned name still leads: it is the one that passed certificate
+        // validation on this network. It has to belong to the ladder, otherwise
+        // a stale cache entry would outlive the route that produced it.
         if let Some(cached) = self
             .engine
             .cache
             .sni(&self.group().id, &self.domain, &self.network)
         {
-            let allowed = hosts.is_empty()
-                || cached.sni.as_deref().is_some_and(|cached| {
-                    hosts.iter().any(|host| host.eq_ignore_ascii_case(cached))
-                });
+            let allowed = if hosts.is_empty() {
+                crate::config::global_sni_allowed(
+                    &self.domain,
+                    cached.sni.as_deref(),
+                    configured,
+                )
+            } else {
+                match cached.sni.as_deref() {
+                    Some(sni) => hosts.iter().any(|host| host.eq_ignore_ascii_case(sni)),
+                    None => hosts.iter().any(|host| host.trim().is_empty()),
+                }
+            };
             if allowed {
                 push(cached.sni);
             }
         }
         if hosts.is_empty() {
-            for candidate in &self.config.advanced.fake_sni_candidates {
-                push(normalize_sni(candidate));
+            // The ladder, not a longer list: no SNI, the domain's own root-dot
+            // name, then the configured name. See `config::global_sni_ladder`.
+            for candidate in crate::config::global_sni_ladder(&self.domain, configured) {
+                push(candidate);
             }
         } else {
             for candidate in hosts {
                 push(normalize_sni(candidate));
             }
         }
-        if out.is_empty() {
-            out.push(None);
-        }
-        // A `None` entry sends no SNI and is effectively a duplicate of Direct:
-        // keep it last so an explicit empty-SNI route still tries named
-        // candidates first.
-        out.sort_by_key(|entry| entry.is_none());
+        // A name that just answered with a foreign certificate will answer the
+        // same way on every address of that origin, so it is out until the
+        // rejection expires. Resets and stalls are not recorded: they may be
+        // about the address, not the name.
+        out.retain(|candidate| !self.engine.sni_rejected(&self.domain, candidate.as_deref()));
+        // Beyond this the marginal chance does not pay for another handshake in
+        // the race window, and a name that keeps failing is already out above.
+        out.truncate(MAX_SNI_CANDIDATES);
         out
     }
 
@@ -688,6 +710,13 @@ impl RouteCursor {
             latency_ms: None,
         });
         self.engine.record_ip(&plan.domain, plan.ip, None, true);
+        // A certificate that cannot cover the domain is a verdict about the
+        // name, not the address: drop it for this domain so the next cold
+        // connection does not spend another handshake on it.
+        if plan.mode == TlsMode::FakeSni && reason == FailureReason::CertInvalid {
+            self.engine
+                .note_sni_rejection(&plan.domain, plan.sni.clone());
+        }
     }
 
     /// Record a successful real connection (TLS + certificate validation already passed).
@@ -704,6 +733,8 @@ impl RouteCursor {
             &self.config,
         );
         if plan.mode == TlsMode::FakeSni {
+            self.engine
+                .clear_sni_rejection(&plan.domain, plan.sni.as_deref());
             self.engine.cache.put_sni(crate::cache::CachedSni {
                 group: self.group().id.clone(),
                 domain: self.domain.clone(),

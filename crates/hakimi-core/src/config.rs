@@ -1068,6 +1068,51 @@ fn strip_legacy_materialized_defaults(config: &mut AppConfig) {
     }
 }
 
+/// One entry of a fake-SNI candidate list, normalized the way the dialer wants
+/// it: trimmed, lowercase, and `None` for "send no SNI".
+fn normalize_sni_candidate(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_ascii_lowercase())
+    }
+}
+
+/// The fake-SNI ladder dialled for a route that uses the global candidate list.
+///
+/// Three names cover the three filter classes; a fourth repeats one of them and
+/// costs another handshake for nothing:
+///
+/// - **no SNI** — servers that serve the real certificate without one;
+/// - **`<domain>.`** — name filters that match the bare name exactly; the
+///   trailing root label resolves to the same server (the Hugging Face case);
+/// - **the configured name** — a normal-looking name that passes SNI filters.
+///
+/// This is the only definition of the ladder: the cursor generates from it and
+/// [`cached_plan`](crate::decision::DecisionEngine::cached_plan) accepts a
+/// learned route through [`global_sni_allowed`], so the two cannot disagree
+/// about which name a route may dial. The dialer still caps one sweep at three
+/// names, so a longer configured list only widens the acceptance check.
+pub fn global_sni_ladder(domain: &str, configured: &[String]) -> Vec<Option<String>> {
+    let mut out = vec![None, Some(format!("{}.", domain.to_ascii_lowercase()))];
+    for candidate in configured {
+        let candidate = normalize_sni_candidate(candidate);
+        if !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+/// Whether `sni` is a name [`global_sni_ladder`] would dial for `domain`.
+pub fn global_sni_allowed(domain: &str, sni: Option<&str>, configured: &[String]) -> bool {
+    let normalized = sni.map(|value| value.trim().to_ascii_lowercase());
+    global_sni_ladder(domain, configured)
+        .into_iter()
+        .any(|candidate| candidate == normalized)
+}
+
 /// Whether `id` is one of the built-in groups.
 ///
 /// [`merge_missing_builtin_groups`] re-adds every built-in id on load, so a
@@ -1648,6 +1693,54 @@ mod tests {
             assert!(
                 !config.group(id).unwrap().recovers_blocked_ips(),
                 "{id} must keep the normal warm-up behavior"
+            );
+        }
+    }
+
+    /// One rung per filter class, and no duplicates. The ladder is also what
+    /// the plan cache validates against, so the two must be the same list.
+    #[test]
+    fn the_global_sni_ladder_covers_each_class_exactly_once() {
+        let configured = vec!["www.bing.com".to_string()];
+        assert_eq!(
+            global_sni_ladder("Example.COM", &configured),
+            vec![
+                None,
+                Some("example.com.".to_string()),
+                Some("www.bing.com".to_string())
+            ]
+        );
+
+        // An empty configured entry is the same rung as "no SNI", and the
+        // domain's own root-dot name must not appear twice either.
+        let reduplicated = vec![
+            String::new(),
+            "example.com.".to_string(),
+            "WWW.Bing.COM".to_string(),
+            "www.bing.com".to_string(),
+        ];
+        assert_eq!(
+            global_sni_ladder("example.com", &reduplicated),
+            vec![
+                None,
+                Some("example.com.".to_string()),
+                Some("www.bing.com".to_string())
+            ]
+        );
+
+        for (sni, expected) in [
+            (None, true),
+            (Some("example.com."), true),
+            (Some("www.bing.com"), true),
+            (Some("WWW.BING.COM"), true),
+            (Some("www.baidu.com"), false),
+            (Some("example.com"), false),
+        ] {
+            assert_eq!(
+                global_sni_allowed("example.com", sni, &configured),
+                expected,
+                "{sni:?} must {} be part of the ladder",
+                if expected { "" } else { "not" }
             );
         }
     }
