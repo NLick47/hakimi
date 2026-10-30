@@ -95,3 +95,25 @@ fn removing_an_unknown_site_is_an_error() {
     let config = ConfigManager::load_or_create(&paths).unwrap();
     assert!(config.remove_group("does-not-exist").is_err());
 }
+
+/// A built-in group is re-added on every load, so removing it has to fail
+/// loudly instead of reporting a removal that the next start undoes.
+#[test]
+fn builtin_sites_cannot_be_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    let config = ConfigManager::load_or_create(&paths).unwrap();
+
+    let error = config.remove_group("github").unwrap_err();
+    assert!(
+        error.to_string().contains("cannot be removed"),
+        "the refusal must say why: {error}"
+    );
+    assert!(
+        config.snapshot().group("github").is_some(),
+        "a refused removal must not touch the group"
+    );
+
+    let reloaded = ConfigManager::load_or_create(&paths).unwrap();
+    assert!(reloaded.snapshot().group("github").is_some());
+}

@@ -1068,6 +1068,14 @@ fn strip_legacy_materialized_defaults(config: &mut AppConfig) {
     }
 }
 
+/// Whether `id` is one of the built-in groups.
+///
+/// [`merge_missing_builtin_groups`] re-adds every built-in id on load, so a
+/// removal that "succeeded" would quietly undo itself at the next start.
+pub fn is_builtin_group(id: &str) -> bool {
+    default_groups().iter().any(|group| group.id == id)
+}
+
 /// `groups` is persisted as one whole array, so builtin sites added in a new
 /// version never reach an existing install — clearing the data was the only
 /// way to see them. Append the builtin groups that are missing here.
@@ -1289,6 +1297,12 @@ impl ConfigManager {
     }
 
     pub fn remove_group(&self, id: &str) -> Result<AppConfig> {
+        // Refusing is the only outcome that survives the next load: the built-in
+        // merge re-adds this id, so reporting success would mean the group
+        // silently comes back after a restart.
+        if is_builtin_group(id) {
+            bail!("builtin group `{id}` cannot be removed; disable it instead");
+        }
         self.mutate(|config| {
             let before = config.groups.len();
             config.groups.retain(|group| group.id != id);
