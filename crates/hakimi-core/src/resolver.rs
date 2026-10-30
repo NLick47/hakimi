@@ -38,6 +38,14 @@ const STALE_REFRESH_BACKOFF_MAX: usize = 1024;
 const NEGATIVE_NODATA_SECS: u32 = 60;
 const NEGATIVE_HTTPS_NODATA_SECS: u32 = 300;
 const NEGATIVE_FAILURE_SECS: u32 = 10;
+/// Lanes and budget for the endpoints after the raced primary/fallback pair.
+/// The remote catalog decides how many there are (up to 64), and one timeout
+/// each would let a silent list stretch every cold lookup to minutes. Two
+/// lanes avoid queueing behind one dead endpoint; the budget is two client
+/// timeouts so the second wave can still find an answer behind a stalled
+/// first. `FALLBACK_LANES * FALLBACK_WAVES` bounds the per-query worst case.
+const FALLBACK_LANES: usize = 2;
+const FALLBACK_WAVES: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct EffectiveEndpoint {
@@ -268,7 +276,7 @@ impl Resolver {
             push(endpoint.clone(), DohSource::Custom, &mut endpoints);
         }
         for endpoint in remote {
-            push(endpoint, DohSource::Custom, &mut endpoints);
+            push(endpoint, DohSource::Catalog, &mut endpoints);
         }
         endpoints
     }
@@ -959,24 +967,53 @@ impl Resolver {
             // still supply an address.
         }
 
-        // For an address query, an empty answer is unusable, so trying every
-        // custom endpoint is worth the latency. For HTTPS/ECH a NODATA answer
-        // from the primary/fallback pair is a usable negative result; probing
-        // every custom endpoint serially would add one timeout per endpoint to
-        // every cold ECH route. Custom endpoints are only consulted when the
-        // raced pair did not produce any answer at all.
+        // For an address query, an empty answer is unusable, so trying the
+        // remaining endpoints is worth the latency. For HTTPS/ECH a NODATA
+        // answer from the primary/fallback pair is a usable negative result;
+        // probing every remaining endpoint would add one timeout per endpoint
+        // to every cold ECH route. They are only consulted when the raced
+        // pair did not produce any answer at all.
         let pair_answered_empty = endpoints.len() >= 2 && empty_answer.is_some();
         if !(qtype == TYPE_HTTPS && pair_answered_empty) {
-            for (index, endpoint) in
-                endpoints
-                    .iter()
-                    .enumerate()
-                    .skip(if endpoints.len() >= 2 { 2 } else { 0 })
-            {
-                let started = Instant::now();
-                match self.query_endpoint(endpoint, domain, qtype).await {
+            let timeout =
+                Duration::from_secs(self.config.snapshot().catalogs.timeout_secs.max(1));
+            let budget = tokio::time::Instant::now() + timeout * FALLBACK_WAVES;
+            let mut remaining = endpoints
+                .iter()
+                .enumerate()
+                .skip(if endpoints.len() >= 2 { 2 } else { 0 });
+            let mut pending: FuturesUnordered<
+                futures_util::future::BoxFuture<
+                    '_,
+                    (usize, Instant, Result<ResolvedAnswer>),
+                >,
+            > = FuturesUnordered::new();
+            for _ in 0..FALLBACK_LANES {
+                let Some((index, endpoint)) = remaining.next() else {
+                    break;
+                };
+                let endpoint = endpoint.clone();
+                pending.push(Box::pin(async move {
+                    let queued = Instant::now();
+                    let result = self.query_endpoint(&endpoint, domain, qtype).await;
+                    (index, queued, result)
+                }));
+            }
+            loop {
+                let next = match tokio::time::timeout_at(budget, pending.next()).await {
+                    Ok(next) => next,
+                    // The shared budget is spent. Queries still in flight are
+                    // dropped and keep no health record this round, the same
+                    // semantics as a dropped race loser.
+                    Err(_) => break,
+                };
+                let Some((index, queued, result)) = next else {
+                    break;
+                };
+                let endpoint = &endpoints[index];
+                match result {
                     Ok(answer) => {
-                        self.record_health(endpoint, true, started.elapsed(), None);
+                        self.record_health(endpoint, true, queued.elapsed(), None);
                         if useful_answer(&answer) {
                             self.store_answer(domain, qtype, &answer);
                             return Ok(TypeQuery {
@@ -995,7 +1032,7 @@ impl Resolver {
                         self.record_health(
                             endpoint,
                             false,
-                            started.elapsed(),
+                            queued.elapsed(),
                             Some(format!("{error:#}")),
                         );
                         tracing::debug!(
@@ -1011,6 +1048,16 @@ impl Resolver {
                             error: format!("{error:#}"),
                         });
                     }
+                }
+                if let Some((next_index, next_endpoint)) = remaining.next() {
+                    let next_endpoint = next_endpoint.clone();
+                    pending.push(Box::pin(async move {
+                        let queued = Instant::now();
+                        let result = self
+                            .query_endpoint(&next_endpoint, domain, qtype)
+                            .await;
+                        (next_index, queued, result)
+                    }));
                 }
             }
         }
@@ -1232,7 +1279,12 @@ impl Resolver {
             // fallback, whose connections are used on every cache miss.
             let evict = clients
                 .iter()
-                .filter(|(_, entry)| entry.source == DohSource::Custom)
+                .filter(|(_, entry)| {
+                    !matches!(
+                        entry.source,
+                        DohSource::Primary | DohSource::Fallback
+                    )
+                })
                 .min_by_key(|(_, entry)| entry.created_at)
                 .or_else(|| clients.iter().min_by_key(|(_, entry)| entry.created_at))
                 .map(|(key, _)| key.clone());
@@ -1430,6 +1482,57 @@ mod tests {
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0].source, DohSource::Primary);
         assert_eq!(endpoints[1].source, DohSource::Custom);
+    }
+
+    #[test]
+    fn catalog_endpoints_are_named_as_catalog_not_custom() {
+        // The remote catalog's endpoints must be distinguishable from the
+        // ones the user typed in, and they must not be able to override a
+        // custom endpoint's name or bootstrap.
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _, _) = resolver(dir.path());
+        let url = "https://from-catalog.example/dns-query";
+        let endpoints = Resolver::build_endpoints(
+            &config.snapshot(),
+            vec![crate::config::DohEndpoint {
+                name: "catalog entry".into(),
+                url: url.into(),
+                bootstrap_ip: Some("1.1.1.1".parse().unwrap()),
+                enabled: true,
+            }],
+        );
+        let entry = endpoints
+            .iter()
+            .find(|endpoint| endpoint.url == url)
+            .expect("the catalog endpoint is appended");
+        assert_eq!(entry.source, DohSource::Catalog);
+
+        // A user custom entry reusing the same URL keeps its Custom source;
+        // the catalog entry adds nothing.
+        config
+            .mutate(|config| {
+                config.doh.custom.push(crate::config::DohEndpoint {
+                    name: "mine".into(),
+                    url: url.into(),
+                    bootstrap_ip: Some("9.9.9.9".parse().unwrap()),
+                    enabled: true,
+                });
+                Ok(())
+            })
+            .unwrap();
+        let merged = Resolver::build_endpoints(
+            &config.snapshot(),
+            vec![crate::config::DohEndpoint {
+                name: "catalog entry".into(),
+                url: url.into(),
+                bootstrap_ip: Some("1.1.1.1".parse().unwrap()),
+                enabled: true,
+            }],
+        );
+        let entries: Vec<_> = merged.iter().filter(|e| e.url == url).collect();
+        assert_eq!(entries.len(), 1, "the catalog entry dedupes into the custom one");
+        assert_eq!(entries[0].source, DohSource::Custom);
+        assert_eq!(entries[0].name, "mine");
     }
 
     #[test]

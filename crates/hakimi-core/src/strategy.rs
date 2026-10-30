@@ -62,6 +62,9 @@ pub enum DohSource {
     Primary,
     Fallback,
     Custom,
+    /// An endpoint handed out by the remote DoH catalog: never user-specified,
+    /// so diagnostics can tell "who chose this" apart.
+    Catalog,
     Cache,
 }
 
@@ -71,6 +74,7 @@ impl DohSource {
             Self::Primary => "primary",
             Self::Fallback => "fallback",
             Self::Custom => "custom",
+            Self::Catalog => "catalog",
             Self::Cache => "cache",
         }
     }

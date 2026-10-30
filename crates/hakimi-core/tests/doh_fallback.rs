@@ -105,6 +105,8 @@ enum DohMode {
     /// A valid HTTP/DNS response with NOERROR and no answer records.
     Empty,
     Fail,
+    /// Read the query, then never answer: the client has to give up.
+    Stall,
 }
 
 /// A DoH server that answers every query with one A record, answers with an
@@ -155,14 +157,23 @@ impl DohServer {
                         let mode = mode.clone();
                         async move {
                             counter.fetch_add(1, Ordering::Relaxed);
-                            if matches!(&mode, DohMode::Fail) {
-                                return Ok::<_, Infallible>(
-                                    hyper::Response::builder()
-                                        .status(503)
-                                        .body(Full::new(Bytes::from_static(b"nope")))
-                                        .unwrap(),
-                                );
-                            }
+                        if matches!(&mode, DohMode::Fail) {
+                            return Ok::<_, Infallible>(
+                                hyper::Response::builder()
+                                    .status(503)
+                                    .body(Full::new(Bytes::from_static(b"nope")))
+                                    .unwrap(),
+                            );
+                        }
+                        if matches!(&mode, DohMode::Stall) {
+                            let _ = req.into_body().collect().await;
+                            // Hold the connection open without answering until
+                            // the client gives up on its own timeout.
+                            let never: std::future::Pending<
+                                Result<hyper::Response<Full<Bytes>>, Infallible>,
+                            > = std::future::pending();
+                            return never.await;
+                        }
                             let query = req.into_body().collect().await.map(|b| b.to_bytes());
                             let Ok(query) = query else {
                                 return Ok::<_, Infallible>(
@@ -194,7 +205,7 @@ impl DohServer {
                                     let name = name_from_query(&query);
                                     response.extend_from_slice(&answer_https(&name, 300, ech));
                                 }
-                                DohMode::Empty | DohMode::Fail => {}
+                                DohMode::Empty | DohMode::Fail | DohMode::Stall => {}
                             }
                             Ok(hyper::Response::builder()
                                 .status(200)
@@ -697,4 +708,143 @@ async fn stale_answers_do_not_spawn_one_refresh_per_connection() {
         total <= 4,
         "one stale burst must not launch a DoH attempt per connection (saw {total})"
     );
+}
+
+/// A resolver whose raced pair and remaining endpoints point at the given
+/// modes, with a one-second DoH timeout so budget tests stay fast. The caller
+/// must hold `ENV_LOCK` for the whole test: the trust hook is process wide.
+async fn resolver_with(modes: &[DohMode]) -> (Arc<Resolver>, Vec<DohServer>) {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    paths.ensure().unwrap();
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    let roots = dir.path().join("extra-root.pem");
+    std::fs::write(&roots, ca.ca_pem()).unwrap();
+    std::env::set_var("HAKIMI_EXTRA_ROOT_CA", &roots);
+
+    let tls = ca.server_config("127.0.0.1").unwrap();
+    let mut servers = Vec::new();
+    for mode in modes {
+        servers.push(DohServer::spawn_mode(tls.clone(), mode.clone()).await);
+    }
+
+    let config = Arc::new(ConfigManager::load_or_create(&paths).unwrap());
+    config
+        .mutate(|config| {
+            config.doh.primary = format!("https://127.0.0.1:{}/dns-query", servers[0].addr.port());
+            config.doh.fallback =
+                format!("https://127.0.0.1:{}/dns-query", servers[1].addr.port());
+            for server in servers.iter().skip(2) {
+                config.doh.custom.push(DohEndpoint {
+                    name: format!("custom{}", servers.iter().position(|s| std::ptr::eq(s, server)).unwrap()),
+                    url: format!("https://127.0.0.1:{}/dns-query", server.addr.port()),
+                    bootstrap_ip: None,
+                    enabled: true,
+                });
+            }
+            config.catalogs.timeout_secs = 1;
+            Ok(())
+        })
+        .unwrap();
+    let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
+    let catalogs = CatalogManager::load(&paths, config.clone(), cache.clone()).unwrap();
+    let resolver = Resolver::new(cache, config, catalogs);
+    std::mem::forget(dir);
+    (resolver, servers)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn silent_remaining_endpoints_share_one_budget() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // Eight endpoints that accept the query and never answer: the endpoints
+    // after the raced pair must not cost one full timeout each, or a long
+    // catalog list stretches every cold lookup to minutes. The budget caps
+    // the whole phase at two client timeouts no matter how long the list is.
+    let (resolver, servers) = resolver_with(&[
+        DohMode::Stall,
+        DohMode::Stall,
+        DohMode::Stall,
+        DohMode::Stall,
+        DohMode::Stall,
+        DohMode::Stall,
+        DohMode::Stall,
+        DohMode::Stall,
+        DohMode::Stall,
+        DohMode::Stall,
+    ])
+    .await;
+
+    let started = std::time::Instant::now();
+    let error = resolver
+        .resolve_ips("example.com")
+        .await
+        .expect_err("nothing answers");
+    let elapsed = started.elapsed();
+    assert!(
+        format!("{error:#}").contains("all DoH endpoints failed"),
+        "unexpected error: {error:#}"
+    );
+    // Serial probing needs 1s (raced pair) + 8s; lanes without a shared
+    // budget need 1s + 4s. The budget must finish near 1s + 2s.
+    assert!(
+        elapsed < std::time::Duration::from_millis(4200),
+        "the remaining endpoints must share one budget, took {elapsed:?}"
+    );
+    // The first lane pair was certainly probed.
+    assert!(servers[2].requests.load(Ordering::Relaxed) >= 1);
+    assert!(servers[3].requests.load(Ordering::Relaxed) >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_working_custom_endpoint_is_not_lost_behind_a_stalled_peer() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // Custom 0 fails fast, custom 1 holds the connection open: the freed lane
+    // must be refilled with custom 2, which answers. A window that never
+    // refills its lanes would report a total failure.
+    let (resolver, servers) = resolver_with(&[
+        DohMode::Fail,
+        DohMode::Fail,
+        DohMode::Fail,
+        DohMode::Stall,
+        DohMode::Answer([203, 0, 113, 7]),
+    ])
+    .await;
+
+    let started = std::time::Instant::now();
+    let resolution = resolver.resolve_ips("example.com").await.unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(2000),
+        "the answer must not wait for the stalled peer, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        resolution.ips,
+        vec!["203.0.113.7".parse::<std::net::IpAddr>().unwrap()]
+    );
+    assert_eq!(resolution.source, DohSource::Custom);
+    assert!(servers[4].requests.load(Ordering::Relaxed) >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_in_the_second_wave_is_still_reached() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // The budget is two client timeouts precisely so an answer behind two
+    // stalled peers is still found: the first wave burns its timeout, the
+    // second wave then carries the working endpoint.
+    let (resolver, servers) = resolver_with(&[
+        DohMode::Fail,
+        DohMode::Fail,
+        DohMode::Stall,
+        DohMode::Stall,
+        DohMode::Answer([203, 0, 113, 7]),
+    ])
+    .await;
+
+    let resolution = resolver.resolve_ips("example.com").await.unwrap();
+    assert_eq!(
+        resolution.ips,
+        vec!["203.0.113.7".parse::<std::net::IpAddr>().unwrap()]
+    );
+    assert_eq!(resolution.source, DohSource::Custom);
+    assert!(servers[4].requests.load(Ordering::Relaxed) >= 1);
 }
