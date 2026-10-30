@@ -41,7 +41,7 @@ use tower_service::Service;
 use crate::config::AppConfig;
 use crate::decision::{ConnectPlan, DecisionEngine, Route, RouteCursor};
 use crate::domain::DomainMatcher;
-use crate::ip_tester::TlsContext;
+use crate::ip_tester::{tcp_phase_budget, tls_phase_budget, TlsContext};
 use crate::status::DomainDiagnostics;
 use crate::strategy::{FailureReason, TlsMode};
 
@@ -167,14 +167,6 @@ const RACE_SIZE: usize = 8;
 /// Delay between race batch member starts, so the first candidate usually wins on a
 /// healthy network and the race only costs extra handshakes when it is actually broken.
 const RACE_STAGGER: Duration = Duration::from_millis(150);
-/// Bounds for the TCP leg of a candidate. It only has to answer "is this
-/// address reachable", so it gets a fraction of the candidate budget: a silent
-/// address is retired before its whole SNI variant list is dialled.
-const MIN_TCP_BUDGET: Duration = Duration::from_millis(500);
-const MAX_TCP_BUDGET: Duration = Duration::from_secs(2);
-/// A TCP handshake that consumed most of the budget still leaves the TLS leg
-/// enough room to fail on its own terms instead of looking like a connect timeout.
-const MIN_TLS_BUDGET: Duration = Duration::from_millis(500);
 
 #[derive(Default)]
 pub(crate) struct UpstreamStats {
@@ -1515,9 +1507,7 @@ impl RouteConnector {
             });
         }
 
-        let remaining = timeout
-            .saturating_sub(started.elapsed())
-            .max(MIN_TLS_BUDGET.min(timeout));
+        let remaining = tls_phase_budget(timeout, started.elapsed());
         let result = tokio::time::timeout(
             remaining,
             self.tls.handshake(
@@ -1707,18 +1697,6 @@ fn launch(
             Err((reason, detail)) => Err((plan, reason, detail)),
         }
     }));
-}
-
-/// The TCP leg only has to prove the address is reachable, so it is capped well
-/// below the candidate budget: a silent address is retired after half of it.
-///
-/// Never above `timeout` itself: `ipTimeoutMs` is the total budget for one
-/// candidate, and a floor larger than that would make a fast-fail configuration
-/// slower than configured.
-fn tcp_phase_budget(timeout: Duration) -> Duration {
-    (timeout / 2)
-        .clamp(MIN_TCP_BUDGET, MAX_TCP_BUDGET)
-        .min(timeout)
 }
 
 /// Describe a failure outcome that carries no detail.

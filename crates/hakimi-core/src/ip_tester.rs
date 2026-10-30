@@ -23,6 +23,34 @@ pub const ALPN_HTTP11: &[u8] = b"http/1.1";
 /// Ceiling for the TCP leg when the caller already applies its own deadline.
 const TCP_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bounds for the TCP leg of one candidate. It only has to answer "is this
+/// address reachable", so it gets a fraction of the candidate budget: a silent
+/// address is retired before its whole SNI variant list is dialled.
+const MIN_TCP_BUDGET: Duration = Duration::from_millis(500);
+const MAX_TCP_BUDGET: Duration = Duration::from_secs(2);
+/// A TCP handshake that consumed most of the budget still leaves the TLS leg
+/// enough room to fail on its own terms instead of looking like a connect
+/// timeout.
+const MIN_TLS_BUDGET: Duration = Duration::from_millis(500);
+
+/// Budget for the TCP leg of a candidate whose total budget is `timeout`.
+///
+/// Never above `timeout` itself: `ipTimeoutMs` is the total budget for one
+/// candidate, and a floor larger than that would make a fast-fail
+/// configuration slower than configured.
+pub(crate) fn tcp_phase_budget(timeout: Duration) -> Duration {
+    (timeout / 2)
+        .clamp(MIN_TCP_BUDGET, MAX_TCP_BUDGET)
+        .min(timeout)
+}
+
+/// Budget left for the TLS handshake after the TCP leg spent `elapsed`.
+pub(crate) fn tls_phase_budget(timeout: Duration, elapsed: Duration) -> Duration {
+    timeout
+        .saturating_sub(elapsed)
+        .max(MIN_TLS_BUDGET.min(timeout))
+}
+
 /// Shared TLS client state: roots, crypto provider and cached client configurations.
 ///
 /// Building a `ClientConfig` rebuilds the ECH setup and the WebPKI verifier. More
@@ -67,9 +95,17 @@ impl TlsContext {
         timeout: Duration,
     ) -> Result<ProbeSuccess, ConnectError> {
         let started = Instant::now();
-        let stream = tokio::time::timeout(timeout, self.connect(ip, port, domain, mode, sni, ech))
-            .await
-            .map_err(|_| ConnectError::ProbeTimeout)??;
+        // The two legs are timed and classified separately, exactly like the
+        // pooled connector. Collapsing both into one deadline reported a
+        // filtered SNI as `tcp_timeout`: the address had answered, only the
+        // handshake stalled, and the operator was pointed at the wrong layer.
+        let tcp = Self::open_tcp_with(ip, port, tcp_phase_budget(timeout)).await?;
+        let stream = tokio::time::timeout(
+            tls_phase_budget(timeout, started.elapsed()),
+            self.handshake(tcp, domain, mode, sni, ech, false),
+        )
+        .await
+        .map_err(|_| ConnectError::TlsTimeout)??;
         let alpn = stream
             .get_ref()
             .1
@@ -385,9 +421,10 @@ fn dns_name(host: &str) -> Result<ServerName<'static>, ConnectError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
-    /// A whole-probe deadline expired. Unlike [`Self::TcpTimeout`] and
-    /// [`Self::TlsTimeout`] this carries no stage information, so it is only
-    /// produced by callers that time the connect and the handshake together.
+    /// A whole-probe deadline expired around a bare TCP connect. The TLS
+    /// probe splits its legs and reports [`Self::TcpTimeout`] or
+    /// [`Self::TlsTimeout`] instead, so this is only produced by
+    /// `Prober::probe_tcp`.
     #[error("connection or handshake timed out")]
     ProbeTimeout,
     #[error("TCP connection timed out")]
@@ -541,6 +578,76 @@ mod tests {
         // 尾部根标签是绕过按字符串匹配的 SNI 过滤的唯一写法
         let name = dns_name("huggingface.co.").unwrap();
         assert_eq!(name.to_str(), "huggingface.co.");
+    }
+
+    /// A server that accepts the TCP handshake and then never speaks TLS. The
+    /// address answered, so only this variant failed: reporting `tcp_timeout`
+    /// here sent the operator looking at the network while the route itself was
+    /// fine, and it told the race to retire a healthy address.
+    #[tokio::test]
+    async fn a_stalled_handshake_is_a_tls_timeout_not_an_unreachable_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(stream);
+        });
+
+        let context = TlsContext::new().unwrap();
+        let error = context
+            .probe(
+                address.ip(),
+                address.port(),
+                "example.com",
+                TlsMode::Direct,
+                None,
+                None,
+                Duration::from_millis(300),
+            )
+            .await
+            .expect_err("a silent TLS server cannot produce a probe success");
+
+        assert_eq!(
+            error.reason(),
+            FailureReason::TlsTimeout,
+            "a stalled handshake must not condemn the address: {error}"
+        );
+        assert!(
+            !error.reason().is_ip_level(),
+            "the address is reachable, so it must stay available to other variants: {error}"
+        );
+        hold.abort();
+    }
+
+    /// The other half of the split: a refused TCP connect is a verdict about the
+    /// address, so it must stay address-level.
+    #[tokio::test]
+    async fn a_refused_port_stays_an_address_level_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let context = TlsContext::new().unwrap();
+        let error = context
+            .probe(
+                address.ip(),
+                address.port(),
+                "example.com",
+                TlsMode::Direct,
+                None,
+                None,
+                Duration::from_millis(500),
+            )
+            .await
+            .expect_err("no listener means no probe");
+
+        assert_eq!(
+            error.reason(),
+            FailureReason::TcpRefused,
+            "a closed port is an address verdict: {error}"
+        );
+        assert!(error.reason().is_ip_level());
     }
 
     #[test]
