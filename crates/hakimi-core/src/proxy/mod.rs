@@ -303,65 +303,91 @@ async fn handle_request(mut req: Request<Incoming>, ctx: Arc<ProxyContext>) -> R
         path == "/proxy.pac" || path.starts_with("/hakimi/")
     };
     if local_path && is_local_request(&req, &ctx) {
-        match req.uri().path() {
-            "/proxy.pac" => {
-                return text_response(
-                    StatusCode::OK,
-                    "application/x-ns-proxy-autoconfig",
-                    ctx.pac_script(),
-                );
-            }
-            "/hakimi/status" => {
-                // `?all=1` returns every known domain; the plain view only
-                // carries the domains the groups show.
-                let every = req
-                    .uri()
-                    .query()
-                    .is_some_and(|query| query.split('&').any(|part| part == "all=1"));
-                let value = (ctx.status_json)(every);
-                return json_response(value);
-            }
-            "/hakimi/health" => {
-                return text_response(StatusCode::OK, "text/plain; charset=utf-8", "ok");
-            }
-            "/hakimi/pause" if req.method() == Method::POST => {
-                ctx.status.set_paused(true);
-                return json_response(serde_json::json!({ "paused": true }));
-            }
-            "/hakimi/resume" if req.method() == Method::POST => {
-                ctx.status.set_paused(false);
-                // Same contract as runtime.resume(): sockets pooled before
-                // the pause are commonly dead once traffic is intercepted
-                // again, so the first requests after the resume must not
-                // touch them.
-                ctx.upstream.retire_pools();
-                return json_response(serde_json::json!({ "paused": false }));
-            }
-            "/hakimi/stop" if req.method() == Method::POST => {
-                // A custom header forces a CORS preflight, so a page in a
-                // browser cannot stop the proxy with a drive-by POST.
-                if req
-                    .headers()
-                    .get("x-hakimi-control")
-                    .and_then(|value| value.to_str().ok())
-                    != Some("1")
-                {
-                    return text_response(
-                        StatusCode::UNAUTHORIZED,
-                        "text/plain; charset=utf-8",
-                        "missing x-hakimi-control header",
-                    );
-                }
-                (ctx.on_stop)();
-                return json_response(serde_json::json!({ "stopping": true }));
-            }
-            _ => {}
-        }
+        return local_response(&req, &ctx);
     }
     if req.method() == Method::CONNECT {
         return handle_connect(&mut req, ctx).await;
     }
     upstream::handle_forward(req, ctx).await
+}
+
+/// Paths that change state. Every one of them requires a POST and the control
+/// header; the read-only endpoints (PAC, status, health) stay open.
+fn is_control_endpoint(path: &str) -> bool {
+    matches!(path, "/hakimi/pause" | "/hakimi/resume" | "/hakimi/stop")
+}
+
+/// A custom header forces a CORS preflight, so a page in a browser cannot fire
+/// one of these with a plain cross-origin form POST.
+fn control_authorized(req: &Request<Incoming>) -> bool {
+    req.headers()
+        .get("x-hakimi-control")
+        .and_then(|value| value.to_str().ok())
+        == Some("1")
+}
+
+/// Answer a request that addressed this instance.
+///
+/// A local path is terminal: it never goes upstream. Forwarding one turned
+/// `GET /hakimi/<typo>` into a request the proxy made to itself, which came back
+/// as a 502 only after an extra self-connection per hop.
+fn local_response(req: &Request<Incoming>, ctx: &Arc<ProxyContext>) -> Response<ProxyBody> {
+    let path = req.uri().path();
+    if is_control_endpoint(path) {
+        if req.method() != Method::POST {
+            return text_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "text/plain; charset=utf-8",
+                "this endpoint requires POST",
+            );
+        }
+        if !control_authorized(req) {
+            return text_response(
+                StatusCode::UNAUTHORIZED,
+                "text/plain; charset=utf-8",
+                "missing x-hakimi-control header",
+            );
+        }
+    }
+    match path {
+        "/proxy.pac" => text_response(
+            StatusCode::OK,
+            "application/x-ns-proxy-autoconfig",
+            ctx.pac_script(),
+        ),
+        "/hakimi/status" => {
+            // `?all=1` returns every known domain; the plain view only
+            // carries the domains the groups show.
+            let every = req
+                .uri()
+                .query()
+                .is_some_and(|query| query.split('&').any(|part| part == "all=1"));
+            json_response((ctx.status_json)(every))
+        }
+        "/hakimi/health" => text_response(StatusCode::OK, "text/plain; charset=utf-8", "ok"),
+        "/hakimi/pause" => {
+            ctx.status.set_paused(true);
+            json_response(serde_json::json!({ "paused": true }))
+        }
+        "/hakimi/resume" => {
+            ctx.status.set_paused(false);
+            // Same contract as runtime.resume(): sockets pooled before
+            // the pause are commonly dead once traffic is intercepted
+            // again, so the first requests after the resume must not
+            // touch them.
+            ctx.upstream.retire_pools();
+            json_response(serde_json::json!({ "paused": false }))
+        }
+        "/hakimi/stop" => {
+            (ctx.on_stop)();
+            json_response(serde_json::json!({ "stopping": true }))
+        }
+        _ => text_response(
+            StatusCode::NOT_FOUND,
+            "text/plain; charset=utf-8",
+            "unknown local endpoint",
+        ),
+    }
 }
 
 fn is_local_request(req: &Request<Incoming>, ctx: &ProxyContext) -> bool {

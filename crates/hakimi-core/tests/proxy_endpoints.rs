@@ -29,7 +29,7 @@ async fn serves_pac_and_status_endpoints() {
     let catalogs = CatalogManager::load(&paths, config.clone(), cache.clone()).unwrap();
     let ca = CertificateAuthority::load_or_create(&paths).unwrap();
     let tls = TlsContext::new().unwrap();
-    let status = Arc::new(StatusStore::new());
+    let store = Arc::new(StatusStore::new());
     let resolver = Resolver::new(cache.clone(), config.clone(), catalogs.clone());
     let engine = DecisionEngine::new(
         config.clone(),
@@ -37,7 +37,7 @@ async fn serves_pac_and_status_endpoints() {
         catalogs.clone(),
         resolver.clone(),
         tls.clone(),
-        status.clone(),
+        store.clone(),
     );
     // The endpoint asks for the small view unless the caller wants every
     // known domain.
@@ -56,7 +56,7 @@ async fn serves_pac_and_status_endpoints() {
         config.clone(),
         cache,
         catalogs,
-        status,
+        store.clone(),
         resolver,
         tls,
         upstream,
@@ -119,14 +119,59 @@ async fn serves_pac_and_status_endpoints() {
     );
 
     // A drive-by page cannot stop the proxy: a custom header is mandatory, and
-    // a cross-origin request cannot send one without a CORS preflight.
+    // a cross-origin request cannot send one without a CORS preflight. The same
+    // guard covers pause/resume, which are just as stateful.
+    for endpoint in ["/hakimi/stop", "/hakimi/pause", "/hakimi/resume"] {
+        let response = client
+            .post(format!("{base}{endpoint}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{endpoint} must reject a request without the control header"
+        );
+    }
+    assert_eq!(stop_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        !store.paused(),
+        "an unauthorized pause must not take effect"
+    );
+
+    // A GET is not a control request either: it must not fall through to the
+    // forwarding path and dial the proxy from inside itself.
     let response = client
-        .post(format!("{base}/hakimi/stop"))
+        .get(format!("{base}/hakimi/pause"))
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
-    assert_eq!(stop_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::METHOD_NOT_ALLOWED
+    );
+
+    let response = client
+        .get(format!("{base}/hakimi/unknown"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "an unknown local path is terminal, never an upstream request"
+    );
+
+    for (endpoint, expected) in [("/hakimi/pause", true), ("/hakimi/resume", false)] {
+        let response = client
+            .post(format!("{base}{endpoint}"))
+            .header("x-hakimi-control", "1")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{endpoint} must succeed");
+        assert_eq!(store.paused(), expected, "{endpoint} must take effect");
+    }
 
     let response = client
         .post(format!("{base}/hakimi/stop"))

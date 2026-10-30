@@ -101,8 +101,10 @@ Linux 上没有统一的系统代理，因此 hakimi 只提供代理端口，**�
 - `/hakimi/status`：运行状态、各域名当前策略（`?all=1` 查看全部域名）
 - `/hakimi/health`：存活探针
 - `/hakimi/pause`、`/hakimi/resume`：暂停 / 恢复加速
-- `/hakimi/stop`：停止进程，需带 `x-hakimi-control: 1` 请求头（浏览器页面无法伪造该头）
+- `/hakimi/stop`：停止进程
 - `/proxy.pac`：PAC 脚本
+
+`pause` / `resume` / `stop` 需 `POST` + `x-hakimi-control: 1`（页面伪造不了该头）。本地路径不转发上游，未知路径 404、方法不对 405。
 
 日志写入数据目录 `logs/hakimi.log`，仅存本地，URL 与目录源脱敏，超限自动轮转。
 
