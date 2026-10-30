@@ -45,6 +45,8 @@ use crate::ip_tester::TlsContext;
 use crate::status::DomainDiagnostics;
 use crate::strategy::{FailureReason, TlsMode};
 
+use super::gate::IpGate;
+
 /// Request body type understood by the pooled clients. Forwarded requests stream the
 /// browser body directly; warm-up requests use an empty `Full` body.
 pub(crate) type UpstreamBody = Either<Incoming, Full<Bytes>>;
@@ -165,6 +167,14 @@ const RACE_SIZE: usize = 8;
 /// Delay between race batch member starts, so the first candidate usually wins on a
 /// healthy network and the race only costs extra handshakes when it is actually broken.
 const RACE_STAGGER: Duration = Duration::from_millis(150);
+/// Bounds for the TCP leg of a candidate. It only has to answer "is this
+/// address reachable", so it gets a fraction of the candidate budget: a silent
+/// address is retired before its whole SNI variant list is dialled.
+const MIN_TCP_BUDGET: Duration = Duration::from_millis(500);
+const MAX_TCP_BUDGET: Duration = Duration::from_secs(2);
+/// A TCP handshake that consumed most of the budget still leaves the TLS leg
+/// enough room to fail on its own terms instead of looking like a connect timeout.
+const MIN_TLS_BUDGET: Duration = Duration::from_millis(500);
 
 #[derive(Default)]
 pub(crate) struct UpstreamStats {
@@ -1351,15 +1361,13 @@ impl RouteConnector {
         force_http1: bool,
         timeout: Duration,
     ) -> std::result::Result<(Arc<ConnectPlan>, PooledIo), String> {
-        type RaceResult =
-            Result<(Arc<ConnectPlan>, PooledIo, u64), (ConnectPlan, FailureReason, String)>;
         enum Event {
             Plan(Option<ConnectPlan>),
-            Result(RaceResult),
+            Result(PlanAttempt),
         }
 
-        let mut pending: FuturesUnordered<Pin<Box<dyn Future<Output = RaceResult> + Send>>> =
-            FuturesUnordered::new();
+        let mut gate = IpGate::new();
+        let mut pending: FuturesUnordered<PlanFuture> = FuturesUnordered::new();
         let mut exhausted = false;
         // Plans generated together form one initial hedge wave. Plans that arrive
         // after a failed handshake start immediately instead of sleeping again.
@@ -1373,64 +1381,82 @@ impl RouteConnector {
         // The cached route is the first member of the race. It starts
         // immediately; generated candidates join after the normal stagger (or
         // as soon as the cached route fails), so a stale cached route can no
-        // longer hold the request for its full 2 s timeout before fallback.
+        // longer hold the request for its full timeout before fallback.
         if let Some(plan) = cached_plan {
-            let this = self.clone();
-            let failed_plan = plan.clone();
-            pending.push(Box::pin(async move {
-                let started = Instant::now();
-                match this.connect_plan(&plan, force_http1, timeout).await {
-                    Ok(io) => Ok((plan, io, started.elapsed().as_millis() as u64)),
-                    Err((reason, detail)) => Err(((*failed_plan).clone(), reason, detail)),
-                }
-            }));
-            first_start = Some(Instant::now());
+            if let Some(plan) = gate.admit((*plan).clone()) {
+                launch(
+                    self,
+                    &mut pending,
+                    plan,
+                    None,
+                    failure_rx.clone(),
+                    force_http1,
+                    timeout,
+                );
+                first_start = Some(Instant::now());
+            }
         }
 
         loop {
+            // Release the variants of every address whose probe has answered.
+            // They start without a stagger: the address is already proven, and
+            // the point of the batch is to compare SNI candidates.
+            let window = RACE_SIZE.saturating_sub(pending.len());
+            for plan in gate.drain_ready(window) {
+                launch(
+                    self,
+                    &mut pending,
+                    plan,
+                    None,
+                    failure_rx.clone(),
+                    force_http1,
+                    timeout,
+                );
+            }
+            if exhausted && pending.is_empty() && gate.is_idle() {
+                return Err(discovery_failure_detail(&mut cursor, gate.discarded()));
+            }
+
             let event = if !exhausted && pending.len() < RACE_SIZE {
                 tokio::select! {
                     plan = cursor.next_plan() => Event::Plan(plan),
-                    Some(result) = pending.next(), if !pending.is_empty() => Event::Result(result),
+                    Some(result) = pending.next() => Event::Result(result),
                 }
             } else if !pending.is_empty() {
                 Event::Result(pending.next().await.expect("pending is not empty"))
             } else {
-                return Err(discovery_failure_detail(&mut cursor));
+                // Without a dial in flight nothing can release the queue; this
+                // only happens when the cursor produced plans and stopped
+                // before any of them started.
+                return Err(discovery_failure_detail(&mut cursor, gate.discarded()));
             };
 
             match event {
                 Event::Plan(Some(plan)) => {
-                    let delay = match first_start {
-                        None => {
-                            first_start = Some(Instant::now());
-                            None
-                        }
-                        Some(start) => {
-                            let deadline = start + RACE_STAGGER;
-                            let now = Instant::now();
-                            (now < deadline).then(|| deadline - now)
-                        }
-                    };
-                    let this = self.clone();
-                    let mut failure_rx = failure_rx.clone();
-                    pending.push(Box::pin(async move {
-                        if let Some(delay) = delay {
-                            if !*failure_rx.borrow() {
-                                tokio::select! {
-                                    _ = tokio::time::sleep(delay) => {}
-                                    _ = failure_rx.changed() => {}
-                                }
+                    // The gate decides whether this plan may dial now, has to
+                    // wait for its address' probe, or is already moot.
+                    if let Some(plan) = gate.admit(plan) {
+                        let delay = match first_start {
+                            None => {
+                                first_start = Some(Instant::now());
+                                None
                             }
-                        }
-                        let started = Instant::now();
-                        match this.connect_plan(&plan, force_http1, timeout).await {
-                            Ok(io) => {
-                                Ok((Arc::new(plan), io, started.elapsed().as_millis() as u64))
+                            Some(start) => {
+                                let deadline = start + RACE_STAGGER;
+                                let now = Instant::now();
+                                (now < deadline).then(|| deadline - now)
                             }
-                            Err((reason, detail)) => Err((plan, reason, detail)),
-                        }
-                    }));
+                        };
+                        launch(
+                            self,
+                            &mut pending,
+                            plan,
+                            delay,
+                            failure_rx.clone(),
+                            force_http1,
+                            timeout,
+                        );
+                    }
                 }
                 Event::Plan(None) => exhausted = true,
                 Event::Result(result) => match result {
@@ -1442,6 +1468,10 @@ impl RouteConnector {
                     Err((plan, reason, detail)) => {
                         self.engine.forget_plan(&plan.domain, plan.port, plan.tls);
                         cursor.note_failure(&plan, reason, detail);
+                        // An address-level failure retires every variant that
+                        // has not started yet, instead of dialling each one for
+                        // a full timeout against a silent address.
+                        gate.record_failure(plan.ip, reason);
                         // A fast failure means the hedge window has done its
                         // job: start the next candidate immediately instead of
                         // making the user wait out the rest of the stagger.
@@ -1455,6 +1485,12 @@ impl RouteConnector {
         }
     }
 
+    /// Open one candidate plan.
+    ///
+    /// The two legs are timed and classified separately. That split is what
+    /// lets the gate tell "this address is unreachable" from "this SNI was
+    /// rejected": only a TCP-level failure retires the address, a stalled or
+    /// reset handshake still proves the address answered.
     async fn connect_plan(
         &self,
         plan: &ConnectPlan,
@@ -1462,40 +1498,37 @@ impl RouteConnector {
         timeout: Duration,
     ) -> std::result::Result<PooledIo, (FailureReason, String)> {
         let address = SocketAddr::new(plan.ip, plan.port);
+        let started = Instant::now();
+
+        let tcp = TlsContext::open_tcp(plan.ip, plan.port, tcp_phase_budget(timeout))
+            .await
+            .map_err(|error| {
+                (
+                    error.reason(),
+                    format!("connecting to {address}: {error}"),
+                )
+            })?;
         if !plan.tls {
-            let stream = tokio::time::timeout(timeout, TcpStream::connect(address))
-                .await
-                .map_err(|_| {
-                    (
-                        FailureReason::TcpTimeout,
-                        format!("TCP connect to {address} timed out"),
-                    )
-                })?
-                .map_err(|error| (FailureReason::TcpRefused, error.to_string()))?;
-            let _ = stream.set_nodelay(true);
-            crate::util::apply_tcp_keepalive(&stream);
             return Ok(PooledIo {
-                io: Transport::Tcp(stream),
+                io: Transport::Tcp(tcp),
                 h2: false,
             });
         }
 
-        let sni = plan.sni.as_deref();
-        let ech = plan.ech_config.as_deref();
-        let connector = self.tls.clone();
-        let mode = plan.mode;
-        let domain = plan.domain.as_str();
-        let result = tokio::time::timeout(timeout, async move {
-            if self.http1_only || force_http1 {
-                connector
-                    .connect_http1(plan.ip, plan.port, domain, mode, sni, ech)
-                    .await
-            } else {
-                connector
-                    .connect(plan.ip, plan.port, domain, mode, sni, ech)
-                    .await
-            }
-        })
+        let remaining = timeout
+            .saturating_sub(started.elapsed())
+            .max(MIN_TLS_BUDGET.min(timeout));
+        let result = tokio::time::timeout(
+            remaining,
+            self.tls.handshake(
+                tcp,
+                plan.domain.as_str(),
+                plan.mode,
+                plan.sni.as_deref(),
+                plan.ech_config.as_deref(),
+                self.http1_only || force_http1,
+            ),
+        )
         .await;
         match result {
             Ok(Ok(stream)) => {
@@ -1507,8 +1540,8 @@ impl RouteConnector {
             }
             Ok(Err(error)) => Err((error.reason(), error.detail())),
             Err(_) => Err((
-                FailureReason::TcpTimeout,
-                format!("TLS connection to {address} timed out"),
+                FailureReason::TlsTimeout,
+                format!("TLS handshake with {address} timed out"),
             )),
         }
     }
@@ -1626,15 +1659,66 @@ impl RouteConnector {
     }
 }
 
-fn discovery_failure_detail(cursor: &mut RouteCursor) -> String {
-    match cursor.outcome() {
+fn discovery_failure_detail(cursor: &mut RouteCursor, discarded: usize) -> String {
+    let base = match cursor.outcome() {
         Some(outcome) => outcome
             .diagnostics
             .detail
             .clone()
             .unwrap_or_else(|| describe_discovery_failure(&outcome.diagnostics)),
         None => "route discovery failed before any candidate was available".into(),
+    };
+    if discarded == 0 {
+        return base;
     }
+    format!(
+        "{base}; {discarded} SNI/ECH variant(s) skipped after their address failed at the TCP level"
+    )
+}
+
+/// One plan attempt inside a cold-route race.
+type PlanAttempt = Result<(Arc<ConnectPlan>, PooledIo, u64), (ConnectPlan, FailureReason, String)>;
+type PlanFuture = Pin<Box<dyn Future<Output = PlanAttempt> + Send>>;
+
+/// Start one plan as a race member.
+#[allow(clippy::too_many_arguments)]
+fn launch(
+    connector: &RouteConnector,
+    pending: &mut FuturesUnordered<PlanFuture>,
+    plan: ConnectPlan,
+    delay: Option<Duration>,
+    mut failure_rx: tokio::sync::watch::Receiver<bool>,
+    force_http1: bool,
+    timeout: Duration,
+) {
+    let this = connector.clone();
+    pending.push(Box::pin(async move {
+        if let Some(delay) = delay {
+            if !*failure_rx.borrow() {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = failure_rx.changed() => {}
+                }
+            }
+        }
+        let started = Instant::now();
+        match this.connect_plan(&plan, force_http1, timeout).await {
+            Ok(io) => Ok((Arc::new(plan), io, started.elapsed().as_millis() as u64)),
+            Err((reason, detail)) => Err((plan, reason, detail)),
+        }
+    }));
+}
+
+/// The TCP leg only has to prove the address is reachable, so it is capped well
+/// below the candidate budget: a silent address is retired after half of it.
+///
+/// Never above `timeout` itself: `ipTimeoutMs` is the total budget for one
+/// candidate, and a floor larger than that would make a fast-fail configuration
+/// slower than configured.
+fn tcp_phase_budget(timeout: Duration) -> Duration {
+    (timeout / 2)
+        .clamp(MIN_TCP_BUDGET, MAX_TCP_BUDGET)
+        .min(timeout)
 }
 
 /// Describe a failure outcome that carries no detail.

@@ -109,7 +109,12 @@ pub enum FailureReason {
     DohFallback,
     RemoteCatalogUnavailable,
     RemoteIpRejected,
+    /// The TCP handshake itself did not complete.
     TcpTimeout,
+    /// TCP came up but the TLS handshake did not finish in time.
+    TlsTimeout,
+    /// The address could not be reached at the IP layer (no route, network down).
+    TcpUnreachable,
     TlsReset,
     CertInvalid,
     EchUnavailable,
@@ -133,6 +138,8 @@ impl FailureReason {
             Self::RemoteCatalogUnavailable => "remote_catalog_unavailable",
             Self::RemoteIpRejected => "remote_ip_rejected",
             Self::TcpTimeout => "tcp_timeout",
+            Self::TlsTimeout => "tls_timeout",
+            Self::TcpUnreachable => "tcp_unreachable",
             Self::TlsReset => "tls_reset",
             Self::CertInvalid => "cert_invalid",
             Self::EchUnavailable => "ech_unavailable",
@@ -165,6 +172,12 @@ impl FailureReason {
             }
             Self::TcpTimeout => {
                 "The candidate IP did not answer within 2 seconds; check local connectivity or try another network."
+            }
+            Self::TlsTimeout => {
+                "TCP reached the address but the TLS handshake stalled. The route and the IP are healthy; try another SNI/ECH strategy."
+            }
+            Self::TcpUnreachable => {
+                "The candidate address is unreachable at the IP layer (no route or network down). Pick another candidate."
             }
             Self::TlsReset => {
                 "The TLS handshake was reset. This often means SNI filtering; try auto/ECH or a different IP."
@@ -202,6 +215,19 @@ impl FailureReason {
             Self::ConfigInvalid => "Fix the group/catalog configuration and reload it.",
             Self::Internal => "Inspect the local log and export diagnostics.",
         }
+    }
+
+    /// Whether this failure condemns the address itself.
+    ///
+    /// TCP come-up is a property of the address, TLS success is a property of
+    /// the (address, SNI, ECH) triple. Only the first group justifies retiring
+    /// every other variant on the same IP: a `tls_reset` or `cert_invalid`
+    /// means the address answered, so another SNI may still work.
+    pub fn is_ip_level(self) -> bool {
+        matches!(
+            self,
+            Self::TcpTimeout | Self::TcpUnreachable | Self::TcpRefused
+        )
     }
 }
 

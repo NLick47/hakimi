@@ -75,12 +75,6 @@ pub struct RouteCursor {
     sni_candidates: Vec<Option<String>>,
     sni_attempt: Option<usize>,
     sni_index: usize,
-    /// IPs whose TCP connect was refused; every SNI variant on them would fail.
-    dead_ips: HashSet<IpAddr>,
-    /// IPs whose connection attempt timed out. Treat the address as an IP-level
-    /// block: skip the remaining SNI variants instead of spending a full timeout
-    /// on each one, but keep the address for the other configured modes.
-    timed_out_ips: HashSet<IpAddr>,
     network: String,
     attempts: Vec<AttemptRecord>,
     last_reason: Option<FailureReason>,
@@ -257,8 +251,6 @@ impl RouteCursor {
             sni_candidates: Vec::new(),
             sni_attempt: None,
             sni_index: 0,
-            dead_ips: HashSet::new(),
-            timed_out_ips: HashSet::new(),
             network: network_id(),
             attempts: Vec::new(),
             last_reason: None,
@@ -526,18 +518,6 @@ impl RouteCursor {
                     return Some(plan);
                 }
                 RouteAttempt::Sni { sni: hosts } => {
-                    if self.dead_ips.contains(&candidate.ip) {
-                        // TCP never came up, so no mode on this IP can help.
-                        self.attempt_index = self.route_attempts.len();
-                        continue;
-                    }
-                    if self.timed_out_ips.contains(&candidate.ip) {
-                        // A timeout is treated as an IP-level block: testing
-                        // every remaining SNI name would only repeat the same
-                        // timeout. Keep the address for direct/ECH.
-                        self.attempt_index += 1;
-                        continue;
-                    }
                     if self.sni_attempt != Some(self.attempt_index) {
                         self.sni_candidates = self.sni_candidates_for(&hosts);
                         self.sni_attempt = Some(self.attempt_index);
@@ -698,17 +678,6 @@ impl RouteCursor {
         );
         self.last_reason = Some(reason);
         self.last_detail = Some(detail.clone());
-        match reason {
-            FailureReason::TcpRefused => {
-                self.dead_ips.insert(plan.ip);
-            }
-            FailureReason::TcpTimeout => {
-                // Treat a timeout as an IP-level block: testing more SNI names on
-                // the same silent address only wastes another full timeout each.
-                self.timed_out_ips.insert(plan.ip);
-            }
-            _ => {}
-        }
         self.attempts.push(AttemptRecord {
             strategy: plan.mode,
             ip: plan.ip,

@@ -1256,17 +1256,20 @@ async fn auto_falls_back_to_fake_sni_and_caches_it() {
 }
 
 #[tokio::test]
-async fn a_timed_out_attempt_skips_the_remaining_sni_names() {
-    // A timeout is handled as an IP-level block: once the direct attempt for an
-    // address timed out, spending another full timeout on each fake SNI name is
-    // deliberately avoided. The address is still available to direct/ECH.
+async fn every_configured_variant_is_planned_for_a_catalog_address() {
+    // Pruning an address after a TCP failure belongs to the race gate, which
+    // sees the TCP handshake while the dial is still in flight. The cursor only
+    // enumerates variants: it cannot observe an attempt that has not reported
+    // back yet, and the old skip-set here was always applied after the whole
+    // variant list had been handed to the race. See
+    // `proxy::gate::tests::a_tcp_failure_retires_the_address_and_its_queue`.
     let harness = harness(
         &["example.com"],
         RoutePolicy::new(vec![
-            RouteAttempt::Direct,
             RouteAttempt::Sni {
-                sni: vec!["www.bing.com".into()],
+                sni: vec!["www.bing.com".into(), "www.apple.com".into()],
             },
+            RouteAttempt::Direct,
         ]),
     );
     *harness.remote.catalog.lock() = true;
@@ -1276,18 +1279,14 @@ async fn a_timed_out_attempt_skips_the_remaining_sni_names() {
         Route::Group(cursor) => cursor,
         _ => panic!("expected a group cursor"),
     };
-    let direct = cursor.next_plan().await.expect("a direct plan");
-    assert_eq!(direct.mode, TlsMode::Direct);
-
-    cursor.note_failure(
-        &direct,
-        FailureReason::TcpTimeout,
-        "TLS handshake timed out".into(),
-    );
-
-    assert!(
-        cursor.next_plan().await.is_none(),
-        "a timed-out address must not spend another timeout on fake SNI"
+    let mut modes = Vec::new();
+    while let Some(plan) = cursor.next_plan().await {
+        modes.push(plan.mode);
+    }
+    assert_eq!(
+        modes,
+        vec![TlsMode::FakeSni, TlsMode::FakeSni, TlsMode::Direct],
+        "the cursor must enumerate every variant; the gate decides what dials"
     );
 }
 
@@ -1308,12 +1307,13 @@ async fn a_timed_out_fake_sni_still_allows_the_direct_fallback() {
     let sni = cursor.next_plan().await.expect("a fake-SNI plan");
     assert_eq!(sni.mode, TlsMode::FakeSni);
 
-    // The fake-SNI handshake timed out (the same classification the pooled
-    // connector uses for an outer TLS timeout).
+    // The fake-SNI handshake timed out after TCP came up: an address-level
+    // verdict would be wrong, and the direct fallback on the same address must
+    // still be planned.
     cursor.note_failure(
         &sni,
-        FailureReason::TcpTimeout,
-        "TLS handshake timed out".into(),
+        FailureReason::TlsTimeout,
+        "TLS handshake with 1.1.1.1:443 timed out".into(),
     );
 
     let direct = cursor

@@ -101,7 +101,7 @@ impl Prober for TlsContext {
         let started = Instant::now();
         let stream = tokio::time::timeout(timeout, TcpStream::connect(SocketAddr::new(ip, port)))
             .await
-            .map_err(|_| ConnectError::Timeout)??;
+            .map_err(|_| ConnectError::ProbeTimeout)??;
         drop(stream);
         Ok(started.elapsed().as_millis() as u64)
     }

@@ -20,6 +20,9 @@ use crate::strategy::{FailureReason, TlsMode};
 pub const ALPN_H2: &[u8] = b"h2";
 pub const ALPN_HTTP11: &[u8] = b"http/1.1";
 
+/// Ceiling for the TCP leg when the caller already applies its own deadline.
+const TCP_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Shared TLS client state: roots, crypto provider and cached client configurations.
 ///
 /// Building a `ClientConfig` rebuilds the ECH setup and the WebPKI verifier. More
@@ -66,7 +69,7 @@ impl TlsContext {
         let started = Instant::now();
         let stream = tokio::time::timeout(timeout, self.connect(ip, port, domain, mode, sni, ech))
             .await
-            .map_err(|_| ConnectError::Timeout)??;
+            .map_err(|_| ConnectError::ProbeTimeout)??;
         let alpn = stream
             .get_ref()
             .1
@@ -124,6 +127,68 @@ impl TlsContext {
         ech: Option<&[u8]>,
         alpn: &[&[u8]],
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ConnectError> {
+        let tcp = Self::open_tcp_with(ip, port, TCP_OPEN_TIMEOUT).await?;
+        self.handshake_alpn(tcp, domain, mode, sni, ech, alpn)
+            .await
+    }
+
+    /// Open the TCP leg on its own.
+    ///
+    /// The pooled race needs the two legs separately: the TCP result decides
+    /// whether the address is reachable at all (and retires it when it is not),
+    /// while the TLS result only judges the variant that was dialled. A stalled
+    /// handshake on one fake SNI must not condemn the address.
+    pub async fn open_tcp(
+        ip: IpAddr,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<TcpStream, ConnectError> {
+        Self::open_tcp_with(ip, port, timeout).await
+    }
+
+    async fn open_tcp_with(
+        ip: IpAddr,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<TcpStream, ConnectError> {
+        let stream = tokio::time::timeout(timeout, TcpStream::connect(SocketAddr::new(ip, port)))
+            .await
+            .map_err(|_| ConnectError::TcpTimeout)?
+            .map_err(ConnectError::from_io)?;
+        let _ = stream.set_nodelay(true);
+        crate::util::apply_tcp_keepalive(&stream);
+        Ok(stream)
+    }
+
+    /// Run the TLS handshake over an already connected socket.
+    pub async fn handshake(
+        &self,
+        tcp: TcpStream,
+        domain: &str,
+        mode: TlsMode,
+        sni: Option<&str>,
+        ech: Option<&[u8]>,
+        http1_only: bool,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ConnectError> {
+        let alpn: &[&[u8]] = if http1_only {
+            &[ALPN_HTTP11]
+        } else {
+            &[ALPN_H2, ALPN_HTTP11]
+        };
+        self.handshake_alpn(tcp, domain, mode, sni, ech, alpn)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handshake_alpn(
+        &self,
+        tcp: TcpStream,
+        domain: &str,
+        mode: TlsMode,
+        sni: Option<&str>,
+        ech: Option<&[u8]>,
+        alpn: &[&[u8]],
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ConnectError> {
         let config = self.client_config_with_alpn(domain, mode, sni, ech, alpn)?;
         let server_name = match mode {
             TlsMode::Direct | TlsMode::Ech => dns_name(domain)?,
@@ -132,11 +197,6 @@ impl TlsContext {
                 _ => ServerName::IpAddress(Ipv4Addr::UNSPECIFIED.into()),
             },
         };
-        let tcp = TcpStream::connect(SocketAddr::new(ip, port))
-            .await
-            .map_err(ConnectError::from_io)?;
-        let _ = tcp.set_nodelay(true);
-        crate::util::apply_tcp_keepalive(&tcp);
         let connector = TlsConnector::from(config);
         connector
             .connect(server_name, tcp)
@@ -325,8 +385,15 @@ fn dns_name(host: &str) -> Result<ServerName<'static>, ConnectError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
+    /// A whole-probe deadline expired. Unlike [`Self::TcpTimeout`] and
+    /// [`Self::TlsTimeout`] this carries no stage information, so it is only
+    /// produced by callers that time the connect and the handshake together.
     #[error("connection or handshake timed out")]
-    Timeout,
+    ProbeTimeout,
+    #[error("TCP connection timed out")]
+    TcpTimeout,
+    #[error("TLS handshake timed out")]
+    TlsTimeout,
     #[error("TCP connection refused")]
     TcpRefused,
     #[error("TCP connection failed: {0}")]
@@ -346,9 +413,13 @@ pub enum ConnectError {
 impl ConnectError {
     pub fn reason(&self) -> FailureReason {
         match self {
-            Self::Timeout => FailureReason::TcpTimeout,
+            // A whole-probe timeout covers TCP and TLS together; treat it as an
+            // address-level answer, which is the conservative choice.
+            Self::ProbeTimeout => FailureReason::TcpTimeout,
+            Self::TcpTimeout => FailureReason::TcpTimeout,
             Self::TcpRefused => FailureReason::TcpRefused,
-            Self::Tcp(_) => FailureReason::TcpTimeout,
+            Self::Tcp(_) => FailureReason::TcpUnreachable,
+            Self::TlsTimeout => FailureReason::TlsTimeout,
             Self::TlsReset(_) => FailureReason::TlsReset,
             Self::CertInvalid(_) => FailureReason::CertInvalid,
             Self::EchUnavailable(_) => FailureReason::EchUnavailable,
@@ -364,7 +435,7 @@ impl ConnectError {
     fn from_io(error: io::Error) -> Self {
         match error.kind() {
             io::ErrorKind::ConnectionRefused => Self::TcpRefused,
-            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => Self::Timeout,
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => Self::TcpTimeout,
             _ => Self::Tcp(error.to_string()),
         }
     }
@@ -381,7 +452,9 @@ impl ConnectError {
             error.kind(),
             io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
         ) {
-            return Self::Timeout;
+            // The socket was already connected, so this is a stalled handshake
+            // rather than an unreachable address.
+            return Self::TlsTimeout;
         }
         if error.kind() == io::ErrorKind::ConnectionRefused {
             return Self::TcpRefused;
