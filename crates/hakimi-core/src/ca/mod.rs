@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use parking_lot::{Mutex, RwLock};
 use rustls::ServerConfig;
 use serde::Serialize;
@@ -618,7 +618,27 @@ impl CertificateAuthority {
 
     /// Create a new CA, replacing the current files (old files are kept as `.bak`). The CA must
     /// be reinstalled afterwards; callers should surface that in the UI.
+    ///
+    /// A CA that is still trusted is removed from the trust store *before* the swap:
+    /// [`Self::uninstall`] can only address the current material, so a regenerate that
+    /// skipped this step would leave the OS trusting a CA the app no longer owns and
+    /// nobody could remove again. Failing here leaves the trust store and the files
+    /// untouched, so a cancelled authorization dialog is not a half-done rotation.
     pub fn regenerate(&self) -> Result<CaStatus> {
+        let previous_sha1 = self.material.read().fingerprint_sha1.clone();
+        if self.status_now().installed {
+            let _guard = self.begin_operation();
+            uninstall_by_sha1(&previous_sha1, true).with_context(|| {
+                format!(
+                    "removing the previous CA ({}) from the trust store; nothing was regenerated",
+                    short_fingerprint(&previous_sha1)
+                )
+            })?;
+            tracing::info!(
+                fingerprint = short_fingerprint(&previous_sha1),
+                "previous ca removed from the trust store"
+            );
+        }
         let cert_path = self.paths.ca_cert_file();
         let key_path = self.paths.ca_key_file();
         for path in [&cert_path, &key_path] {
