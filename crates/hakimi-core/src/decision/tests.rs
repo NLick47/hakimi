@@ -1603,6 +1603,176 @@ async fn an_explicit_sni_list_keeps_the_written_order() {
     assert_eq!(second.sni.as_deref(), Some("example.com."));
 }
 
+/// A rejected name is out only for the TTL: a changed certificate or a new CDN
+/// edge must recover without restarting the app.
+#[tokio::test]
+async fn a_rejected_sni_name_returns_after_the_ttl() {
+    let harness = harness(&["example.com"], RoutePolicy::sni(Vec::new()));
+    *harness.remote.catalog.lock() = true;
+    let ip: IpAddr = "1.1.1.1".parse().unwrap();
+    *harness.remote.ips.lock() = Some(vec![ip]);
+    harness.prober.bad_cert.lock().push((ip, None));
+
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group cursor"),
+    };
+    let first = cursor.next_plan().await.expect("a fake-SNI plan");
+    cursor.note_failure(&first, FailureReason::CertInvalid, "foreign cert".into());
+    assert!(harness.engine.sni_rejected("example.com", None));
+
+    {
+        let mut rejected = harness.engine.sni_rejections.write();
+        for by_name in rejected.values_mut() {
+            for at in by_name.values_mut() {
+                *at = Instant::now()
+                    - super::engine::SNI_REJECTION_TTL
+                    - Duration::from_secs(1);
+            }
+        }
+    }
+    assert!(
+        !harness.engine.sni_rejected("example.com", None),
+        "the rejection must expire on its own"
+    );
+
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group cursor"),
+    };
+    let next = cursor.next_plan().await.expect("a fake-SNI plan");
+    assert_eq!(next.sni, None, "the name is dialled again after the TTL");
+}
+
+/// Learning belongs to the network it was made on: a different path may behave
+/// completely differently, so the whole table is forgotten.
+#[tokio::test]
+async fn a_network_change_forgets_rejected_sni_names() {
+    let harness = harness(&["example.com"], RoutePolicy::sni(Vec::new()));
+    harness
+        .engine
+        .note_sni_rejection("example.com", Some("www.bing.com".into()));
+    assert!(harness.engine.sni_rejected("example.com", Some("www.bing.com")));
+
+    harness.engine.on_network_change();
+    assert!(!harness.engine.sni_rejected("example.com", Some("www.bing.com")));
+}
+
+/// When every name is out, the route has no fake-SNI attempt left: it must fall
+/// straight through to the next configured mode instead of dialling nothing.
+#[tokio::test]
+async fn a_fully_rejected_sweep_plans_no_fake_sni_attempt() {
+    let harness = harness(
+        &["example.com"],
+        RoutePolicy::sni(vec!["www.bing.com".into()]),
+    );
+    *harness.remote.catalog.lock() = true;
+    let ip: IpAddr = "1.1.1.1".parse().unwrap();
+    *harness.remote.ips.lock() = Some(vec![ip]);
+    harness
+        .prober
+        .bad_cert
+        .lock()
+        .push((ip, Some("www.bing.com".into())));
+
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group cursor"),
+    };
+    let first = cursor.next_plan().await.expect("a fake-SNI plan");
+    assert_eq!(first.mode, TlsMode::FakeSni);
+    cursor.note_failure(&first, FailureReason::CertInvalid, "foreign cert".into());
+
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group cursor"),
+    };
+    let next = cursor.next_plan().await.expect("the direct fallback");
+    assert_eq!(
+        next.mode,
+        TlsMode::Direct,
+        "an empty sweep must be skipped, not planned"
+    );
+}
+
+/// The cap drops configured names from the tail, never the name this network
+/// already proved.
+#[tokio::test]
+async fn the_cap_keeps_the_learned_name() {
+    let route = RoutePolicy::sni(vec![
+        "a.example".into(),
+        "b.example".into(),
+        "c.example".into(),
+        "d.example".into(),
+    ]);
+    let harness = harness(&["example.com"], route);
+    *harness.remote.catalog.lock() = true;
+    *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+    harness.cache.put_sni(crate::cache::CachedSni {
+        group: "test".into(),
+        domain: "example.com".into(),
+        network_id: network_id(),
+        sni: Some("d.example".into()),
+        saved_at: now(),
+    });
+
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group cursor"),
+    };
+    let mut dialled = Vec::new();
+    while let Some(plan) = cursor.next_plan().await {
+        if plan.mode != TlsMode::FakeSni {
+            break;
+        }
+        dialled.push(plan.sni.unwrap_or_default());
+    }
+    assert_eq!(
+        dialled,
+        vec!["d.example", "a.example", "b.example"],
+        "the learned name leads and the tail is what the cap drops"
+    );
+}
+
+/// A rejection says "do not spend another handshake", not "throw the proven
+/// route away": the cached plan points at an address that already answered.
+#[tokio::test]
+async fn a_rejection_keeps_the_learned_plan() {
+    let harness = harness(&["example.com"], RoutePolicy::sni(Vec::new()));
+    *harness.remote.catalog.lock() = true;
+    let ip: IpAddr = "1.1.1.1".parse().unwrap();
+    *harness.remote.ips.lock() = Some(vec![ip]);
+    harness.prober.working_fake_sni.lock().insert((ip, None));
+
+    let outcome = harness.engine.decide_https("example.com").await;
+    assert!(outcome.plan.is_some());
+    assert!(harness.engine.cached_plan("example.com", 443, true).is_some());
+
+    harness.engine.note_sni_rejection("example.com", None);
+    assert!(
+        harness.engine.cached_plan("example.com", 443, true).is_some(),
+        "the proven route must survive a rejection recorded elsewhere"
+    );
+}
+
+/// A direct handshake that fails certificate validation says nothing about the
+/// no-SNI rung, even though both have `sni = None`.
+#[tokio::test]
+async fn a_direct_certificate_failure_does_not_reject_the_no_sni_rung() {
+    let harness = harness(&["example.com"], RoutePolicy::direct());
+    *harness.remote.catalog.lock() = true;
+    let ip: IpAddr = "1.1.1.1".parse().unwrap();
+    *harness.remote.ips.lock() = Some(vec![ip]);
+    harness.prober.bad_cert.lock().push((ip, None));
+
+    let outcome = harness.engine.decide_https("example.com").await;
+    assert_eq!(outcome.diagnostics.error, Some(FailureReason::CertInvalid));
+    assert!(
+        !harness.engine.sni_rejected("example.com", None),
+        "only a fake-SNI attempt may reject a name"
+    );
+}
+
 #[tokio::test]
 async fn failure_returns_reasons_and_attempts() {
     let harness = harness(&["example.com"], RoutePolicy::direct());

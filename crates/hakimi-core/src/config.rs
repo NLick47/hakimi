@@ -1070,7 +1070,7 @@ fn strip_legacy_materialized_defaults(config: &mut AppConfig) {
 
 /// One entry of a fake-SNI candidate list, normalized the way the dialer wants
 /// it: trimmed, lowercase, and `None` for "send no SNI".
-fn normalize_sni_candidate(raw: &str) -> Option<String> {
+pub(crate) fn normalize_sni_candidate(raw: &str) -> Option<String> {
     let value = raw.trim();
     if value.is_empty() {
         None

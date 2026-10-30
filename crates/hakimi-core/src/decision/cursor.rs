@@ -391,7 +391,7 @@ impl RouteCursor {
             }
         } else {
             for candidate in hosts {
-                push(normalize_sni(candidate));
+                push(crate::config::normalize_sni_candidate(candidate));
             }
         }
         // A name that just answered with a foreign certificate will answer the
@@ -401,7 +401,15 @@ impl RouteCursor {
         out.retain(|candidate| !self.engine.sni_rejected(&self.domain, candidate.as_deref()));
         // Beyond this the marginal chance does not pay for another handshake in
         // the race window, and a name that keeps failing is already out above.
-        out.truncate(MAX_SNI_CANDIDATES);
+        if out.len() > MAX_SNI_CANDIDATES {
+            tracing::debug!(
+                domain = %self.domain,
+                configured = out.len(),
+                limit = MAX_SNI_CANDIDATES,
+                "fake-SNI sweep capped; the names beyond the limit are not dialled"
+            );
+            out.truncate(MAX_SNI_CANDIDATES);
+        }
         out
     }
 
@@ -833,15 +841,6 @@ impl RouteCursor {
             plan: None,
             diagnostics,
         });
-    }
-}
-
-fn normalize_sni(raw: &str) -> Option<String> {
-    let value = raw.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_ascii_lowercase())
     }
 }
 

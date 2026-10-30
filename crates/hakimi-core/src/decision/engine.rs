@@ -93,7 +93,7 @@ const IP_REJECTION_TTL: Duration = Duration::from_secs(300);
 /// How long a fake-SNI name stays out after answering with a foreign
 /// certificate. Long enough to stop the repeat on every cold connection, short
 /// enough that a changed CDN edge or a config fix recovers on its own.
-const SNI_REJECTION_TTL: Duration = Duration::from_secs(600);
+pub(super) const SNI_REJECTION_TTL: Duration = Duration::from_secs(600);
 /// Cap for the re-probe backoff of continuously failing addresses.
 const PROBE_BACKOFF_MAX: Duration = Duration::from_secs(1800);
 
@@ -746,13 +746,18 @@ impl DecisionEngine {
     /// answered with, not the address, so another IP of the same origin would
     /// answer the same way. A reset or a stalled handshake says nothing about
     /// the name and must keep its turn.
+    ///
+    /// `name` is compared as the dialer spells it (lowercase, `None` for "no
+    /// SNI"); both the recorder and this lookup take the name straight from the
+    /// ladder, so the two spellings cannot drift.
     pub(super) fn sni_rejected(&self, domain: &str, name: Option<&str>) -> bool {
-        let key = name.map(str::to_owned);
         let rejected = self.sni_rejections.read();
-        rejected
-            .get(domain)
-            .and_then(|by_name| by_name.get(&key))
-            .is_some_and(|at| at.elapsed() < SNI_REJECTION_TTL)
+        let Some(by_name) = rejected.get(domain) else {
+            return false;
+        };
+        by_name
+            .iter()
+            .any(|(known, at)| known.as_deref() == name && at.elapsed() < SNI_REJECTION_TTL)
     }
 
     /// Remember that `name` got a certificate that cannot cover `domain`.
