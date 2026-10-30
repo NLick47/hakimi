@@ -97,6 +97,30 @@ fn plan_cache_domain(domain: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Addresses retired during one serial route discovery.
+///
+/// The pooled race keeps the same verdict in `IpGate`, including the queued
+/// variants and the "an address that answered is open for its other variants"
+/// state. A serial probe needs none of that: it never has two plans of one
+/// address in flight, so the whole policy collapses to "this address is dead".
+#[derive(Default)]
+struct DeadAddresses(std::collections::HashSet<IpAddr>);
+
+impl DeadAddresses {
+    fn contains(&self, ip: IpAddr) -> bool {
+        self.0.contains(&ip)
+    }
+
+    /// Record a failure verdict. Only an address-level failure retires the IP;
+    /// a stalled or rejected handshake proves the address answered and leaves
+    /// its other variants eligible.
+    fn record(&mut self, ip: IpAddr, reason: FailureReason) {
+        if reason.is_ip_level() {
+            self.0.insert(ip);
+        }
+    }
+}
+
 impl DecisionEngine {
     pub fn new(
         config: Arc<ConfigManager>,
@@ -193,36 +217,62 @@ impl DecisionEngine {
         // `route` (the proxy hot path), not to the probe path.
         match self.route_inner(domain, port, tls, true) {
             Route::Bypass(outcome) | Route::Blocked(outcome) => outcome,
-            Route::Group(mut cursor) => loop {
-                let Some(plan) = cursor.next_plan().await else {
-                    return cursor
-                        .outcome()
-                        .cloned()
-                        .unwrap_or_else(|| self.internal_failure(domain));
-                };
-                let result = if plan.tls {
-                    self.prober
-                        .probe_tls(
-                            plan.ip,
-                            plan.port,
-                            &plan.domain,
-                            plan.mode,
-                            plan.sni.as_deref(),
-                            plan.ech_config.as_deref(),
-                            timeout,
-                        )
-                        .await
-                        .map(|probe| probe.latency_ms)
-                } else {
-                    self.prober.probe_tcp(plan.ip, plan.port, timeout).await
-                };
-                match result {
-                    Ok(latency_ms) => return cursor.note_success(Arc::new(plan), latency_ms),
-                    Err(error) => {
-                        cursor.note_failure(&plan, error.reason(), error.detail());
+            Route::Group(mut cursor) => {
+                // A serial probe has to apply the same address verdict the
+                // pooled race applies through `IpGate`: once the TCP handshake
+                // failed, no other (mode, SNI) variant on that address can
+                // succeed, and dialling each of them only spends one full
+                // timeout per variant. The rule itself lives in
+                // `FailureReason::is_ip_level`, so the two paths cannot drift.
+                //
+                // This is deliberately local to the serial caller: the race
+                // cannot use it because its plans are already in flight when
+                // the first verdict arrives.
+                let mut dead = DeadAddresses::default();
+                let mut skipped = 0usize;
+                loop {
+                    let Some(plan) = cursor.next_plan().await else {
+                        if skipped > 0 {
+                            tracing::debug!(
+                                domain = %domain,
+                                skipped,
+                                "skipped the remaining variants of an address that failed at the TCP level"
+                            );
+                        }
+                        return cursor
+                            .outcome()
+                            .cloned()
+                            .unwrap_or_else(|| self.internal_failure(domain));
+                    };
+                    if dead.contains(plan.ip) {
+                        skipped += 1;
+                        continue;
+                    }
+                    let result = if plan.tls {
+                        self.prober
+                            .probe_tls(
+                                plan.ip,
+                                plan.port,
+                                &plan.domain,
+                                plan.mode,
+                                plan.sni.as_deref(),
+                                plan.ech_config.as_deref(),
+                                timeout,
+                            )
+                            .await
+                            .map(|probe| probe.latency_ms)
+                    } else {
+                        self.prober.probe_tcp(plan.ip, plan.port, timeout).await
+                    };
+                    match result {
+                        Ok(latency_ms) => return cursor.note_success(Arc::new(plan), latency_ms),
+                        Err(error) => {
+                            dead.record(plan.ip, error.reason());
+                            cursor.note_failure(&plan, error.reason(), error.detail());
+                        }
                     }
                 }
-            },
+            }
         }
     }
 

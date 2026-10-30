@@ -64,6 +64,10 @@ impl IpResolver for FakeResolver {
 struct FakeProber {
     working: Mutex<HashSet<IpAddr>>,
     working_fake_sni: Mutex<HashSet<(IpAddr, Option<String>)>>,
+    /// Addresses that never answer the TCP handshake.
+    dead_tcp: Mutex<HashSet<IpAddr>>,
+    /// Variants whose TCP leg connects but whose handshake never completes.
+    stalled_tls: Mutex<Vec<(IpAddr, TlsMode)>>,
     calls: Mutex<Vec<(IpAddr, TlsMode, Option<String>)>>,
     tcp_calls: AtomicUsize,
 }
@@ -83,6 +87,17 @@ impl Prober for FakeProber {
         self.calls
             .lock()
             .push((ip, mode, sni.map(ToOwned::to_owned)));
+        if self.dead_tcp.lock().contains(&ip) {
+            return Err(ConnectError::TcpTimeout);
+        }
+        if self
+            .stalled_tls
+            .lock()
+            .iter()
+            .any(|(stalled_ip, stalled_mode)| *stalled_ip == ip && *stalled_mode == mode)
+        {
+            return Err(ConnectError::TlsTimeout);
+        }
         let works = match mode {
             TlsMode::FakeSni => self
                 .working_fake_sni
@@ -942,6 +957,70 @@ async fn falls_back_to_second_remote_ip_in_order() {
     let calls = harness.prober.calls.lock();
     assert_eq!(calls[0].0.to_string(), "1.1.1.1");
     assert_eq!(calls[1].0.to_string(), "8.8.8.8");
+}
+
+/// A TCP-level failure belongs to the address, not to the variant. The pooled
+/// race prunes it through `IpGate`; the serial probe must prune it too, or
+/// `doctor` spends one full `ipTimeoutMs` per configured variant on a silent
+/// address before reporting the same `tcp_timeout` for each of them.
+#[tokio::test]
+async fn a_tcp_dead_address_is_probed_once_not_once_per_variant() {
+    let harness = harness(&["example.com"], RoutePolicy::auto());
+    let ip: IpAddr = "203.0.113.7".parse().unwrap();
+    *harness.remote.catalog.lock() = true;
+    *harness.remote.ips.lock() = Some(vec![ip]);
+    harness.prober.dead_tcp.lock().insert(ip);
+
+    let outcome = harness.engine.decide_https("example.com").await;
+
+    let calls = harness.prober.calls.lock().clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the first TCP verdict must retire the address for every variant, got {calls:?}"
+    );
+    assert_eq!(outcome.diagnostics.error, Some(FailureReason::TcpTimeout));
+}
+
+/// The other half of the same verdict: a stalled handshake proves the address
+/// answered. Retiring it there would drop the direct fallback of a filtered
+/// fake SNI, which is the whole point of the auto route.
+#[tokio::test]
+async fn a_stalled_handshake_keeps_the_other_variants_of_the_address() {
+    let harness = harness(
+        &["example.com"],
+        RoutePolicy::new(vec![
+            RouteAttempt::Sni {
+                sni: vec!["www.bing.com".into()],
+            },
+            RouteAttempt::Direct,
+        ]),
+    );
+    let ip: IpAddr = "203.0.113.8".parse().unwrap();
+    *harness.remote.catalog.lock() = true;
+    *harness.remote.ips.lock() = Some(vec![ip]);
+    harness.prober.working.lock().insert(ip);
+    harness
+        .prober
+        .stalled_tls
+        .lock()
+        .push((ip, TlsMode::FakeSni));
+
+    let outcome = harness.engine.decide_https("example.com").await;
+
+    let plan = outcome
+        .plan
+        .expect("the direct fallback must still be planned");
+    assert_eq!(plan.ip, ip);
+    assert_eq!(plan.mode, TlsMode::Direct);
+    let calls = harness.prober.calls.lock().clone();
+    assert_eq!(
+        calls.len(),
+        2,
+        "both variants of the reachable address must be dialled, got {calls:?}"
+    );
+    assert_eq!(calls[0].1, TlsMode::FakeSni);
+    assert_eq!(calls[1].1, TlsMode::Direct);
 }
 
 #[tokio::test]
