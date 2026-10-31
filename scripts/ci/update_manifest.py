@@ -32,6 +32,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--desktop-macos-asset", required=True)
     parser.add_argument("--android-version", required=True)
     parser.add_argument("--android-apk-asset", required=True)
+    parser.add_argument("--android-apk-armv7-asset", required=True)
     args = parser.parse_args(argv)
 
     release = args.release.strip()
@@ -47,7 +48,8 @@ def main(argv: list[str] | None = None) -> int:
     windows_asset = args.desktop_windows_asset.strip()
     macos_asset = args.desktop_macos_asset.strip()
     apk_asset = args.android_apk_asset.strip()
-    if not windows_asset or not macos_asset or not apk_asset:
+    apk_armv7_asset = args.android_apk_armv7_asset.strip()
+    if not windows_asset or not macos_asset or not apk_asset or not apk_armv7_asset:
         fail("asset names must not be empty")
 
     manifest = {
@@ -67,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
             "url": release_url,
             "assets": {
                 "arm64": apk_asset,
+                "armv7": apk_armv7_asset,
             },
         },
     }

@@ -210,7 +210,7 @@ jobs:
           if-no-files-found: error
 
   android:
-    name: Android arm64
+    name: Android arm64 + armv7
     needs: prepare
     runs-on: ubuntu-24.04
     steps:
@@ -223,11 +223,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: android-arm64
+          shared-key: android
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
@@ -335,43 +335,57 @@ jobs:
 
           echo "HAKIMI_CA_DIR=$CA_DIR" >> "$GITHUB_ENV"
 
-      - name: Build APK
+      - name: Build APKs
         shell: bash
         env:
           VERSION: ${{ needs.prepare.outputs.android_version }}
           VERSION_CODE: ${{ needs.prepare.outputs.android_version_code }}
-          ABIS: arm64-v8a
           IS_RELEASE: ${{ needs.prepare.outputs.is_release }}
           DEBUGGABLE: "0"
         run: |
           set -euo pipefail
           mkdir -p dist
 
-          APK="$GITHUB_WORKSPACE/dist/hakimi-${VERSION}-android-arm64.apk"
-          (
-            cd android/probe
-            VERSION_NAME="$VERSION" \
-            VERSION_CODE="$VERSION_CODE" \
-            APK_OUT="$APK" \
-            bash ./build.sh
-          )
+          build_one() {
+            local abi="$1" tag="$2"
+            local apk="$GITHUB_WORKSPACE/dist/hakimi-${VERSION}-${tag}.apk"
+            (
+              cd android/probe
+              ABIS="$abi" \
+              VERSION_NAME="$VERSION" \
+              VERSION_CODE="$VERSION_CODE" \
+              APK_OUT="$apk" \
+              bash ./build.sh
+            )
 
-          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --print-certs "$APK"
-          # Capture first: `aapt2 | head` can trip pipefail when aapt2 exits early.
-          BADGING="$("$ANDROID_HOME/build-tools/37.0.0/aapt2" dump badging "$APK")"
-          echo "$BADGING" | sed -n '1p'
+            "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --print-certs "$apk"
+            # Capture first: `aapt2 | head` can trip pipefail when aapt2 exits early.
+            local badging
+            badging="$("$ANDROID_HOME/build-tools/37.0.0/aapt2" dump badging "$apk")"
+            echo "$badging" | sed -n '1p'
 
-          if [[ "$IS_RELEASE" == "true" ]] && grep -q '^application-debuggable' <<< "$BADGING"; then
-            echo "::error::正式发布 APK 不允许包含 android:debuggable=\"true\"。"
-            exit 1
-          fi
+            if ! grep -q "^native-code: .*'$abi'" <<< "$badging"; then
+              echo "::error::$apk 里没有 $abi 的原生库。"
+              exit 1
+            fi
 
-          ls -lh "$APK"
+            if [[ "$IS_RELEASE" == "true" ]] && grep -q '^application-debuggable' <<< "$badging"; then
+              echo "::error::正式发布 APK 不允许包含 android:debuggable=\"true\"。"
+              exit 1
+            fi
+
+            ls -lh "$apk"
+          }
+
+          build_one arm64-v8a android
+          build_one armeabi-v7a android-armv7
 
       - uses: actions/upload-artifact@v7
         with:
-          name: hakimi-${{ needs.prepare.outputs.android_version }}-android-arm64
-          path: dist/hakimi-*-android-arm64.apk
+          name: hakimi-${{ needs.prepare.outputs.android_version }}-android
+          path: |
+            dist/hakimi-*-android.apk
+            dist/hakimi-*-android-armv7.apk
           if-no-files-found: error
 
   release:
@@ -410,7 +424,8 @@ jobs:
           for file in \
             "dist/hakimi-${DESKTOP_VERSION}-windows-x64.zip" \
             "dist/hakimi-${DESKTOP_VERSION}-macos-arm64.dmg" \
-            "dist/hakimi-${ANDROID_VERSION}-android-arm64.apk"
+            "dist/hakimi-${ANDROID_VERSION}-android.apk" \
+            "dist/hakimi-${ANDROID_VERSION}-android-armv7.apk"
           do
             if [[ ! -f "$file" ]]; then
               echo "::error::missing release artifact: $file"
@@ -435,7 +450,8 @@ jobs:
             --desktop-windows-asset "hakimi-${DESKTOP_VERSION}-windows-x64.zip" \
             --desktop-macos-asset "hakimi-${DESKTOP_VERSION}-macos-arm64.dmg" \
             --android-version "$ANDROID_VERSION" \
-            --android-apk-asset "hakimi-${ANDROID_VERSION}-android-arm64.apk"
+            --android-apk-asset "hakimi-${ANDROID_VERSION}-android.apk" \
+            --android-apk-armv7-asset "hakimi-${ANDROID_VERSION}-android-armv7.apk"
           cat dist/latest.json
 
       - name: Generate checksums
