@@ -60,8 +60,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
-import java.time.LocalDate
-import java.time.format.DateTimeFormatter
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.Executors
 
 class MainActivity : Activity(), Host {
@@ -465,7 +466,7 @@ class MainActivity : Activity(), Host {
 
         starting = true
         try {
-            startForegroundService(
+            startServiceCompat(
                 Intent(this, ProxyService::class.java).setAction(ProxyService.ACTION_START)
             )
             showSnack("正在启动本地核心…")
@@ -481,7 +482,7 @@ class MainActivity : Activity(), Host {
     private fun launchVpn() {
         starting = true
         try {
-            startForegroundService(
+            startServiceCompat(
                 Intent(this, HakimiVpnService::class.java).setAction(HakimiVpnService.ACTION_START)
             )
             showSnack("正在建立 VPN…")
@@ -492,6 +493,15 @@ class MainActivity : Activity(), Host {
         }
         watchdogStart()
         refreshNow()
+    }
+
+    /** startForegroundService needs API 26; older devices fall back to startService. */
+    private fun startServiceCompat(intent: Intent) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
     }
 
     private fun watchdogStart() {
@@ -1365,7 +1375,7 @@ class MainActivity : Activity(), Host {
     }
 
     private fun backupName(): String =
-        "hakimi-ca-${LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE)}.crt"
+        "hakimi-ca-${SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())}.crt"
 
     private fun caFileName(): String = caExportName.ifEmpty { CaStore.INSTALL_NAME }
 

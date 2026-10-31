@@ -2,8 +2,9 @@ package com.hakimi.probe.ui
 
 import org.json.JSONArray
 import org.json.JSONObject
-import java.time.Duration
-import java.time.OffsetDateTime
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 
 data class DomainInfo(
     val host: String,
@@ -191,17 +192,13 @@ data class CoreData(
 
     fun uptimeText(): String {
         if (startedAt.isEmpty()) return "—"
-        return try {
-            val started = OffsetDateTime.parse(startedAt)
-            val seconds = Duration.between(started, OffsetDateTime.now()).seconds.coerceAtLeast(0)
-            val hours = seconds / 3600
-            val minutes = (seconds % 3600) / 60
-            val secs = seconds % 60
-            if (hours > 0) "%d:%02d:%02d".format(hours, minutes, secs)
-            else "%02d:%02d".format(minutes, secs)
-        } catch (_: Throwable) {
-            "—"
-        }
+        val started = rfc3339Seconds(startedAt) ?: return "—"
+        val seconds = (System.currentTimeMillis() / 1000 - started).coerceAtLeast(0)
+        val hours = seconds / 3600
+        val minutes = (seconds % 3600) / 60
+        val secs = seconds % 60
+        return if (hours > 0) "%d:%02d:%02d".format(hours, minutes, secs)
+        else "%02d:%02d".format(minutes, secs)
     }
 
     fun site(id: String): SiteInfo? = sites.firstOrNull { it.id == id }
@@ -451,4 +448,23 @@ object CoreParser {
             val value = opt(index)
             if (value == null || value == JSONObject.NULL) null else value.toString()
         }
+}
+
+private val RFC3339 =
+    Regex("""(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})""")
+
+/** RFC3339 → epoch seconds. java.time is API 26 and the app ships from 24. */
+private fun rfc3339Seconds(value: String): Long? {
+    val match = RFC3339.find(value) ?: return null
+    val format = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
+    format.timeZone = TimeZone.getTimeZone("UTC")
+    val base = runCatching { format.parse(match.groupValues[1]) }.getOrNull() ?: return null
+    val zone = match.groupValues[2]
+    val offset = if (zone == "Z") {
+        0L
+    } else {
+        val sign = if (zone[0] == '-') -1 else 1
+        sign * (zone.substring(1, 3).toLong() * 3600 + zone.substring(4, 6).toLong() * 60)
+    }
+    return base.time / 1000 - offset
 }

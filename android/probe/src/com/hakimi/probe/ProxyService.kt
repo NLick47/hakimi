@@ -62,14 +62,16 @@ class ProxyService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        val manager = getSystemService(NotificationManager::class.java)
-        manager?.createNotificationChannel(
-            NotificationChannel(CHANNEL, "加速服务", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "保持本地加速核心在后台运行"
-                setShowBadge(false)
-                lockscreenVisibility = Notification.VISIBILITY_PRIVATE
-            }
-        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(
+                NotificationChannel(CHANNEL, "加速服务", NotificationManager.IMPORTANCE_LOW).apply {
+                    description = "保持本地加速核心在后台运行"
+                    setShowBadge(false)
+                    lockscreenVisibility = Notification.VISIBILITY_PRIVATE
+                }
+            )
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -151,6 +153,13 @@ class ProxyService : Service() {
         manager.notify(NOTIFICATION_ID, buildNotification(title, text))
     }
 
+    private fun notificationBuilder(): Notification.Builder =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL)
+        } else {
+            Notification.Builder(this)
+        }
+
     private fun startForegroundCompat() {
         val notification = buildNotification("hakimi 加速中", "本地核心正在为浏览器提供加速")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -177,7 +186,7 @@ class ProxyService : Service() {
             Intent(this, ProxyService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val builder = Notification.Builder(this, CHANNEL)
+        val builder = notificationBuilder()
             .setContentTitle(title)
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_notification)

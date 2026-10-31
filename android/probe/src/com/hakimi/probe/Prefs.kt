@@ -2,6 +2,7 @@ package com.hakimi.probe
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Build
 import android.provider.Settings
 import java.util.UUID
 
@@ -30,8 +31,16 @@ object Prefs {
         get(context).edit().putBoolean(DESIRED, desired).commit()
     }
 
-    fun mode(context: Context): String =
-        get(context).getString(MODE, MODE_VPN) ?: MODE_VPN
+    /** VPN capture needs API 33, so older devices start on the local proxy. */
+    fun mode(context: Context): String {
+        val saved = get(context).getString(MODE, null)
+            ?: return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                MODE_VPN
+            } else {
+                MODE_PROXY
+            }
+        return if (saved == MODE_VPN) MODE_VPN else MODE_PROXY
+    }
 
     fun setMode(context: Context, mode: String) {
         get(context).edit().putString(MODE, if (mode == MODE_VPN) MODE_VPN else MODE_PROXY).commit()

@@ -26,7 +26,9 @@ object CoreController {
     fun start(context: Context, ownerToken: String, callback: (Boolean, String) -> Unit) {
         executor.execute {
             val app = context.applicationContext
-            if (Native.isProxyRunning()) {
+            // A wrong-ABI install cannot load the native library: degrade to a
+            // start failure instead of killing this worker thread.
+            if (runCatching { Native.isProxyRunning() }.getOrDefault(false)) {
                 owner = ownerToken
                 clearLegacyProxy(app)
                 main.post { callback(true, "") }

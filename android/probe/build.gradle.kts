@@ -42,7 +42,7 @@ android {
 
     defaultConfig {
         applicationId = "com.hakimi.probe"
-        minSdk = 26
+        minSdk = 24
         targetSdk = 35
         versionCode = versionCodeFor(appVersion)
         versionName = appVersion
@@ -125,6 +125,7 @@ val buildRustJni = tasks.register<Exec>("buildRustJni") {
     commandLine(
         cargo, "ndk",
         "-t", "arm64-v8a",
+        "-t", "armeabi-v7a",
         "-t", "x86_64",
         "-o", rustJniDir.absolutePath,
         "build", "-p", "hakimi-android", "--profile", "android-release", "--offline"

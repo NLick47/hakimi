@@ -100,14 +100,16 @@ class HakimiVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
-        val manager = getSystemService(NotificationManager::class.java)
-        manager?.createNotificationChannel(
-            NotificationChannel(CHANNEL, "VPN 加速", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "按站点接管应用流量"
-                setShowBadge(false)
-                lockscreenVisibility = Notification.VISIBILITY_PRIVATE
-            }
-        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(
+                NotificationChannel(CHANNEL, "VPN 加速", NotificationManager.IMPORTANCE_LOW).apply {
+                    description = "按站点接管应用流量"
+                    setShowBadge(false)
+                    lockscreenVisibility = Notification.VISIBILITY_PRIVATE
+                }
+            )
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -362,6 +364,13 @@ class HakimiVpnService : VpnService() {
         manager.notify(NOTIFICATION_ID, buildNotification(title, text))
     }
 
+    private fun notificationBuilder(): Notification.Builder =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL)
+        } else {
+            Notification.Builder(this)
+        }
+
     private fun startForegroundCompat() {
         val notification = buildNotification("hakimi VPN", "正在准备浏览器接管…")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -390,7 +399,7 @@ class HakimiVpnService : VpnService() {
                 .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val builder = Notification.Builder(this, CHANNEL)
+        val builder = notificationBuilder()
             .setContentTitle(title)
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_notification)

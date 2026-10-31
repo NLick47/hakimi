@@ -22,8 +22,8 @@ REPO="$(cd "$ROOT/../.." && pwd)"
 BUILD="$ROOT/build"
 JNI_DIR="$REPO/target/android-jni"
 
-# Official releases are arm64-only. Pass ABIS=x86_64 when building for an
-# emulator, or ABIS="arm64-v8a x86_64" for a combined local build.
+# Official releases ship one APK per ABI (arm64-v8a and armeabi-v7a); pass a
+# single ABI to build one of them, or ABIS="arm64-v8a armeabi-v7a" to test.
 ABIS="${ABIS:-arm64-v8a}"
 
 # Local builds follow the Rust workspace version for the client/APK version.
@@ -66,7 +66,7 @@ esac
 DEFAULT_VERSION_CODE=$((10#$version_major * 1000000 + 10#$version_minor * 1000 + 10#$version_patch))
 VERSION_CODE="${VERSION_CODE:-$DEFAULT_VERSION_CODE}"
 APK_OUT="${APK_OUT:-$ROOT/hakimi-probe.apk}"
-MIN_SDK="${MIN_SDK:-26}"
+MIN_SDK="${MIN_SDK:-24}"
 TARGET_SDK="${TARGET_SDK:-35}"
 COMPILE_SDK="${COMPILE_SDK:-37}"
 BUILD_TOOLS="${BUILD_TOOLS:-37.0.0}"
@@ -177,8 +177,10 @@ if [ "${SKIP_RUST:-0}" != "1" ]; then
   fi
   # `android-release` is size-first (opt-level=z, fat LTO, stripped) but keeps
   # the unwind panic strategy so the JNI shell's catch_unwind still works.
+  # macOS ships bash 3.2, where "${arr[@]}" on an empty array is unbound.
   (cd "$REPO" && cargo ndk "${TARGETS[@]}" -o "$JNI_DIR" \
-      build -p hakimi-android --profile android-release "${CARGO_ARGS[@]}")
+      build -p hakimi-android --profile android-release \
+      ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"})
 fi
 
 # The probe CA is generated locally and never committed: its private key is
@@ -350,7 +352,8 @@ fi
 
 mkdir -p "$(dirname "$APK_OUT")"
 rm -f "$APK_OUT"
-# minSdk is 26, so v1/JAR signing is dead weight; v2/v3 are enough.
+# minSdk is 24, so v2 signing alone installs on every supported device; v1 is
+# only needed below Android 7.0.
 "$JAVA" -jar "$(winpath "$APKSIGNER_JAR")" sign \
   --ks "$(winpath "$KEYSTORE")" \
   --ks-key-alias "$KEY_ALIAS" \
