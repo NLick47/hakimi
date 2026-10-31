@@ -2,7 +2,7 @@
 name = "hakimi-core"
 # Independent from the client release tag. Bump this when the proxy core
 # changes; release CI only rewrites [workspace.package] version.
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
