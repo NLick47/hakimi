@@ -76,7 +76,10 @@
       "id": "poipiku",
       "name": "Poipiku",
       "domains": [
-        { "pattern": "poipiku.com" },
+        {
+          "pattern": "poipiku.com",
+          "route": { "attempts": [{ "mode": "sni", "sni": [""] }, { "mode": "direct" }] }
+        },
         { "pattern": "img.poipiku.com" },
         { "pattern": "cdn.poipiku.com" },
         { "pattern": "*.poipiku.com" }

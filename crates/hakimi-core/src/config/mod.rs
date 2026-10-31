@@ -12,6 +12,10 @@ use crate::paths::Paths;
 use crate::strategy::TlsMode;
 use crate::util::{atomic_write_json, decode_key_material, now, read_json};
 
+mod migrate;
+
+pub use migrate::SCHEMA_VERSION;
+
 pub const MAX_GROUPS: usize = 128;
 pub const MAX_DOMAINS_PER_GROUP: usize = 512;
 pub const MAX_TOTAL_DOMAINS: usize = 5000;
@@ -37,6 +41,14 @@ pub struct AppConfig {
     pub catalog_version: u64,
     pub advanced: AdvancedConfig,
     pub log: LogConfig,
+    /// Shape version of this file. Missing on old files (reads as 0);
+    /// migrations bring it up to `SCHEMA_VERSION` on load.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+}
+
+fn default_schema_version() -> u32 {
+    0
 }
 
 impl Default for AppConfig {
@@ -49,6 +61,7 @@ impl Default for AppConfig {
             catalog_version: 0,
             advanced: AdvancedConfig::default(),
             log: LogConfig::default(),
+            schema_version: migrate::SCHEMA_VERSION,
         }
     }
 }
@@ -687,7 +700,13 @@ pub fn default_groups() -> Vec<GroupConfig> {
             "poipiku",
             "Poipiku",
             vec![
-                plain("poipiku.com"),
+                // The filter normalizes the root-dot variant away, so the
+                // attempt is no-SNI: CloudFront then serves the default cert
+                // whose SAN covers poipiku.com and *.poipiku.com.
+                DomainRule::routed(
+                    "poipiku.com",
+                    RoutePolicy::sni(vec![String::new()]),
+                ),
                 plain("img.poipiku.com"),
                 plain("cdn.poipiku.com"),
                 plain("*.poipiku.com"),
@@ -1044,30 +1063,6 @@ struct Inner {
     matcher: Arc<DomainMatcher>,
 }
 
-fn strip_legacy_materialized_defaults(config: &mut AppConfig) {
-    const LEGACY_HTTP1_HOSTS: [&str; 3] = ["*.pximg.net", "img.poipiku.com", "cdn.poipiku.com"];
-    let pinned = config
-        .advanced
-        .http1_hosts
-        .iter()
-        .map(String::as_str)
-        .eq(LEGACY_HTTP1_HOSTS);
-    if pinned {
-        config.advanced.http1_hosts = AdvancedConfig::default().http1_hosts;
-    }
-
-    // Older builds materialized the generic `auto` route for Poipiku. That
-    // route spends a DoH HTTPS-RR lookup on ECH and five fake-SNI handshakes
-    // per address even though CloudFront supports neither. Treat the exact old
-    // default as unset so the new direct-only default reaches existing installs;
-    // a user-customized Poipiku route is left untouched.
-    if let Some(group) = config.groups.iter_mut().find(|group| group.id == "poipiku") {
-        if group.default_route == RoutePolicy::auto() {
-            group.default_route = RoutePolicy::direct();
-        }
-    }
-}
-
 /// One entry of a fake-SNI candidate list, normalized the way the dialer wants
 /// it: trimmed, lowercase, and `None` for "send no SNI".
 pub(crate) fn normalize_sni_candidate(raw: &str) -> Option<String> {
@@ -1233,10 +1228,21 @@ impl ConfigManager {
     }
 
     fn new(path: PathBuf, mut config: AppConfig) -> Result<Self> {
-        strip_legacy_materialized_defaults(&mut config);
+        let applied = migrate::run_migrations(&mut config);
         merge_missing_builtin_groups(&mut config);
         config.canonicalize();
         config.validate()?;
+        if !applied.is_empty() {
+            // Persist the migrated shape so the next load starts clean. A
+            // failure only costs one repeated (idempotent) pass at startup.
+            if let Err(error) = atomic_write_json(&path, &sanitized_persisted_value(&config)) {
+                tracing::warn!(
+                    error = %error,
+                    path = %path.display(),
+                    "migrated config could not be written back"
+                );
+            }
+        }
         let matcher = Arc::new(config.matcher()?);
         Ok(Self {
             path,
@@ -1396,10 +1402,16 @@ mod tests {
         let eh = config.group("eh").unwrap();
         assert!(eh.enabled);
         assert!(config.groups.iter().all(|group| group.enabled));
+        let poipiku = config.group("poipiku").unwrap();
         assert_eq!(
-            config.group("poipiku").unwrap().default_route,
+            poipiku.default_route,
             RoutePolicy::direct(),
-            "CloudFront publishes no ECHConfig and rejects foreign SNI"
+            "img/cdn stay direct"
+        );
+        assert_eq!(
+            poipiku.domain("poipiku.com").unwrap().route.as_ref().unwrap(),
+            &RoutePolicy::sni(vec![String::new()]),
+            "the apex dials no-SNI; the filter normalizes the root-dot variant away"
         );
         // The adult sites ship enabled with their own CDN domains.
         let hitomi = config.group("hitomi").unwrap();
@@ -1927,6 +1939,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path());
         let mut legacy = AppConfig::default();
+        legacy.schema_version = 0;
         legacy.advanced.http1_hosts = vec![
             "*.pximg.net".to_string(),
             "img.poipiku.com".to_string(),
@@ -1969,6 +1982,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path());
         let mut legacy = AppConfig::default();
+        legacy.schema_version = 0;
         legacy
             .groups
             .iter_mut()
@@ -1989,6 +2003,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path());
         let mut custom = AppConfig::default();
+        custom.schema_version = 0;
         let route = RoutePolicy::sni(vec!["www.example.com".to_string()]);
         custom
             .groups
@@ -2002,6 +2017,66 @@ mod tests {
         assert_eq!(
             manager.snapshot().group("poipiku").unwrap().default_route,
             route
+        );
+    }
+
+    #[test]
+    fn legacy_poipiku_apex_adopts_no_sni() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let mut legacy = AppConfig::default();
+        legacy.schema_version = 0;
+        // 模拟旧模板：裸域规则没有自己的 route
+        legacy
+            .group_mut("poipiku")
+            .unwrap()
+            .domains
+            .iter_mut()
+            .find(|rule| rule.pattern == "poipiku.com")
+            .unwrap()
+            .route = None;
+        std::fs::write(paths.config_file(), serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        let manager = ConfigManager::load(paths.config_file()).unwrap();
+        let snapshot = manager.snapshot();
+        assert_eq!(
+            snapshot.group("poipiku").unwrap().domain("poipiku.com").unwrap().route,
+            Some(RoutePolicy::sni(vec![String::new()]))
+        );
+        assert_eq!(snapshot.schema_version, SCHEMA_VERSION);
+        // 迁移结果已落盘
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(paths.config_file()).unwrap()).unwrap();
+        assert_eq!(parsed.get("schemaVersion"), Some(&serde_json::json!(2)));
+    }
+
+    #[test]
+    fn customized_poipiku_apex_route_survives_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let mut custom = AppConfig::default();
+        custom.schema_version = 0;
+        let route = RoutePolicy::sni(vec!["www.example.com".to_string()]);
+        custom
+            .group_mut("poipiku")
+            .unwrap()
+            .domains
+            .iter_mut()
+            .find(|rule| rule.pattern == "poipiku.com")
+            .unwrap()
+            .route = Some(route.clone());
+        std::fs::write(paths.config_file(), serde_json::to_string(&custom).unwrap()).unwrap();
+
+        let manager = ConfigManager::load(paths.config_file()).unwrap();
+        assert_eq!(
+            manager
+                .snapshot()
+                .group("poipiku")
+                .unwrap()
+                .domain("poipiku.com")
+                .unwrap()
+                .route,
+            Some(route)
         );
     }
 
