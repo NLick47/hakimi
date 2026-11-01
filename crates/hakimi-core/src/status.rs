@@ -224,10 +224,13 @@ impl StatusStore {
         // on the log writer, and status readers must not wait for it.
         let mut transition_log: Option<(State, State, Arc<DomainDiagnostics>)> = None;
         if let Some(existing) = map.get_mut(&diagnostics.domain) {
-            // Never let a slower, older probe overwrite a newer result.
+            // Never let a slower, older probe overwrite a newer result: a
+            // terminal state is final for its generation. `Checking` stays
+            // transient — a fresh terminal record still absorbs it, and
+            // re-marking an existing Checking record is unchanged.
             if existing.last_check > diagnostics.last_check
-                && existing.state != State::Checking
-                && diagnostics.state == State::Checking
+                && (diagnostics.state != State::Checking
+                    || existing.state != State::Checking)
             {
                 return;
             }
@@ -825,5 +828,25 @@ mod tests {
         crate::bench::measure("status.snapshot", 2_000, || {
             let _ = store.domains_snapshot_with_counts();
         });
+    }
+
+    /// Regression test (audit finding 8, fixed): the out-of-order guard now
+    /// also covers terminal states. A probe that was sent earlier but
+    /// returned later must not overwrite a newer result and flip the UI red
+    /// until the next probe.
+    #[test]
+    fn an_older_failed_probe_cannot_overwrite_a_newer_result() {
+        let store = StatusStore::new();
+        store.record(report("example.com", State::Normal));
+
+        let mut older = report("example.com", State::Failed);
+        older.last_check = now() - chrono::Duration::seconds(5);
+        store.record(older);
+
+        assert_eq!(
+            store.get("example.com").unwrap().state,
+            State::Normal,
+            "an older terminal result must not overwrite a newer one"
+        );
     }
 }
