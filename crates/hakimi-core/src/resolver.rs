@@ -38,6 +38,9 @@ const STALE_REFRESH_BACKOFF_MAX: usize = 1024;
 const NEGATIVE_NODATA_SECS: u32 = 60;
 const NEGATIVE_HTTPS_NODATA_SECS: u32 = 300;
 const NEGATIVE_FAILURE_SECS: u32 = 10;
+/// RFC 8767: a zero-TTL answer gets a small minimum cache time, or every new
+/// connection pays a full endpoint race for the same domain.
+const MIN_CACHE_TTL_SECS: u32 = 5;
 /// Lanes and budget for the endpoints after the raced primary/fallback pair.
 /// The remote catalog decides how many there are (up to 64), and one timeout
 /// each would let a silent list stretch every cold lookup to minutes. Two
@@ -666,6 +669,14 @@ impl Resolver {
 
         let mut live_error: Option<anyhow::Error> = None;
         let mut live_failed = false;
+        // A remembered authoritative NODATA proves the HTTPS RR and its ECH
+        // config are gone. Skipping the live query is fine; resurrecting the
+        // stale config is not. A mere failure entry must keep falling through
+        // to query_one_type so the stale config stays available as a last
+        // resort.
+        if self.cache.doh_negative_authoritative(&domain, TYPE_HTTPS) {
+            bail!("HTTPS RR for `{domain}` does not contain an ECH config");
+        }
         match self.query_one_type(&domain, TYPE_HTTPS).await {
             Ok(query) => {
                 // A successful NODATA answer is authoritative when every
@@ -1069,14 +1080,16 @@ impl Resolver {
             let endpoint = &endpoints[index];
             // An authoritative empty answer repeats for every cold connection:
             // remember it so the next query skips the endpoint race entirely
-            let ttl = if attempts.is_empty() && qtype == TYPE_HTTPS {
+            let authoritative = attempts.is_empty();
+            let ttl = if authoritative && qtype == TYPE_HTTPS {
                 NEGATIVE_HTTPS_NODATA_SECS
-            } else if attempts.is_empty() {
+            } else if authoritative {
                 NEGATIVE_NODATA_SECS
             } else {
                 NEGATIVE_FAILURE_SECS
             };
-            self.cache.put_doh_negative(domain, qtype, ttl);
+            self.cache
+                .put_doh_negative(domain, qtype, ttl, authoritative);
             return Ok(TypeQuery {
                 answer,
                 source: endpoint.source,
@@ -1092,7 +1105,7 @@ impl Resolver {
             .collect::<Vec<_>>()
             .join("; ");
         self.cache
-            .put_doh_negative(domain, qtype, NEGATIVE_FAILURE_SECS);
+            .put_doh_negative(domain, qtype, NEGATIVE_FAILURE_SECS, false);
         bail!("all DoH endpoints failed: {detail}")
     }
 
@@ -1110,7 +1123,7 @@ impl Resolver {
                     .ech
                     .as_ref()
                     .map(|ech| base64::engine::general_purpose::STANDARD.encode(ech)),
-                ttl_secs: answer.ttl,
+                ttl_secs: answer.ttl.max(MIN_CACHE_TTL_SECS),
                 fetched_at: now(),
             });
         } else if qtype == TYPE_HTTPS {

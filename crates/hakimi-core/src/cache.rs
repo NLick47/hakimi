@@ -136,9 +136,13 @@ struct CacheData {
 
 /// A remembered "this query has no useful answer". NODATA entries trust the
 /// DNS TTL; total endpoint failures only back off for a short window.
+/// `authoritative` marks a NODATA answer that every endpoint agreed on: it
+/// proves the record does not exist, while a failure entry only proves the
+/// endpoints were unreachable.
 #[derive(Debug, Clone)]
 struct CachedNegative {
     ttl_secs: u32,
+    authoritative: bool,
     fetched_at: DateTime<Utc>,
 }
 
@@ -720,7 +724,24 @@ impl CacheManager {
             .is_some_and(|entry| entry.is_fresh(now))
     }
 
-    pub fn put_doh_negative(&self, domain: &str, qtype: u16, ttl_secs: u32) {
+    /// True while a fresh *authoritative* negative result exists: every
+    /// endpoint answered NOERROR/NODATA, so the record is known to be absent.
+    pub fn doh_negative_authoritative(&self, domain: &str, qtype: u16) -> bool {
+        let now = now();
+        self.data
+            .read()
+            .doh_negative
+            .get(&doh_key(domain, qtype))
+            .is_some_and(|entry| entry.authoritative && entry.is_fresh(now))
+    }
+
+    pub fn put_doh_negative(
+        &self,
+        domain: &str,
+        qtype: u16,
+        ttl_secs: u32,
+        authoritative: bool,
+    ) {
         if ttl_secs == 0 {
             return;
         }
@@ -729,6 +750,7 @@ impl CacheManager {
             doh_key(domain, qtype),
             CachedNegative {
                 ttl_secs,
+                authoritative,
                 fetched_at: now(),
             },
         );
