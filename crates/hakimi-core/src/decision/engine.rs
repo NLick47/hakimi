@@ -1151,8 +1151,10 @@ impl DecisionEngine {
     ///
     /// Returns the plans whose alternative won twice in a row. The caller
     /// drops the plan and retires that host's pooled sockets so the next
-    /// request opens a connection that re-races. A failed probe is not
-    /// evidence of a better route, so it only resets the streak.
+    /// request opens a connection that re-races. A probe that cannot complete
+    /// proves nothing about the address, so a failed live probe only resets
+    /// the streak; a failed challenger also takes a failure record, otherwise
+    /// it would be picked again on every check.
     pub async fn recheck_routes(&self, budget: usize) -> Vec<Arc<ConnectPlan>> {
         if budget == 0 {
             return Vec::new();

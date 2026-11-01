@@ -1100,7 +1100,7 @@ impl HakimiRuntime {
 
         // Route recheck: a pooled connection never reports another handshake,
         // so without this the chosen route is never compared again. One check
-        // per tick keeps the cost at a couple of handshakes a minute.
+        // per tick, two handshakes each, stays under six a minute.
         let runtime = self.clone();
         let mut receiver = shutdown.subscribe();
         self.spawn(async move {
