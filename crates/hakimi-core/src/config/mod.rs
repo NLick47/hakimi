@@ -1294,8 +1294,12 @@ impl ConfigManager {
         config.canonicalize();
         config.validate()?;
         let matcher = Arc::new(config.matcher()?);
-        atomic_write_json(&self.path, &sanitized_persisted_value(&config))?;
+        // The disk write and the pointer swap share one write lock, so disk
+        // and memory can never disagree. Callers pass a complete config:
+        // concurrent mutate changes between the caller's snapshot and this
+        // call are overwritten — inherent to full-config overwrite semantics.
         let mut guard = self.inner.write();
+        atomic_write_json(&self.path, &sanitized_persisted_value(&config))?;
         guard.config = Arc::new(config);
         guard.matcher = matcher;
         // Publish the revision while the new config is still write-locked, so
@@ -1310,9 +1314,19 @@ impl ConfigManager {
     where
         F: FnOnce(&mut AppConfig) -> Result<()>,
     {
-        let mut config = (*self.snapshot()).clone();
+        // Snapshot-modify-overwrite must hold the write lock as a whole, or two
+        // concurrent writers lose each other's changes. The closure must not
+        // call back into ConfigManager (the write lock is not reentrant).
+        let mut guard = self.inner.write();
+        let mut config = (*guard.config).clone();
         f(&mut config)?;
-        self.update(config.clone())?;
+        config.canonicalize();
+        config.validate()?;
+        let matcher = Arc::new(config.matcher()?);
+        atomic_write_json(&self.path, &sanitized_persisted_value(&config))?;
+        guard.config = Arc::new(config.clone());
+        guard.matcher = matcher;
+        self.revision.fetch_add(1, Ordering::Relaxed);
         Ok(config)
     }
 
