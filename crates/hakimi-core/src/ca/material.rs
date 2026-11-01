@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    KeyIdMethod, KeyPair, KeyUsagePurpose,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -163,9 +163,50 @@ fn issuer_params_from(
         KeyUsagePurpose::DigitalSignature,
     ];
     params.use_authority_key_identifier_extension = true;
+    // rcgen derives the AKI from the key with a truncated SHA-256, while every
+    // CA we load here was made by openssl with a SHA-1 key id. Clients compare
+    // the two byte for byte before they try the signature, so the leaf has to
+    // carry the certificate's own id or the chain never builds.
+    if let Some(key_id) = subject_key_identifier(certificate) {
+        params.key_identifier_method = KeyIdMethod::PreSpecified(key_id);
+    }
     params.not_before = certificate.validity().not_before.to_datetime();
     params.not_after = certificate.validity().not_after.to_datetime();
     Ok(params)
+}
+
+/// The CA's own key identifier, so a leaf can repeat it as its AKI.
+fn subject_key_identifier(
+    certificate: &x509_parser::certificate::X509Certificate<'_>,
+) -> Option<Vec<u8>> {
+    const SKI_OID: &str = "2.5.29.14";
+    let extension = certificate
+        .extensions()
+        .iter()
+        .find(|extension| extension.oid.to_id_string() == SKI_OID)?;
+    // extnValue wraps the key identifier in one OCTET STRING.
+    octet_string(extension.value).map(<[u8]>::to_vec)
+}
+
+fn octet_string(bytes: &[u8]) -> Option<&[u8]> {
+    if *bytes.first()? != 0x04 {
+        return None;
+    }
+    let (length, start) = match *bytes.get(1)? {
+        short if short < 0x80 => (short as usize, 2),
+        long => {
+            let count = (long & 0x7f) as usize;
+            if count == 0 || count > 2 {
+                return None;
+            }
+            let mut length = 0usize;
+            for byte in bytes.get(2..2 + count)? {
+                length = (length << 8) | *byte as usize;
+            }
+            (length, 2 + count)
+        }
+    };
+    bytes.get(start..start + length)
 }
 
 fn material_from_parts(issuer: Certificate, key: KeyPair) -> CaMaterial {
