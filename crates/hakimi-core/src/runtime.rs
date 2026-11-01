@@ -1084,6 +1084,11 @@ impl HakimiRuntime {
                     // new connections to re-race routes while still testing the
                     // last-good IP first.
                     runtime.engine.on_network_change();
+                    // Clearing the plans is not enough on its own: the pooled
+                    // sockets still point at the old network's addresses, so the
+                    // next request would reuse one instead of opening a
+                    // connection that re-races. Same swap as `resume`.
+                    runtime.upstream.retire_pools();
                     // Cached resolver answers belong to the old network
                     crate::proxy::clear_dns_cache();
                     let _ = runtime.resolver.health_check().await;
