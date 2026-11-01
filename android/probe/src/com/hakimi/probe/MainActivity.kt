@@ -886,6 +886,7 @@ class MainActivity : Activity(), Host {
                 raw = raw,
             )
             handler.post {
+                if (isFinishing || isDestroyed) return@post
                 diagnosingNow = false
                 render()
                 done(outcome)
@@ -917,6 +918,15 @@ class MainActivity : Activity(), Host {
                 showSnack("配置尚未就绪", error = true)
                 return@input
             }
+            // A not-yet-polled core answers with "{}" or an error object; the
+            // sections below are then absent and getJSONObject would crash.
+            val proxyObj = next.optJSONObject("proxy")
+            val dohObj = next.optJSONObject("doh")
+            val catalogsObj = next.optJSONObject("catalogs")
+            if (proxyObj == null || dohObj == null || catalogsObj == null) {
+                showSnack("配置尚未就绪", error = true)
+                return@input
+            }
             val changed = when (key) {
                 "proxy.port" -> {
                     val port = raw.toIntOrNull()
@@ -924,7 +934,7 @@ class MainActivity : Activity(), Host {
                         showSnack("端口必须是 1–65535 之间的数字", error = true)
                         false
                     } else {
-                        next.getJSONObject("proxy").put("port", port)
+                        proxyObj.put("port", port)
                         true
                     }
                 }
@@ -933,7 +943,7 @@ class MainActivity : Activity(), Host {
                         showSnack("DoH 地址不能为空", error = true)
                         false
                     } else {
-                        next.getJSONObject("doh").put("primary", raw)
+                        dohObj.put("primary", raw)
                         true
                     }
                 }
@@ -942,7 +952,7 @@ class MainActivity : Activity(), Host {
                         showSnack("备用 DoH 地址不能为空", error = true)
                         false
                     } else {
-                        next.getJSONObject("doh").put("fallback", raw)
+                        dohObj.put("fallback", raw)
                         true
                     }
                 }
@@ -955,7 +965,7 @@ class MainActivity : Activity(), Host {
                         showSnack("目录地址必须以 http:// 或 https:// 开头", error = true)
                         false
                     } else {
-                        next.getJSONObject("catalogs").put(key.substringAfter('.'), value)
+                        catalogsObj.put(key.substringAfter('.'), value)
                         true
                     }
                 }
@@ -995,7 +1005,11 @@ class MainActivity : Activity(), Host {
                 showSnack("默认目录不可用", error = true)
                 return@confirm
             }
-            val catalogs = next.getJSONObject("catalogs")
+            val catalogs = next.optJSONObject("catalogs")
+            if (catalogs == null) {
+                showSnack("配置尚未就绪", error = true)
+                return@confirm
+            }
             catalogs.put("ip", ip)
             catalogs.put("doh", doh)
             applyConfig(next) { ok, error ->
@@ -1100,6 +1114,7 @@ class MainActivity : Activity(), Host {
                 "读取日志失败：$error"
             }
             handler.post {
+                if (isFinishing || isDestroyed) return@post
                 logLoading = false
                 render()
                 if (content.isEmpty()) {

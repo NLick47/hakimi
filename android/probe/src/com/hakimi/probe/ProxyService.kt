@@ -106,7 +106,7 @@ class ProxyService : Service() {
     private fun startCore() {
         if (starting || stopping) return
         starting = true
-        CoreController.start(this, ownerToken) { ok, error ->
+        CoreController.start(this, ownerToken) { ok, error, _ ->
             starting = false
             if (stopping) return@start
             if (!Prefs.desired(this)) {

@@ -23,21 +23,24 @@ object CoreController {
     @Volatile
     private var owner = ""
 
-    fun start(context: Context, ownerToken: String, callback: (Boolean, String) -> Unit) {
+    fun start(context: Context, ownerToken: String, callback: (Boolean, String, Boolean) -> Unit) {
         executor.execute {
             val app = context.applicationContext
+            // Computed on this worker thread: a full key-store scan must never
+            // run on the main thread inside the service callback.
+            val trusted = CaTrust.isTrusted(
+                runCatching { Bootstrap.caPem(app) }.getOrDefault("")
+            )
             // A wrong-ABI install cannot load the native library: degrade to a
             // start failure instead of killing this worker thread.
             if (runCatching { Native.isProxyRunning() }.getOrDefault(false)) {
                 owner = ownerToken
+                runCatching { Native.setCaTrusted(trusted) }
                 clearLegacyProxy(app)
-                main.post { callback(true, "") }
+                main.post { callback(true, "", trusted) }
                 return@execute
             }
             val initialized = runCatching { Bootstrap.init(app) }.getOrDefault(false)
-            val trusted = CaTrust.isTrusted(
-                runCatching { Bootstrap.caPem(app) }.getOrDefault("")
-            )
             runCatching { Native.setCaTrusted(trusted) }
             clearLegacyProxy(app)
             val started = initialized && runCatching { Native.startProxy() }.getOrDefault(false)
@@ -47,7 +50,7 @@ object CoreController {
             } else {
                 Log.w(TAG, "core start failed: $error")
             }
-            main.post { callback(started, error) }
+            main.post { callback(started, error, trusted) }
         }
     }
 

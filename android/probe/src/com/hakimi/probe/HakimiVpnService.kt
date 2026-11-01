@@ -161,7 +161,7 @@ class HakimiVpnService : VpnService() {
     private fun startCoreAndVpn() {
         if (starting || stopping || active) return
         starting = true
-        CoreController.start(this, ownerToken) { ok, error ->
+        CoreController.start(this, ownerToken) { ok, error, trusted ->
             starting = false
             if (stopping) return@start
             if (!Prefs.desired(this) && !alwaysOn) {
@@ -176,9 +176,6 @@ class HakimiVpnService : VpnService() {
                 return@start
             }
 
-            val trusted = CaTrust.isTrusted(
-                runCatching { Bootstrap.caPem(this) }.getOrDefault("")
-            )
             runCatching { Native.setCaTrusted(trusted) }
             if (!trusted) {
                 lastError = "证书未安装"
@@ -295,7 +292,7 @@ class HakimiVpnService : VpnService() {
     private fun startCoreOnly() {
         if (starting || stopping) return
         starting = true
-        CoreController.start(this, ownerToken) { ok, error ->
+        CoreController.start(this, ownerToken) { ok, error, _ ->
             starting = false
             if (stopping) return@start
             if (ok) {
