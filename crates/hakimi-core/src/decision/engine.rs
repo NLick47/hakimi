@@ -67,6 +67,16 @@ pub struct DecisionEngine {
     /// The map is bounded; when it overflows the stale entries are dropped,
     /// which costs one extra line per domain and nothing else.
     logged_routes: parking_lot::RwLock<HashMap<String, (IpAddr, TlsMode, Instant)>>,
+    /// Live routes, remembered for the background recheck.
+    ///
+    /// A pooled connection never reports another handshake, so `ip_scores`
+    /// freezes at connect time and the degraded check cannot fire. This is the
+    /// only table that knows which plan is live and when it was last compared
+    /// against an alternative.
+    route_quality: parking_lot::RwLock<HashMap<String, RouteQuality>>,
+    /// Token bucket for the recheck, so a burst of domains cannot turn the
+    /// background task into a probe storm.
+    recheck_budget: parking_lot::Mutex<(f64, Instant)>,
     /// True while the initial warmup is probing. Failures are published as
     /// Checking instead of Failed so the first probe's retry does not flash
     /// red; the runtime settles the remaining ones after warmup.
@@ -98,6 +108,29 @@ pub(super) const SNI_REJECTION_TTL: Duration = Duration::from_secs(600);
 const PROBE_BACKOFF_MAX: Duration = Duration::from_secs(1800);
 /// Entry cap for the same table, matching the other observation tables.
 const PROBE_BACKOFF_ENTRIES: usize = 1024;
+/// Cap for the live-route table. Only domains that actually connected have an
+/// entry, and an idle one is evicted before the map grows past this.
+const ROUTE_QUALITY_CAP: usize = 1024;
+/// How long a live route may go unverified.
+const RECHECK_INTERVAL: Duration = Duration::from_secs(300);
+/// A challenger must beat the live route by this factor to count as faster.
+const RECHECK_MARGIN: f64 = 0.75;
+/// Consecutive confirmations before a route is retired, so one lucky sample
+/// cannot flap a healthy route.
+const RECHECK_CONFIRMATIONS: u8 = 2;
+/// Checks per minute. One check costs two handshakes, live route plus rival.
+const RECHECK_CHECKS_PER_MIN: f64 = 3.0;
+/// A domain with no successful connection for this long is not worth a probe.
+const ROUTE_ACTIVE_WINDOW: Duration = Duration::from_secs(900);
+
+/// One live route, kept so the background task can compare it.
+struct RouteQuality {
+    plan: Arc<ConnectPlan>,
+    last_seen: Instant,
+    checked_at: Instant,
+    challenger: Option<IpAddr>,
+    streak: u8,
+}
 
 /// The key a plan is stored under.  Hot-path callers already pass a
 /// normalized host, so the common case borrows.
@@ -160,6 +193,8 @@ impl DecisionEngine {
             ip_rejections: parking_lot::RwLock::new(HashMap::new()),
             sni_rejections: parking_lot::RwLock::new(HashMap::new()),
             logged_routes: parking_lot::RwLock::new(HashMap::new()),
+            route_quality: parking_lot::RwLock::new(HashMap::new()),
+            recheck_budget: parking_lot::Mutex::new((1.0, Instant::now())),
             probe_backoff: parking_lot::Mutex::new(HashMap::new()),
             warming: AtomicBool::new(false),
         })
@@ -854,6 +889,9 @@ impl DecisionEngine {
         self.ip_rejections.write().clear();
         self.sni_rejections.write().clear();
         self.probe_backoff.lock().clear();
+        // The live plans were measured on the old network, so their quality
+        // entries are not evidence for the new one.
+        self.route_quality.write().clear();
         {
             let mut scores = self.ip_scores.write();
             scores.clear();
@@ -899,12 +937,7 @@ impl DecisionEngine {
 
     #[cfg(test)]
     pub(crate) fn ip_failures(&self, domain: &str, ip: IpAddr) -> u32 {
-        self.ip_scores
-            .read()
-            .get(domain)
-            .and_then(|by_ip| by_ip.get(&ip))
-            .map(|score| score.failures)
-            .unwrap_or(0)
+        self.ip_failures_count(domain, ip)
     }
 
     /// Score a cursor's candidate list under one read lock. A cold route can
@@ -1071,6 +1104,307 @@ impl DecisionEngine {
         }
     }
 
+    /// Remember the route that just succeeded so the background task can
+    /// verify it later.
+    ///
+    /// Called once per new connection, not per request. A reconnect on the
+    /// same address keeps the challenge streak, so two confirmations can span
+    /// a fresh connection; a different address starts a new comparison.
+    pub(super) fn record_quality(&self, plan: &Arc<ConnectPlan>) {
+        // The recheck probes TLS only, so a plaintext plan has nothing to
+        // compare and must not take a slot in the table.
+        if !plan.tls {
+            return;
+        }
+        let mut quality = self.route_quality.write();
+        if quality.len() >= ROUTE_QUALITY_CAP && !quality.contains_key(&plan.domain) {
+            let oldest = quality
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_seen)
+                .map(|(domain, _)| domain.clone());
+            if let Some(domain) = oldest {
+                quality.remove(&domain);
+            }
+        }
+        if let Some(entry) = quality.get_mut(&plan.domain) {
+            if entry.plan.ip != plan.ip {
+                entry.challenger = None;
+                entry.streak = 0;
+            }
+            entry.plan = plan.clone();
+            entry.last_seen = Instant::now();
+            return;
+        }
+        quality.insert(
+            plan.domain.clone(),
+            RouteQuality {
+                plan: plan.clone(),
+                last_seen: Instant::now(),
+                checked_at: Instant::now(),
+                challenger: None,
+                streak: 0,
+            },
+        );
+    }
+
+    /// Compare up to `budget` live routes against their best alternative.
+    ///
+    /// Returns the plans whose alternative won twice in a row. The caller
+    /// drops the plan and retires that host's pooled sockets so the next
+    /// request opens a connection that re-races. A failed probe is not
+    /// evidence of a better route, so it only resets the streak.
+    pub async fn recheck_routes(&self, budget: usize) -> Vec<Arc<ConnectPlan>> {
+        if budget == 0 {
+            return Vec::new();
+        }
+        let due: Vec<(String, Arc<ConnectPlan>)> = {
+            let quality = self.route_quality.read();
+            let mut due: Vec<(Instant, String, Arc<ConnectPlan>)> = quality
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.checked_at.elapsed() >= RECHECK_INTERVAL
+                        && entry.last_seen.elapsed() < ROUTE_ACTIVE_WINDOW
+                })
+                .map(|(domain, entry)| (entry.checked_at, domain.clone(), entry.plan.clone()))
+                .collect();
+            due.sort_by_key(|(checked_at, _, _)| *checked_at);
+            due.into_iter()
+                .take(budget)
+                .map(|(_, domain, plan)| (domain, plan))
+                .collect()
+        };
+
+        let timeout = Duration::from_millis(self.config.snapshot().advanced.ip_timeout_ms);
+        let mut retired = Vec::new();
+        for (domain, plan) in due {
+            let Some(rival) = self.recheck_rival(&domain, plan.ip, self.preferred_challenger(&domain))
+            else {
+                self.touch_quality(&domain);
+                continue;
+            };
+            if !self.take_recheck_token() {
+                break;
+            }
+            let current = self
+                .prober
+                .probe_tls(
+                    plan.ip,
+                    plan.port,
+                    &domain,
+                    plan.mode,
+                    plan.sni.as_deref(),
+                    plan.ech_config.as_deref(),
+                    timeout,
+                )
+                .await;
+            let challenger = self
+                .prober
+                .probe_tls(
+                    rival,
+                    plan.port,
+                    &domain,
+                    plan.mode,
+                    plan.sni.as_deref(),
+                    plan.ech_config.as_deref(),
+                    timeout,
+                )
+                .await;
+
+            // A broken challenger must sink in the ranking. Without this it
+            // keeps the best rank, is picked again on every check, and hides
+            // the healthy candidates behind it.
+            if challenger.is_err() {
+                self.record_ip(&domain, rival, None, true);
+            }
+            let faster = match (&current, &challenger) {
+                (Ok(current), Ok(challenger)) => {
+                    Some(challenger.latency_ms as f64 <= current.latency_ms as f64 * RECHECK_MARGIN)
+                }
+                _ => None,
+            };
+            let confirmed = self.record_challenge(&domain, &plan, rival, faster);
+            if confirmed {
+                tracing::info!(
+                    domain = %domain,
+                    from = %plan.ip,
+                    to = %rival,
+                    mode = %plan.mode,
+                    current_ms = current.as_ref().map(|probe| probe.latency_ms).unwrap_or(0),
+                    challenger_ms = challenger.as_ref().map(|probe| probe.latency_ms).unwrap_or(0),
+                    "a faster candidate was confirmed; retiring the route"
+                );
+                self.route_quality.write().remove(&domain);
+                retired.push(plan);
+            }
+        }
+        retired
+    }
+
+    /// Apply one challenge verdict and report whether the route is beaten.
+    ///
+    /// A connection can replace the live route while the probes are in flight,
+    /// so a verdict computed for the old plan is discarded instead of retiring
+    /// the plan that replaced it.
+    pub(super) fn record_challenge(
+        &self,
+        domain: &str,
+        plan: &ConnectPlan,
+        rival: IpAddr,
+        faster: Option<bool>,
+    ) -> bool {
+        let mut quality = self.route_quality.write();
+        let Some(entry) = quality.get_mut(domain) else {
+            return false;
+        };
+        entry.checked_at = Instant::now();
+        if entry.plan.ip != plan.ip {
+            return false;
+        }
+        match faster {
+            Some(true) if entry.challenger == Some(rival) => {
+                entry.streak = entry.streak.saturating_add(1);
+            }
+            Some(true) => {
+                entry.challenger = Some(rival);
+                entry.streak = 1;
+            }
+            _ => {
+                entry.challenger = None;
+                entry.streak = 0;
+            }
+        }
+        entry.streak >= RECHECK_CONFIRMATIONS
+    }
+
+    /// Note the check without changing the verdict, used when no rival exists.
+    fn touch_quality(&self, domain: &str) {
+        if let Some(entry) = self.route_quality.write().get_mut(domain) {
+            entry.checked_at = Instant::now();
+        }
+    }
+
+    /// Best alternative for a live route, by the same score the cursor uses.
+    ///
+    /// `preferred` is the challenger of the previous check. Reusing it keeps
+    /// two confirmations on the same pair of addresses; without that, a rank
+    /// shift between checks picks a different rival and resets the streak, so
+    /// a clearly faster candidate could never accumulate two wins.
+    fn recheck_rival(
+        &self,
+        domain: &str,
+        current: IpAddr,
+        preferred: Option<IpAddr>,
+    ) -> Option<IpAddr> {
+        let config = self.config.snapshot();
+        let mut ips: Vec<IpAddr> = Vec::new();
+        if let Some(remote) = self.remote.remote_ips(domain) {
+            ips.extend(remote);
+        }
+        // Domains whose addresses only come from DoH still need an opponent.
+        // The cached answers cost nothing to read, unlike a fresh query.
+        for qtype in [1, 65] {
+            if let Some(answer) = self.cache.doh_answer(domain, qtype) {
+                ips.extend(answer.ips);
+                ips.extend(answer.hints);
+            }
+        }
+        if let Some(ip) = self
+            .cache
+            .last_good_route(domain, config.advanced.last_good_days)
+        {
+            ips.push(ip);
+        }
+        ips.retain(|ip| *ip != current && !self.ip_rejected(domain, *ip));
+        ips.sort_unstable();
+        ips.dedup();
+        if ips.is_empty() {
+            return None;
+        }
+        // Keep the previous challenger unless it has a failure record; a dead
+        // address must not be carried over just to keep the streak.
+        if let Some(preferred) = preferred {
+            if ips.contains(&preferred) && self.ip_failures_count(domain, preferred) == 0 {
+                return Some(preferred);
+            }
+        }
+        let candidates: Vec<Candidate> = ips
+            .into_iter()
+            .map(|ip| Candidate {
+                ip,
+                source: IpSource::Remote,
+            })
+            .collect();
+        let scores = self.score_candidates(domain, &candidates);
+        candidates
+            .into_iter()
+            .zip(scores)
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(candidate, _)| candidate.ip)
+    }
+
+    /// Failures recorded for one address, zero when it was never seen.
+    fn ip_failures_count(&self, domain: &str, ip: IpAddr) -> u32 {
+        self.ip_scores
+            .read()
+            .get(domain)
+            .and_then(|by_ip| by_ip.get(&ip))
+            .map(|score| score.failures)
+            .unwrap_or(0)
+    }
+
+    /// The challenger of the previous check, if it is still being compared.
+    fn preferred_challenger(&self, domain: &str) -> Option<IpAddr> {
+        self.route_quality
+            .read()
+            .get(domain)
+            .and_then(|entry| entry.challenger)
+    }
+
+    /// Take one check from the bucket. A check costs two handshakes, so the
+    /// bucket is sized in checks but refilled at the probe rate.
+    fn take_recheck_token(&self) -> bool {
+        let now = Instant::now();
+        let mut bucket = self.recheck_budget.lock();
+        let elapsed = now.duration_since(bucket.1).as_secs_f64();
+        bucket.0 = (bucket.0 + elapsed * RECHECK_CHECKS_PER_MIN / 60.0).min(2.0);
+        bucket.1 = now;
+        if bucket.0 >= 1.0 {
+            bucket.0 -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn quality_len(&self) -> usize {
+        self.route_quality.read().len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn backdate_quality(&self, domain: &str, age: Duration) {
+        if let Some(entry) = self.route_quality.write().get_mut(domain) {
+            entry.checked_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn backdate_quality_seen(&self, domain: &str, age: Duration) {
+        if let Some(entry) = self.route_quality.write().get_mut(domain) {
+            entry.last_seen = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_recheck_tokens(&self, tokens: f64) {
+        self.recheck_budget.lock().0 = tokens;
+    }
+
+    #[cfg(test)]
+    pub(super) fn grant_recheck_budget(&self) {
+        self.set_recheck_tokens(2.0);
+    }
+
     #[cfg(test)]
     pub(super) fn plan_cache_len(&self) -> usize {
         self.plan_cache_count.load(Ordering::Relaxed)
@@ -1220,6 +1554,7 @@ impl DecisionEngine {
             catalog_version: config.catalog_version,
         });
         self.remember_plan_arc(plan.clone());
+        self.record_quality(plan);
         if degraded {
             // The proven route suddenly got slow: drop the cached plan so the next
             // connection re-races the routes instead of staying pinned to it.

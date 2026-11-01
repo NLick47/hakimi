@@ -968,6 +968,16 @@ impl UpstreamPool {
         self.rejected_clients.lock().remove(host);
     }
 
+    /// Retire one host's pooled sockets so its next request opens a fresh
+    /// connection and re-races the route.
+    ///
+    /// Reuses the replacement-pool machinery: the host gets a dedicated pool
+    /// for one idle window, which is exactly long enough for the old sockets
+    /// to age out. In-flight requests keep their sockets.
+    pub(crate) fn retire_host(&self, host: &str) {
+        self.mark_rejected(host);
+    }
+
     fn host_slots(&self, host: &str) -> Arc<Semaphore> {
         // Hot path: every image request already has a slot after the first
         // one. Read it without taking the write lock or allocating a key.

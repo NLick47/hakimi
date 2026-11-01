@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -64,6 +64,8 @@ impl IpResolver for FakeResolver {
 struct FakeProber {
     working: Mutex<HashSet<IpAddr>>,
     working_fake_sni: Mutex<HashSet<(IpAddr, Option<String>)>>,
+    /// Per-address handshake latency, `10` when absent.
+    latencies: Mutex<HashMap<IpAddr, u64>>,
     /// Addresses that never answer the TCP handshake.
     dead_tcp: Mutex<HashSet<IpAddr>>,
     /// Variants whose TCP leg connects but whose handshake never completes.
@@ -115,7 +117,7 @@ impl Prober for FakeProber {
         };
         if works {
             Ok(ProbeSuccess {
-                latency_ms: 10,
+                latency_ms: self.latencies.lock().get(&ip).copied().unwrap_or(10),
                 alpn: None,
             })
         } else {
@@ -2022,5 +2024,407 @@ async fn plan_cache_overwrite_does_not_penalize_either_ip() {
     assert!(
         scores.get("example.com").is_none(),
         "no ip may gain a failure record from a route-level rejection"
+    );
+}
+
+/// The recheck exists for one case the scores cannot see: a pooled connection
+/// never reports another handshake, so a route that is live but slower than an
+/// alternative would stay chosen forever. Two confirmations are required so a
+/// single lucky sample cannot move a healthy route.
+#[tokio::test]
+async fn a_confirmed_faster_candidate_retires_the_live_route() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let slow: IpAddr = "203.0.113.10".parse().unwrap();
+    let fast: IpAddr = "203.0.113.11".parse().unwrap();
+    h.remote.ips.lock().replace(vec![slow, fast]);
+    h.prober.working.lock().extend([slow, fast]);
+    h.prober.latencies.lock().insert(slow, 500);
+    h.prober.latencies.lock().insert(fast, 100);
+
+    let mut plan = test_plan(TlsMode::Direct, None);
+    plan.ip = slow;
+    h.engine.record_quality(&Arc::new(plan));
+
+    assert!(
+        h.engine.recheck_routes(4).await.is_empty(),
+        "a route checked at connect time is not due yet"
+    );
+
+    h.engine.grant_recheck_budget();
+    h.engine
+        .backdate_quality("example.com", Duration::from_secs(600));
+    assert!(
+        h.engine.recheck_routes(4).await.is_empty(),
+        "one sample must not move the route"
+    );
+
+    h.engine.grant_recheck_budget();
+    h.engine
+        .backdate_quality("example.com", Duration::from_secs(600));
+    let retired = h.engine.recheck_routes(4).await;
+    assert_eq!(
+        retired.len(),
+        1,
+        "the second confirmation must retire the route"
+    );
+    assert_eq!(
+        retired[0].ip, slow,
+        "the live route is the one that has to go, not the challenger"
+    );
+}
+
+#[tokio::test]
+async fn a_slower_candidate_never_moves_the_route() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let live: IpAddr = "203.0.113.10".parse().unwrap();
+    let slower: IpAddr = "203.0.113.11".parse().unwrap();
+    h.remote.ips.lock().replace(vec![live, slower]);
+    h.prober.working.lock().extend([live, slower]);
+    h.prober.latencies.lock().insert(live, 100);
+    h.prober.latencies.lock().insert(slower, 500);
+
+    let mut plan = test_plan(TlsMode::Direct, None);
+    plan.ip = live;
+    h.engine.record_quality(&Arc::new(plan));
+
+    for _ in 0..4 {
+        h.engine.grant_recheck_budget();
+        h.engine
+            .backdate_quality("example.com", Duration::from_secs(600));
+        assert!(
+            h.engine.recheck_routes(4).await.is_empty(),
+            "a challenger that loses must reset the streak"
+        );
+    }
+}
+
+/// A probe that cannot complete says nothing about the alternative. Treating
+/// it as a win would move the route on every network hiccup.
+#[tokio::test]
+async fn a_failed_challenger_probe_never_moves_the_route() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let live: IpAddr = "203.0.113.10".parse().unwrap();
+    let broken: IpAddr = "203.0.113.11".parse().unwrap();
+    h.remote.ips.lock().replace(vec![live, broken]);
+    h.prober.working.lock().insert(live);
+
+    let mut plan = test_plan(TlsMode::Direct, None);
+    plan.ip = live;
+    h.engine.record_quality(&Arc::new(plan));
+
+    for _ in 0..4 {
+        h.engine.grant_recheck_budget();
+        h.engine
+            .backdate_quality("example.com", Duration::from_secs(600));
+        assert!(h.engine.recheck_routes(4).await.is_empty());
+    }
+}
+
+/// Without an alternative there is nothing to compare, and the check must not
+/// spend a handshake on the route it already knows.
+#[tokio::test]
+async fn a_single_candidate_is_not_probed() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let only: IpAddr = "203.0.113.10".parse().unwrap();
+    h.remote.ips.lock().replace(vec![only]);
+    h.prober.working.lock().insert(only);
+
+    let mut plan = test_plan(TlsMode::Direct, None);
+    plan.ip = only;
+    h.engine.record_quality(&Arc::new(plan));
+
+    h.engine.grant_recheck_budget();
+    h.engine
+        .backdate_quality("example.com", Duration::from_secs(600));
+    assert!(h.engine.recheck_routes(4).await.is_empty());
+    assert!(
+        h.prober.calls.lock().is_empty(),
+        "no alternative means no probe"
+    );
+}
+
+/// The probe budget must go to domains that are actually in use. A domain
+/// with no successful connection for the active window is skipped entirely.
+#[tokio::test]
+async fn an_idle_domain_is_not_rechecked() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let live: IpAddr = "203.0.113.10".parse().unwrap();
+    let faster: IpAddr = "203.0.113.11".parse().unwrap();
+    h.remote.ips.lock().replace(vec![live, faster]);
+    h.prober.working.lock().extend([live, faster]);
+    h.prober.latencies.lock().insert(live, 500);
+    h.prober.latencies.lock().insert(faster, 100);
+
+    let mut plan = test_plan(TlsMode::Direct, None);
+    plan.ip = live;
+    h.engine.record_quality(&Arc::new(plan));
+
+    h.engine.grant_recheck_budget();
+    h.engine
+        .backdate_quality("example.com", Duration::from_secs(600));
+    h.engine
+        .backdate_quality_seen("example.com", Duration::from_secs(3600));
+    assert!(h.engine.recheck_routes(4).await.is_empty());
+    assert!(
+        h.prober.calls.lock().is_empty(),
+        "an idle domain must not spend the probe budget"
+    );
+}
+
+/// The budget is what keeps the background task cheap: with one token only a
+/// single pair of probes may run, even when several domains are due.
+#[tokio::test]
+async fn the_probe_budget_caps_checks_per_window() {
+    let h = harness(&["example.com", "second.test"], RoutePolicy::direct());
+    let live: IpAddr = "203.0.113.10".parse().unwrap();
+    let rival: IpAddr = "203.0.113.11".parse().unwrap();
+    h.remote.ips.lock().replace(vec![live, rival]);
+    h.prober.working.lock().extend([live, rival]);
+    h.prober.latencies.lock().insert(live, 500);
+    h.prober.latencies.lock().insert(rival, 100);
+
+    for domain in ["example.com", "second.test"] {
+        let mut plan = test_plan(TlsMode::Direct, None);
+        plan.domain = domain.into();
+        plan.ip = live;
+        h.engine.record_quality(&Arc::new(plan));
+        h.engine.backdate_quality(domain, Duration::from_secs(600));
+    }
+
+    h.engine.set_recheck_tokens(1.0);
+    assert!(h.engine.recheck_routes(4).await.is_empty());
+    assert_eq!(
+        h.prober.calls.lock().len(),
+        2,
+        "one token must allow exactly one live-route plus one challenger probe"
+    );
+}
+
+/// A plaintext plan has no TLS handshake to compare, so it must not take a
+/// slot in the table nor spend the budget.
+#[tokio::test]
+async fn plaintext_plans_are_not_rechecked() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    h.remote
+        .ips
+        .lock()
+        .replace(vec!["203.0.113.11".parse().unwrap()]);
+
+    let mut plan = test_plan(TlsMode::Direct, None);
+    plan.ip = "203.0.113.10".parse().unwrap();
+    plan.tls = false;
+    h.engine.record_quality(&Arc::new(plan));
+
+    h.engine.grant_recheck_budget();
+    h.engine
+        .backdate_quality("example.com", Duration::from_secs(600));
+    assert!(h.engine.recheck_routes(4).await.is_empty());
+    assert!(h.prober.calls.lock().is_empty());
+}
+
+/// A rival that never answers must not become the permanent challenger. It
+/// outranks the healthy alternative only because the recheck never recorded
+/// its failure, so every check redials the dead address and the route is
+/// never moved to the candidate that actually works.
+#[tokio::test]
+async fn a_dead_challenger_must_not_block_the_recheck_forever() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let live: IpAddr = "203.0.113.10".parse().unwrap();
+    let dead: IpAddr = "203.0.113.11".parse().unwrap();
+    let better: IpAddr = "203.0.113.12".parse().unwrap();
+    h.remote.ips.lock().replace(vec![live, dead, better]);
+    h.prober.working.lock().extend([live, better]);
+    h.prober.latencies.lock().insert(live, 500);
+    h.prober.latencies.lock().insert(better, 100);
+
+    let mut plan = test_plan(TlsMode::Direct, None);
+    plan.ip = live;
+    h.engine.record_quality(&Arc::new(plan));
+
+    let mut retired = Vec::new();
+    for _ in 0..4 {
+        h.engine.grant_recheck_budget();
+        h.engine
+            .backdate_quality("example.com", Duration::from_secs(600));
+        retired = h.engine.recheck_routes(4).await;
+        if !retired.is_empty() {
+            break;
+        }
+    }
+
+    assert!(
+        h.prober.calls.lock().iter().any(|(ip, _, _)| *ip == better),
+        "the healthy alternative must be tried once the dead rival fails"
+    );
+    assert_eq!(retired.len(), 1, "the faster candidate must eventually win");
+}
+
+/// Routes measured on the old network are not evidence for the new one. The
+/// plans are dropped on a network change, so their quality entries have to go
+/// too; otherwise the recheck spends probes on plans that are no longer live.
+#[tokio::test]
+async fn a_network_change_forgets_the_live_route_quality() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    h.remote
+        .ips
+        .lock()
+        .replace(vec!["203.0.113.11".parse().unwrap()]);
+
+    let mut plan = test_plan(TlsMode::Direct, None);
+    plan.ip = "203.0.113.10".parse().unwrap();
+    h.engine.record_quality(&Arc::new(plan));
+    assert_eq!(h.engine.quality_len(), 1);
+
+    h.engine.on_network_change();
+    assert_eq!(
+        h.engine.quality_len(),
+        0,
+        "a network change must drop the routes measured on the old one"
+    );
+}
+
+/// The probes take time, and a new connection can move the route while they
+/// are in flight. The verdict then belongs to a plan that is no longer live:
+/// acting on it would drop the healthy replacement and force a pointless race.
+#[tokio::test]
+async fn a_verdict_for_a_replaced_plan_is_discarded() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let old: IpAddr = "203.0.113.10".parse().unwrap();
+    let new: IpAddr = "203.0.113.11".parse().unwrap();
+    let rival: IpAddr = "203.0.113.12".parse().unwrap();
+
+    let mut plan_old = test_plan(TlsMode::Direct, None);
+    plan_old.ip = old;
+    let mut plan_new = test_plan(TlsMode::Direct, None);
+    plan_new.ip = new;
+
+    h.engine.record_quality(&Arc::new(plan_old.clone()));
+    // A connection succeeded on the new address while the probes were running.
+    h.engine.record_quality(&Arc::new(plan_new.clone()));
+
+    assert!(
+        !h.engine
+            .record_challenge("example.com", &plan_old, rival, Some(true)),
+        "a verdict for the replaced plan must not retire anything"
+    );
+    assert!(
+        !h.engine
+            .record_challenge("example.com", &plan_new, rival, Some(true)),
+        "the discarded verdict must not count as the new plan's first confirmation"
+    );
+}
+
+/// Two confirmations must compare the same pair of addresses. A rank shift
+/// between checks would otherwise swap the challenger and reset the streak, so
+/// a clearly faster candidate could never accumulate the second win.
+#[tokio::test]
+async fn the_same_challenger_is_kept_across_checks() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let live: IpAddr = "203.0.113.10".parse().unwrap();
+    let first: IpAddr = "203.0.113.11".parse().unwrap();
+    let other: IpAddr = "203.0.113.12".parse().unwrap();
+    h.remote.ips.lock().replace(vec![live, first, other]);
+    h.prober.working.lock().extend([live, first, other]);
+    h.prober.latencies.lock().insert(live, 500);
+    h.prober.latencies.lock().insert(first, 120);
+    h.prober.latencies.lock().insert(other, 110);
+
+    let mut plan = test_plan(TlsMode::Direct, None);
+    plan.ip = live;
+    h.engine.record_quality(&Arc::new(plan));
+
+    h.engine.grant_recheck_budget();
+    h.engine
+        .backdate_quality("example.com", Duration::from_secs(600));
+    assert!(h.engine.recheck_routes(4).await.is_empty());
+
+    // A connection made the other candidate outrank the first challenger.
+    h.engine.record_ip("example.com", other, Some(50), false);
+
+    h.engine.grant_recheck_budget();
+    h.engine
+        .backdate_quality("example.com", Duration::from_secs(600));
+    let retired = h.engine.recheck_routes(4).await;
+    assert_eq!(
+        retired.len(),
+        1,
+        "the second confirmation must stay on the first challenger"
+    );
+    assert_eq!(retired[0].ip, live);
+}
+
+/// A dead challenger must not be carried over, or a single failing address
+/// would keep the streak while never beating the live route.
+#[tokio::test]
+async fn a_failed_challenger_is_not_preferred_again() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let live: IpAddr = "203.0.113.10".parse().unwrap();
+    let dead: IpAddr = "203.0.113.11".parse().unwrap();
+    let better: IpAddr = "203.0.113.12".parse().unwrap();
+    h.remote.ips.lock().replace(vec![live, dead, better]);
+    h.prober.working.lock().extend([live, better]);
+    h.prober.latencies.lock().insert(live, 500);
+    h.prober.latencies.lock().insert(better, 100);
+
+    let mut plan = test_plan(TlsMode::Direct, None);
+    plan.ip = live;
+    h.engine.record_quality(&Arc::new(plan.clone()));
+
+    // The previous check settled on the dead address and left a failure
+    // record behind. Keeping it as the preferred challenger would redial it
+    // forever and never reach the healthy candidate.
+    assert!(!h
+        .engine
+        .record_challenge("example.com", &plan, dead, Some(true)));
+    h.engine.record_ip("example.com", dead, None, true);
+
+    h.engine.grant_recheck_budget();
+    h.engine
+        .backdate_quality("example.com", Duration::from_secs(600));
+    h.engine.recheck_routes(4).await;
+    assert!(
+        h.prober.calls.lock().iter().any(|(ip, _, _)| *ip == better),
+        "a challenger with a failure record must not be preferred"
+    );
+}
+
+/// Addresses that only come from DoH still deserve an opponent; the cached
+/// answer costs nothing to read.
+#[tokio::test]
+async fn a_doh_only_domain_still_gets_an_opponent() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let live: IpAddr = "203.0.113.10".parse().unwrap();
+    let doh: IpAddr = "203.0.113.12".parse().unwrap();
+    h.prober.working.lock().extend([live, doh]);
+    h.prober.latencies.lock().insert(live, 500);
+    h.prober.latencies.lock().insert(doh, 100);
+    h.cache.put_doh_answer(crate::cache::CachedAnswer {
+        domain: "example.com".into(),
+        qtype: 1,
+        ips: vec![doh],
+        hints: Vec::new(),
+        ech_config: None,
+        ttl_secs: 300,
+        fetched_at: now(),
+    });
+
+    let mut plan = test_plan(TlsMode::Direct, None);
+    plan.ip = live;
+    h.engine.record_quality(&Arc::new(plan));
+
+    let mut retired = Vec::new();
+    for _ in 0..3 {
+        h.engine.grant_recheck_budget();
+        h.engine
+            .backdate_quality("example.com", Duration::from_secs(600));
+        retired = h.engine.recheck_routes(4).await;
+        if !retired.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        retired.len(),
+        1,
+        "a DoH-only candidate must be usable as the challenger"
     );
 }

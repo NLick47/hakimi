@@ -725,6 +725,72 @@ async fn retiring_the_pools_reopens_the_connection() {
     );
 }
 
+/// The recheck retires one host, not the whole pool. The next request for that
+/// host has to open a fresh connection so the route is re-raced, while every
+/// other host keeps its sockets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retiring_one_host_reopens_only_its_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepted = accepts.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            accepted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 8192];
+                loop {
+                    match socket.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\
+                                      Connection: keep-alive\r\n\r\nok",
+                                )
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, config) = engine_for(dir.path());
+    let tls = TlsContext::new().unwrap();
+    let pool = UpstreamPool::new(engine, tls, &config.snapshot());
+
+    let request = |path: &str| {
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("http://upstream.test:{port}{path}"))
+            .body(Either::Right(Full::new(Bytes::new())))
+            .unwrap()
+    };
+    let first = pool.send(request("/one"), false).await.unwrap();
+    let body = first.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"ok");
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+
+    pool.retire_host("upstream.test");
+
+    let second = pool.send(request("/two"), false).await.unwrap();
+    assert_eq!(second.status(), http::StatusCode::OK);
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        2,
+        "a retired host must not serve the next request from its old socket"
+    );
+}
+
 /// Image hosts sit on the http1 list, where the stall hedge is disabled. The
 /// hard-failure replay must still cover them — a broken thumbnail is the
 /// visible symptom this targets.

@@ -1097,6 +1097,31 @@ impl HakimiRuntime {
                 }
             }
         });
+
+        // Route recheck: a pooled connection never reports another handshake,
+        // so without this the chosen route is never compared again. One check
+        // per tick keeps the cost at a couple of handshakes a minute.
+        let runtime = self.clone();
+        let mut receiver = shutdown.subscribe();
+        self.spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(20));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = receiver.changed() => break,
+                    _ = ticker.tick() => {}
+                }
+                if runtime.status.paused() {
+                    continue;
+                }
+                for plan in runtime.engine.recheck_routes(1).await {
+                    runtime
+                        .engine
+                        .forget_plan(&plan.domain, plan.port, plan.tls);
+                    runtime.upstream.retire_host(&plan.domain);
+                }
+            }
+        });
     }
 
     fn spawn<F>(self: &Arc<Self>, future: F)
