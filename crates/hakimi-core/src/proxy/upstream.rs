@@ -722,6 +722,9 @@ mod tests {
         assert_eq!(host_header_name("example.com"), "example.com");
         assert_eq!(host_header_name("[2001:db8::1]:8443"), "2001:db8::1");
         assert_eq!(host_header_name("example.com."), "example.com.");
+        // A bare IPv6 literal must survive intact, not be truncated to
+        // `2001:db8:` by the host:port split.
+        assert_eq!(host_header_name("2001:db8::1"), "2001:db8::1");
     }
 
     #[test]

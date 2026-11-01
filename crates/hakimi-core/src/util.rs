@@ -313,7 +313,15 @@ pub fn host_header_name(value: &str) -> &str {
         return rest.split_once(']').map_or(rest, |(host, _)| host);
     }
     match value.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        // A bare IPv6 literal keeps splitting forever: a host part that still
+        // holds a colon was never a host:port pair.
+        Some((host, port))
+            if !host.is_empty()
+                && !host.contains(':')
+                && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            host
+        }
         _ => value,
     }
 }

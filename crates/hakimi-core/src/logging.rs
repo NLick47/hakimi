@@ -448,6 +448,19 @@ pub fn append_manual_line(path: &Path, line: &str) -> Result<()> {
     Ok(())
 }
 
+/// `host:port` (the most common log form) → redacted ip, keeping the port.
+/// Bracketed IPv6 survives the punctuation trim, so the brackets are
+/// stripped again here before parsing.
+fn redact_ip_port(token: &str) -> Option<String> {
+    let (host, port) = token.rsplit_once(':')?;
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let bare = host.trim_matches(|c: char| c == '[' || c == ']');
+    let ip = bare.parse::<std::net::IpAddr>().ok()?;
+    Some(format!("{}:{}", redact_ip(ip), port))
+}
+
 /// Mask IP addresses and URL query strings in exported log lines.
 pub fn redact_log_line(line: &str) -> String {
     line.split(' ')
@@ -461,6 +474,8 @@ pub fn redact_log_line(line: &str) -> String {
             });
             let replacement = if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
                 Some(redact_ip(ip))
+            } else if let Some(redacted) = redact_ip_port(trimmed) {
+                Some(redacted)
             } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
                 Some(redact_url(trimmed))
             } else {
@@ -598,6 +613,29 @@ mod tests {
         assert!(redacted.contains("ip=20.205.243.x"));
         assert!(redacted.contains("url=https://doh.example/redacted"));
         assert!(!redacted.contains("secret"));
+    }
+
+    #[test]
+    fn redacts_ip_port_pairs_in_log_lines() {
+        // `host:port` is the most common form in proxy logs; it used to slip
+        // past the bare-IP parse and into the exported diagnostics verbatim.
+        let redacted = redact_log_line("connected to 20.205.243.166:443 fine");
+        assert!(
+            !redacted.contains("20.205.243.166"),
+            "the full address must not survive: {redacted}"
+        );
+        assert!(
+            redacted.contains("to 20.205.243.x:443 fine"),
+            "the port is kept: {redacted}"
+        );
+
+        let redacted = redact_log_line("upstream=[2001:db8::1]:8443 done");
+        assert!(!redacted.contains("2001:db8::1"), "{redacted}");
+        assert!(redacted.contains(":8443"), "{redacted}");
+
+        // Bare IPs and URLs keep their existing behavior.
+        let redacted = redact_log_line("via 203.0.113.9, then");
+        assert!(redacted.contains("203.0.113.x"), "{redacted}");
     }
 
     #[test]
