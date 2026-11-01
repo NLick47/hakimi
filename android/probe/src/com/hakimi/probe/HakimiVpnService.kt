@@ -7,7 +7,9 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
 import android.net.IpPrefix
+import android.net.NetworkCapabilities
 import android.net.ProxyInfo
 import android.net.VpnService
 import android.os.Build
@@ -16,6 +18,7 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import org.json.JSONObject
+import java.net.Inet6Address
 import java.net.InetAddress
 
 /**
@@ -234,6 +237,12 @@ class HakimiVpnService : VpnService() {
                 )
             )
 
+        // Captured apps that do not read the system proxy resolve names
+        // through this network; with no servers they fail as "network
+        // unavailable" while the core keeps resolving on its own.
+        val dnsServers = underlyingDnsServers()
+        dnsServers.forEach { server -> runCatching { builder.addDnsServer(server) } }
+
         // SCOPE_ONLY narrows the VPN to an explicit allowlist; every other
         // scope captures everything. Both paths keep the hakimi process itself
         // out so the core's catalog/DoH traffic cannot loop back into its own
@@ -278,7 +287,7 @@ class HakimiVpnService : VpnService() {
         active = true
         lastError = ""
         retryDelay = 3_000L
-        Log.i(TAG, "VPN established apps=${if (scopeOnly) "only:${allowed.size}" else "all"} proxy=127.0.0.1:$port")
+        Log.i(TAG, "VPN established apps=${if (scopeOnly) "only:${allowed.size}" else "all"} dns=${dnsServers.size} proxy=127.0.0.1:$port")
         notice("hakimi VPN 加速中", captureLabel())
         scheduleHealth(15_000L)
     }
@@ -301,6 +310,31 @@ class HakimiVpnService : VpnService() {
                 scheduleHealth(retryDelay)
             }
         }
+    }
+
+    /**
+     * DNS servers to hand to the VPN network, taken from whatever physical
+     * network is up. Reading our own VPN network would return an empty list.
+     */
+    private fun underlyingDnsServers(): List<InetAddress> {
+        val manager = getSystemService(ConnectivityManager::class.java) ?: return emptyList()
+        fun serversOf(network: android.net.Network): List<InetAddress> {
+            val capabilities = manager.getNetworkCapabilities(network) ?: return emptyList()
+            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return emptyList()
+            return manager.getLinkProperties(network)?.dnsServers.orEmpty()
+        }
+        val active = manager.activeNetwork?.let { serversOf(it) }.orEmpty()
+        val servers = if (active.isNotEmpty()) {
+            active
+        } else {
+            manager.allNetworks.flatMap { serversOf(it) }
+        }
+        // IPv4 first: a stale IPv6 server on a v6-less carrier stalls every
+        // lookup. Link-local servers are useless on a network with no routes.
+        return servers
+            .distinct()
+            .filterNot { it.isLinkLocalAddress || it.isLoopbackAddress }
+            .sortedBy { it is Inet6Address }
     }
 
     private fun excludeAllTraffic(builder: VpnService.Builder) {
