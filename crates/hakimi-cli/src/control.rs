@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -7,7 +8,13 @@ use serde_json::Value;
 /// Local control endpoint on the configured proxy address.
 pub fn endpoint(runtime: &HakimiRuntime, path: &str) -> String {
     let config = runtime.config().snapshot();
-    format!("http://{}:{}{path}", config.proxy.bind, config.proxy.port)
+    endpoint_url(config.proxy.bind, config.proxy.port, path)
+}
+
+fn endpoint_url(bind: IpAddr, port: u16, path: &str) -> String {
+    // A v6 bind needs brackets in the authority: `http://::1:p` parses for
+    // no HTTP client. Same dialing rules as `hakimi env`.
+    format!("http://{}:{port}{path}", crate::env::dial_host(bind))
 }
 
 pub fn client(timeout: Duration) -> Result<reqwest::Client> {
@@ -93,5 +100,22 @@ pub async fn note_live_instance(runtime: &HakimiRuntime) {
     };
     if probe.get(url).send().await.is_ok() {
         eprintln!("note: the running instance keeps its current config until it restarts");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_url;
+
+    #[test]
+    fn v6_binds_are_bracketed_in_the_authority() {
+        let bind: std::net::IpAddr = "::1".parse().unwrap();
+        assert_eq!(
+            endpoint_url(bind, 8443, "/hakimi/stop"),
+            "http://[::1]:8443/hakimi/stop",
+            "`http://::1:8443` would fail to parse in every HTTP client"
+        );
+        let bind: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(endpoint_url(bind, 8443, "/x"), "http://127.0.0.1:8443/x");
     }
 }

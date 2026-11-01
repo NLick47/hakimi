@@ -34,6 +34,10 @@ pub async fn run(runtime: &HakimiRuntime, args: CatalogCommand, out: Output) -> 
         CatalogKind::Ip => vec![runtime.refresh_catalog("ip", force).await],
         CatalogKind::Doh => vec![runtime.refresh_catalog("doh", force).await],
     };
+    // Human mode only prints reports as they happen, so the value list never
+    // fills: "nothing configured" must be judged by the attempt count, or a
+    // total refresh failure would claim no catalog is configured at all.
+    let attempted = results.len();
     let mut failed = false;
     let mut values = Vec::new();
     for result in results {
@@ -57,7 +61,7 @@ pub async fn run(runtime: &HakimiRuntime, args: CatalogCommand, out: Output) -> 
     }
     if out.is_json() {
         out.json(&values)?;
-    } else if values.is_empty() {
+    } else if attempted == 0 {
         println!("no remote catalog configured (catalogs.ip and catalogs.doh are empty)");
     }
     Ok(if failed {

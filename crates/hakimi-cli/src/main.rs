@@ -113,7 +113,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Config(args) => config_cmd::run(&runtime, args, out).await?,
         Command::Ca { command } => return ca::run(&runtime, command, out).await,
         Command::Catalog { command } => return catalog::run(&runtime, command, out).await,
-        Command::Doh { command } => doh::run(&runtime, command, out).await?,
+        Command::Doh { command } => return doh::run(&runtime, command, out).await,
         Command::Env(args) => env::run(&runtime, args, out)?,
         Command::Pac => pac::run(&runtime).await?,
         Command::Export(args) => export::run(&runtime, args)?,

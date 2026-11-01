@@ -42,7 +42,15 @@ async fn try_live_status(runtime: &HakimiRuntime) -> Option<Value> {
 }
 
 fn same_data_dir(live: &Value, local: &Value) -> bool {
-    live["ca"]["fingerprintSha1"] == local["ca"]["fingerprintSha1"]
+    // A missing fingerprint on either side proves nothing: treating a
+    // stranger as this instance would show its status as our own.
+    match (
+        live["ca"]["fingerprintSha1"].as_str(),
+        local["ca"]["fingerprintSha1"].as_str(),
+    ) {
+        (Some(live_fp), Some(local_fp)) => live_fp == local_fp,
+        _ => false,
+    }
 }
 
 fn print_human(out: Output, value: &Value) {
@@ -131,5 +139,27 @@ fn print_warnings(value: &Value) {
             }
             println!("warning: {warning}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_data_dir;
+    use serde_json::json;
+
+    #[test]
+    fn missing_fingerprints_do_not_match_instances() {
+        assert!(same_data_dir(
+            &json!({"ca": {"fingerprintSha1": "abc"}}),
+            &json!({"ca": {"fingerprintSha1": "abc"}})
+        ));
+        assert!(!same_data_dir(
+            &json!({"ca": {"fingerprintSha1": "abc"}}),
+            &json!({"ca": {"fingerprintSha1": "def"}})
+        ));
+        assert!(
+            !same_data_dir(&json!({}), &json!({})),
+            "two fingerprint-less instances are not provably the same instance"
+        );
     }
 }
