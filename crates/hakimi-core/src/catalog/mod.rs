@@ -667,7 +667,7 @@ impl CatalogManager {
         }
 
         Ok(FetchOutcome::Body {
-            bytes: bytes.to_vec(),
+            bytes,
             etag,
             last_modified,
         })

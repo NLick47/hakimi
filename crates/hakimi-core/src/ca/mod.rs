@@ -208,12 +208,15 @@ impl CertificateAuthority {
     /// first read after start or after [`Self::invalidate_status`] — runs the
     /// probe itself, because guessing "untrusted" there would be wrong.
     pub fn installed(self: &Arc<Self>) -> bool {
-        // Test hook: a harness cannot install a CA without a user prompt.
-        if crate::hooks::assume_ca_installed() {
+        // Trust state changes only when the user (de)installs the CA. The
+        // flag is the common true case: every CONNECT passes through here,
+        // and the test hook below costs a process env lock plus an
+        // allocation. The two checks are order-equivalent.
+        if self.installed_flag.load(Ordering::Relaxed) {
             return true;
         }
-        // Trust state changes only when the user (de)installs the CA.
-        if self.installed_flag.load(Ordering::Relaxed) {
+        // Test hook: a harness cannot install a CA without a user prompt.
+        if crate::hooks::assume_ca_installed() {
             return true;
         }
         match self.cached_snapshot() {
