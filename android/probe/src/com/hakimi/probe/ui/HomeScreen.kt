@@ -108,7 +108,7 @@ class HomeScreen(private val context: Context, private val host: Host) {
             vpnMode && vpnActive -> {
                 heroTitle.text = "VPN 已开启"
                 heroSubtitle.text = if (data.running) {
-                    "全部应用已接管"
+                    captureSummary()
                 } else {
                     "核心重连中"
                 }
@@ -118,7 +118,7 @@ class HomeScreen(private val context: Context, private val host: Host) {
             }
             vpnMode -> {
                 heroTitle.text = "VPN 已暂停"
-                heroSubtitle.text = "浏览器自动接管"
+                heroSubtitle.text = "开启后走加速"
                 heroAction.text = "开启"
                 heroAction.isEnabled = true
                 heroAction.clickOnce { host.toggleAcceleration() }
@@ -148,6 +148,16 @@ class HomeScreen(private val context: Context, private val host: Host) {
             } else if (data.normalDomains > 0) {
                 append(" · ").append(data.normalDomains).append(" 个正常")
             }
+        }
+    }
+
+    /** Mirrors what the VPN actually captured, not what the mode is called. */
+    private fun captureSummary(): String {
+        val count = Prefs.allowedApps(context).size
+        return if (Prefs.scope(context) == Prefs.SCOPE_ONLY && count > 0) {
+            "仅 $count 个应用"
+        } else {
+            "全部应用走加速"
         }
     }
 

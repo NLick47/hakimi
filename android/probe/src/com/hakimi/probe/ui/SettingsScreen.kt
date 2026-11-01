@@ -27,7 +27,9 @@ class SettingsScreen(private val context: Context, private val host: Host) {
     private lateinit var envRow: SettingRow
     private lateinit var serviceRow: SettingRow
     private lateinit var modeRow: SettingRow
-    private lateinit var excludedRow: SettingRow
+    private lateinit var scopeRow: SettingRow
+    private var scopeCacheKey = ""
+    private var scopeCacheValue = ""
     private lateinit var certRow: SettingRow
     private lateinit var certInfo: TextView
 
@@ -50,15 +52,15 @@ class SettingsScreen(private val context: Context, private val host: Host) {
             LinearLayout.LayoutParams.WRAP_CONTENT
         ))
         content.addView(section("连接"))
-        modeRow = SettingRow(context, "运行模式", "本地代理或 VPN 接管全部应用")
+        modeRow = SettingRow(context, "运行模式", "本地代理 / VPN")
         modeRow.clickOnce { host.chooseMode() }
-        excludedRow = SettingRow(context, "排除应用", "这些应用不经过 hakimi，直接连接网络")
-        excludedRow.clickOnce { host.chooseExcludedApps() }
+        scopeRow = SettingRow(context, "接管范围", "哪些应用走加速")
+        scopeRow.clickOnce { host.chooseAppScope() }
         envRow = SettingRow(context, "环境状态", "证书安装状态")
         envRow.hideChevron()
         serviceRow = SettingRow(context, "核心服务", "本地加速核心的运行状态")
         serviceRow.hideChevron()
-        content.addView(rowsCard(modeRow, excludedRow, envRow, serviceRow))
+        content.addView(rowsCard(modeRow, scopeRow, envRow, serviceRow))
         content.addView(space(10f))
 
         content.addView(section("证书"))
@@ -177,14 +179,19 @@ class SettingsScreen(private val context: Context, private val host: Host) {
     fun refresh(data: CoreData) {
         val trusted = data.userCaTrusted
         val vpn = Prefs.mode(context) == Prefs.MODE_VPN
-        val excluded = Prefs.excludedApps(context)
+        val scope = Prefs.scope(context)
         modeRow.setValue(
-            if (vpn) "VPN · 全部应用" else "本地代理",
+            if (vpn) "VPN" else "本地代理",
             if (vpn) Palette.ACCENT else Palette.TEXT_2
         )
-        excludedRow.setValue(
-            excludedSummary(excluded),
-            if (excluded.isEmpty()) Palette.TEXT_2 else Palette.ACCENT
+        scopeRow.setSubtitle(if (vpn) "哪些应用走加速" else "仅 VPN 模式生效")
+        scopeRow.setValue(
+            scopeSummary(scope),
+            when {
+                !vpn -> Palette.MUTED
+                scope == Prefs.SCOPE_ALL -> Palette.TEXT_2
+                else -> Palette.ACCENT
+            }
         )
         envRow.setValue(
             when {
@@ -286,20 +293,30 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         }
     }
 
-    private fun excludedSummary(packages: Set<String>): String {
-        if (packages.isEmpty()) return "未排除"
-        val labels = packages.mapNotNull { pkg ->
-            runCatching {
-                val info = context.packageManager.getApplicationInfo(pkg, 0)
-                context.packageManager.getApplicationLabel(info).toString()
-            }.getOrNull()
+    private fun scopeSummary(scope: String): String {
+        if (scope != Prefs.SCOPE_ONLY) return "全部应用"
+        val packages = Prefs.allowedApps(context)
+        val key = "${packages.size}|${packages.hashCode()}"
+        if (key == scopeCacheKey) return scopeCacheValue
+        scopeCacheKey = key
+        scopeCacheValue = if (packages.isEmpty()) {
+            "未选择应用"
+        } else {
+            "${packages.size} 个 · ${labelOf(packages)}"
         }
-        return when {
-            labels.isEmpty() -> "${packages.size} 个"
-            labels.size == 1 -> labels.first()
-            else -> "${labels.first()} 等 ${labels.size} 个"
-        }
+        return scopeCacheValue
     }
+
+    private fun labelOf(packages: Set<String>): String = packages
+        .map { packageName ->
+            runCatching {
+                context.packageManager.getApplicationLabel(
+                    context.packageManager.getApplicationInfo(packageName, 0)
+                ).toString()
+            }.getOrDefault(packageName)
+        }
+        .minOrNull()
+        .orEmpty()
 
     private fun rowsCard(vararg rows: View): LinearLayout {
         val card = LinearLayout(context).apply {

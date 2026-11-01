@@ -32,7 +32,7 @@ import com.hakimi.probe.ui.CoreData
 import com.hakimi.probe.ui.CoreParser
 import com.hakimi.probe.ui.DiagnoseOutcome
 import com.hakimi.probe.ui.DiagnoseResultSheet
-import com.hakimi.probe.ui.ExcludedAppsSheet
+import com.hakimi.probe.ui.AppsScopeSheet
 import com.hakimi.probe.ui.HomeScreen
 import com.hakimi.probe.ui.Host
 import com.hakimi.probe.ui.Palette
@@ -166,8 +166,8 @@ class MainActivity : Activity(), Host {
     private var tab = 0
 
     /** One sheet instance for this activity; show() is idempotent. */
-    private val excludedAppsSheet: ExcludedAppsSheet by lazy {
-        ExcludedAppsSheet(this, this)
+    private val appsScopeSheet: AppsScopeSheet by lazy {
+        AppsScopeSheet(this, this)
     }
 
     private enum class CaWriteKind { INSTALL, BACKUP }
@@ -198,6 +198,7 @@ class MainActivity : Activity(), Host {
         super.onCreate(savedInstanceState)
         lastCaExportName = Prefs.caExportName(this)
         awaitingCaInstall = Prefs.awaitingCaInstall(this)
+        Prefs.seedScope(this)
         appVersionName = runCatching {
             packageManager.getPackageInfo(packageName, 0).versionName
         }.getOrNull().orEmpty().ifEmpty { "0.0.0" }
@@ -579,7 +580,7 @@ class MainActivity : Activity(), Host {
         ))
         sheet.add(modeOption(
             "VPN · 全部应用",
-            "自动接管所有应用，包括浏览器与 WebView（Android 13+）",
+            "HTTP(S) 走加速 · Android 13+",
             current == Prefs.MODE_VPN
         ) {
             sheet.dismiss()
@@ -696,15 +697,15 @@ class MainActivity : Activity(), Host {
         }
     }
 
-    override fun chooseExcludedApps() {
-        excludedAppsSheet.show()
+    override fun chooseAppScope() {
+        appsScopeSheet.show()
     }
 
-    override fun onExcludedAppsChanged() {
+    override fun onAppScopeChanged() {
         if (Prefs.mode(this) == Prefs.MODE_VPN &&
             (HakimiVpnService.active || data.running)
         ) {
-            showSnack("正在应用排除列表…")
+            showSnack("正在应用接管范围…")
             startService(
                 Intent(this, HakimiVpnService::class.java)
                     .setAction(HakimiVpnService.ACTION_STOP)

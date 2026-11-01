@@ -82,7 +82,7 @@ class HakimiVpnService : VpnService() {
                     lastError = ""
                     notice(
                         "hakimi VPN 加速中",
-                        "已接管全部应用"
+                        captureLabel()
                     )
                 }
                 handler.postDelayed(this, 15_000L)
@@ -113,6 +113,7 @@ class HakimiVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Prefs.migrateScope(this)
         alwaysOn = effectiveAlwaysOn()
         lockdown = isLockdownCompat()
         if (alwaysOn) {
@@ -146,7 +147,7 @@ class HakimiVpnService : VpnService() {
 
         stopping = false
         if (active) {
-            notice("hakimi VPN 加速中", "已接管全部应用")
+            notice("hakimi VPN 加速中", captureLabel())
             scheduleHealth(15_000L)
         } else {
             startCoreAndVpn()
@@ -233,21 +234,32 @@ class HakimiVpnService : VpnService() {
                 )
             )
 
-        // No allowed-application list: every app is captured. Exclude the
-        // hakimi process itself so the core's catalog/DoH traffic cannot loop
-        // back into its own proxy, plus every app the user opted out of.
-        var excluded = 0
-        if (runCatching { builder.addDisallowedApplication(packageName) }.isSuccess) {
-            excluded++
+        // SCOPE_ONLY narrows the VPN to an explicit allowlist; every other
+        // scope captures everything. Both paths keep the hakimi process itself
+        // out so the core's catalog/DoH traffic cannot loop back into its own
+        // proxy, plus every app the user opted out of. The builder rejects a
+        // mixed allow/disallow set, so the allowlist is resolved first.
+        val scopeOnly = Prefs.scope(this) == Prefs.SCOPE_ONLY
+        val allowed = if (scopeOnly) {
+            Prefs.allowedApps(this).filter { pkg ->
+                pkg != packageName &&
+                    runCatching { packageManager.getApplicationInfo(pkg, 0) }.isSuccess
+            }
+        } else {
+            emptyList()
         }
-        Prefs.excludedApps(this).forEach { pkg ->
-            if (pkg == packageName) return@forEach
-            if (runCatching { packageManager.getApplicationInfo(pkg, 0) }.isFailure) {
-                return@forEach
-            }
-            if (runCatching { builder.addDisallowedApplication(pkg) }.isSuccess) {
-                excluded++
-            }
+        // A builder without an allowlist captures everything, so an empty
+        // allowlist has to abort instead of quietly widening the scope.
+        if (scopeOnly && allowed.isEmpty()) {
+            lastError = "接管范围内还没有应用"
+            notice("hakimi VPN", "请在「接管范围」里至少选择一个应用")
+            return
+        }
+        if (scopeOnly) {
+            allowed.forEach { pkg -> runCatching { builder.addAllowedApplication(pkg) } }
+        } else if (runCatching { builder.addDisallowedApplication(packageName) }.isSuccess) {
+            // Only the hakimi process stays out; the core talks to its catalogs
+            // and must not loop back into its own proxy.
         }
 
         excludeAllTraffic(builder)
@@ -266,8 +278,8 @@ class HakimiVpnService : VpnService() {
         active = true
         lastError = ""
         retryDelay = 3_000L
-        Log.i(TAG, "VPN established apps=all excluded=$excluded proxy=127.0.0.1:$port")
-        notice("hakimi VPN 加速中", "已接管全部应用")
+        Log.i(TAG, "VPN established apps=${if (scopeOnly) "only:${allowed.size}" else "all"} proxy=127.0.0.1:$port")
+        notice("hakimi VPN 加速中", captureLabel())
         scheduleHealth(15_000L)
     }
 
@@ -280,7 +292,7 @@ class HakimiVpnService : VpnService() {
             if (ok) {
                 retryDelay = 3_000L
                 lastError = ""
-                notice("hakimi VPN 加速中", "已接管全部应用")
+                notice("hakimi VPN 加速中", captureLabel())
                 scheduleHealth(15_000L)
             } else {
                 retryDelay = (retryDelay * 2).coerceAtMost(30_000L)
@@ -354,6 +366,18 @@ class HakimiVpnService : VpnService() {
             CoreController.detach(ownerToken)
         }
         super.onDestroy()
+    }
+
+    /** What the notification claims to cover; must match what establishVpn captured. */
+    private fun captureLabel(): String {
+        val count = Prefs.allowedApps(this).count { pkg ->
+            runCatching { packageManager.getApplicationInfo(pkg, 0) }.isSuccess
+        }
+        return if (Prefs.scope(this) == Prefs.SCOPE_ONLY && count > 0) {
+            "已接管 $count 个应用"
+        } else {
+            "已接管全部应用"
+        }
     }
 
     private fun notice(title: String, text: String) {

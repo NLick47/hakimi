@@ -11,10 +11,16 @@ object Prefs {
     const val MODE_PROXY = "proxy"
     const val MODE_VPN = "vpn"
 
+    const val SCOPE_ALL = "all"
+    const val SCOPE_EXCLUDE = "exclude"
+    const val SCOPE_ONLY = "only"
+
     private const val FILE = "hakimi"
     private const val DESIRED = "desired_running"
     private const val MODE = "run_mode"
+    private const val SCOPE = "vpn_scope"
     private const val EXCLUDED_APPS = "vpn_excluded_apps"
+    private const val ALLOWED_APPS = "vpn_allowed_apps"
     private const val CA_EXPORT_NAME = "ca_export_name"
     private const val AWAITING_CA_INSTALL = "awaiting_ca_install"
     private const val UPDATE_CHECKED_AT = "update_checked_at"
@@ -52,6 +58,53 @@ object Prefs {
 
     fun setExcludedApps(context: Context, packages: Set<String>) {
         get(context).edit().putStringSet(EXCLUDED_APPS, packages.toSet()).commit()
+    }
+
+    /**
+     * Which apps the VPN captures. An install that never touched the scope
+     * keeps its exclusion list, so the stored value only overrides the legacy
+     * inference once the user actually picks a scope.
+     */
+    fun scope(context: Context): String {
+        val saved = get(context).getString(SCOPE, null)
+        if (saved == SCOPE_ONLY) return SCOPE_ONLY
+        return SCOPE_ALL
+    }
+
+    fun setScope(context: Context, scope: String) {
+        get(context).edit().putString(SCOPE, scope).commit()
+    }
+
+    /** The allowlist used when the scope is [SCOPE_ONLY]; empty means none. */
+    fun allowedApps(context: Context): Set<String> =
+        get(context).getStringSet(ALLOWED_APPS, null)?.toSet() ?: emptySet()
+
+    fun setAllowedApps(context: Context, packages: Set<String>) {
+        get(context).edit().putStringSet(ALLOWED_APPS, packages.toSet()).commit()
+    }
+
+    /** Turns a legacy exclusion list into the equivalent allowlist once. */
+    fun migrateScope(context: Context) {
+        if (get(context).getString(SCOPE, null) != SCOPE_EXCLUDE) return
+        val excluded = excludedApps(context)
+        val allowed = InstalledApps.launchable(context)
+            .map { it.packageName }
+            .filterNot { it in excluded }
+            .toSet()
+        setAllowedApps(context, allowed)
+        setScope(context, SCOPE_ONLY)
+        get(context).edit().remove(EXCLUDED_APPS).apply()
+    }
+
+    /**
+     * First run starts narrow: capturing every app breaks anything that does not
+     * read the system proxy. An install that already keeps an exclusion list has
+     * made its own choice and keeps it.
+     */
+    fun seedScope(context: Context) {
+        migrateScope(context)
+        if (get(context).contains(SCOPE)) return
+        setScope(context, SCOPE_ALL)
     }
 
     /** Last CA file this device exported, used to keep the install sheet honest. */

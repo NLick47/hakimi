@@ -6,7 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 
 /**
- * Launchable applications with network access. Used by the exclusion picker.
+ * Launchable applications with network access. Used by the scope picker.
  * A launcher query keeps the app within normal package visibility while still
  * covering every app a user can open, including WebView-based browsers.
  */

@@ -169,7 +169,7 @@ class Sheet(
         secondaryLabel: String? = null,
         onSecondary: () -> Unit = {},
         danger: Boolean = false,
-    ) {
+    ): TextView {
         val content = ensureFooter()
         val row = context.row()
         if (secondaryLabel != null) {
@@ -189,6 +189,7 @@ class Sheet(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ))
+        return primary
     }
 
     private fun ensureFooter(): LinearLayout {
