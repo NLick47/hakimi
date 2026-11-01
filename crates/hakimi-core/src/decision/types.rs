@@ -15,5 +15,8 @@ pub(super) struct DohExpansion {
     pub(super) stale: bool,
 }
 
-/// Consume this many initial (catalog/cache) candidates before expanding with DoH.
+/// Floor for the initial-candidate count at which DoH expansion is allowed.
+/// The cursor only expands once the initial list is exhausted (or has room
+/// below its cap), so a full catalog list delays DoH until every candidate
+/// has failed; `prefetch_cold_route` covers that window for real traffic.
 pub(super) const EARLY_DOH_AFTER: usize = 3;

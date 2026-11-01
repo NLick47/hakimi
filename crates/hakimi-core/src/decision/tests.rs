@@ -1955,3 +1955,72 @@ fn bench_wide_group_plan_cache_lookup() {
         let _ = h.engine.cached_plan("last.example.com", 443, true);
     });
 }
+
+/// Regression test (audit finding 5, fixed): a route-level 403 retires the
+/// route only and never records an IP failure. A masked-SNI request rejected
+/// by the origin says something about the name, not the address — the same
+/// policy as note_blocked_candidate. The old behavior pulled the healthy
+/// IP's ewma toward 10s and degraded its direct-mode ranking.
+#[tokio::test]
+async fn route_level_403_keeps_the_ip_unpunished() {
+    let h = harness(
+        &["example.com"],
+        RoutePolicy::sni(vec!["www.baidu.com".into()]),
+    );
+    let ip: IpAddr = "1.1.1.1".parse().unwrap();
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::FakeSni, Some("www.baidu.com"))));
+
+    assert!(h
+        .engine
+        .note_http_rejection("example.com", 443, true, http::StatusCode::FORBIDDEN));
+
+    assert!(
+        h.engine.cached_plan("example.com", 443, true).is_none(),
+        "the rejected route is forgotten"
+    );
+    assert!(
+        h.engine.route_rejected("example.com", TlsMode::FakeSni),
+        "the mode is still retired"
+    );
+    let scores = h.engine.ip_scores.read();
+    assert!(
+        scores.get("example.com").and_then(|by_ip| by_ip.get(&ip)).is_none(),
+        "a route-level rejection must not write a failure record for the address"
+    );
+}
+
+/// Regression test (audit finding 6, fixed): note_http_rejection looks the
+/// plan up by (host, port, tls). When connection B overwrote the plan cache,
+/// connection A's 403 used to penalize the innocent IP2. After the fix a
+/// route-level rejection has no per-IP side effects at all, so neither IP is
+/// touched no matter which plan the cache returns.
+#[tokio::test]
+async fn plan_cache_overwrite_does_not_penalize_either_ip() {
+    let h = harness(
+        &["example.com"],
+        RoutePolicy::sni(vec!["www.baidu.com".into()]),
+    );
+    let real_offender: IpAddr = "203.0.113.50".parse().unwrap();
+    let innocent: IpAddr = "203.0.113.51".parse().unwrap();
+
+    let mut plan = test_plan(TlsMode::FakeSni, Some("www.baidu.com"));
+    plan.ip = real_offender;
+    h.engine.remember_plan_arc(Arc::new(plan));
+
+    // Connection B succeeds with a different ip and overwrites the plan cache.
+    let mut other = test_plan(TlsMode::FakeSni, Some("www.baidu.com"));
+    other.ip = innocent;
+    h.engine.remember_plan_arc(Arc::new(other));
+
+    // Connection A's 403 arrives now.
+    assert!(h
+        .engine
+        .note_http_rejection("example.com", 443, true, http::StatusCode::FORBIDDEN));
+
+    let scores = h.engine.ip_scores.read();
+    assert!(
+        scores.get("example.com").is_none(),
+        "no ip may gain a failure record from a route-level rejection"
+    );
+}

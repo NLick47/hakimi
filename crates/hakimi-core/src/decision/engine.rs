@@ -96,6 +96,8 @@ const IP_REJECTION_TTL: Duration = Duration::from_secs(300);
 pub(super) const SNI_REJECTION_TTL: Duration = Duration::from_secs(600);
 /// Cap for the re-probe backoff of continuously failing addresses.
 const PROBE_BACKOFF_MAX: Duration = Duration::from_secs(1800);
+/// Entry cap for the same table, matching the other observation tables.
+const PROBE_BACKOFF_ENTRIES: usize = 1024;
 
 /// The key a plan is stored under.  Hot-path callers already pass a
 /// normalized host, so the common case borrows.
@@ -190,8 +192,14 @@ impl DecisionEngine {
                 routes.clear();
             }
         }
-        match routes.get(domain) {
-            Some((known_ip, known_mode, _)) if *known_ip == ip && *known_mode == mode => false,
+        match routes.get_mut(domain) {
+            // Unchanged route: refresh the stamp so the read-lock fast path
+            // keeps working and the retention below never drops an active
+            // domain (which would log a phantom "changed" route).
+            Some((known_ip, known_mode, at)) if *known_ip == ip && *known_mode == mode => {
+                *at = now;
+                false
+            }
             _ => {
                 routes.insert(domain.to_string(), (ip, mode, now));
                 true
@@ -605,9 +613,16 @@ impl DecisionEngine {
     /// route completes TLS and then returns 403 from nginx. Drop that route and
     /// let the next connection try the next configured attempt.
     ///
-    /// Returns true when the plan (route or candidate IP) was actually
-    /// rejected, so the pool can retire the connection that produced the
-    /// response instead of handing it to the next request.
+    /// Every action here is mode-scoped, never IP-scoped: a route-level 403
+    /// says nothing about the address (the same policy as
+    /// [`Self::note_blocked_candidate`]), so a route rejection must not touch
+    /// `ip_scores`. The plan comes from the cache — a pooled response cannot
+    /// be attributed to the connection that produced it — which is safe
+    /// precisely because no action depends on the plan's IP.
+    ///
+    /// Returns true when the plan (route) was actually rejected, so the pool
+    /// can retire the connection that produced the response instead of handing
+    /// it to the next request.
     #[must_use]
     pub fn note_http_rejection(
         &self,
@@ -634,7 +649,6 @@ impl DecisionEngine {
         );
         self.forget_plan(&plan.domain, plan.port, plan.tls);
         self.cache.mark_skip_once([plan.domain.clone()]);
-        self.record_ip(&plan.domain, plan.ip, None, true);
         let mut rejections = self.route_rejections.write();
         if rejections.len() > 1024 {
             rejections.retain(|_, at| at.elapsed() < ROUTE_REJECTION_TTL);
@@ -799,6 +813,15 @@ impl DecisionEngine {
 
     fn note_probe_failure(&self, domain: &str, ip: IpAddr) {
         let mut map = self.probe_backoff.lock();
+        // Bounded like every other observation table. Expired entries are
+        // already "ready", so dropping them changes nothing observable.
+        if map.len() >= PROBE_BACKOFF_ENTRIES {
+            let now = Instant::now();
+            map.retain(|_, (_, next)| *next > now);
+            if map.len() >= PROBE_BACKOFF_ENTRIES {
+                map.clear();
+            }
+        }
         let consecutive = map.get(&(domain.to_string(), ip)).map_or(0, |(n, _)| *n) + 1;
         let delay_secs = 60u64
             .saturating_mul(1u64 << (consecutive - 1).min(5))
