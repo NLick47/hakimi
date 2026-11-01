@@ -28,6 +28,14 @@ fn set_init_error(message: impl Into<String>) {
 }
 
 fn alloc_string(value: String) -> *mut c_char {
+    // JSON strings may legally carry NUL; replace it lossily instead of
+    // returning null, which callers read as "invalid handle or panic" and
+    // which would poison every later status call.
+    let value = if value.as_bytes().contains(&0) {
+        value.replace('\0', "\u{FFFD}")
+    } else {
+        value
+    };
     match CString::new(value) {
         Ok(value) => value.into_raw(),
         Err(_) => ptr::null_mut(),
@@ -405,6 +413,18 @@ pub unsafe extern "C" fn hakimi_free_string(value: *mut c_char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alloc_string_survives_embedded_nul() {
+        let pointer = alloc_string("{\"name\":\"a\u{0}b\"}".to_string());
+        assert!(
+            !pointer.is_null(),
+            "a NUL in a JSON string must not null out the response"
+        );
+        let text = unsafe { CStr::from_ptr(pointer) }.to_string_lossy().to_string();
+        unsafe { hakimi_free_string(pointer) };
+        assert!(text.contains('\u{FFFD}'), "NUL is replaced lossily: {text}");
+    }
 
     #[test]
     fn ffi_roundtrip_status_and_command() {
