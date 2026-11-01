@@ -1155,7 +1155,7 @@ impl DecisionEngine {
     /// proves nothing about the address, so a failed live probe only resets
     /// the streak; a failed challenger also takes a failure record, otherwise
     /// it would be picked again on every check.
-    pub async fn recheck_routes(&self, budget: usize) -> Vec<Arc<ConnectPlan>> {
+    pub(crate) async fn recheck_routes(&self, budget: usize) -> Vec<Arc<ConnectPlan>> {
         if budget == 0 {
             return Vec::new();
         }
