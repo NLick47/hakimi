@@ -712,7 +712,7 @@ impl DecisionEngine {
         status: StatusCode,
     ) -> bool {
         if matches!(status.as_u16(), 400 | 403 | 429 | 451)
-            && self.note_blocked_candidate(domain, port, tls, status)
+            && self.note_blocked_candidate(domain, port, tls, status, false)
         {
             return true;
         }
@@ -724,12 +724,22 @@ impl DecisionEngine {
     /// whole mode would also discard its healthy addresses. Only groups that
     /// opt in (currently GitHub) are affected; for every other site the
     /// response remains a normal warm-up result.
+    ///
+    /// `penalize_ip` marks callers that can attribute the response to the
+    /// connection's own plan. The warm-up dials fresh and may penalize; the
+    /// traffic path looks the plan up in the cache, where a newer generation
+    /// may have replaced it — penalizing then would block the current best IP
+    /// for the rejection window while the real offender keeps serving. The
+    /// traffic path still retires the route (`forget_plan` + `skip_once`) so
+    /// the next connection re-plans; the IP-level feedback is left to warm-up
+    /// and the periodic route recheck.
     pub fn note_blocked_candidate(
         &self,
         domain: &str,
         port: u16,
         tls: bool,
         status: StatusCode,
+        penalize_ip: bool,
     ) -> bool {
         let Some(plan) = self.cached_plan(domain, port, tls) else {
             return false;
@@ -760,10 +770,13 @@ impl DecisionEngine {
             ip = %plan.ip,
             mode = %plan.mode,
             status = status.as_u16(),
-            "upstream returned a block page; penalizing the candidate IP"
+            "upstream returned a block page; retiring the route"
         );
         self.forget_plan(&plan.domain, plan.port, plan.tls);
         self.cache.mark_skip_once([plan.domain.clone()]);
+        if !penalize_ip {
+            return true;
+        }
         self.record_ip(&plan.domain, plan.ip, None, true);
         let mut rejected = self.ip_rejections.write();
         if rejected.len() > 1024 {

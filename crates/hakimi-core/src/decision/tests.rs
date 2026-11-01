@@ -244,6 +244,7 @@ fn masked_sni_block_status_does_not_penalize_the_ip() {
         443,
         true,
         http::StatusCode::FORBIDDEN,
+        true,
     ));
     assert!(!h
         .engine
@@ -260,6 +261,7 @@ fn masked_sni_block_status_does_not_penalize_the_ip() {
         443,
         true,
         http::StatusCode::FORBIDDEN,
+        true,
     ));
     assert!(h
         .engine
@@ -836,12 +838,14 @@ async fn blocked_warmup_penalizes_only_the_cached_ip() {
         "example.com",
         443,
         true,
-        http::StatusCode::BAD_REQUEST
+        http::StatusCode::BAD_REQUEST,
+        true
     ));
     assert!(h.engine.cached_plan("example.com", 443, true).is_some());
     assert!(!h.engine.ip_rejected("example.com", bad));
 
-    // GitHub opts in: the same status drops only that IP.
+    // GitHub opts in: the same status drops only that IP. The warm-up dials
+    // fresh, so its plan attribution is trusted and the IP penalty applies.
     let mut github_plan = test_plan(TlsMode::Direct, None);
     github_plan.domain = "github.com".into();
     github_plan.group_id = "github".into();
@@ -850,7 +854,8 @@ async fn blocked_warmup_penalizes_only_the_cached_ip() {
         "github.com",
         443,
         true,
-        http::StatusCode::BAD_REQUEST
+        http::StatusCode::BAD_REQUEST,
+        true
     ));
 
     assert!(h.engine.cached_plan("github.com", 443, true).is_none());
@@ -881,6 +886,40 @@ async fn blocked_warmup_penalizes_only_the_cached_ip() {
     assert_eq!(plan.ip, good);
 }
 
+/// Regression test (finding C1): the traffic path looks the plan up in the
+/// cache, where a newer generation may have replaced the one that produced
+/// the response. It must retire the route but never touch ip_scores or
+/// ip_rejections.
+#[tokio::test]
+async fn traffic_path_block_pages_retire_without_penalizing_the_ip() {
+    // The traffic path looks the plan up in the cache, where a newer
+    // generation may have replaced the one that produced the response. It
+    // must retire the route but never touch ip_scores or ip_rejections.
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let cached_ip: IpAddr = "1.1.1.1".parse().unwrap();
+    let mut github_plan = test_plan(TlsMode::Direct, None);
+    github_plan.domain = "github.com".into();
+    github_plan.group_id = "github".into();
+    h.engine.remember_plan_arc(Arc::new(github_plan));
+
+    assert!(
+        h.engine
+            .note_blocked_candidate("github.com", 443, true, http::StatusCode::TOO_MANY_REQUESTS, false),
+        "the route must still be reported as invalidated"
+    );
+    assert!(
+        h.engine.cached_plan("github.com", 443, true).is_none(),
+        "the plan is forgotten so the next connection re-plans"
+    );
+    let scores = h.engine.ip_scores.read();
+    assert!(
+        scores.get("github.com").is_none(),
+        "an unattributable response must not write a failure record"
+    );
+    drop(scores);
+    assert!(!h.engine.ip_rejected("github.com", cached_ip));
+}
+
 #[test]
 fn real_traffic_block_pages_use_candidate_recovery_for_opted_groups() {
     let h = harness(
@@ -908,13 +947,16 @@ fn real_traffic_block_pages_use_candidate_recovery_for_opted_groups() {
             true,
             http::StatusCode::TOO_MANY_REQUESTS
         ),
-        "the blocked IP must be reported to the pool"
+        "the connection must still be retired so the next request re-plans"
     );
     assert!(
         !h.engine.route_rejected("github.com", TlsMode::Direct),
         "a block page for one opted-in candidate must not discard the whole mode"
     );
-    assert!(h.engine.ip_rejected("github.com", bad));
+    // The traffic path cannot attribute the response to the connection's own
+    // plan (the cache may hold a newer generation), so the IP-level penalty
+    // is left to the warm-up, which dials fresh.
+    assert!(!h.engine.ip_rejected("github.com", bad));
 }
 
 #[tokio::test]

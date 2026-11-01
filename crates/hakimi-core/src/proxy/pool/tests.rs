@@ -232,7 +232,7 @@ async fn cancelled_discovery_does_not_poison_the_domain() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_real_block_page_penalizes_the_candidate_ip() {
+async fn a_real_block_page_drops_the_route_without_an_ip_penalty() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -269,9 +269,12 @@ async fn a_real_block_page_penalizes_the_candidate_ip() {
         engine.cached_plan("upstream.test", port, false).is_none(),
         "the blocked route must be dropped"
     );
-    assert!(
-        engine.ip_failures("upstream.test", "127.0.0.1".parse().unwrap()) > 0,
-        "the blocked address should have a failure score"
+    // The traffic path cannot attribute a pooled response to the connection's
+    // own plan, so the IP-level penalty is left to the warm-up.
+    assert_eq!(
+        engine.ip_failures("upstream.test", "127.0.0.1".parse().unwrap()),
+        0,
+        "an unattributable response must not score a failure"
     );
 }
 

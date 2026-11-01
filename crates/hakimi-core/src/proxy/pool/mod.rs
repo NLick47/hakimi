@@ -567,7 +567,15 @@ impl UpstreamPool {
             } else {
                 clients.auto.clone()
             };
-            (client, clients.recovery.clone())
+            // A rejected host must not replay into the global recovery pool:
+            // its sockets may predate the rejection and would hand the request
+            // a route that was just retired, bypassing the connector.
+            let recovery_client = if rejected_client.is_some() {
+                client.clone()
+            } else {
+                clients.recovery.clone()
+            };
+            (client, recovery_client)
         };
         let debug_host = host;
         let debug_path = uri.path();
@@ -1047,7 +1055,9 @@ impl UpstreamPool {
             Ok(Ok(response)) => {
                 let status = response.status();
                 if matches!(status.as_u16(), 400 | 403 | 429 | 451)
-                    && self.engine.note_blocked_candidate(host, port, true, status)
+                    && self
+                        .engine
+                        .note_blocked_candidate(host, port, true, status, true)
                 {
                     // Only opted-in groups (GitHub) treat this as a route
                     // failure; other sites keep the previous warm-up behavior.
