@@ -13,7 +13,7 @@ use crate::config::{AppConfig, ConfigManager, EchSource, GroupConfig, RoutePolic
 use crate::domain::normalize_hostname;
 use crate::resolver::{DohResolution, IpResolver};
 use crate::status::{AttemptRecord, DomainDiagnostics, State, StatusStore};
-use crate::strategy::{CacheStatus, FailureReason, IpSource, TlsMode};
+use crate::strategy::{CacheStatus, DohSource, FailureReason, IpSource, TlsMode};
 use crate::util::now;
 
 use super::cursor::{Route, RouteCursor};
@@ -1728,7 +1728,12 @@ impl DecisionEngine {
                 // is logged too: "DoH added nothing" and "DoH answered with
                 // the address that is already black-holed" need different
                 // fixes, and only the raw IPs tell them apart.
-                if elapsed > 1000 {
+                //
+                // A cached answer cannot be slow by itself: its elapsed time is
+                // the wait on the resolver's single-flight lock while another
+                // request ran the real query, so it never belongs on the
+                // was-slow path.
+                if elapsed > 1000 && !matches!(source, DohSource::Cache) {
                     tracing::warn!(
                         domain = %domain,
                         source = ?source,
