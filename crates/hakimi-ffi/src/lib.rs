@@ -65,6 +65,9 @@ impl HakimiHandle {
     }
 
     fn command(&self, request: &str) -> String {
+        // Same entry contract as the Android shell: every command starts from
+        // a clean last_error, so it always mirrors the most recent command.
+        self.clear_error();
         let value: Value = match serde_json::from_str(request) {
             Ok(value) => value,
             Err(error) => return self.error_json(format!("invalid command JSON: {error}")),
@@ -100,10 +103,11 @@ impl HakimiHandle {
                 json!({"ok": true, "result": {"paused": false}}).to_string()
             }
             "setPaused" => {
-                let paused = value
-                    .get("paused")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                // A missing field must not silently resume acceleration: the
+                // default would flip global traffic, so require the value.
+                let Some(paused) = value.get("paused").and_then(Value::as_bool) else {
+                    return self.error_json("setPaused needs boolean `paused`");
+                };
                 self.runtime.set_paused(paused);
                 json!({"ok": true, "result": {"paused": paused}}).to_string()
             }

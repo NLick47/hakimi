@@ -103,10 +103,15 @@ fn start_proxy() -> Result<()> {
 }
 
 fn stop_proxy() {
+    clear_error();
     let _guard = LIFECYCLE_LOCK.lock();
     let host = HOST.lock().clone();
     if let Some(host) = host {
-        let _ = host.tokio.block_on(host.runtime.stop());
+        // A failed stop must reach the Java side; swallowing it leaves the
+        // supervisor believing the service ended cleanly.
+        if let Err(error) = host.tokio.block_on(host.runtime.stop()) {
+            set_error(format!("{error:#}"));
+        }
     }
 }
 
@@ -467,6 +472,9 @@ pub extern "system" fn Java_com_hakimi_probe_Native_exportDiagnostics(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
+    // Same entry contract as bool_entry: start from a clean last_error so it
+    // only ever reflects the most recent command.
+    clear_error();
     let value = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(export_diagnostics)) {
         Ok(Ok(path)) => path,
         Ok(Err(error)) => {

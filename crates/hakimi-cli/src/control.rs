@@ -61,11 +61,17 @@ pub async fn stop(runtime: &HakimiRuntime) -> Result<()> {
         bail!("the instance did not accept the stop request");
     }
     // The instance flushes the cache and restores the OS proxy before it
-    // closes the listener, so wait for the port to stop answering.
+    // closes the listener, so wait for the port to stop answering. Only a
+    // refused connection proves it stopped: during the flush the listener
+    // still accepts, so a timeout just means it is busy.
     let health = endpoint(runtime, "/hakimi/health");
     let probe = client(Duration::from_millis(400))?;
     for _ in 0..40 {
-        if probe.get(&health).send().await.is_err() {
+        let stopped = match probe.get(&health).send().await {
+            Err(error) => error.is_connect(),
+            Ok(_) => false,
+        };
+        if stopped {
             println!("stopped");
             return Ok(());
         }
