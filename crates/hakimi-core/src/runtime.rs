@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -187,6 +187,20 @@ pub struct HakimiRuntime {
     /// Per-domain warm-up backoff: domains whose last warm-up failed are
     /// re-tried on a growing interval instead of on every warm trigger.
     warm_backoff: Mutex<HashMap<String, (u32, Instant)>>,
+    /// Serializes the OS proxy writes: apply/restore/disable each run several
+    /// OS commands and must not interleave (the manual re-apply button races
+    /// the network-change monitor).
+    proxy_write: Mutex<()>,
+    /// Monotonic intent counter for OS proxy writes. Every apply/release/
+    /// disable captures a sequence when the intent happens; a write that
+    /// lands after a newer intent was captured is skipped, so a toggle race
+    /// resolves to the last user action instead of the last scheduler winner.
+    proxy_intent: AtomicU64,
+    /// Merge concurrent probe sweeps: a sweep arriving while another runs
+    /// waits for it and skips its own pass.
+    sweep_gate: tokio::sync::Mutex<()>,
+    sweep_epoch: AtomicU64,
+    sweep_done: AtomicU64,
     started_at: DateTime<Utc>,
 }
 
@@ -308,6 +322,11 @@ impl HakimiRuntime {
             started: AtomicBool::new(false),
             probe_gate: Arc::new(Semaphore::new(8)),
             warm_backoff: Mutex::new(HashMap::new()),
+            proxy_write: Mutex::new(()),
+            proxy_intent: AtomicU64::new(0),
+            sweep_gate: tokio::sync::Mutex::new(()),
+            sweep_epoch: AtomicU64::new(0),
+            sweep_done: AtomicU64::new(0),
             started_at,
         });
         // A previous crash may have left the OS proxy pointing at us.
@@ -595,9 +614,20 @@ impl HakimiRuntime {
     /// The core is paused, any service that still points at us is switched
     /// off, and the snapshot is dropped: restoring it later would put our
     /// captured state on top of the settings the new owner just wrote.
+    fn proxy_write_seq(&self) -> u64 {
+        self.proxy_intent.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// True when a newer write intent was captured after `seq`: this
+    /// operation's outcome is obsolete and must not touch the OS or the
+    /// status fields the newer intent now owns.
+    fn proxy_write_stale(&self, seq: u64) -> bool {
+        self.proxy_intent.load(Ordering::SeqCst) > seq
+    }
+
     pub fn abandon_takeover(&self) {
         self.pause();
-        self.disable_system_proxy_inner();
+        self.disable_system_proxy_inner(self.proxy_write_seq());
         self.system_proxy.forget();
         *self.proxy_error.write() = Some("system proxy was changed by another program".to_string());
         tracing::warn!(
@@ -608,10 +638,18 @@ impl HakimiRuntime {
     /// Disable a PAC takeover that points at this instance. Only this
     /// instance's own PAC is touched; a user-configured proxy is left alone.
     pub fn disable_system_proxy(&self) {
-        self.disable_system_proxy_inner();
+        self.disable_system_proxy_inner(self.proxy_write_seq());
     }
 
-    fn disable_system_proxy_inner(&self) {
+    fn disable_system_proxy_inner(&self, seq: u64) {
+        let _write = self.proxy_write.lock();
+        if self.proxy_write_stale(seq) {
+            return;
+        }
+        self.disable_system_proxy_unlocked();
+    }
+
+    fn disable_system_proxy_unlocked(&self) {
         *self.proxy_applied.write() = None;
         *self.proxy_error.write() = None;
         let Some(url) = self.pac_url() else {
@@ -630,7 +668,8 @@ impl HakimiRuntime {
     }
 
     pub fn apply_system_proxy(&self) -> Result<SystemProxyStatus> {
-        self.apply_system_proxy_inner()
+        let seq = self.proxy_write_seq();
+        self.apply_system_proxy_inner(seq)
     }
 
     /// Apply the OS proxy on a worker thread: the write runs several OS
@@ -640,6 +679,7 @@ impl HakimiRuntime {
     /// only exists after that. Waiting for it here keeps a fast toggle from
     /// returning silently with acceleration "on" and the OS proxy still off.
     pub fn apply_system_proxy_async(self: &Arc<Self>) {
+        let seq = self.proxy_write_seq();
         let runtime = self.clone();
         std::thread::spawn(move || {
             if !runtime.wait_for_listener(Duration::from_secs(3)) {
@@ -648,7 +688,7 @@ impl HakimiRuntime {
                     Some("the local proxy was not listening when the proxy was applied".into());
                 return;
             }
-            if let Err(error) = runtime.apply_system_proxy_inner() {
+            if let Err(error) = runtime.apply_system_proxy_inner(seq) {
                 tracing::error!(error = %error, "failed to apply the system proxy");
             }
         });
@@ -668,9 +708,10 @@ impl HakimiRuntime {
     }
 
     pub fn disable_system_proxy_async(self: &Arc<Self>) {
+        let seq = self.proxy_write_seq();
         let runtime = self.clone();
         std::thread::spawn(move || {
-            runtime.disable_system_proxy_inner();
+            runtime.disable_system_proxy_inner(seq);
         });
     }
 
@@ -682,33 +723,48 @@ impl HakimiRuntime {
     /// switching our PAC off when no snapshot exists (a snapshot written by an
     /// older build, or a takeover whose state file is gone).
     pub fn release_system_proxy(&self) {
-        if !self.system_proxy.saved_state_exists() {
-            self.disable_system_proxy_inner();
+        self.release_system_proxy_seq(self.proxy_write_seq());
+    }
+
+    fn release_system_proxy_seq(&self, seq: u64) {
+        let _write = self.proxy_write.lock();
+        if self.proxy_write_stale(seq) {
             return;
         }
-        match self.restore_system_proxy() {
+        if !self.system_proxy.saved_state_exists() {
+            self.disable_system_proxy_unlocked();
+            return;
+        }
+        match self.restore_system_proxy_unlocked() {
             Ok(_) => {
                 // A snapshot written before the sanitizer (or by a killed run)
                 // can still put our own PAC back; never leave the system
                 // pointing at a proxy that is no longer accelerating.
-                self.disable_system_proxy_inner();
+                self.disable_system_proxy_unlocked();
                 tracing::info!("system proxy released");
             }
             Err(error) => {
                 tracing::warn!(error = %error, "failed to release the system proxy");
-                self.disable_system_proxy_inner();
+                self.disable_system_proxy_unlocked();
             }
         }
     }
 
     pub fn release_system_proxy_async(self: &Arc<Self>) {
+        let seq = self.proxy_write_seq();
         let runtime = self.clone();
-        std::thread::spawn(move || runtime.release_system_proxy());
+        std::thread::spawn(move || runtime.release_system_proxy_seq(seq));
     }
 
     /// Restore OS proxy settings saved by a previous `serve` (also usable from a separate
-    /// process after the proxy was terminated).
+    /// process after the proxy was terminated). Terminal cleanup: this runs
+    /// regardless of any pending intent.
     pub fn restore_system_proxy(&self) -> Result<bool> {
+        let _write = self.proxy_write.lock();
+        self.restore_system_proxy_unlocked()
+    }
+
+    fn restore_system_proxy_unlocked(&self) -> Result<bool> {
         let result = self.system_proxy.restore();
         *self.proxy_applied.write() = None;
         *self.proxy_error.write() = match &result {
@@ -718,7 +774,12 @@ impl HakimiRuntime {
         result
     }
 
-    fn apply_system_proxy_inner(&self) -> Result<SystemProxyStatus> {
+    fn apply_system_proxy_inner(&self, seq: u64) -> Result<SystemProxyStatus> {
+        let _write = self.proxy_write.lock();
+        if self.proxy_write_stale(seq) {
+            // A newer intent owns the outcome; do not clobber its state.
+            return self.system_proxy.status(None, None);
+        }
         let started = std::time::Instant::now();
         tracing::info!("applying the system proxy");
         let config = self.config.snapshot();
@@ -934,6 +995,17 @@ impl HakimiRuntime {
     /// manual 测速 is one atomic operation instead of N futures the caller
     /// has to count.
     pub async fn probe_sweep(self: &Arc<Self>) {
+        // Single-flight with join: a sweep arriving while another runs waits
+        // for it and skips its own pass, instead of scanning every domain
+        // twice (double click, two JNI threads). One arriving on an idle
+        // runtime always runs.
+        let arrived = self.sweep_epoch.load(Ordering::SeqCst);
+        let was_running = self.sweep_done.load(Ordering::SeqCst) < arrived;
+        let _gate = self.sweep_gate.lock().await;
+        if was_running && self.sweep_done.load(Ordering::SeqCst) >= arrived {
+            return;
+        }
+        let epoch = self.sweep_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let config = self.config.snapshot();
         let mut seen = HashSet::new();
         let mut hosts = Vec::new();
@@ -945,6 +1017,7 @@ impl HakimiRuntime {
             }
         }
         self.probe_hosts(hosts, "all").await;
+        self.sweep_done.store(epoch, Ordering::SeqCst);
     }
 
     /// Probe a set of hosts through the shared gate. Each task checks out one
