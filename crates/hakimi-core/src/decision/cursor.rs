@@ -10,7 +10,7 @@ use crate::util::{network_id, now};
 
 use super::engine::DecisionEngine;
 use super::plan::{ConnectPlan, DecisionOutcome};
-use super::types::{Candidate, DohExpansion, EARLY_DOH_AFTER};
+use super::types::{Candidate, DohExpansion};
 
 /// How many fake-SNI names one discovery may dial per address.
 ///
@@ -661,12 +661,13 @@ impl RouteCursor {
             // answer would never be tried. Allow one extra DoH wave after a
             // full initial list has been consumed; thin lists keep the original
             // single cap.
+            //
+            // This block only runs once the candidate list is exhausted, so
+            // there is no separate "after N candidates" gate here: a lookup
+            // that should start earlier is `DecisionEngine::prefetch_cold_route`,
+            // which fires during the browser's CONNECT handshake.
             let within_initial_cap = self.candidates.len() < self.max;
-            let initial_exhausted = self.candidate_index >= self.candidates.len();
-            if !self.doh_loaded
-                && (within_initial_cap || initial_exhausted)
-                && self.candidate_index >= EARLY_DOH_AFTER.min(self.candidates.len())
-            {
+            if !self.doh_loaded {
                 let limit = if within_initial_cap {
                     self.max
                 } else {
