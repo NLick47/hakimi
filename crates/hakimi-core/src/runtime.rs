@@ -547,7 +547,10 @@ impl HakimiRuntime {
             tracing::warn!(error = %error, "failed to restore the system proxy");
         }
         // Final flush so the routes since the last checkpoint survive shutdown.
-        self.cache.flush_if_dirty();
+        // The write includes an fsync, so keep it off the async worker the
+        // same way the auto-flush task does.
+        let cache = Arc::clone(&self.cache);
+        let _ = tokio::task::spawn_blocking(move || cache.flush_if_dirty()).await;
         tracing::info!("hakimi runtime stopped");
         Ok(())
     }
