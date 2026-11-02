@@ -126,7 +126,9 @@ SCENARIOS = [
     Scenario("imported but never trusted", "install", "imported_untrusted", False, False, False, False),
     Scenario("trust lands late (retry)", "install", "delayed_trust", False, False, True, True),
     Scenario("uninstall succeeds", "uninstall", "ok", True, True, True, False),
-    Scenario("uninstall when missing", "uninstall", "ok", False, False, False, False),
+    # Removing a CA that was never installed is a documented no-op, not a failure.
+    Scenario("uninstall when missing", "uninstall", "ok", False, False, True, False),
+    Scenario("regenerate removes the old ca", "regenerate", "ok", True, True, True, None),
 ]
 
 
@@ -159,7 +161,7 @@ def run(binary, scenario):
     env["FAKE_CA_SCENARIO"] = scenario.scenario
 
     proc = subprocess.run(
-        [binary, "--data-dir", data_dir, "ca", scenario.command],
+        [binary, "--data-dir", data_dir, "--json", "ca", scenario.command],
         capture_output=True,
         text=True,
         env=env,
@@ -199,16 +201,24 @@ def main():
 
         checks = []
         checks.append(("exit", ok == scenario.expect_ok))
-        if scenario.expect_ok:
+        if scenario.expect_ok and scenario.command != "regenerate":
             checks.append(("installed", installed == scenario.expect_installed))
         # A failed install must not leave an imported certificate behind.
         if scenario.command == "install" and not scenario.expect_ok:
             checks.append(("rolled back", state["imported"] is False))
         if scenario.command == "uninstall" and scenario.expect_ok:
             checks.append(("trust cleared", state["trusted"] is False))
+        # Rotating the CA must take the old certificate out of the trust store:
+        # after the swap the app can no longer address it.
+        if scenario.command == "regenerate" and scenario.expect_ok:
+            checks.append(("old ca removed", state["imported"] is False))
+            checks.append(("trust cleared", state["trusted"] is False))
+            checks.append(("used -t", "delete-certificate" in log))
         if scenario.scenario == "delayed_trust":
             checks.append(("retried verify", state["verify_calls"] >= 3))
-        if scenario.command == "uninstall" and scenario.expect_ok:
+        # Removing trust is only a `security` call when something was imported;
+        # a no-op removal must not invoke it.
+        if scenario.command == "uninstall" and scenario.expect_ok and scenario.installed:
             checks.append(("used -t", "delete-certificate" in log))
 
         bad = [name for name, passed in checks if not passed]
