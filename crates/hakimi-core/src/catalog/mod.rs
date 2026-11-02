@@ -433,7 +433,6 @@ impl CatalogManager {
                     let version = config.catalog_version.saturating_add(1);
                     let warnings = validated.warnings.clone();
 
-                    atomic_write(&self.paths.catalog_ip_file(), &bytes)?;
                     let meta = CatalogMeta {
                         source: source.clone(),
                         etag,
@@ -443,7 +442,17 @@ impl CatalogManager {
                         catalog_version: version,
                         warnings: warnings.clone(),
                     };
-                    atomic_write_json(&self.paths.catalog_ip_meta_file(), &meta)?;
+                    // 写盘含 fsync，目录体最大 2MB。挪到 blocking 线程，
+                    // worker 与 refresh_lock 的其它等待者不被磁盘卡住。
+                    let ip_file = self.paths.catalog_ip_file();
+                    let meta_file = self.paths.catalog_ip_meta_file();
+                    let meta_for_disk = meta.clone();
+                    tokio::task::spawn_blocking(move || -> Result<()> {
+                        atomic_write(&ip_file, &bytes)?;
+                        atomic_write_json(&meta_file, &meta_for_disk)
+                    })
+                    .await
+                    .context("catalog write task failed")??;
                     *self.ip_meta.write() = Some(meta);
                     *self.ip_catalog.write() = Some(validated);
                     self.revision.fetch_add(1, Ordering::Relaxed);
@@ -582,7 +591,6 @@ impl CatalogManager {
                         .as_ref()
                         .map(|meta| meta.catalog_version.saturating_add(1))
                         .unwrap_or(1);
-                    atomic_write(&self.paths.catalog_doh_file(), &bytes)?;
                     let meta = CatalogMeta {
                         source: source.clone(),
                         etag,
@@ -592,7 +600,16 @@ impl CatalogManager {
                         catalog_version: version,
                         warnings: Vec::new(),
                     };
-                    atomic_write_json(&self.paths.catalog_doh_meta_file(), &meta)?;
+                    // 同 refresh_ip：写盘含 fsync，移到 blocking 线程。
+                    let doh_file = self.paths.catalog_doh_file();
+                    let meta_file = self.paths.catalog_doh_meta_file();
+                    let meta_for_disk = meta.clone();
+                    tokio::task::spawn_blocking(move || -> Result<()> {
+                        atomic_write(&doh_file, &bytes)?;
+                        atomic_write_json(&meta_file, &meta_for_disk)
+                    })
+                    .await
+                    .context("catalog write task failed")??;
                     *self.doh_meta.write() = Some(meta);
                     *self.doh_catalog.write() = Some(endpoints);
                     self.revision.fetch_add(1, Ordering::Relaxed);
