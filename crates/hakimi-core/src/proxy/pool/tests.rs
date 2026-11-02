@@ -1178,6 +1178,210 @@ async fn cached_candidate_is_not_blocked_by_slow_doh_expansion() {
     );
 }
 
+/// A leader parked on a stalled discovery must not hold its followers past
+/// `FOLLOWER_WAIT`: the 2026-11-01 incident had every concurrent request
+/// waiting out the leader's full five-second stall with no escape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_discovery_releases_its_followers() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = crate::paths::Paths::new(dir.path());
+    paths.ensure().unwrap();
+
+    // The only candidate is a listener that accepts TCP but never completes
+    // the TLS handshake, and the candidate timeout is far past FOLLOWER_WAIT:
+    // the leader's discovery stays in flight for the whole test.
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = dead.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = dead.accept().await {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(socket);
+            });
+        }
+    });
+
+    let (engine, config) = engine_for_with_resolver(dir.path(), Some(Duration::from_secs(15)));
+    engine.cache.put_last_good(LastGoodEntry {
+        domain: "upstream.test".into(),
+        ip: "127.0.0.1".parse().unwrap(),
+        source: IpSource::Cache,
+        saved_at: now(),
+        catalog_version: 0,
+    });
+    config
+        .mutate(|c| {
+            c.advanced.ip_timeout_ms = 10_000;
+            Ok(())
+        })
+        .unwrap();
+
+    let tls = TlsContext::new().unwrap();
+    let pool = Arc::new(UpstreamPool::new(engine.clone(), tls, &config.snapshot()));
+    let uri = format!("https://upstream.test:{port}/");
+    let request = |uri: &str| {
+        Request::builder()
+            .method(Method::HEAD)
+            .uri(uri)
+            .body(Either::Right(Full::new(Bytes::new())))
+            .unwrap()
+    };
+
+    let leader_pool = pool.clone();
+    let leader_uri = uri.clone();
+    let leader = tokio::spawn(async move {
+        leader_pool
+            .send(request(&leader_uri), true)
+            .await
+            .map(|response| response.status())
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let started = std::time::Instant::now();
+    let follower = match pool.send(request(&uri), true).await {
+        Ok(_) => panic!("the leader is parked on a stalled discovery"),
+        Err(error) => error,
+    };
+    let elapsed = started.elapsed();
+    // The leader's own verdict needs 15 s (the stub resolver) and the stalled
+    // handshake its full candidate timeout; only the follower timeout returns
+    // an error near FOLLOWER_WAIT. hyper collapses the connector's anyhow
+    // message into "client error (Connect)", so the timing is the assertion.
+    assert!(
+        elapsed >= Duration::from_millis(2_500) && elapsed <= Duration::from_millis(8_000),
+        "the follower must escape near FOLLOWER_WAIT (3 s), took {elapsed:?}"
+    );
+    assert!(
+        !leader.is_finished(),
+        "the leader must still be parked when the follower gives up"
+    );
+}
+
+/// The recovery pool replays requests whose shared discovery stalled. Its
+/// connector therefore has to race on its own instead of queueing behind the
+/// very discovery it is escaping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_recovery_connector_races_on_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = crate::paths::Paths::new(dir.path());
+    paths.ensure().unwrap();
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    let roots = dir.path().join("extra-root.pem");
+    std::fs::write(&roots, ca.ca_pem()).unwrap();
+    std::env::set_var("HAKIMI_EXTRA_ROOT_CA", &roots);
+
+    let live_tls = ca.server_config("upstream.test").unwrap();
+    let live = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = live.local_addr().unwrap().port();
+    let acceptor = tokio_rustls::TlsAcceptor::from(live_tls);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = live.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let service = hyper::service::service_fn(
+                    |_req: hyper::Request<hyper::body::Incoming>| async {
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                            http_body_util::Full::new(Bytes::from_static(b"ok")),
+                        ))
+                    },
+                );
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), service)
+                .await;
+            });
+        }
+    });
+
+    // The dead candidate: same port on ::1, accepts TCP, never answers TLS.
+    let dead = TcpListener::bind(("::1", port)).await.unwrap();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = dead.accept().await {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(socket);
+            });
+        }
+    });
+
+    let (engine, config) = engine_for(dir.path());
+    engine.cache.put_last_good(LastGoodEntry {
+        domain: "upstream.test".into(),
+        ip: "::1".parse().unwrap(),
+        source: IpSource::Cache,
+        saved_at: now(),
+        catalog_version: 0,
+    });
+    config
+        .mutate(|c| {
+            c.advanced.ip_timeout_ms = 10_000;
+            Ok(())
+        })
+        .unwrap();
+
+    let tls = TlsContext::new().unwrap();
+    let pool = Arc::new(UpstreamPool::new(engine.clone(), tls, &config.snapshot()));
+    // Wiring guard: only the recovery connector may skip single-flight.
+    assert!(pool.auto_connector.single_flight);
+    assert!(pool.http1_connector.single_flight);
+    assert!(!pool.recovery_connector.single_flight);
+
+    let uri = format!("https://upstream.test:{port}/");
+    let request = |method: Method| {
+        Request::builder()
+            .method(method)
+            .uri(&uri)
+            .body(Either::Right(Full::new(Bytes::new())))
+            .unwrap()
+    };
+
+    // The leader parks on the dead candidate (its TLS handshake hangs until
+    // the candidate timeout).
+    let leader_pool = pool.clone();
+    let leader_uri = uri.clone();
+    let leader = tokio::spawn(async move {
+        let request = Request::builder()
+            .method(Method::HEAD)
+            .uri(&leader_uri)
+            .body(Either::Right(Full::new(Bytes::new())))
+            .unwrap();
+        leader_pool.send(request, true).await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Point the route at the working address and mark the host slow, so the
+    // next request replays on the recovery pool. A single-flight-bound
+    // connector would queue behind the stalled leader and only escape at the
+    // follower timeout; the bypass connector races the live address directly.
+    engine.cache.put_last_good(LastGoodEntry {
+        domain: "upstream.test".into(),
+        ip: "127.0.0.1".parse().unwrap(),
+        source: IpSource::Cache,
+        saved_at: now(),
+        catalog_version: 0,
+    });
+    pool.mark_slow("upstream.test");
+
+    let started = std::time::Instant::now();
+    let response = pool
+        .send(request(Method::GET), false)
+        .await
+        .expect("the recovery pool must race the live address on its own");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert!(
+        started.elapsed() < Duration::from_millis(2_500),
+        "the recovery request must not queue behind the stalled leader, took {started:?}"
+    );
+    let _ = leader.await;
+}
+
 /// Concurrent cold connections for one domain share a single route
 /// discovery.  Without the single flight every request would race the
 /// candidates on its own and dial the dead one again.

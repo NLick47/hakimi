@@ -714,6 +714,13 @@ async fn stale_answers_do_not_spawn_one_refresh_per_connection() {
 /// modes, with a one-second DoH timeout so budget tests stay fast. The caller
 /// must hold `ENV_LOCK` for the whole test: the trust hook is process wide.
 async fn resolver_with(modes: &[DohMode]) -> (Arc<Resolver>, Vec<DohServer>) {
+    resolver_with_timeout(modes, 1).await
+}
+
+async fn resolver_with_timeout(
+    modes: &[DohMode],
+    timeout_secs: u64,
+) -> (Arc<Resolver>, Vec<DohServer>) {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::new(dir.path());
     paths.ensure().unwrap();
@@ -742,7 +749,7 @@ async fn resolver_with(modes: &[DohMode]) -> (Arc<Resolver>, Vec<DohServer>) {
                     enabled: true,
                 });
             }
-            config.catalogs.timeout_secs = 1;
+            config.catalogs.timeout_secs = timeout_secs;
             Ok(())
         })
         .unwrap();
@@ -847,4 +854,52 @@ async fn an_answer_in_the_second_wave_is_still_reached() {
     );
     assert_eq!(resolution.source, DohSource::Custom);
     assert!(servers[4].requests.load(Ordering::Relaxed) >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_answer_cuts_a_stalled_peer_short() {
+    // One endpoint answers NOERROR with no records, the other stalls until its
+    // full request timeout. The race must stop after the grace window instead
+    // of holding the answer (and every request parked behind the resolver's
+    // single-flight lock) until the stalled endpoint times out: the 2026-11-01
+    // incident measured exactly this as a silent five-second connect stall.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (resolver, servers) = resolver_with_timeout(&[DohMode::Empty, DohMode::Stall], 4).await;
+
+    let started = std::time::Instant::now();
+    let outcome = resolver.resolve_ips("example.com").await;
+    let elapsed = started.elapsed();
+    // Neither endpoint has an address: an error, not a four-second wait.
+    assert!(outcome.is_err(), "no endpoint has an address");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(1_200),
+        "the grace window must not cut off the peer before it had a fair chance, took {elapsed:?}"
+    );
+    // Strictly below the 2.5 s race deadline: the grace window (empty at
+    // ~50 ms + 1.5 s) must end the race before the overall deadline would.
+    assert!(
+        elapsed < std::time::Duration::from_millis(2_200),
+        "an empty answer must not wait out the stalled peer's full timeout, took {elapsed:?}"
+    );
+    // The empty endpoint answered; the stalled one got its query too.
+    assert!(servers[0].requests.load(Ordering::Relaxed) >= 1);
+    assert!(servers[1].requests.load(Ordering::Relaxed) >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_stalled_endpoints_cannot_hold_the_race_past_the_deadline() {
+    // When neither endpoint answers at all there is no first result to start
+    // the grace window from; the race deadline ends the wait instead. Without
+    // it the pair runs until the request timeout of the slower endpoint.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (resolver, _servers) = resolver_with_timeout(&[DohMode::Stall, DohMode::Stall], 4).await;
+
+    let started = std::time::Instant::now();
+    let outcome = resolver.resolve_ips("example.com").await;
+    let elapsed = started.elapsed();
+    assert!(outcome.is_err(), "nothing answers");
+    assert!(
+        elapsed < std::time::Duration::from_millis(3_500),
+        "the race deadline must cap the stall below the request timeout, took {elapsed:?}"
+    );
 }

@@ -17,7 +17,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -167,6 +167,15 @@ const RACE_SIZE: usize = 8;
 /// Delay between race batch member starts, so the first candidate usually wins on a
 /// healthy network and the race only costs extra handshakes when it is actually broken.
 const RACE_STAGGER: Duration = Duration::from_millis(150);
+/// How long a follower waits for the single-flight leader's verdict. A healthy
+/// discovery finishes in well under a second; a leader parked on a stalled DoH
+/// query used to hold every concurrent request for its full timeout, with no
+/// escape hatch at all. On expiry the follower errors out and the retryable
+/// request replays on the recovery pool, whose connector skips single-flight.
+const FOLLOWER_WAIT: Duration = Duration::from_millis(3000);
+/// A route discovery slower than this is logged: the 2026-11-01 incident showed
+/// a 5 s fully silent discovery that left nothing to diagnose from.
+const SLOW_DISCOVERY: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 pub(crate) struct UpstreamStats {
@@ -292,6 +301,8 @@ pub struct UpstreamPool {
     /// Connectors reused when a replacement pool is created.
     auto_connector: RouteConnector,
     http1_connector: RouteConnector,
+    /// Recovery variant: identical to `auto_connector` but single-flight-free.
+    recovery_connector: RouteConnector,
     /// Idle timeout and per-host idle limits for replacement pools.
     client_idle: Duration,
     max_idle: usize,
@@ -388,6 +399,22 @@ struct Inflight {
     /// The plan is shared, so publishing it to the followers of one discovery
     /// does not copy the domain, group and SNI strings.
     result: Mutex<Option<Result<Arc<ConnectPlan>, String>>>,
+    /// Requests currently parked on the notify. Diagnostic only.
+    waiters: AtomicUsize,
+}
+
+impl Inflight {
+    fn add_waiter(&self) {
+        self.waiters.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn remove_waiter(&self) {
+        self.waiters.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn waiter_count(&self) -> usize {
+        self.waiters.load(Ordering::Relaxed)
+    }
 }
 
 /// Guarantees single-flight cleanup no matter how the leader's future ends.
@@ -441,6 +468,19 @@ impl UpstreamPool {
             http1_hosts: http1_hosts.clone(),
             discovery: discovery.clone(),
             stats: stats.clone(),
+            single_flight: true,
+        };
+        // Same behaviour as the normal connector except for single-flight: the
+        // recovery pool replays requests whose shared discovery stalled, so its
+        // connections must not queue behind that stalled discovery again.
+        let recovery_connector = RouteConnector {
+            engine: engine.clone(),
+            tls: tls.clone(),
+            http1_only: false,
+            http1_hosts: http1_hosts.clone(),
+            discovery: discovery.clone(),
+            stats: stats.clone(),
+            single_flight: false,
         };
         let http1_connector = RouteConnector {
             engine: engine.clone(),
@@ -449,6 +489,7 @@ impl UpstreamPool {
             http1_hosts: http1_hosts.clone(),
             discovery: discovery.clone(),
             stats: stats.clone(),
+            single_flight: true,
         };
         Arc::new(Self {
             clients: RwLock::new(PoolClients {
@@ -473,11 +514,12 @@ impl UpstreamPool {
                 // stalled one.  It keeps that connection afterwards: without idle
                 // reuse every request in the recovery window would pay for a
                 // handshake, which is exactly the cost the recovery avoids.
-                recovery: build_client(client_idle, auto_connector.clone(), max_idle),
+                recovery: build_client(client_idle, recovery_connector.clone(), max_idle),
             }),
             rejected_clients: Mutex::new(HashMap::new()),
             auto_connector,
             http1_connector,
+            recovery_connector,
             client_idle,
             max_idle,
             http1_idle: max_idle.max(http1_limit),
@@ -1117,8 +1159,11 @@ impl UpstreamPool {
                 self.http1_connector.clone(),
                 self.max_idle,
             );
-            clients.recovery =
-                build_client(self.client_idle, self.auto_connector.clone(), self.max_idle);
+            clients.recovery = build_client(
+                self.client_idle,
+                self.recovery_connector.clone(),
+                self.max_idle,
+            );
         }
         // Replacement pools for rejected hosts carry sockets from the same
         // pre-interruption era; the markers themselves are harmless and can
@@ -1140,6 +1185,10 @@ struct RouteConnector {
     http1_hosts: Arc<DomainMatcher>,
     discovery: Arc<Discovery>,
     stats: Arc<UpstreamStats>,
+    /// Recovery connectors skip the single-flight discovery: a replay exists
+    /// because the shared route discovery stalled, so joining it again would
+    /// wait on the very stall the replay is meant to escape.
+    single_flight: bool,
 }
 
 impl Service<Uri> for RouteConnector {
@@ -1295,6 +1344,23 @@ impl RouteConnector {
         }
 
         let key = format!("{}|{}|{}", cursor.domain(), cursor.port(), tls);
+        if !self.single_flight {
+            // Recovery path: race on our own. The shared discovery may be
+            // stalled, and this request exists to escape that stall.
+            let domain = cursor.domain().to_string();
+            let started = std::time::Instant::now();
+            let outcome = self
+                .race_plans(cursor, cached_plan, force_http1, timeout)
+                .await;
+            if started.elapsed() > SLOW_DISCOVERY {
+                tracing::warn!(
+                    domain = %domain,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "recovery route discovery was slow"
+                );
+            }
+            return outcome.map(|(_, io)| io).map_err(anyhow::Error::msg);
+        }
         let (inflight, leader) = {
             let mut map = self.discovery.inflight.lock();
             if let Some(existing) = map.get(&key) {
@@ -1313,9 +1379,20 @@ impl RouteConnector {
                 key: key.clone(),
                 entry: inflight.clone(),
             };
+            let domain = cursor.domain().to_string();
+            let started = std::time::Instant::now();
             let outcome = self
                 .race_plans(cursor, cached_plan, force_http1, timeout)
                 .await;
+            let elapsed = started.elapsed();
+            if elapsed > SLOW_DISCOVERY {
+                tracing::warn!(
+                    domain = %domain,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    followers = inflight.waiter_count(),
+                    "route discovery was slow"
+                );
+            }
             let shared = match &outcome {
                 Ok((plan, _)) => Ok(plan.clone()),
                 Err(error) => Err(error.clone()),
@@ -1331,8 +1408,22 @@ impl RouteConnector {
         let notified = inflight.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if inflight.result.lock().is_none() {
-            notified.await;
+        inflight.add_waiter();
+        let wait_result = if inflight.result.lock().is_none() {
+            tokio::time::timeout(FOLLOWER_WAIT, &mut notified).await
+        } else {
+            Ok(())
+        };
+        inflight.remove_waiter();
+        if wait_result.is_err() {
+            // The leader is parked far past a healthy discovery (a stalled DoH
+            // query used to hold every concurrent request for seconds). Fail
+            // fast: retryable requests replay on the recovery pool, whose
+            // connector skips single-flight and races on its own.
+            return Err(anyhow!(
+                "route discovery for {} did not finish within {FOLLOWER_WAIT:?}",
+                cursor.domain()
+            ));
         }
         let plan = {
             let guard = inflight.result.lock();

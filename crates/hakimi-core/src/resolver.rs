@@ -50,6 +50,19 @@ const MIN_CACHE_TTL_SECS: u32 = 5;
 const FALLBACK_LANES: usize = 2;
 const FALLBACK_WAVES: u32 = 2;
 
+/// How long the other raced endpoint may keep answering after one of them
+/// returned no usable address. Covers a normal query several times over;
+/// caps the cost of a stalled endpoint below its full request timeout.
+const EMPTY_ANSWER_GRACE: Duration = Duration::from_millis(1500);
+
+/// Hard ceiling for the raced pair itself. When both endpoints stall without
+/// answering anything there is no first result to start the grace window from,
+/// and the race used to run until the request timeout of the slower endpoint —
+/// parking every connection behind the resolver's single-flight lock for that
+/// long. A healthy endpoint answers in a few hundred milliseconds; 2.5 s is
+/// still eight times that, and never below the configured per-request timeout.
+const RACE_DEADLINE: Duration = Duration::from_millis(2500);
+
 #[derive(Debug, Clone)]
 pub struct EffectiveEndpoint {
     pub name: String,
@@ -929,7 +942,26 @@ impl Resolver {
                     self.query_endpoint(&endpoints[1], domain, qtype).await,
                 )
             }));
-            while let Some((index, result)) = pending.next().await {
+            // Once a raced endpoint answered without a usable address, the other
+            // one only gets this long to produce one. Without the grace window a
+            // stalled primary holds the whole race — and every request parked
+            // behind the resolver's single-flight lock — until its full request
+            // timeout, while a healthy retry a second later would succeed.
+            let race_deadline = tokio::time::Instant::now()
+                + RACE_DEADLINE.min(Duration::from_secs(
+                    self.config.snapshot().catalogs.timeout_secs.max(1),
+                ));
+            let mut grace_deadline: Option<tokio::time::Instant> = None;
+            while let Some((index, result)) = {
+                let deadline = match grace_deadline {
+                    Some(grace) if grace < race_deadline => grace,
+                    _ => race_deadline,
+                };
+                tokio::time::timeout_at(deadline, pending.next())
+                    .await
+                    .ok()
+                    .flatten()
+            } {
                 let endpoint = &endpoints[index];
                 match result {
                     Ok(answer) => {
@@ -949,6 +981,9 @@ impl Resolver {
                         // try AAAA and report a precise error.
                         if empty_answer.is_none() {
                             empty_answer = Some((index, answer));
+                        }
+                        if grace_deadline.is_none() {
+                            grace_deadline = Some(tokio::time::Instant::now() + EMPTY_ANSWER_GRACE);
                         }
                     }
                     Err(error) => {
@@ -970,6 +1005,9 @@ impl Resolver {
                             source: endpoint.source,
                             error: format!("{error:#}"),
                         });
+                        if grace_deadline.is_none() {
+                            grace_deadline = Some(tokio::time::Instant::now() + EMPTY_ANSWER_GRACE);
+                        }
                     }
                 }
             }
