@@ -999,10 +999,17 @@ impl HakimiRuntime {
         // for it and skips its own pass, instead of scanning every domain
         // twice (double click, two JNI threads). One arriving on an idle
         // runtime always runs.
-        let arrived = self.sweep_epoch.load(Ordering::SeqCst);
-        let was_running = self.sweep_done.load(Ordering::SeqCst) < arrived;
+        //
+        // Sample `done` before waiting: if it advances while this call is
+        // parked, another sweep was (or started) running after this call
+        // arrived and has already covered the same domain set. Sampling a
+        // "was running" flag before the lock is not enough: two callers that
+        // both arrive just before the leader takes the gate see an idle
+        // runtime, so both think they are the leader. An aborted leader never
+        // advances `done`, which is what lets the next waiter take over.
+        let done_at_arrival = self.sweep_done.load(Ordering::SeqCst);
         let _gate = self.sweep_gate.lock().await;
-        if was_running && self.sweep_done.load(Ordering::SeqCst) >= arrived {
+        if self.sweep_done.load(Ordering::SeqCst) > done_at_arrival {
             return;
         }
         let epoch = self.sweep_epoch.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1591,6 +1598,65 @@ mod status_snapshot_tests {
         crate::bench::measure("status.json(2k)", 200, || {
             let _ = runtime.status_json();
         });
+    }
+
+    /// Two probe sweeps that arrive while the gate is idle must still merge:
+    /// the second one waits for the first and skips its own pass.
+    ///
+    /// The gate used to decide whether to skip from `was_running` sampled
+    /// *before* waiting for the mutex. Two callers that both arrived on an idle
+    /// runtime therefore both saw `false`, and both ran a full sweep one after
+    /// the other. A fast double click (or two Android JNI threads) reproduced
+    /// exactly that; the UI's own re-entry guard is only a fast path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn simultaneous_probe_sweeps_are_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = HakimiRuntime::new(Some(dir.path().to_path_buf())).unwrap();
+        // No enabled group means each sweep has no host to probe, so the test
+        // exercises the gate without touching the network.
+        runtime
+            .config
+            .mutate(|config| {
+                for group in &mut config.groups {
+                    group.enabled = false;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        // Hold the gate so both callers sample the idle epoch/done counters
+        // before either can start, which is the double-click window.
+        let gate = runtime.sweep_gate.lock().await;
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(2);
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let runtime = runtime.clone();
+            let started_tx = started_tx.clone();
+            tasks.push(tokio::spawn(async move {
+                started_tx.send(()).await.unwrap();
+                runtime.probe_sweep().await;
+            }));
+        }
+        drop(started_tx);
+        started_rx.recv().await.unwrap();
+        started_rx.recv().await.unwrap();
+        // Both tasks have entered `probe_sweep` and are parked on the gate.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(gate);
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(
+            runtime.sweep_epoch.load(Ordering::SeqCst),
+            1,
+            "the second simultaneous sweep must join the first instead of running again"
+        );
+        assert_eq!(
+            runtime.sweep_done.load(Ordering::SeqCst),
+            1,
+            "the joined sweep must not leave the done counter behind"
+        );
     }
 
     /// A domain whose warm-up failed is retried on a growing interval instead
