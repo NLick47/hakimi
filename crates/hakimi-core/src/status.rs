@@ -225,13 +225,10 @@ impl StatusStore {
         let mut transition_log: Option<(State, State, Arc<DomainDiagnostics>)> = None;
         if let Some(existing) = map.get_mut(&diagnostics.domain) {
             // Never let a slower, older probe overwrite a newer result: a
-            // terminal state is final for its generation. `Checking` stays
-            // transient — a fresh terminal record still absorbs it, and
-            // re-marking an existing Checking record is unchanged.
-            if existing.last_check > diagnostics.last_check
-                && (diagnostics.state != State::Checking
-                    || existing.state != State::Checking)
-            {
+            // terminal state is final for its generation, and two Checking
+            // records must not walk last_check backwards either. A fresh
+            // terminal record still absorbs a transient Checking one.
+            if existing.last_check > diagnostics.last_check {
                 return;
             }
             // Re-marking an already-checking domain is the common cold-connect
@@ -847,6 +844,28 @@ mod tests {
             store.get("example.com").unwrap().state,
             State::Normal,
             "an older terminal result must not overwrite a newer one"
+        );
+    }
+
+    /// The other half of the same guard: two Checking records from concurrent
+    /// cold connects must not walk last_check backwards either. The guard
+    /// used to exempt Checking == Checking, so a probe built earlier but
+    /// recorded later regressed the timestamp of the newer mark.
+    #[test]
+    fn an_older_checking_mark_cannot_overwrite_a_newer_one() {
+        let store = StatusStore::new();
+        store.record(report("example.com", State::Checking));
+
+        let mut older = report("example.com", State::Checking);
+        older.last_check = now() - chrono::Duration::seconds(5);
+        store.record(older);
+
+        let entry = store.get("example.com").unwrap();
+        assert_eq!(entry.state, State::Checking);
+        assert!(
+            entry.last_check > now() - chrono::Duration::seconds(2),
+            "an older Checking record must not regress last_check: {:?}",
+            entry.last_check
         );
     }
 }
