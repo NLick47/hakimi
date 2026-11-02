@@ -378,14 +378,14 @@ jobs:
           }
 
           build_one arm64-v8a android
-          build_one armeabi-v7a android-armv7
+          build_one armeabi-v7a armv7
 
       - uses: actions/upload-artifact@v7
         with:
           name: hakimi-${{ needs.prepare.outputs.android_version }}-android
           path: |
             dist/hakimi-*-android.apk
-            dist/hakimi-*-android-armv7.apk
+            dist/hakimi-*-armv7.apk
           if-no-files-found: error
 
   release:
@@ -425,7 +425,7 @@ jobs:
             "dist/hakimi-${DESKTOP_VERSION}-windows-x64.zip" \
             "dist/hakimi-${DESKTOP_VERSION}-macos-arm64.dmg" \
             "dist/hakimi-${ANDROID_VERSION}-android.apk" \
-            "dist/hakimi-${ANDROID_VERSION}-android-armv7.apk"
+            "dist/hakimi-${ANDROID_VERSION}-armv7.apk"
           do
             if [[ ! -f "$file" ]]; then
               echo "::error::missing release artifact: $file"
@@ -451,7 +451,7 @@ jobs:
             --desktop-macos-asset "hakimi-${DESKTOP_VERSION}-macos-arm64.dmg" \
             --android-version "$ANDROID_VERSION" \
             --android-apk-asset "hakimi-${ANDROID_VERSION}-android.apk" \
-            --android-apk-armv7-asset "hakimi-${ANDROID_VERSION}-android-armv7.apk"
+            --android-apk-armv7-asset "hakimi-${ANDROID_VERSION}-armv7.apk"
           cat dist/latest.json
 
       - name: Generate checksums
