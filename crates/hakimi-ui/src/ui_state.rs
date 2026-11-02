@@ -373,13 +373,16 @@ pub fn sync_window(model: &AppModel, app: &AppWindow) {
 
 // -- environment probing ------------------------------------------------------
 
-/// Probe the environment. Spawns subprocesses (the CA status, and `security`
-/// on macOS), so it must run OFF the UI thread — callers post the result back
+/// Probe the environment. May spawn subprocesses (`check_proxy_os` runs
+/// `scutil` on macOS, and a stale CA snapshot schedules a background probe),
+/// so it must run OFF the UI thread — callers post the result back
 /// through the event loop. The system-proxy result is the last write recorded
 /// by the runtime; the OS is only read back when `check_proxy_os` is set,
 /// which costs a `scutil` run on macOS and is therefore throttled by callers.
 pub fn probe_env(runtime: &HakimiRuntime, check_proxy_os: bool) -> EnvState {
-    let ca = runtime.ca().status();
+    // The polled snapshot never runs `security` on this thread; a stale
+    // value is refreshed by the CA's own background probe.
+    let ca = runtime.ca().status_cached();
     EnvState {
         ca_ok: ca.installed,
         ca_error: ca.error.unwrap_or_default(),

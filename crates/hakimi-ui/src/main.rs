@@ -574,7 +574,11 @@ fn wire_window(app: &AppWindow, ctx: &UiContext) {
         app.on_probe_selected(move || {
             // One atomic sweep on the runtime: the UI only flips the phase and
             // awaits completion, no per-domain bookkeeping here.
-            sweep.running.store(true, Ordering::SeqCst);
+            // A second click while one sweep is running must not spawn another:
+            // two concurrent sweeps would race the settle/commit state machine.
+            if sweep.running.swap(true, Ordering::SeqCst) {
+                return;
+            }
             if let Some(app) = weak.upgrade() {
                 // Flip the rows to 检测中 now; the sweep runs off-thread.
                 refresh(&app, &runtime, &expanded.borrow(), &sweep);
@@ -601,10 +605,19 @@ fn wire_window(app: &AppWindow, ctx: &UiContext) {
     }
     {
         let runtime = runtime.clone();
+        let reapplying = Arc::new(AtomicBool::new(false));
         app.on_reapply_proxy(move || {
+            // One re-apply at a time: the OS write runs several subprocesses
+            // and must not interleave with itself.
+            if reapplying.swap(true, Ordering::SeqCst) {
+                return;
+            }
             let runtime = runtime.clone();
+            let reapplying = reapplying.clone();
             std::thread::spawn(move || {
-                if let Err(error) = runtime.apply_system_proxy() {
+                let result = runtime.apply_system_proxy();
+                reapplying.store(false, Ordering::SeqCst);
+                if let Err(error) = result {
                     eprintln!("hakimi-ui: manual system proxy re-apply failed: {error:#}");
                 }
             });
@@ -1206,6 +1219,11 @@ const HF_LOGO: &[u8] = include_bytes!("../assets/hf.png");
 pub(crate) fn load_assets() {
     ASSETS.with(|assets| {
         let mut map = assets.borrow_mut();
+        // Icons persist until release_ui_caches clears them; re-decoding the
+        // whole set on every tray reveal is wasted work.
+        if !map.is_empty() {
+            return;
+        }
         for &(key, bytes) in &ICON_ASSETS {
             if let Ok(image) = slint::Image::load_from_data(bytes, Some("png")) {
                 map.insert(key.to_string(), image);
