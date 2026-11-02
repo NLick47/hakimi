@@ -28,8 +28,8 @@ struct FakeRemote {
 }
 
 impl RemoteIpProvider for FakeRemote {
-    fn remote_ips(&self, _domain: &str) -> Option<Vec<IpAddr>> {
-        self.ips.lock().clone()
+    fn remote_ips(&self, _domain: &str) -> Option<Arc<[IpAddr]>> {
+        self.ips.lock().clone().map(Arc::from)
     }
     fn has_ip_catalog(&self) -> bool {
         *self.catalog.lock()

@@ -134,7 +134,7 @@ impl RouteCursor {
         };
         let add_remote = |candidates: &mut Vec<Candidate>| {
             if let Some(ips) = &remote {
-                for ip in ips {
+                for ip in ips.iter() {
                     if candidates.len() >= max {
                         break;
                     }

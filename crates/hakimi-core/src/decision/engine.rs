@@ -563,7 +563,7 @@ impl DecisionEngine {
         // address that is black-holed leaves the connection with nowhere to
         // go — and the DoH lookup that could have supplied an alternative only
         // starts once the first attempt has already burned its timeout.
-        let known = last_good.is_some() as usize + remote.as_ref().map_or(0, Vec::len);
+        let known = last_good.is_some() as usize + remote.as_ref().map_or(0, |ips| ips.len());
         // A thin list has no fallback. A *full* list is the other dangerous
         // case: the cursor only expands to DoH after one of those candidates
         // has already failed, and all of them may be black-holed. Start the
@@ -1313,7 +1313,7 @@ impl DecisionEngine {
         let config = self.config.snapshot();
         let mut ips: Vec<IpAddr> = Vec::new();
         if let Some(remote) = self.remote.remote_ips(domain) {
-            ips.extend(remote);
+            ips.extend(remote.iter().copied());
         }
         // Domains whose addresses only come from DoH still need an opponent.
         // The cached answers cost nothing to read, unlike a fresh query.

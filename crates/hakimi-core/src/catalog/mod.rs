@@ -148,7 +148,7 @@ pub trait RemoteIpProvider: Send + Sync {
     /// Candidate IPs for a domain. The catalog pattern is not part of the
     /// result: the route cursor only needs the addresses, so the pattern
     /// string is not copied for every new connection.
-    fn remote_ips(&self, domain: &str) -> Option<Vec<std::net::IpAddr>>;
+    fn remote_ips(&self, domain: &str) -> Option<Arc<[std::net::IpAddr]>>;
     fn has_ip_catalog(&self) -> bool;
 
     /// Remote IPs for a domain plus the "an IP catalog is loaded" flag.
@@ -156,13 +156,16 @@ pub trait RemoteIpProvider: Send + Sync {
     /// The decision cursor needs both for every new connection. The default
     /// keeps existing providers working; implementations that can answer both
     /// from one snapshot should override it.
-    fn remote_ips_with_catalog(&self, domain: &str) -> (Option<Vec<std::net::IpAddr>>, bool) {
+    fn remote_ips_with_catalog(
+        &self,
+        domain: &str,
+    ) -> (Option<Arc<[std::net::IpAddr]>>, bool) {
         (self.remote_ips(domain), self.has_ip_catalog())
     }
 }
 
 impl RemoteIpProvider for CatalogManager {
-    fn remote_ips(&self, domain: &str) -> Option<Vec<std::net::IpAddr>> {
+    fn remote_ips(&self, domain: &str) -> Option<Arc<[std::net::IpAddr]>> {
         CatalogManager::remote_ips(self, domain)
     }
 
@@ -170,7 +173,10 @@ impl RemoteIpProvider for CatalogManager {
         CatalogManager::has_ip_catalog(self)
     }
 
-    fn remote_ips_with_catalog(&self, domain: &str) -> (Option<Vec<std::net::IpAddr>>, bool) {
+    fn remote_ips_with_catalog(
+        &self,
+        domain: &str,
+    ) -> (Option<Arc<[std::net::IpAddr]>>, bool) {
         CatalogManager::remote_ips_with_catalog(self, domain)
     }
 }
@@ -250,23 +256,29 @@ impl CatalogManager {
         self.ip_catalog.read().is_some()
     }
 
-    pub fn remote_ips(&self, domain: &str) -> Option<Vec<std::net::IpAddr>> {
+    /// The IP list is shared as an `Arc`: this runs on every new connection,
+    /// and deep-copying the slice out of the catalog lock only fed the
+    /// allocator addresses the cursor would mostly discard again.
+    pub fn remote_ips(&self, domain: &str) -> Option<Arc<[std::net::IpAddr]>> {
         self.ip_catalog
             .read()
             .as_ref()
             .and_then(|catalog| catalog.lookup_ips_normalized(domain))
-            .map(|(_, ips)| ips.clone())
+            .map(|(_, ips)| Arc::clone(ips))
     }
 
     /// One read-lock acquisition for the domain's IPs and the catalog flag.
     /// The decision cursor asks for both on every new connection.
-    pub fn remote_ips_with_catalog(&self, domain: &str) -> (Option<Vec<std::net::IpAddr>>, bool) {
+    pub fn remote_ips_with_catalog(
+        &self,
+        domain: &str,
+    ) -> (Option<Arc<[std::net::IpAddr]>>, bool) {
         let catalog = self.ip_catalog.read();
         let available = catalog.is_some();
         let ips = catalog
             .as_ref()
             .and_then(|catalog| catalog.lookup_ips_normalized(domain))
-            .map(|(_, ips)| ips.clone());
+            .map(|(_, ips)| Arc::clone(ips));
         (ips, available)
     }
 

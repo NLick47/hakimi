@@ -21,8 +21,8 @@ struct StubRemote;
 
 #[async_trait::async_trait]
 impl crate::catalog::RemoteIpProvider for StubRemote {
-    fn remote_ips(&self, _domain: &str) -> Option<Vec<std::net::IpAddr>> {
-        Some(vec!["127.0.0.1".parse().unwrap()])
+    fn remote_ips(&self, _domain: &str) -> Option<Arc<[std::net::IpAddr]>> {
+        Some(Arc::from(vec!["127.0.0.1".parse().unwrap()]))
     }
 
     fn has_ip_catalog(&self) -> bool {
@@ -36,8 +36,8 @@ struct DualRemote;
 
 #[async_trait::async_trait]
 impl crate::catalog::RemoteIpProvider for DualRemote {
-    fn remote_ips(&self, _domain: &str) -> Option<Vec<std::net::IpAddr>> {
-        Some(vec!["::1".parse().unwrap()])
+    fn remote_ips(&self, _domain: &str) -> Option<Arc<[std::net::IpAddr]>> {
+        Some(Arc::from(vec!["::1".parse().unwrap()]))
     }
 
     fn has_ip_catalog(&self) -> bool {

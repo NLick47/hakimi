@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,10 @@ pub struct IpCatalog {
     /// Raw group definitions, for UI display.
     pub groups: BTreeMap<String, Vec<String>>,
     /// Normalized domain or wildcard -> ordered candidate IPs.
-    pub ips: HashMap<String, Vec<IpAddr>>,
+    ///
+    /// Stored as `Arc` slices so a new connection shares the list instead of
+    /// deep-copying it out of the catalog lock.
+    pub ips: HashMap<String, Arc<[IpAddr]>>,
     pub warnings: Vec<String>,
     /// Sum of every domain's IP list. Status polling reads this while holding
     /// the catalog lock; recomputing it there scanned the whole catalog.
@@ -43,14 +47,14 @@ pub struct IpCatalog {
 }
 
 impl IpCatalog {
-    pub fn lookup_ips(&self, domain: &str) -> Option<(&String, &Vec<IpAddr>)> {
+    pub fn lookup_ips(&self, domain: &str) -> Option<(&String, &Arc<[IpAddr]>)> {
         let host = normalize_hostname(domain).ok()?;
         self.lookup_ips_normalized(&host)
     }
 
     /// Lookup for callers that already normalized the host (the route cursor
     /// does this once per connection).
-    pub fn lookup_ips_normalized(&self, host: &str) -> Option<(&String, &Vec<IpAddr>)> {
+    pub fn lookup_ips_normalized(&self, host: &str) -> Option<(&String, &Arc<[IpAddr]>)> {
         if let Some((key, ips)) = self.ips.get_key_value(host) {
             return Some((key, ips));
         }
@@ -176,7 +180,7 @@ pub fn validate(raw: IpCatalogRaw, config: &AppConfig) -> Result<IpCatalog> {
     }
     let coverage = DomainMatcher::from_patterns(coverage_entries)?;
 
-    let mut ips: HashMap<String, Vec<IpAddr>> = HashMap::new();
+    let mut ips: HashMap<String, Arc<[IpAddr]>> = HashMap::new();
     for (raw_domain, raw_ips) in raw.ips {
         let pattern = DomainPattern::parse(&raw_domain)
             .with_context(|| format!("IP catalog entry `{raw_domain}`"))?;
@@ -215,7 +219,7 @@ pub fn validate(raw: IpCatalogRaw, config: &AppConfig) -> Result<IpCatalog> {
             ));
             continue;
         }
-        if ips.insert(pattern.as_str().to_string(), parsed).is_some() {
+        if ips.insert(pattern.as_str().to_string(), Arc::from(parsed)).is_some() {
             warnings.push(format!(
                 "IP catalog contains duplicate entry `{raw_domain}`; last one wins"
             ));
@@ -235,7 +239,7 @@ pub fn validate(raw: IpCatalogRaw, config: &AppConfig) -> Result<IpCatalog> {
                 .map(|suffix| (suffix.to_string(), key.clone()))
         })
         .collect();
-    let ip_count = ips.values().map(Vec::len).sum();
+    let ip_count = ips.values().map(|ips| ips.len()).sum();
 
     Ok(IpCatalog {
         schema_version: raw.v,
@@ -546,7 +550,7 @@ mod tests {
         for index in 0..COUNT {
             ips.insert(
                 format!("*.sub{index}.example.com"),
-                vec!["1.1.1.1".parse().unwrap()],
+                Arc::from(vec!["1.1.1.1".parse().unwrap()]),
             );
         }
         let catalog = IpCatalog {
