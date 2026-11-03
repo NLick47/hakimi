@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::header;
-use http::{Method, Request, Response, StatusCode, Uri};
+use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use http_body_util::Full;
 use hyper::body::{Frame, Incoming, SizeHint};
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
@@ -30,6 +30,8 @@ const MIB: u64 = 1024 * 1024;
 const BACKLOG_CHUNKS: usize = 8;
 /// Per-chunk attempt cap; a re-dial can pick a different IP
 const MAX_ATTEMPTS: u32 = 3;
+/// A range probe must not hold the browser's first byte for long
+const RANGE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct DownloadManager {
     slots: Arc<Semaphore>,
@@ -79,6 +81,64 @@ fn headers_eligible(
     })
 }
 
+/// A response that carries a content encoding cannot be sliced by byte offset:
+/// range requests are normally answered with the identity representation, so
+/// the offsets would refer to different bytes.
+fn content_encoded(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_ENCODING)
+        .is_some_and(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
+}
+
+/// `bytes START-END/TOTAL`; the total may be `*`.
+fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let rest = value.trim().strip_prefix("bytes")?.trim_start();
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.trim().parse().ok()?;
+    let end = end.trim().parse().ok()?;
+    if start > end {
+        return None;
+    }
+    let total = match total.trim() {
+        "*" => None,
+        total => Some(total.parse().ok()?),
+    };
+    Some((start, end, total))
+}
+
+/// Headers for the range requests that fill the later chunks. The base is the
+/// browser's request with credentials already stripped when the response came
+/// from a mirror, so a third party never sees the GitHub session.
+fn range_request_headers(base: &HeaderMap, response: &HeaderMap) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for name in [
+        header::USER_AGENT,
+        header::REFERER,
+        header::COOKIE,
+        header::AUTHORIZATION,
+    ] {
+        if let Some(value) = base.get(&name) {
+            headers.insert(name, value.clone());
+        }
+    }
+    headers.insert(header::ACCEPT, HeaderValue::from_static("*/*"));
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
+    // If the file changed between the first response and a segment request,
+    // the server answers 200 instead of 206 and the worker stops instead of
+    // splicing two versions together.
+    if let Some(validator) = response
+        .get(header::ETAG)
+        .or_else(|| response.get(header::LAST_MODIFIED))
+    {
+        headers.insert(header::IF_RANGE, validator.clone());
+    }
+    headers
+}
+
 /// Built-in download host rules (hardcoded in v1)
 fn candidate_uri(uri: &Uri) -> bool {
     let Some(host) = uri.host() else {
@@ -91,7 +151,8 @@ fn candidate_uri(uri: &Uri) -> bool {
         return true;
     }
     if host == "github.com" {
-        return uri.path().contains("/releases/download/");
+        let path = uri.path();
+        return path.contains("/releases/download/") || path.contains("/releases/latest/download/");
     }
     host.ends_with(".githubusercontent.com")
 }
@@ -138,9 +199,27 @@ pub(crate) fn signed_url(uri: &Uri) -> bool {
         return false;
     };
     query.split('&').any(|pair| {
-        let key = pair.split('=').next().unwrap_or_default().to_ascii_lowercase();
-        matches!(key.as_str(), "sig" | "signature" | "policy" | "key-pair-id")
-            || key.starts_with("x-amz-")
+        let key = pair
+            .split('=')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        matches!(
+            key.as_str(),
+            "sig"
+                | "signature"
+                | "policy"
+                | "key-pair-id"
+                | "token"
+                | "access_token"
+                | "jwt"
+                | "api_key"
+                | "apikey"
+                | "auth"
+                | "code"
+                | "credential"
+                | "password"
+        ) || key.starts_with("x-amz-")
             || key.starts_with("x-goog-")
     })
 }
@@ -187,10 +266,7 @@ pub(crate) fn mirror_origins(
         uri.authority()?.as_str(),
         uri.path_and_query()?
     );
-    Some(MirrorPlan {
-        origin,
-        candidates,
-    })
+    Some(MirrorPlan { origin, candidates })
 }
 
 pub(crate) fn segment_eligible(
@@ -204,6 +280,9 @@ pub(crate) fn segment_eligible(
         return false;
     }
     let headers = response.headers();
+    if content_encoded(headers) {
+        return false;
+    }
     let len = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -212,8 +291,12 @@ pub(crate) fn segment_eligible(
         .get(header::ACCEPT_RANGES)
         .and_then(|value| value.to_str().ok());
     // a 1 MiB hard floor rejects most traffic before the config snapshot is paid for
-    if !headers_eligible(response.status(), len.map(|len| len.to_string()).as_deref(), ranges, MIB)
-    {
+    if !headers_eligible(
+        response.status(),
+        len.map(|len| len.to_string()).as_deref(),
+        ranges,
+        MIB,
+    ) {
         return false;
     }
     let config = &ctx.config.snapshot().advanced.download;
@@ -247,6 +330,8 @@ struct Shared {
     uri: Uri,
     pool: Arc<super::UpstreamPool>,
     slots: Arc<Semaphore>,
+    /// Base headers for segment requests (never the mirror's credentials)
+    headers: HeaderMap,
     chunks_total: u64,
     chunk_len: u64,
     total_len: u64,
@@ -258,6 +343,9 @@ struct Shared {
     fatal_tx: watch::Sender<bool>,
     fatal_rx: watch::Receiver<bool>,
     reason: Mutex<Option<String>>,
+    /// Bytes actually handed to the browser for this download
+    delivered: AtomicU64,
+    /// Process-wide total, kept for the status endpoint
     finished: Arc<AtomicU64>,
     active: Arc<AtomicUsize>,
     started: Instant,
@@ -273,15 +361,22 @@ impl Shared {
             }
         }
         let _ = self.fatal_tx.send(true);
-        // log the full URL with the reason: a mirror 400 is only diagnosable from
-        // the error body
-        let url = self.uri.to_string();
+        // Log the path but not the query: direct storage URLs carry signatures
+        // in `sig`/`jwt`/`X-Amz-*`, and this file is a local log.
+        let url = uri_without_query(&self.uri);
         tracing::warn!(
             host = %self.host,
             url = %truncate(&url, 300),
             reason,
             "segmented download failed"
         );
+    }
+}
+
+fn uri_without_query(uri: &Uri) -> String {
+    match (uri.scheme_str(), uri.authority()) {
+        (Some(scheme), Some(authority)) => format!("{scheme}://{authority}{}", uri.path()),
+        _ => uri.path().to_string(),
     }
 }
 
@@ -292,14 +387,16 @@ fn truncate(value: &str, max: usize) -> &str {
     }
 }
 
-/// Read the body of a non-206 reply; a mirror explains itself there
-async fn error_body_text(body: Incoming) -> String {
-    let mut limited = http_body_util::Limited::new(body, 256);
-    match limited.collect().await {
-        Ok(collected) => String::from_utf8_lossy(&collected.to_bytes())
+/// Read the body of a non-206 reply; a mirror explains itself there.
+/// The timeout matters: a server that sends headers and then stalls the body
+/// must not wedge a segment worker forever.
+async fn error_body_text(body: Incoming, timeout: Duration) -> String {
+    let limited = http_body_util::Limited::new(body, 256);
+    match tokio::time::timeout(timeout, limited.collect()).await {
+        Ok(Ok(collected)) => String::from_utf8_lossy(&collected.to_bytes())
             .trim()
             .to_string(),
-        Err(_) => String::new(),
+        _ => String::new(),
     }
 }
 
@@ -308,7 +405,7 @@ impl Drop for Shared {
         self.active.fetch_sub(1, Ordering::Relaxed);
         tracing::info!(
             host = %self.host,
-            bytes = self.finished.load(Ordering::Relaxed),
+            bytes = self.delivered.load(Ordering::Relaxed),
             elapsed_ms = self.started.elapsed().as_millis() as u64,
             "segmented download ended"
         );
@@ -422,16 +519,6 @@ impl Worker {
         let expected = (end - start) as usize;
         let mut got = 0usize;
         let mut attempts = 0u32;
-        if let Some(carry) = self.carry.take() {
-            let leftover = push_bytes(&self.shared, index, carry, expected, &mut got).await;
-            if !leftover.is_empty() {
-                self.carry = Some(leftover);
-                self.shared
-                    .finished
-                    .fetch_add(expected as u64, Ordering::Relaxed);
-                return Ok(());
-            }
-        }
         loop {
             if *self.shared.fatal_rx.borrow() {
                 return Err("download cancelled".into());
@@ -452,7 +539,15 @@ impl Worker {
             }
             let outcome = match &mut self.source {
                 Source::Stream(body) => {
-                    read_stream(&self.shared, body, &mut self.carry, index, expected, &mut got).await
+                    read_stream(
+                        &self.shared,
+                        body,
+                        &mut self.carry,
+                        index,
+                        expected,
+                        &mut got,
+                    )
+                    .await
                 }
                 Source::Dialed(conn) => {
                     read_dialed(
@@ -572,11 +667,15 @@ async fn read_dialed(
     if conn.tx.is_closed() {
         return ReadOutcome::SourceDead("connection closed".into());
     }
-    let request = match Request::builder()
+    let Ok(range) = HeaderValue::from_bytes(format!("bytes={range_start}-{range_end}").as_bytes())
+    else {
+        return ReadOutcome::SourceDead("range header build failed".into());
+    };
+    let mut headers = shared.headers.clone();
+    headers.insert(header::RANGE, range);
+    let mut request = match Request::builder()
         .method(Method::GET)
         .uri(shared.uri.clone())
-        .header(header::RANGE, format!("bytes={range_start}-{range_end}"))
-        .header(header::ACCEPT, "*/*")
         .body(Full::new(Bytes::new()))
     {
         Ok(request) => request,
@@ -584,24 +683,63 @@ async fn read_dialed(
             return ReadOutcome::SourceDead(format!("range request build failed: {error}"))
         }
     };
-    let response =
-        match tokio::time::timeout(shared.header_wait, conn.tx.send_request(request)).await {
-            Err(_) => return ReadOutcome::SourceDead("range request header timeout".into()),
-            Ok(Err(error)) => return ReadOutcome::SourceDead(format!("range request failed: {error}")),
-            Ok(Ok(response)) => response,
-        };
+    *request.headers_mut() = headers;
+    let response = match tokio::time::timeout(shared.header_wait, conn.tx.send_request(request))
+        .await
+    {
+        Err(_) => return ReadOutcome::SourceDead("range request header timeout".into()),
+        Ok(Err(error)) => return ReadOutcome::SourceDead(format!("range request failed: {error}")),
+        Ok(Ok(response)) => response,
+    };
     let status = response.status();
     if status != StatusCode::PARTIAL_CONTENT {
-        let body_text = error_body_text(response.into_body()).await;
+        let body_text = error_body_text(
+            response.into_body(),
+            shared.stall.min(Duration::from_secs(3)),
+        )
+        .await;
         let detail = if body_text.is_empty() {
             String::new()
         } else {
             format!(": {}", truncate(&body_text, 200))
         };
+        return ReadOutcome::SourceDead(format!("range request returned {}{}", status, detail));
+    }
+    let content_range = response
+        .headers()
+        .get(header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_content_range);
+    let Some((start, end, total)) = content_range else {
+        return ReadOutcome::SourceDead("range response has no valid Content-Range".into());
+    };
+    if start != range_start || end != range_end {
         return ReadOutcome::SourceDead(format!(
-            "range request returned {}{}",
-            status, detail
+            "range response covers {start}-{end}, expected {range_start}-{range_end}"
         ));
+    }
+    if let Some(total) = total {
+        if total != shared.total_len {
+            return ReadOutcome::SourceDead(format!(
+                "range total changed from {} to {total}",
+                shared.total_len
+            ));
+        }
+    }
+    if content_encoded(response.headers()) {
+        return ReadOutcome::SourceDead("range response is encoded".into());
+    }
+    if let Some(len) = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        if len != expected as u64 {
+            return ReadOutcome::SourceDead(format!(
+                "range response length {len}, expected {expected}"
+            ));
+        }
     }
     let mut body = response.into_body();
     while *got < expected {
@@ -626,26 +764,51 @@ async fn read_dialed(
     ReadOutcome::Complete
 }
 
+async fn send_merge_error(shared: &Shared, out_tx: &mpsc::Sender<Result<Bytes, String>>) {
+    let reason = shared
+        .reason
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| "download interrupted".into());
+    let _ = out_tx.send(Err(reason)).await;
+}
+
 async fn run_merger(
     shared: Arc<Shared>,
     mut order_rx: mpsc::Receiver<(u64, Bytes)>,
     out_tx: mpsc::Sender<Result<Bytes, String>>,
 ) {
+    // The Shared sender keeps the order channel open, so a closed receiver is
+    // not how a failed worker reaches us; watch the fatal flag instead.
+    let mut fatal_rx = shared.fatal_rx.clone();
     let mut pending: BTreeMap<u64, (VecDeque<Bytes>, usize)> = BTreeMap::new();
     let mut next = 0u64;
     loop {
+        if *fatal_rx.borrow() {
+            send_merge_error(&shared, &out_tx).await;
+            return;
+        }
         // keep draining while the next chunk has fragments; recv only when the
         // chunk is complete or a gap appears
         while let Some(entry) = pending.get_mut(&next) {
             let Some(fragment) = entry.0.pop_front() else {
                 break;
             };
+            let len = fragment.len();
             if out_tx.send(Ok(fragment)).await.is_err() {
                 shared.set_fatal("browser went away");
                 return;
             }
+            shared.delivered.fetch_add(len as u64, Ordering::Relaxed);
             if entry.0.is_empty()
-                && entry.1 == expected_chunk_len(next, shared.chunks_total, shared.chunk_len, shared.total_len)
+                && entry.1
+                    == expected_chunk_len(
+                        next,
+                        shared.chunks_total,
+                        shared.chunk_len,
+                        shared.total_len,
+                    )
             {
                 pending.remove(&next);
                 next += 1;
@@ -655,20 +818,23 @@ async fn run_merger(
         if next >= shared.chunks_total {
             return;
         }
-        match order_rx.recv().await {
-            Some((index, bytes)) => {
-                let entry = pending.entry(index).or_default();
-                entry.1 += bytes.len();
-                entry.0.push_back(bytes);
-            }
-            None => {
-                let reason = shared
-                    .reason
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .unwrap_or_else(|| "download interrupted".into());
-                let _ = out_tx.send(Err(reason)).await;
+        tokio::select! {
+            item = order_rx.recv() => match item {
+                Some((index, bytes)) => {
+                    let entry = pending.entry(index).or_default();
+                    entry.1 += bytes.len();
+                    entry.0.push_back(bytes);
+                }
+                None => {
+                    send_merge_error(&shared, &out_tx).await;
+                    return;
+                }
+            },
+            changed = fatal_rx.changed() => {
+                // A closed watch sender cannot happen while Shared holds the
+                // sender; either way the download can no longer finish cleanly.
+                let _ = changed;
+                send_merge_error(&shared, &out_tx).await;
                 return;
             }
         }
@@ -678,33 +844,133 @@ async fn run_merger(
 /// An advertised range support is not a real one (gh-proxy answers some range
 /// requests with 400). Probe with `bytes=0-0` first; on failure the download
 /// falls back to a single connection and still completes, just without speed-up.
-async fn probe_range(pool: &super::UpstreamPool, uri: &Uri, timeout: Duration) -> bool {
-    let Ok(io) = pool.dial_http1(uri.clone()).await else {
-        return false;
-    };
-    let Ok((mut tx, conn)) = hyper::client::conn::http1::handshake(io).await else {
-        return false;
-    };
+async fn probe_range(
+    pool: &super::UpstreamPool,
+    uri: &Uri,
+    headers: &HeaderMap,
+    total_len: u64,
+    timeout: Duration,
+) -> Result<(), String> {
+    let io = pool
+        .dial_http1(uri.clone())
+        .await
+        .map_err(|error| format!("dial failed: {error}"))?;
+    let (mut tx, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .map_err(|error| format!("handshake failed: {error}"))?;
     tokio::spawn(async move {
         let _ = conn.await;
     });
-    let request = match Request::builder()
+    let mut request = Request::builder()
         .method(Method::GET)
         .uri(uri.clone())
-        .header(header::RANGE, "bytes=0-0")
-        .header(header::ACCEPT, "*/*")
         .body(Full::new(Bytes::new()))
+        .map_err(|error| format!("request build failed: {error}"))?;
+    *request.headers_mut() = headers.clone();
+    request
+        .headers_mut()
+        .insert(header::RANGE, HeaderValue::from_static("bytes=0-0"));
+    let response = match tokio::time::timeout(timeout, tx.send_request(request)).await {
+        Err(_) => return Err("timed out".into()),
+        Ok(Err(error)) => return Err(format!("request failed: {error}")),
+        Ok(Ok(response)) => response,
+    };
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        return Err(format!("returned {}", response.status()));
+    }
+    let (start, end, total) = response
+        .headers()
+        .get(header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_content_range)
+        .ok_or_else(|| "returned no valid Content-Range".to_string())?;
+    if start != 0 || end != 0 {
+        return Err(format!("returned range {start}-{end}, expected 0-0"));
+    }
+    if let Some(total) = total {
+        if total != total_len {
+            return Err(format!("returned total {total}, expected {total_len}"));
+        }
+    }
+    if content_encoded(response.headers()) {
+        return Err("returned an encoded body".into());
+    }
+    Ok(())
+}
+
+/// Whether `prefix` honours byte ranges, probing and remembering it when the
+/// answer is not cached. The probe result is shared through the mirror list,
+/// so one download pays for it and the rest reuse the judgement.
+pub(crate) async fn mirror_range_ok(
+    ctx: &super::ProxyContext,
+    uri: &Uri,
+    range_headers: &HeaderMap,
+    response: &UpstreamResponse,
+    prefix: &str,
+) -> bool {
+    let total_len = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let host = uri.host().unwrap_or("").to_string();
+    if let Some(supported) = ctx.download.mirrors.range_supported(prefix) {
+        return supported;
+    }
+    let started = Instant::now();
+    let result = match tokio::time::timeout(
+        RANGE_PROBE_TIMEOUT,
+        probe_range(
+            &ctx.upstream,
+            uri,
+            range_headers,
+            total_len,
+            RANGE_PROBE_TIMEOUT,
+        ),
+    )
+    .await
     {
-        Ok(request) => request,
-        Err(_) => return false,
+        Ok(result) => result,
+        Err(_) => Err("timed out".to_string()),
     };
-    let Ok(Ok(response)) = tokio::time::timeout(timeout, tx.send_request(request)).await else {
-        return false;
+    let elapsed = started.elapsed().as_millis() as u64;
+    ctx.download.mirrors.note_range(prefix, result.is_ok());
+    match result {
+        Ok(()) => true,
+        Err(reason) => {
+            tracing::info!(
+                host = %host,
+                mirror = prefix,
+                elapsed_ms = elapsed,
+                reason = %reason,
+                "mirror range probe failed"
+            );
+            false
+        }
+    }
+}
+
+/// The mirror candidates to try when the serving mirror does not honour byte
+/// ranges: everything after it in list order that is not cooling down. A
+/// direct download (no mirror) returns an empty list — the original response
+/// already streams from the origin.
+pub(crate) fn mirrors_after(serving: Option<&str>, candidates: Vec<String>) -> Vec<String> {
+    let Some(prefix) = serving else {
+        return Vec::new();
     };
-    response.status() == StatusCode::PARTIAL_CONTENT
-        && response
-            .headers()
-            .contains_key(header::CONTENT_RANGE)
+    match candidates.iter().position(|entry| entry == prefix) {
+        Some(index) => candidates[index + 1..].to_vec(),
+        None => candidates
+            .into_iter()
+            .filter(|entry| entry != prefix)
+            .collect(),
+    }
+}
+
+/// Headers for the range probe of a fresh mirror response.
+pub(crate) fn probe_headers(base: &HeaderMap, response: &UpstreamResponse) -> HeaderMap {
+    range_request_headers(base, response.headers())
 }
 
 pub(crate) async fn segment(
@@ -712,6 +978,8 @@ pub(crate) async fn segment(
     uri: Uri,
     response: UpstreamResponse,
     mirrored: bool,
+    base_headers: &HeaderMap,
+    mirror_prefix: Option<&str>,
 ) -> Response<ProxyBody> {
     let config = ctx.config.snapshot();
     let download = &config.advanced.download;
@@ -721,21 +989,19 @@ pub(crate) async fn segment(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
+    let range_headers = range_request_headers(base_headers, response.headers());
 
     if mirrored {
-        let probe_timeout = Duration::from_secs(download.stall_timeout_secs.max(2));
-        let host = uri.host().unwrap_or("").to_string();
-        if !probe_range(&ctx.upstream, &uri, probe_timeout).await {
+        let prefix = mirror_prefix.unwrap_or_default();
+        if prefix.is_empty() || !mirror_range_ok(ctx, &uri, &range_headers, &response, prefix).await
+        {
             tracing::info!(
-                host = %host,
-                "mirror range probe failed, falling back to single stream"
+                host = uri.host().unwrap_or(""),
+                "mirror does not support ranges, falling back to single stream"
             );
             let (mut parts, body) = response.into_parts();
             super::upstream::sanitize_response_headers(&mut parts.headers, false);
-            return Response::from_parts(
-                parts,
-                ProxyBody::upstream(body, uri, StatusCode::OK),
-            );
+            return Response::from_parts(parts, ProxyBody::upstream(body, uri, StatusCode::OK));
         }
     }
 
@@ -765,6 +1031,7 @@ pub(crate) async fn segment(
         uri: uri.clone(),
         pool: ctx.upstream.clone(),
         slots: ctx.download.slots.clone(),
+        headers: range_headers,
         next: AtomicU64::new(0),
         chunks_total,
         chunk_len,
@@ -776,6 +1043,7 @@ pub(crate) async fn segment(
         fatal_tx,
         fatal_rx: fatal_rx.clone(),
         reason: Mutex::new(None),
+        delivered: AtomicU64::new(0),
         finished: ctx.download.finished.clone(),
         active: ctx.download.active.clone(),
         started: Instant::now(),
@@ -859,13 +1127,14 @@ impl hyper::body::Body for SegmentedBody {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_uri, claim, expected_chunk_len, headers_eligible, mirror_candidate,
-        mirror_origins, signed_url, MIB,
+        candidate_uri, claim, content_encoded, expected_chunk_len, headers_eligible,
+        mirror_candidate, mirror_origins, parse_content_range, range_request_headers, signed_url,
+        MIB,
     };
     use crate::config::DownloadConfig;
     use crate::mirror::{MirrorList, BUILTIN_MIRRORS};
+    use http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use std::sync::atomic::AtomicU64;
-    use http::{Method, StatusCode, Uri};
 
     fn builtin_mirrors() -> MirrorList {
         MirrorList::load(None)
@@ -895,7 +1164,9 @@ mod tests {
 
         let avatar: Uri = "https://avatars.githubusercontent.com/u/1".parse().unwrap();
         assert!(mirror_origins(&config, &mirrors, &Method::GET, &avatar).is_none());
-        let raw: Uri = "https://raw.githubusercontent.com/o/r/main/x".parse().unwrap();
+        let raw: Uri = "https://raw.githubusercontent.com/o/r/main/x"
+            .parse()
+            .unwrap();
         assert!(mirror_origins(&config, &mirrors, &Method::GET, &raw).is_none());
         let page: Uri = "https://github.com/owner/repo".parse().unwrap();
         assert!(mirror_origins(&config, &mirrors, &Method::GET, &page).is_none());
@@ -934,6 +1205,68 @@ mod tests {
             .unwrap();
         assert!(signed_url(&cloudfront));
         assert!(!signed_url(&release()));
+
+        // GitHub's private entry points use these instead of `sig`.
+        for key in ["token", "access_token", "jwt", "code"] {
+            let uri: Uri = format!("https://github.com/o/r/archive/main.zip?{key}=secret")
+                .parse()
+                .unwrap();
+            assert!(
+                signed_url(&uri),
+                "a `{key}` query must never be embedded in a mirror URL"
+            );
+        }
+    }
+
+    #[test]
+    fn content_range_must_match_the_requested_chunk() {
+        assert_eq!(
+            parse_content_range("bytes 0-0/100"),
+            Some((0, 0, Some(100)))
+        );
+        assert_eq!(
+            parse_content_range("bytes 100-199/*"),
+            Some((100, 199, None))
+        );
+        assert_eq!(parse_content_range("bytes 100-99/200"), None);
+        assert_eq!(parse_content_range("bytes 100-199"), None);
+        assert_eq!(parse_content_range("items 0-0/1"), None);
+    }
+
+    #[test]
+    fn encoded_responses_are_never_segmented() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert!(content_encoded(&headers));
+        headers.insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+        assert!(!content_encoded(&headers));
+        assert!(!content_encoded(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn range_headers_drop_mirror_credentials_and_pin_the_validator() {
+        let mut base = HeaderMap::new();
+        base.insert(header::USER_AGENT, HeaderValue::from_static("browser"));
+        base.insert(header::COOKIE, HeaderValue::from_static("session=1"));
+        base.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer x"));
+        let mut response = HeaderMap::new();
+        response.insert(header::ETAG, HeaderValue::from_static("\"v1\""));
+
+        let headers = range_request_headers(&base, &response);
+        assert_eq!(headers.get(header::USER_AGENT).unwrap(), "browser");
+        assert_eq!(headers.get(header::COOKIE).unwrap(), "session=1");
+        assert_eq!(headers.get(header::ACCEPT_ENCODING).unwrap(), "identity");
+        assert_eq!(headers.get(header::IF_RANGE).unwrap(), "\"v1\"");
+        assert!(headers.get(header::RANGE).is_none());
+
+        // A mirrored response's base had its credentials removed upstream.
+        let stripped = HeaderMap::new();
+        let headers = range_request_headers(&stripped, &response);
+        assert!(headers.get(header::COOKIE).is_none());
+        assert!(headers.get(header::AUTHORIZATION).is_none());
     }
 
     #[test]
@@ -954,12 +1287,35 @@ mod tests {
     }
 
     #[test]
+    fn the_failover_tail_skips_the_serving_mirror() {
+        use super::mirrors_after;
+        let list = vec![
+            "https://a.example".to_string(),
+            "https://b.example".to_string(),
+            "https://c.example".to_string(),
+        ];
+        // The serving mirror is the first candidate: the tail is the rest.
+        assert_eq!(
+            mirrors_after(Some("https://a.example"), list.clone()),
+            vec!["https://b.example", "https://c.example"]
+        );
+        // A serving mirror that dropped out of the list still excludes itself,
+        // and an unknown mirror leaves every other candidate reachable.
+        assert_eq!(mirrors_after(Some("https://z.example"), list.clone()), list);
+        // A direct download has no mirror to fail over to.
+        assert_eq!(mirrors_after(None, list), Vec::<String>::new());
+    }
+
+    #[test]
     fn a_failing_mirror_falls_through_to_the_next_one() {
         let config = DownloadConfig::default();
         let mirrors = builtin_mirrors();
         mirrors.cool_down(BUILTIN_MIRRORS[0]);
         let plan = mirror_origins(&config, &mirrors, &Method::GET, &release()).unwrap();
-        assert_eq!(plan.candidates[0], BUILTIN_MIRRORS[1], "the next mirror takes over");
+        assert_eq!(
+            plan.candidates[0], BUILTIN_MIRRORS[1],
+            "the next mirror takes over"
+        );
         let rewritten = plan.rewrite(&plan.candidates[0]).unwrap();
         assert_eq!(
             rewritten.host(),
@@ -979,33 +1335,48 @@ mod tests {
     #[test]
     fn mirror_candidate_is_narrower_than_segment_rules() {
         let codeload: Uri = "https://codeload.github.com/o/r/zip/1".parse().unwrap();
-        let dl: Uri = "https://github.com/o/r/releases/download/v1/x".parse().unwrap();
-        let latest: Uri = "https://github.com/o/r/releases/latest/download/x".parse().unwrap();
-        let archive: Uri = "https://github.com/o/r/archive/refs/tags/v1.zip".parse().unwrap();
+        let dl: Uri = "https://github.com/o/r/releases/download/v1/x"
+            .parse()
+            .unwrap();
+        let latest: Uri = "https://github.com/o/r/releases/latest/download/x"
+            .parse()
+            .unwrap();
+        let archive: Uri = "https://github.com/o/r/archive/refs/tags/v1.zip"
+            .parse()
+            .unwrap();
         assert!(mirror_candidate(&codeload));
         assert!(mirror_candidate(&dl));
         assert!(mirror_candidate(&latest));
         assert!(mirror_candidate(&archive));
 
         // a web page whose path happens to contain the same words stays direct
-        let blob: Uri = "https://github.com/o/r/blob/main/archive/notes.md".parse().unwrap();
+        let blob: Uri = "https://github.com/o/r/blob/main/archive/notes.md"
+            .parse()
+            .unwrap();
         assert!(!mirror_candidate(&blob), "a blob page is not a download");
-        let nested: Uri =
-            "https://github.com/o/r/blob/main/docs/releases/download/x.md"
-                .parse()
-                .unwrap();
+        let nested: Uri = "https://github.com/o/r/blob/main/docs/releases/download/x.md"
+            .parse()
+            .unwrap();
         assert!(!mirror_candidate(&nested));
         let repo_page: Uri = "https://github.com/o/r".parse().unwrap();
         assert!(!mirror_candidate(&repo_page));
 
         let avatar: Uri = "https://avatars.githubusercontent.com/u/1".parse().unwrap();
         assert!(!mirror_candidate(&avatar));
-        assert!(candidate_uri(&avatar), "segment rules stay wide for direct mode");
+        assert!(
+            candidate_uri(&avatar),
+            "segment rules stay wide for direct mode"
+        );
     }
 
     #[test]
     fn headers_gate_blocks_wrong_status_size_and_missing_ranges() {
-        assert!(headers_eligible(StatusCode::OK, Some("1048576"), Some("bytes"), MIB));
+        assert!(headers_eligible(
+            StatusCode::OK,
+            Some("1048576"),
+            Some("bytes"),
+            MIB
+        ));
         assert!(!headers_eligible(
             StatusCode::PARTIAL_CONTENT,
             Some("1048576"),
@@ -1013,9 +1384,24 @@ mod tests {
             MIB
         ));
         assert!(!headers_eligible(StatusCode::OK, None, Some("bytes"), MIB));
-        assert!(!headers_eligible(StatusCode::OK, Some("1024"), Some("bytes"), MIB));
-        assert!(!headers_eligible(StatusCode::OK, Some("1048576"), Some("none"), MIB));
-        assert!(!headers_eligible(StatusCode::OK, Some("abc"), Some("bytes"), MIB));
+        assert!(!headers_eligible(
+            StatusCode::OK,
+            Some("1024"),
+            Some("bytes"),
+            MIB
+        ));
+        assert!(!headers_eligible(
+            StatusCode::OK,
+            Some("1048576"),
+            Some("none"),
+            MIB
+        ));
+        assert!(!headers_eligible(
+            StatusCode::OK,
+            Some("abc"),
+            Some("bytes"),
+            MIB
+        ));
         // below the configured threshold but above the 1 MiB floor: the caller
         // applies the config on top
         assert!(!headers_eligible(
@@ -1028,7 +1414,9 @@ mod tests {
 
     #[test]
     fn download_rules_cover_github_assets_only() {
-        let uri: Uri = "https://objects.githubusercontent.com/x/y?sig=1".parse().unwrap();
+        let uri: Uri = "https://objects.githubusercontent.com/x/y?sig=1"
+            .parse()
+            .unwrap();
         assert!(candidate_uri(&uri));
         let uri: Uri = "https://release-assets.githubusercontent.com/a/b"
             .parse()
@@ -1038,6 +1426,13 @@ mod tests {
             .parse()
             .unwrap();
         assert!(candidate_uri(&uri));
+        let uri: Uri = "https://github.com/owner/repo/releases/latest/download/x.zip"
+            .parse()
+            .unwrap();
+        assert!(
+            candidate_uri(&uri),
+            "the latest shorthand is a download too"
+        );
         let uri: Uri = "https://codeload.github.com/owner/repo/zip/refs/tags/v1"
             .parse()
             .unwrap();

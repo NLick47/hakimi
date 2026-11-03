@@ -194,10 +194,7 @@ impl ProxyContext {
         status_json: Arc<dyn Fn(bool) -> serde_json::Value + Send + Sync>,
         on_stop: Arc<dyn Fn() + Send + Sync>,
     ) -> Arc<Self> {
-        let download = Arc::new(download::DownloadManager::new(
-            &config.snapshot(),
-            mirrors,
-        ));
+        let download = Arc::new(download::DownloadManager::new(&config.snapshot(), mirrors));
         Arc::new(Self {
             engine,
             ca,
@@ -327,7 +324,7 @@ async fn handle_request(mut req: Request<Incoming>, ctx: Arc<ProxyContext>) -> R
         path == "/proxy.pac" || path.starts_with("/hakimi/")
     };
     if local_path && is_local_request(&req, &ctx) {
-        return local_response(&req, &ctx);
+        return local_response(&req, &ctx).await;
     }
     if req.method() == Method::CONNECT {
         return handle_connect(&mut req, ctx).await;
@@ -338,7 +335,10 @@ async fn handle_request(mut req: Request<Incoming>, ctx: Arc<ProxyContext>) -> R
 /// Paths that change state. Every one of them requires a POST and the control
 /// header; the read-only endpoints (PAC, status, health) stay open.
 fn is_control_endpoint(path: &str) -> bool {
-    matches!(path, "/hakimi/pause" | "/hakimi/resume" | "/hakimi/stop")
+    matches!(
+        path,
+        "/hakimi/pause" | "/hakimi/resume" | "/hakimi/stop" | "/hakimi/refresh-mirrors"
+    )
 }
 
 /// A custom header forces a CORS preflight, so a page in a browser cannot fire
@@ -355,7 +355,7 @@ fn control_authorized(req: &Request<Incoming>) -> bool {
 /// A local path is terminal: it never goes upstream. Forwarding one turned
 /// `GET /hakimi/<typo>` into a request the proxy made to itself, which came back
 /// as a 502 only after an extra self-connection per hop.
-fn local_response(req: &Request<Incoming>, ctx: &Arc<ProxyContext>) -> Response<ProxyBody> {
+async fn local_response(req: &Request<Incoming>, ctx: &Arc<ProxyContext>) -> Response<ProxyBody> {
     let path = req.uri().path();
     if is_control_endpoint(path) {
         if req.method() != Method::POST {
@@ -397,6 +397,31 @@ fn local_response(req: &Request<Incoming>, ctx: &Arc<ProxyContext>) -> Response<
             json_response(value)
         }
         "/hakimi/health" => text_response(StatusCode::OK, "text/plain; charset=utf-8", "ok"),
+        "/hakimi/refresh-mirrors" => {
+            let source = ctx
+                .config
+                .snapshot()
+                .advanced
+                .download
+                .mirror_source
+                .clone();
+            if source.trim().is_empty() {
+                return json_response(
+                    serde_json::json!({"ok": true, "count": 0, "message": "mirror is off"}),
+                );
+            }
+            match ctx.download.mirrors.refresh(&source).await {
+                Ok(count) => json_response(serde_json::json!({
+                    "ok": true,
+                    "count": count,
+                    "mirrors": ctx.download.mirrors.all(),
+                    "usable": ctx.download.mirrors.available(),
+                })),
+                Err(error) => {
+                    json_response(serde_json::json!({"ok": false, "error": format!("{error:#}")}))
+                }
+            }
+        }
         "/hakimi/pause" => {
             ctx.status.set_paused(true);
             json_response(serde_json::json!({ "paused": true }))
