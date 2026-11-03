@@ -136,7 +136,7 @@ class SettingsScreen(private val context: Context, private val host: Host) {
             host.editSetting(
                 "advanced.download.mirrorSource",
                 "镜像列表",
-                "远端镜像列表地址，留空则停用镜像加速",
+                "留空停用",
                 mirrorSource()
             )
         }
