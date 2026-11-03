@@ -129,9 +129,9 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         content.addView(space(10f))
 
         content.addView(section("下载"))
-        mirrorRow = SwitchRow(context, "GitHub 镜像加速", "release 资产与源码包改走第三方镜像")
+        mirrorRow = SwitchRow(context, "GitHub 镜像加速")
         mirrorRow.onCheckedChange = { host.setDownloadMirror(it) }
-        mirrorSourceRow = SettingRow(context, "镜像列表", "留空则停用加速")
+        mirrorSourceRow = SettingRow(context, "镜像列表", "仅公开仓库")
         mirrorSourceRow.clickOnce {
             host.editSetting(
                 "advanced.download.mirrorSource",

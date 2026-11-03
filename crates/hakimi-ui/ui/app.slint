@@ -1788,7 +1788,7 @@ export component AppWindow inherits Window {
 
                             ToggleRow {
                                 label: "GitHub 镜像加速";
-                                hint: "release 资产与源码包改走第三方镜像";
+                                hint: "release 资产与源码包改走第三方镜像（仅公开仓库）";
                                 checked: root.cfg-download-mirror;
                                 toggled(value) => {
                                     root.save-bool("advanced.download.mirrorSource", value);
@@ -1797,7 +1797,7 @@ export component AppWindow inherits Window {
                             RowLine { }
                             FieldRow {
                                 label: "镜像列表";
-                                hint: "留空则停用加速";
+                                hint: "仅公开仓库；留空则停用加速";
                                 setting-key: "advanced.download.mirrorSource";
                                 error-key: root.cfg-error-key;
                                 placeholder: "https://…";
