@@ -7,6 +7,7 @@ mod doh;
 mod env;
 mod export;
 mod group;
+mod mirror;
 mod output;
 mod pac;
 mod serve;
@@ -73,6 +74,8 @@ enum Command {
         #[command(subcommand)]
         command: doh::DohCommand,
     },
+    /// Show or switch the GitHub download mirror.
+    Mirror(mirror::MirrorArgs),
     /// Print the proxy environment variables for this shell.
     Env(env::EnvArgs),
     /// Print the PAC script.
@@ -114,6 +117,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Ca { command } => return ca::run(&runtime, command, out).await,
         Command::Catalog { command } => return catalog::run(&runtime, command, out).await,
         Command::Doh { command } => return doh::run(&runtime, command, out).await,
+        Command::Mirror(args) => return mirror::run(&runtime, args, out).await,
         Command::Env(args) => env::run(&runtime, args, out)?,
         Command::Pac => pac::run(&runtime).await?,
         Command::Export(args) => export::run(&runtime, args)?,
