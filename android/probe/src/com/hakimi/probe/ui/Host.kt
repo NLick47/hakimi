@@ -18,6 +18,8 @@ data class DiagnoseOutcome(
 interface Host {
     val core: CoreData
     val probing: Boolean
+    /** True between the tap on 开启 and the core reporting running. */
+    val startingAcceleration: Boolean
     val caReady: Boolean
     val caLockReady: Boolean
     val caExportName: String

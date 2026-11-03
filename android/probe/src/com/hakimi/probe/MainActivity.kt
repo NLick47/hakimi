@@ -109,6 +109,9 @@ class MainActivity : Activity(), Host {
     override val probing: Boolean
         get() = probeInFlight
 
+    override val startingAcceleration: Boolean
+        get() = starting
+
     override val refreshingCatalogs: Boolean
         get() = catalogsRefreshing
 
@@ -153,6 +156,7 @@ class MainActivity : Activity(), Host {
     private var reopenCaSheet = false
     private var startAfterCaInstall = false
     private var starting = false
+    private var pendingToggle = false
     private var lastAccelToggle = 0L
     private var exporting = false
     private var catalogsRefreshing = false
@@ -431,7 +435,10 @@ class MainActivity : Activity(), Host {
 
     override fun toggleAcceleration() {
         if (!caChecked) {
-            showSnack("正在检查环境，请稍候")
+            // A tap right after launch lands before the CA probe returns; keep it
+            // instead of dropping it, syncCaTrust replays it once the state is known.
+            pendingToggle = true
+            showSnack("正在检查环境，稍候自动开始")
             return
         }
         val now = SystemClock.elapsedRealtime()
@@ -466,6 +473,7 @@ class MainActivity : Activity(), Host {
         }
 
         starting = true
+        render()
         try {
             startServiceCompat(
                 Intent(this, ProxyService::class.java).setAction(ProxyService.ACTION_START)
@@ -473,6 +481,7 @@ class MainActivity : Activity(), Host {
             showSnack("正在启动本地核心…")
         } catch (error: Throwable) {
             starting = false
+            render()
             showSnack("启动失败：${error.message}", error = true)
             return
         }
@@ -482,6 +491,7 @@ class MainActivity : Activity(), Host {
 
     private fun launchVpn() {
         starting = true
+        render()
         try {
             startServiceCompat(
                 Intent(this, HakimiVpnService::class.java).setAction(HakimiVpnService.ACTION_START)
@@ -489,6 +499,7 @@ class MainActivity : Activity(), Host {
             showSnack("正在建立 VPN…")
         } catch (error: Throwable) {
             starting = false
+            render()
             showSnack("VPN 启动失败：${error.message}", error = true)
             return
         }
@@ -1375,6 +1386,7 @@ class MainActivity : Activity(), Host {
                     data = data.copy(userCaTrusted = trusted)
                 }
                 if (!resumed) {
+                    pendingToggle = false
                     caCallbacks.clear()
                     return@post
                 }
@@ -1384,6 +1396,10 @@ class MainActivity : Activity(), Host {
                 caCallbacks.clear()
                 callbacks.forEach { callback ->
                     runCatching { callback() }
+                }
+                if (pendingToggle) {
+                    pendingToggle = false
+                    toggleAcceleration()
                 }
                 refreshNow()
             }

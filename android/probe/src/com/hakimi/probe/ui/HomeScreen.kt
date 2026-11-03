@@ -96,14 +96,12 @@ class HomeScreen(private val context: Context, private val host: Host) {
                 if (!host.caLockReady) {
                     heroTitle.text = "需要设置锁屏"
                     heroSubtitle.text = "Android 11 及以上安装 CA 需要锁屏"
-                    heroAction.text = "设置"
+                    bindAction("设置") { host.openCaSetup() }
                 } else {
                     heroTitle.text = "需要安装证书"
                     heroSubtitle.text = "安装本地 CA 后才能加速"
-                    heroAction.text = "安装"
+                    bindAction("安装") { host.openCaSetup() }
                 }
-                heroAction.isEnabled = true
-                heroAction.clickOnce { host.openCaSetup() }
             }
             vpnMode && vpnActive -> {
                 heroTitle.text = "VPN 已开启"
@@ -112,30 +110,39 @@ class HomeScreen(private val context: Context, private val host: Host) {
                 } else {
                     "核心重连中"
                 }
-                heroAction.text = "暂停"
-                heroAction.isEnabled = true
-                heroAction.clickOnce { host.toggleAcceleration() }
+                bindAction("暂停") { host.toggleAcceleration() }
+            }
+            vpnMode && (host.startingAcceleration || data.running) -> {
+                heroTitle.text = "正在建立 VPN"
+                if (host.startingAcceleration) {
+                    heroSubtitle.text = "正在启动本地核心"
+                    busyAction()
+                } else {
+                    // The core is up but the tunnel is not: keep 暂停 reachable so a
+                    // failed establish can still be cancelled from here.
+                    heroSubtitle.text = "核心已就绪，正在接管网络"
+                    bindAction("暂停") { host.toggleAcceleration() }
+                }
             }
             vpnMode -> {
                 heroTitle.text = "VPN 已暂停"
                 heroSubtitle.text = "开启后走加速"
-                heroAction.text = "开启"
-                heroAction.isEnabled = true
-                heroAction.clickOnce { host.toggleAcceleration() }
+                bindAction("开启") { host.toggleAcceleration() }
+            }
+            host.startingAcceleration -> {
+                heroTitle.text = "正在启动"
+                heroSubtitle.text = "本地核心启动中"
+                busyAction()
             }
             data.running -> {
                 heroTitle.text = "加速已开启"
                 heroSubtitle.text = data.endpoint
-                heroAction.text = "暂停"
-                heroAction.isEnabled = true
-                heroAction.clickOnce { host.toggleAcceleration() }
+                bindAction("暂停") { host.toggleAcceleration() }
             }
             else -> {
                 heroTitle.text = "加速已暂停"
                 heroSubtitle.text = data.endpoint
-                heroAction.text = "开启"
-                heroAction.isEnabled = true
-                heroAction.clickOnce { host.toggleAcceleration() }
+                bindAction("开启") { host.toggleAcceleration() }
             }
         }
 
@@ -149,6 +156,21 @@ class HomeScreen(private val context: Context, private val host: Host) {
                 append(" · ").append(data.normalDomains).append(" 个正常")
             }
         }
+    }
+
+    /** Action is inert until the core reports a running listener. */
+    private fun busyAction() {
+        heroAction.text = "启动中"
+        heroAction.isEnabled = false
+        heroAction.setTextColor(Palette.MUTED)
+    }
+
+    /** Restores the accent styling a former [busyAction] removed. */
+    private fun bindAction(label: String, action: () -> Unit) {
+        heroAction.text = label
+        heroAction.isEnabled = true
+        heroAction.setTextColor(Palette.ACCENT)
+        heroAction.clickOnce { action() }
     }
 
     /** Mirrors what the VPN actually captured, not what the mode is called. */
