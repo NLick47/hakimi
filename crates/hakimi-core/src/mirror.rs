@@ -29,6 +29,8 @@ const MAX_MIRRORS: usize = 16;
 const MAX_BYTES: usize = 64 * 1024;
 /// How long a failing mirror is skipped
 const COOLDOWN: Duration = Duration::from_secs(300);
+/// How long a mirror's range support is remembered before probing again
+const RANGE_TTL: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -44,6 +46,14 @@ pub struct MirrorList {
     cache: Option<PathBuf>,
     mirrors: RwLock<Arc<Vec<String>>>,
     down: RwLock<HashMap<String, MirrorFailure>>,
+    /// Whether a prefix honours `Range`; some mirrors return a full 200 instead
+    range_ok: RwLock<HashMap<String, RangeState>>,
+}
+
+#[derive(Clone, Copy)]
+struct RangeState {
+    supported: bool,
+    checked: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -78,6 +88,7 @@ impl MirrorList {
             cache,
             mirrors: RwLock::new(Arc::new(mirrors)),
             down: RwLock::new(HashMap::new()),
+            range_ok: RwLock::new(HashMap::new()),
         }
     }
 
@@ -115,6 +126,27 @@ impl MirrorList {
     /// A success wipes the failure count so the next outage starts over
     pub fn note_success(&self, mirror: &str) {
         self.down.write().remove(mirror);
+    }
+
+    /// The remembered range capability of a prefix, if it is still fresh.
+    /// `None` means the next segmented download should probe.
+    pub fn range_supported(&self, mirror: &str) -> Option<bool> {
+        let now = Instant::now();
+        self.range_ok.read().get(mirror).and_then(|state| {
+            (now.saturating_duration_since(state.checked) < RANGE_TTL).then_some(state.supported)
+        })
+    }
+
+    /// Records whether the prefix honoured the range probe. `false` avoids
+    /// paying the probe on every download from a mirror that streams whole files.
+    pub fn note_range(&self, mirror: &str, supported: bool) {
+        self.range_ok.write().insert(
+            mirror.to_string(),
+            RangeState {
+                supported,
+                checked: Instant::now(),
+            },
+        );
     }
 
     /// Fetch the remote list and persist it. An empty source means mirrors are off.
@@ -155,6 +187,9 @@ impl MirrorList {
         let count = mirrors.len();
         *self.mirrors.write() = Arc::new(mirrors);
         self.down.write().clear();
+        // A new list may contain different prefixes; do not let a stale
+        // capability judgement decide its segmented downloads.
+        self.range_ok.write().clear();
         Ok(count)
     }
 }
@@ -185,6 +220,15 @@ fn normalize_prefix(raw: &str) -> Option<String> {
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return None;
     }
+    // A query or fragment would swallow the embedded origin URL, and
+    // userinfo would put a credential into a path the mirror sees.
+    if url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
     Some(trimmed.to_string())
 }
 
@@ -201,6 +245,26 @@ mod tests {
         assert!(normalize_prefix("gh-proxy.com").is_none());
         assert!(normalize_prefix("ftp://gh-proxy.com").is_none());
         assert!(normalize_prefix("  ").is_none());
+        // A query/fragment would swallow the rewritten origin, and userinfo
+        // would leak a credential into the mirror path.
+        assert!(normalize_prefix("https://gh-proxy.com/?a=1").is_none());
+        assert!(normalize_prefix("https://gh-proxy.com/#x").is_none());
+        assert!(normalize_prefix("https://user:pass@gh-proxy.com").is_none());
+        assert_eq!(
+            normalize_prefix("https://mirror.example/gh/").as_deref(),
+            Some("https://mirror.example/gh")
+        );
+    }
+
+    #[test]
+    fn range_capability_is_remembered_and_cleared() {
+        let mirrors = MirrorList::load(None);
+        assert_eq!(mirrors.range_supported("https://gh-proxy.com"), None);
+        mirrors.note_range("https://gh-proxy.com", false);
+        assert_eq!(mirrors.range_supported("https://gh-proxy.com"), Some(false));
+        mirrors.note_range("https://gh-proxy.com", true);
+        assert_eq!(mirrors.range_supported("https://gh-proxy.com"), Some(true));
+        assert_eq!(mirrors.range_supported("https://ghfast.top"), None);
     }
 
     #[test]
