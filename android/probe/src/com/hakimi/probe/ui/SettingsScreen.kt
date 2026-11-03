@@ -37,6 +37,8 @@ class SettingsScreen(private val context: Context, private val host: Host) {
     private lateinit var ipCatalogRow: SettingRow
     private lateinit var dohCatalogRow: SettingRow
     private lateinit var resetCatalogRow: SettingRow
+    private lateinit var mirrorRow: SwitchRow
+    private lateinit var mirrorSourceRow: SettingRow
     private lateinit var alwaysOnRow: SettingRow
     private lateinit var batteryRow: SettingRow
     private lateinit var refreshCatalogRow: SettingRow
@@ -124,6 +126,21 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         resetCatalogRow = SettingRow(context, "恢复默认目录", "把 IP/DoH 目录恢复为内置地址")
         resetCatalogRow.clickOnce { host.resetCatalogs() }
         content.addView(rowsCard(portRow, ipCatalogRow, dohCatalogRow, resetCatalogRow))
+        content.addView(space(10f))
+
+        content.addView(section("下载"))
+        mirrorRow = SwitchRow(context, "GitHub 镜像加速", "release 资产与源码包改走第三方镜像")
+        mirrorRow.onCheckedChange = { host.setDownloadMirror(it) }
+        mirrorSourceRow = SettingRow(context, "镜像列表", "留空则停用加速")
+        mirrorSourceRow.clickOnce {
+            host.editSetting(
+                "advanced.download.mirrorSource",
+                "镜像列表",
+                "远端镜像列表地址，留空则停用镜像加速",
+                mirrorSource()
+            )
+        }
+        content.addView(rowsCard(mirrorRow, mirrorSourceRow))
         content.addView(space(10f))
 
         content.addView(section("后台"))
@@ -240,6 +257,16 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         ipCatalogRow.setValue(shorten(configString("catalogs", "ip")).ifEmpty { "未设置" })
         dohCatalogRow.setValue(shorten(configString("catalogs", "doh")).ifEmpty { "未设置" })
 
+        // The source URL doubles as the switch: empty means the mirror is off.
+        val mirrorSource = mirrorSource().trim()
+        val mirrorEnabled = mirrorSource.isNotEmpty()
+        // Keep the tap the user just made visible until the save settles.
+        if (!host.savingConfig) mirrorRow.setChecked(mirrorEnabled)
+        mirrorSourceRow.setValue(
+            if (mirrorEnabled) shorten(mirrorSource) else "未设置",
+            if (mirrorEnabled) Palette.TEXT_2 else Palette.MUTED
+        )
+
         val always = Prefs.systemAlwaysOn(context)
         alwaysOnRow.setValue(
             if (always) "已开启" else "未开启",
@@ -256,6 +283,8 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         ipCatalogRow.setBusy(host.savingConfig)
         dohCatalogRow.setBusy(host.savingConfig)
         resetCatalogRow.setBusy(host.savingConfig)
+        mirrorRow.setBusy(host.savingConfig)
+        mirrorSourceRow.setBusy(host.savingConfig)
         refreshCatalogRow.setBusy(host.refreshingCatalogs)
         diagnoseRow.setBusy(host.diagnosing)
         logRow.setBusy(host.loadingLog)
@@ -359,6 +388,12 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         val core = host.core
         return core.configJson.optJSONObject(group)?.optString(key).orEmpty()
     }
+
+    private fun mirrorSource(): String = host.core.configJson
+        .optJSONObject("advanced")
+        ?.optJSONObject("download")
+        ?.optString("mirrorSource")
+        .orEmpty()
 
     private fun shorten(value: String): String = when {
         value.isEmpty() -> ""

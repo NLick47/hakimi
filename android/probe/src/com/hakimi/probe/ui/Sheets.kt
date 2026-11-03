@@ -15,6 +15,7 @@ object Sheets {
         value: String,
         hint: String,
         numeric: Boolean = false,
+        allowEmpty: Boolean = false,
         onSave: (String) -> Unit,
     ) {
         val sheet = Sheet(context, title, subtitle)
@@ -42,7 +43,7 @@ object Sheets {
             "保存",
             {
                 val next = edit.text.toString().trim()
-                if (next.isEmpty()) {
+                if (next.isEmpty() && !allowEmpty) {
                     error.text = "不能为空"
                     error.visibility = TextView.VISIBLE
                 } else {

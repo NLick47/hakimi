@@ -34,6 +34,7 @@ interface Host {
 
     fun toggleAcceleration()
     fun setGroupEnabled(site: SiteInfo, enabled: Boolean)
+    fun setDownloadMirror(enabled: Boolean)
     fun saveGroup(group: JSONObject, isNew: Boolean, done: (Boolean, String?) -> Unit)
     fun deleteGroup(id: String, done: (Boolean, String?) -> Unit)
     fun runProbeSweep()

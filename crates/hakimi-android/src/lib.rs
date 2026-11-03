@@ -138,11 +138,13 @@ fn config_json() -> String {
     }
 }
 
-/// Built-in catalog endpoints, exposed so the UI can offer a one-tap reset.
+/// Built-in remote endpoints, exposed so the UI can offer a one-tap reset and
+/// restore the default mirror list after it was switched off.
 fn default_catalog_urls() -> String {
     serde_json::json!({
         "ip": hakimi_core::config::DEFAULT_CATALOG_IP,
         "doh": hakimi_core::config::DEFAULT_CATALOG_DOH,
+        "mirror": hakimi_core::config::DEFAULT_MIRROR_SOURCE,
     })
     .to_string()
 }

@@ -259,6 +259,7 @@ class SwitchView @JvmOverloads constructor(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (!isEnabled) return super.onTouchEvent(event)
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 isPressed = true
@@ -281,6 +282,7 @@ class SwitchView @JvmOverloads constructor(
 
     override fun performClick(): Boolean {
         super.performClick()
+        if (!isEnabled) return true
         setChecked(!checked)
         onCheckedChange?.invoke(checked)
         return true
@@ -597,6 +599,62 @@ class SettingRow(
 
     fun hideChevron() {
         chevron.visibility = View.GONE
+    }
+}
+
+/** A settings row with a switch on the right; tapping the row toggles it too. */
+class SwitchRow(
+    context: Context,
+    title: String,
+    subtitle: String = "",
+) : LinearLayout(context) {
+    private val toggle = SwitchView(context)
+
+    var onCheckedChange: ((Boolean) -> Unit)? = null
+
+    init {
+        orientation = HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        setPadding(context.dp(16f), context.dp(14f), context.dp(14f), context.dp(14f))
+        background = context.selectableBackground()
+        isClickable = true
+        isFocusable = true
+
+        val texts = context.column()
+        addView(texts, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+        texts.addView(context.text(title, 14.5f, Palette.TEXT, medium = true))
+        val subtitleView = context.text(subtitle, 12f, Palette.MUTED).apply {
+            setPadding(0, context.dp(3f), 0, 0)
+            visibility = if (subtitle.isEmpty()) View.GONE else View.VISIBLE
+        }
+        texts.addView(subtitleView)
+
+        toggle.layoutParams = LayoutParams(
+            LayoutParams.WRAP_CONTENT,
+            LayoutParams.WRAP_CONTENT
+        ).apply { marginStart = context.dp(12f) }
+        toggle.onCheckedChange = { checked -> onCheckedChange?.invoke(checked) }
+        addView(toggle)
+
+        clickOnce { toggleFromRow() }
+    }
+
+    fun setChecked(value: Boolean, animate: Boolean = true) {
+        toggle.setChecked(value, animate)
+    }
+
+    /** Visually locks the row while its async action is still running. */
+    fun setBusy(busy: Boolean) {
+        isEnabled = !busy
+        toggle.isEnabled = !busy
+        alpha = if (busy) 0.55f else 1f
+    }
+
+    private fun toggleFromRow() {
+        if (!isEnabled) return
+        val value = !toggle.isChecked()
+        toggle.setChecked(value)
+        onCheckedChange?.invoke(value)
     }
 }
 

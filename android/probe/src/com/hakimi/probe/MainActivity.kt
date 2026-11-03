@@ -785,6 +785,38 @@ class MainActivity : Activity(), Host {
         }
     }
 
+    // The mirror has no separate boolean: the source URL doubles as the switch,
+    // so on restores the built-in list URL and off clears it.
+    override fun setDownloadMirror(enabled: Boolean) {
+        if (configSaving) {
+            showSnack("正在保存设置，请稍候")
+            return
+        }
+        val next = runCatching { JSONObject(data.configJson.toString()) }.getOrNull()
+        val download = next?.optJSONObject("advanced")?.optJSONObject("download")
+        if (next == null || download == null) {
+            showSnack("配置尚未就绪", error = true)
+            return
+        }
+        val source = if (enabled) defaultMirrorSource() else ""
+        if (enabled && source.isEmpty()) {
+            showSnack("无法读取默认镜像列表地址，请在「镜像列表」中手动填写", error = true)
+            return
+        }
+        download.put("mirrorSource", source)
+        applyConfig(next) { ok, error ->
+            when {
+                !ok -> showSnack(error ?: "保存失败", error = true)
+                enabled -> showSnack("镜像加速已开启")
+                else -> showSnack("镜像加速已关闭")
+            }
+        }
+    }
+
+    private fun defaultMirrorSource(): String = runCatching {
+        JSONObject(Native.defaultCatalogUrls()).optString("mirror")
+    }.getOrDefault("")
+
     override fun saveGroup(group: JSONObject, isNew: Boolean, done: (Boolean, String?) -> Unit) {
         operations.execute {
             val ok = runCatching { Native.upsertGroup(group.toString()) }.getOrDefault(false)
@@ -922,7 +954,8 @@ class MainActivity : Activity(), Host {
             subtitle,
             value,
             if (key == "proxy.port") "8443" else "https://…",
-            numeric = key == "proxy.port"
+            numeric = key == "proxy.port",
+            allowEmpty = key == "advanced.download.mirrorSource"
         ) { raw ->
             val next = runCatching { JSONObject(data.configJson.toString()) }.getOrNull()
             if (next == null) {
@@ -977,6 +1010,26 @@ class MainActivity : Activity(), Host {
                         false
                     } else {
                         catalogsObj.put(key.substringAfter('.'), value)
+                        true
+                    }
+                }
+                // An empty value is the off switch, so it must be allowed here.
+                "advanced.download.mirrorSource" -> {
+                    val value = raw.trim()
+                    if (value.isNotEmpty() &&
+                        !value.startsWith("http://") &&
+                        !value.startsWith("https://")
+                    ) {
+                        showSnack("镜像列表地址必须以 http:// 或 https:// 开头", error = true)
+                        false
+                    } else {
+                        val download = next.optJSONObject("advanced")
+                            ?.optJSONObject("download")
+                        if (download == null) {
+                            showSnack("配置尚未就绪", error = true)
+                            return@input
+                        }
+                        download.put("mirrorSource", value)
                         true
                     }
                 }
@@ -1046,6 +1099,9 @@ class MainActivity : Activity(), Host {
             val error = if (ok) null else runCatching { Native.lastError() }.getOrDefault("")
             handler.post {
                 configSaving = false
+                // Show the saved values immediately instead of waiting for the
+                // next status poll to carry the new config back.
+                if (ok) data = data.copy(configJson = next)
                 render()
                 if (ok) refreshNow()
                 done(ok, error?.ifEmpty { "配置保存失败" })
