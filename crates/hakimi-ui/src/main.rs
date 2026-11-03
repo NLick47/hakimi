@@ -14,7 +14,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use hakimi_core::config::{AppConfig, DomainRule, GroupConfig, RouteAttempt, RoutePolicy};
+use hakimi_core::config::{
+    AppConfig, DomainRule, GroupConfig, RouteAttempt, RoutePolicy, DEFAULT_MIRROR_SOURCE,
+};
 use hakimi_core::instance::{InstanceLock, InstanceLockError};
 use hakimi_core::runtime::HakimiRuntime;
 use serde_json::Value;
@@ -703,6 +705,26 @@ fn wire_window(app: &AppWindow, ctx: &UiContext) {
     }
     {
         let runtime = runtime.clone();
+        let expanded = expanded.clone();
+        let weak = app.as_weak();
+        let sweep = sweep.clone();
+        app.on_save_bool(move |key, value| {
+            let key = key.to_string();
+            let error = apply_setting_bool(&runtime, &key, value);
+            if let Some(app) = weak.upgrade() {
+                let failed = error.is_some();
+                app.set_cfg_error(SharedString::from(error.unwrap_or_default()));
+                app.set_cfg_error_key(SharedString::from(if failed {
+                    key.clone()
+                } else {
+                    String::new()
+                }));
+                refresh(&app, &runtime, &expanded.borrow(), &sweep);
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
         app.on_open_data_dir(move || {
             let dir = runtime.paths().root().to_path_buf();
             std::thread::spawn(move || {
@@ -1141,6 +1163,12 @@ fn apply_ui_update(
         if changed(|s| &s.catalog_doh) {
             app.set_cfg_catalog_doh(SharedString::from(settings.catalog_doh.clone()));
         }
+        if old.is_none_or(|prev| prev.download_mirror != settings.download_mirror) {
+            app.set_cfg_download_mirror(settings.download_mirror);
+        }
+        if changed(|s| &s.mirror_source) {
+            app.set_cfg_mirror_source(SharedString::from(settings.mirror_source.clone()));
+        }
     }
 
     if prev.as_ref().map(|state| state.ca) != Some(ca) {
@@ -1241,6 +1269,8 @@ pub(crate) struct SettingsValues {
     pub doh_fallback: String,
     pub catalog_ip: String,
     pub catalog_doh: String,
+    pub mirror_source: String,
+    pub download_mirror: bool,
 }
 
 pub(crate) fn settings_values(config: &Value) -> SettingsValues {
@@ -1250,12 +1280,20 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
             .map(|value| text(value, key))
             .unwrap_or_default()
     };
+    // the source URL doubles as the switch: empty means the mirror is off
+    let mirror_source = config
+        .get("advanced")
+        .and_then(|advanced| advanced.get("download"))
+        .map(|download| text(download, "mirrorSource"))
+        .unwrap_or_default();
     SettingsValues {
         proxy_port: field("proxy", "port"),
         doh_primary: field("doh", "primary"),
         doh_fallback: field("doh", "fallback"),
         catalog_ip: field("catalogs", "ip"),
         catalog_doh: field("catalogs", "doh"),
+        download_mirror: !mirror_source.trim().is_empty(),
+        mirror_source,
     }
 }
 
@@ -1278,6 +1316,9 @@ fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Opti
             "doh.fallback" => config.doh.fallback = value.to_string(),
             "catalogs.ip" => config.catalogs.ip = value.to_string(),
             "catalogs.doh" => config.catalogs.doh = value.to_string(),
+            "advanced.download.mirrorSource" => {
+                config.advanced.download.mirror_source = value.to_string()
+            }
             other => bail!("未知设置项 {other}"),
         }
         Ok(())
@@ -1288,6 +1329,28 @@ fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Opti
             // already bound and the PAC points at the live address.
             None
         }
+        Err(error) => Some(format!("{error:#}")),
+    }
+}
+
+/// Commit one boolean setting. The download mirror is the only one: on restores
+/// the default list URL, off clears it, because the URL doubles as the switch.
+fn apply_setting_bool(runtime: &HakimiRuntime, key: &str, value: bool) -> Option<String> {
+    let result = runtime.config().mutate(|config| {
+        match key {
+            "advanced.download.mirrorSource" => {
+                config.advanced.download.mirror_source = if value {
+                    DEFAULT_MIRROR_SOURCE.to_string()
+                } else {
+                    String::new()
+                };
+            }
+            other => bail!("未知设置项 {other}"),
+        }
+        Ok(())
+    });
+    match result {
+        Ok(_) => None,
         Err(error) => Some(format!("{error:#}")),
     }
 }
@@ -1624,6 +1687,9 @@ fn sample_config() -> Value {
             "ip": "https://gitee.com/hakimi/catalogs/ip.json",
             "doh": "https://gitee.com/hakimi/catalogs/doh.json"
         },
+        "advanced": {
+            "download": { "mirrorSource": "https://gitee.com/hakimi/catalogs/mirrors.json" }
+        },
         "groups": [
             { "id": "pixiv", "name": "Pixiv", "enabled": true,
               "defaultRoute": { "attempts": [{ "mode": "direct" }] },
@@ -1680,6 +1746,8 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     app.set_cfg_doh_fallback(SharedString::from(settings.doh_fallback.clone()));
     app.set_cfg_catalog_ip(SharedString::from(settings.catalog_ip.clone()));
     app.set_cfg_catalog_doh(SharedString::from(settings.catalog_doh.clone()));
+    app.set_cfg_download_mirror(settings.download_mirror);
+    app.set_cfg_mirror_source(SharedString::from(settings.mirror_source.clone()));
     app.set_cfg_data_dir(SharedString::from("~/Library/Application Support/hakimi"));
     app.set_cfg_version(SharedString::from(env!("CARGO_PKG_VERSION")));
     app.set_cfg_core_version(SharedString::from(hakimi_core::VERSION));
