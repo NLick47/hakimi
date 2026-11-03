@@ -749,10 +749,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
                 // The filter normalizes the root-dot variant away, so the
                 // attempt is no-SNI: CloudFront then serves the default cert
                 // whose SAN covers poipiku.com and *.poipiku.com.
-                DomainRule::routed(
-                    "poipiku.com",
-                    RoutePolicy::sni(vec![String::new()]),
-                ),
+                DomainRule::routed("poipiku.com", RoutePolicy::sni(vec![String::new()])),
                 plain("img.poipiku.com"),
                 plain("cdn.poipiku.com"),
                 plain("*.poipiku.com"),
@@ -884,6 +881,24 @@ impl AppConfig {
                 &self.advanced.download.mirror_source,
                 "advanced.download.mirrorSource",
             )?;
+        }
+        // Wide enough for existing hand-edited configs, narrow enough that a
+        // typo cannot allocate an enormous semaphore or overflow the 32-bit
+        // `usize` cast in the segment worker.
+        if !(1..=1024).contains(&self.advanced.download.max_conns) {
+            bail!("advanced.download.maxConns must be between 1 and 1024");
+        }
+        if !(1..=64).contains(&self.advanced.download.segments) {
+            bail!("advanced.download.segments must be between 1 and 64");
+        }
+        if !(64 * 1024..=256 * 1024 * 1024).contains(&self.advanced.download.chunk_bytes) {
+            bail!("advanced.download.chunkBytes must be between 65536 and 268435456");
+        }
+        if self.advanced.download.min_size_bytes > 1024 * 1024 * 1024 {
+            bail!("advanced.download.minSizeBytes must not exceed 1073741824");
+        }
+        if !(1..=3600).contains(&self.advanced.download.stall_timeout_secs) {
+            bail!("advanced.download.stallTimeoutSecs must be between 1 and 3600");
         }
 
         validate_doh_url(&self.doh.primary, "doh.primary")?;
@@ -1475,7 +1490,12 @@ mod tests {
             "img/cdn stay direct"
         );
         assert_eq!(
-            poipiku.domain("poipiku.com").unwrap().route.as_ref().unwrap(),
+            poipiku
+                .domain("poipiku.com")
+                .unwrap()
+                .route
+                .as_ref()
+                .unwrap(),
             &RoutePolicy::sni(vec![String::new()]),
             "the apex dials no-SNI; the filter normalizes the root-dot variant away"
         );
@@ -2106,7 +2126,12 @@ mod tests {
         let manager = ConfigManager::load(paths.config_file()).unwrap();
         let snapshot = manager.snapshot();
         assert_eq!(
-            snapshot.group("poipiku").unwrap().domain("poipiku.com").unwrap().route,
+            snapshot
+                .group("poipiku")
+                .unwrap()
+                .domain("poipiku.com")
+                .unwrap()
+                .route,
             Some(RoutePolicy::sni(vec![String::new()]))
         );
         assert_eq!(snapshot.schema_version, SCHEMA_VERSION);

@@ -1323,6 +1323,10 @@ fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Opti
         }
         Ok(())
     });
+    if result.is_ok() && key == "advanced.download.mirrorSource" {
+        // A new list URL must be fetched now, not on the six-hour tick.
+        runtime.request_mirror_refresh();
+    }
     match result {
         Ok(_) => {
             // Bind/port changes land on the next launch: the running proxy is
@@ -1349,6 +1353,9 @@ fn apply_setting_bool(runtime: &HakimiRuntime, key: &str, value: bool) -> Option
         }
         Ok(())
     });
+    if result.is_ok() && key == "advanced.download.mirrorSource" {
+        runtime.request_mirror_refresh();
+    }
     match result {
         Ok(_) => None,
         Err(error) => Some(format!("{error:#}")),

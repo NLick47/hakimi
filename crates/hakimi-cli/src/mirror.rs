@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 use hakimi_core::config::DEFAULT_MIRROR_SOURCE;
 use hakimi_core::runtime::HakimiRuntime;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::control;
 use crate::output::Output;
@@ -47,6 +47,52 @@ pub async fn run(runtime: &HakimiRuntime, args: MirrorArgs, out: Output) -> Resu
             Ok(ExitCode::SUCCESS)
         }
         MirrorCommand::Refresh => {
+            // A running instance owns the in-memory list; refreshing this
+            // process's copy would leave the daemon on the old one.
+            if control::instance_alive(runtime).await {
+                match control::refresh_mirrors(runtime).await {
+                    Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
+                        let count = value.get("count").and_then(Value::as_u64).unwrap_or(0);
+                        if out.is_json() {
+                            out.json(&value)?;
+                        } else if count == 0 {
+                            println!("mirror is off; nothing to fetch");
+                        } else {
+                            println!("fetched {count} mirrors on the running instance");
+                            for mirror in value
+                                .get("mirrors")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                            {
+                                println!("  {mirror}");
+                            }
+                        }
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    Ok(value) => {
+                        let error = value
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("refresh failed");
+                        if out.is_json() {
+                            out.json(&value)?;
+                        } else {
+                            eprintln!("refresh failed: {error}");
+                        }
+                        return Ok(ExitCode::FAILURE);
+                    }
+                    Err(error) => {
+                        if out.is_json() {
+                            out.json(&json!({ "error": format!("{error:#}") }))?;
+                        } else {
+                            eprintln!("refresh failed: {error:#}");
+                        }
+                        return Ok(ExitCode::FAILURE);
+                    }
+                }
+            }
             match runtime.refresh_mirrors().await {
                 Ok(0) => {
                     if !out.is_json() {

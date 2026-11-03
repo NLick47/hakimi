@@ -27,8 +27,16 @@ pub fn client(timeout: Duration) -> Result<reqwest::Client> {
 }
 
 async fn post(runtime: &HakimiRuntime, path: &str) -> Result<Value> {
+    post_with_timeout(runtime, path, Duration::from_secs(3)).await
+}
+
+async fn post_with_timeout(
+    runtime: &HakimiRuntime,
+    path: &str,
+    timeout: Duration,
+) -> Result<Value> {
     let url = endpoint(runtime, path);
-    let response = client(Duration::from_secs(3))?
+    let response = client(timeout)?
         .post(&url)
         .header("x-hakimi-control", "1")
         .send()
@@ -97,14 +105,25 @@ pub async fn live_pac(runtime: &HakimiRuntime) -> Option<String> {
     text.contains("FindProxyForURL").then_some(text)
 }
 
+/// Whether something is listening on the configured proxy address.
+pub async fn instance_alive(runtime: &HakimiRuntime) -> bool {
+    let url = endpoint(runtime, "/hakimi/health");
+    let Ok(probe) = client(Duration::from_millis(250)) else {
+        return false;
+    };
+    probe.get(url).send().await.is_ok()
+}
+
+/// Ask a running instance to fetch the mirror list now. Falls back to the
+/// caller's own runtime when nothing is listening.
+pub async fn refresh_mirrors(runtime: &HakimiRuntime) -> Result<Value> {
+    post_with_timeout(runtime, "/hakimi/refresh-mirrors", Duration::from_secs(20)).await
+}
+
 /// Configuration edits land on disk; a running instance only reads them on
 /// its next start.
 pub async fn note_live_instance(runtime: &HakimiRuntime) {
-    let url = endpoint(runtime, "/hakimi/health");
-    let Ok(probe) = client(Duration::from_millis(250)) else {
-        return;
-    };
-    if probe.get(url).send().await.is_ok() {
+    if instance_alive(runtime).await {
         eprintln!("note: the running instance keeps its current config until it restarts");
     }
 }

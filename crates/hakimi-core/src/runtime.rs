@@ -172,6 +172,9 @@ pub struct HakimiRuntime {
     engine: Arc<DecisionEngine>,
     upstream: Arc<UpstreamPool>,
     mirrors: Arc<crate::mirror::MirrorList>,
+    /// Wakes the mirror refresh task when the configured source changes, so a
+    /// newly enabled/custom list is fetched now instead of up to six hours later.
+    mirror_refresh: Arc<tokio::sync::Notify>,
     system_proxy: Arc<SystemProxyManager>,
     status_provider: Arc<StatusProvider>,
     proxy_running: Arc<AtomicBool>,
@@ -315,6 +318,7 @@ impl HakimiRuntime {
             engine,
             upstream,
             mirrors,
+            mirror_refresh: Arc::new(tokio::sync::Notify::new()),
             system_proxy,
             status_provider,
             proxy_running,
@@ -883,11 +887,24 @@ impl HakimiRuntime {
 
     /// Fetch the remote mirror list. An empty source means mirroring is off.
     pub async fn refresh_mirrors(&self) -> Result<usize> {
-        let source = self.config.snapshot().advanced.download.mirror_source.clone();
+        let source = self
+            .config
+            .snapshot()
+            .advanced
+            .download
+            .mirror_source
+            .clone();
         if source.trim().is_empty() {
             return Ok(0);
         }
         self.mirrors.refresh(&source).await
+    }
+
+    /// Wake the background mirror refresh task. Hosts that mutate the config
+    /// through [`ConfigManager`] (instead of [`Self::update_config`]) call this
+    /// after a source change so the new list is fetched now.
+    pub fn request_mirror_refresh(&self) {
+        self.mirror_refresh.notify_one();
     }
 
     pub async fn refresh_catalogs(&self, force: bool) -> Vec<Result<RefreshReport>> {
@@ -984,9 +1001,16 @@ impl HakimiRuntime {
         if !sections.is_empty() {
             tracing::info!(sections = ?sections, "configuration updated");
         }
+        // A new source (or the first enable) must take effect now, not after
+        // the six-hour refresh tick.
+        let mirror_source_changed =
+            current.advanced.download.mirror_source != config.advanced.download.mirror_source;
         let result = self.config.update(config);
         if result.is_ok() {
             self.engine.clear_route_rejections();
+            if mirror_source_changed {
+                self.mirror_refresh.notify_one();
+            }
         }
         result
     }
@@ -1148,6 +1172,7 @@ impl HakimiRuntime {
         // routinely and the list expires before the binary does, so this runs in
         // the background and never blocks startup.
         let runtime = self.clone();
+        let refresh = self.mirror_refresh.clone();
         let mut receiver = shutdown.subscribe();
         self.spawn(async move {
             tokio::select! {
@@ -1162,6 +1187,7 @@ impl HakimiRuntime {
                 }
                 tokio::select! {
                     _ = receiver.changed() => break,
+                    _ = refresh.notified() => {}
                     _ = tokio::time::sleep(Duration::from_secs(6 * 3600)) => {}
                 }
             }
