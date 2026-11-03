@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -78,8 +79,7 @@ pub(crate) async fn handle_forward(
             .await
         }
         None => {
-            let path_and_query =
-                path_and_query.unwrap_or_else(|| PathAndQuery::from_static("/"));
+            let path_and_query = path_and_query.unwrap_or_else(|| PathAndQuery::from_static("/"));
             forward_with_pool(
                 &ctx,
                 req,
@@ -422,33 +422,54 @@ async fn forward_with_uri(
     let mirrored = plan.is_some();
     let (mut parts, body) = req.into_parts();
     sanitize_request_headers(&mut parts.headers, upgrade_requested);
-    // a mirror that fails is re-sent unchanged, so keep the headers from before
-    // the credentials are stripped
-    let retry = mirrored.then(|| (parts.method.clone(), parts.headers.clone()));
+    // Keep the browser's headers for the direct retry and for the range
+    // requests of a direct download: a private codeload archive needs its
+    // cookies on every chunk. A mirror never sees them.
+    let direct_headers = parts.headers.clone();
     if mirrored {
-        // a third-party mirror neither needs nor deserves the user's GitHub session
+        // A third-party mirror neither needs nor deserves the user's GitHub
+        // session.
         parts.headers.remove(header::COOKIE);
         parts.headers.remove(header::AUTHORIZATION);
     }
+    let mirror_headers = parts.headers.clone();
 
     let response_uri;
     let mut response;
     let mut served_by_mirror = false;
+    let mut mirror_prefix: Option<String> = None;
+    let method = parts.method.clone();
+    // Kept for the range-probe failover: the next candidate needs a rewrite.
+    let mut mirror_plan: Option<super::download::MirrorPlan> = None;
     if let Some(plan) = plan {
-        let (method, headers) = retry.expect("a mirror plan implies a retry snapshot");
-        match try_mirrors(ctx, &plan, &method, &headers, upgrade_requested).await {
-            Some((mirrored_response, uri, prefix)) => {
+        mirror_plan = Some(plan);
+        match try_mirrors(
+            ctx,
+            &mirror_plan.as_ref().unwrap(),
+            &method,
+            &mirror_headers,
+            upgrade_requested,
+        )
+        .await
+        {
+            Some((mut mirrored_response, uri, prefix)) => {
                 tracing::debug!(mirror = %prefix, path = %rule_uri.path(), "served through a mirror");
+                // The browser sees this response as github.com, so a mirror
+                // must not be able to plant cookies on that origin.
+                mirrored_response.headers_mut().remove(header::SET_COOKIE);
+                mirrored_response.headers_mut().remove(&SET_COOKIE2);
                 response = mirrored_response;
                 response_uri = uri;
                 served_by_mirror = true;
+                mirror_prefix = Some(prefix);
             }
             None => {
                 tracing::info!(
                     path = %rule_uri.path(),
                     "every mirror failed, serving direct"
                 );
-                response = send_once(ctx, &method, &headers, &rule_uri, upgrade_requested).await?;
+                response =
+                    send_once(ctx, &method, &direct_headers, &rule_uri, upgrade_requested).await?;
                 response_uri = rule_uri.clone();
             }
         }
@@ -498,7 +519,102 @@ async fn forward_with_uri(
     }
 
     if super::download::segment_eligible(ctx, &rule_uri, is_get, has_range, &response) {
-        return Ok(super::download::segment(ctx, response_uri, response, served_by_mirror).await);
+        let base_headers = if served_by_mirror {
+            &mirror_headers
+        } else {
+            &direct_headers
+        };
+        // The serving mirror gets one range probe (3s, remembered for 10
+        // minutes). When it fails, the remaining candidates are tried with a
+        // full mirror request each; only when none qualifies does the already
+        // streaming response serve as a single stream.
+        if served_by_mirror && !mirror_prefix.as_deref().unwrap_or_default().is_empty() {
+            let range_ok = super::download::mirror_range_ok(
+                ctx,
+                &response_uri,
+                &super::download::probe_headers(base_headers, &response),
+                &response,
+                mirror_prefix.as_deref().unwrap_or_default(),
+            )
+            .await;
+            if !range_ok {
+                let tail = super::download::mirrors_after(
+                    mirror_prefix.as_deref(),
+                    ctx.download.mirrors.available(),
+                );
+                for prefix in tail {
+                    let Some(uri) = mirror_plan.as_ref().and_then(|plan| plan.rewrite(&prefix))
+                    else {
+                        continue;
+                    };
+                    let attempt = tokio::time::timeout(
+                        MIRROR_BUDGET,
+                        send_once(ctx, &method, &mirror_headers, &uri, upgrade_requested),
+                    )
+                    .await;
+                    let response = match attempt {
+                        Ok(Ok(response)) if !mirror_failed(response.status()) => {
+                            ctx.download.mirrors.note_success(&prefix);
+                            response
+                        }
+                        Ok(Ok(response)) => {
+                            if mirror_blame(response.status()) {
+                                ctx.download.mirrors.cool_down(&prefix);
+                            }
+                            tracing::info!(
+                                status = %response.status(),
+                                mirror = %prefix,
+                                "mirror refused the download"
+                            );
+                            continue;
+                        }
+                        Ok(Err(error)) => {
+                            ctx.download.mirrors.cool_down(&prefix);
+                            tracing::info!(error = %error, mirror = %prefix, "mirror request failed");
+                            continue;
+                        }
+                        Err(_) => {
+                            ctx.download.mirrors.cool_down(&prefix);
+                            tracing::info!(mirror = %prefix, "mirror did not answer in time");
+                            continue;
+                        }
+                    };
+                    if super::download::mirror_range_ok(
+                        ctx,
+                        &uri,
+                        &super::download::probe_headers(base_headers, &response),
+                        &response,
+                        &prefix,
+                    )
+                    .await
+                    {
+                        tracing::info!(mirror = %prefix, "mirror takes over the segmented download");
+                        return Ok(super::download::segment(
+                            ctx,
+                            uri,
+                            response,
+                            true,
+                            base_headers,
+                            Some(&prefix),
+                        )
+                        .await);
+                    }
+                }
+                tracing::info!(
+                    path = %rule_uri.path(),
+                    "no mirror supports ranges, serving the first response as a single stream"
+                );
+            }
+        }
+        return Ok(super::download::segment(
+            ctx,
+            response_uri,
+            response,
+            served_by_mirror,
+            base_headers,
+            mirror_prefix.as_deref(),
+        )
+        .await);
     }
 
     Ok(into_proxy_response(response, response_uri))
@@ -506,7 +622,9 @@ async fn forward_with_uri(
 
 /// First-byte budget for one mirror. A hung mirror must not hold the download
 /// for the global header timeout.
-const MIRROR_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+const MIRROR_BUDGET: Duration = Duration::from_secs(8);
+/// A list with many dead mirrors must not stall the browser for minutes.
+const MIRROR_TOTAL_BUDGET: Duration = Duration::from_secs(10);
 
 /// Walks the candidate prefixes in order. A failing mirror is cooled down and the
 /// next one is tried; `None` means none of them worked.
@@ -517,12 +635,18 @@ async fn try_mirrors(
     headers: &HeaderMap,
     upgrade_requested: bool,
 ) -> Option<(Response<UpstreamResponseBody>, Uri, String)> {
+    let deadline = Instant::now() + MIRROR_TOTAL_BUDGET;
     for prefix in &plan.candidates {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::info!("mirror budget exhausted, serving direct");
+            break;
+        }
         let Some(uri) = plan.rewrite(prefix) else {
             continue;
         };
         let attempt = tokio::time::timeout(
-            MIRROR_BUDGET,
+            MIRROR_BUDGET.min(remaining),
             send_once(ctx, method, headers, &uri, upgrade_requested),
         )
         .await;
@@ -600,6 +724,7 @@ fn into_proxy_response(
 /// `&str` builds a new name on every call.
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
+const SET_COOKIE2: HeaderName = HeaderName::from_static("set-cookie2");
 
 const HOP_CONNECTION: u16 = 1 << 0;
 const HOP_PROXY_AUTHENTICATE: u16 = 1 << 1;
@@ -999,7 +1124,8 @@ mod tests {
     }
 
     #[test]
-    fn authority_brackets_ipv6_literals() {        assert_eq!(authority("2001:db8::1", 443, true), "[2001:db8::1]");
+    fn authority_brackets_ipv6_literals() {
+        assert_eq!(authority("2001:db8::1", 443, true), "[2001:db8::1]");
         assert_eq!(authority("2001:db8::1", 8443, true), "[2001:db8::1]:8443");
         assert_eq!(authority("example.com", 443, true), "example.com");
         assert_eq!(authority("example.com", 8443, true), "example.com:8443");
@@ -1089,7 +1215,10 @@ mod tests {
 
         // A URL without a path still has one.  The reusable form keeps it in
         // the URI, the rebuilt form in `path_and_query`.
-        let req = Request::builder().uri("http://example.com").body(()).unwrap();
+        let req = Request::builder()
+            .uri("http://example.com")
+            .body(())
+            .unwrap();
         let target = target_of(&req).unwrap();
         assert_eq!(host_of(&target), "example.com");
         let path = target
