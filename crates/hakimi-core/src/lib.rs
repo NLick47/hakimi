@@ -34,6 +34,7 @@ pub mod hooks;
 pub mod instance;
 pub mod ip_tester;
 pub mod logging;
+pub mod mirror;
 pub mod pac;
 pub mod paths;
 pub mod proxy;

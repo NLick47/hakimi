@@ -1,4 +1,5 @@
 mod connect;
+mod download;
 mod gate;
 mod pool;
 mod response;
@@ -60,6 +61,7 @@ enum ProxyBodyKind {
         uri: http::Uri,
         status: StatusCode,
     },
+    Download(download::SegmentedBody),
     Full(Full<Bytes>),
     Empty,
 }
@@ -80,6 +82,12 @@ impl ProxyBody {
     pub(crate) fn upstream(body: UpstreamResponseBody, uri: http::Uri, status: StatusCode) -> Self {
         Self {
             kind: ProxyBodyKind::Upstream { body, uri, status },
+        }
+    }
+
+    pub(crate) fn download(body: download::SegmentedBody) -> Self {
+        Self {
+            kind: ProxyBodyKind::Download(body),
         }
     }
 }
@@ -107,6 +115,13 @@ impl Body for ProxyBody {
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             },
+            ProxyBodyKind::Download(body) => match Pin::new(body).poll_frame(cx) {
+                Poll::Ready(Some(result)) => {
+                    Poll::Ready(Some(result.map_err(|error| Box::from(error) as BoxError)))
+                }
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            },
             ProxyBodyKind::Full(body) => match Pin::new(body).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
                 Poll::Ready(Some(Err(never))) => match never {},
@@ -120,6 +135,7 @@ impl Body for ProxyBody {
     fn is_end_stream(&self) -> bool {
         match &self.kind {
             ProxyBodyKind::Upstream { body, .. } => body.is_end_stream(),
+            ProxyBodyKind::Download(_) => false,
             ProxyBodyKind::Full(body) => body.is_end_stream(),
             ProxyBodyKind::Empty => true,
         }
@@ -128,6 +144,7 @@ impl Body for ProxyBody {
     fn size_hint(&self) -> SizeHint {
         match &self.kind {
             ProxyBodyKind::Upstream { body, .. } => body.size_hint(),
+            ProxyBodyKind::Download(_) => SizeHint::default(),
             ProxyBodyKind::Full(body) => body.size_hint(),
             ProxyBodyKind::Empty => SizeHint::with_exact(0),
         }
@@ -151,6 +168,7 @@ pub struct ProxyContext {
     pub resolver: Arc<Resolver>,
     pub tls: Arc<TlsContext>,
     pub upstream: Arc<UpstreamPool>,
+    pub download: Arc<download::DownloadManager>,
     /// The status snapshot. The flag asks for every known domain instead of
     /// the ones the groups show; the polled view is the small one.
     pub status_json: Arc<dyn Fn(bool) -> serde_json::Value + Send + Sync>,
@@ -172,9 +190,14 @@ impl ProxyContext {
         resolver: Arc<Resolver>,
         tls: Arc<TlsContext>,
         upstream: Arc<UpstreamPool>,
+        mirrors: Arc<crate::mirror::MirrorList>,
         status_json: Arc<dyn Fn(bool) -> serde_json::Value + Send + Sync>,
         on_stop: Arc<dyn Fn() + Send + Sync>,
     ) -> Arc<Self> {
+        let download = Arc::new(download::DownloadManager::new(
+            &config.snapshot(),
+            mirrors,
+        ));
         Arc::new(Self {
             engine,
             ca,
@@ -185,6 +208,7 @@ impl ProxyContext {
             resolver,
             tls,
             upstream,
+            download,
             status_json,
             on_stop,
             proxy_addr: OnceLock::new(),
@@ -362,7 +386,15 @@ fn local_response(req: &Request<Incoming>, ctx: &Arc<ProxyContext>) -> Response<
                 .uri()
                 .query()
                 .is_some_and(|query| query.split('&').any(|part| part == "all=1"));
-            json_response((ctx.status_json)(every))
+            let mut value = (ctx.status_json)(every);
+            let (active, finished_bytes) = ctx.download.stats();
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "download".into(),
+                    serde_json::json!({ "active": active, "finishedBytes": finished_bytes }),
+                );
+            }
+            json_response(value)
         }
         "/hakimi/health" => text_response(StatusCode::OK, "text/plain; charset=utf-8", "ok"),
         "/hakimi/pause" => {

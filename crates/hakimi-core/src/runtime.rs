@@ -171,6 +171,7 @@ pub struct HakimiRuntime {
     status: Arc<StatusStore>,
     engine: Arc<DecisionEngine>,
     upstream: Arc<UpstreamPool>,
+    mirrors: Arc<crate::mirror::MirrorList>,
     system_proxy: Arc<SystemProxyManager>,
     status_provider: Arc<StatusProvider>,
     proxy_running: Arc<AtomicBool>,
@@ -276,6 +277,9 @@ impl HakimiRuntime {
             status.clone(),
         );
         let upstream = UpstreamPool::new(engine.clone(), tls.clone(), &config.snapshot());
+        let mirrors = Arc::new(crate::mirror::MirrorList::load(Some(
+            paths.mirror_list_file(),
+        )));
         let system_proxy = Arc::new(SystemProxyManager::new(paths.system_proxy_state_file()));
         let started_at = now();
         let proxy_running = Arc::new(AtomicBool::new(false));
@@ -310,6 +314,7 @@ impl HakimiRuntime {
             status,
             engine,
             upstream,
+            mirrors,
             system_proxy,
             status_provider,
             proxy_running,
@@ -480,6 +485,7 @@ impl HakimiRuntime {
                 self.resolver.clone(),
                 self.tls.clone(),
                 self.upstream.clone(),
+                self.mirrors.clone(),
                 status_json,
                 on_stop,
             );
@@ -870,6 +876,20 @@ impl HakimiRuntime {
             .clone()
     }
 
+    /// The download mirror list, for status output and manual refresh.
+    pub fn mirrors(&self) -> &Arc<crate::mirror::MirrorList> {
+        &self.mirrors
+    }
+
+    /// Fetch the remote mirror list. An empty source means mirroring is off.
+    pub async fn refresh_mirrors(&self) -> Result<usize> {
+        let source = self.config.snapshot().advanced.download.mirror_source.clone();
+        if source.trim().is_empty() {
+            return Ok(0);
+        }
+        self.mirrors.refresh(&source).await
+    }
+
     pub async fn refresh_catalogs(&self, force: bool) -> Vec<Result<RefreshReport>> {
         let config = self.config.snapshot();
         let mut results = Vec::new();
@@ -992,7 +1012,7 @@ impl HakimiRuntime {
 
     /// Probe every exact domain of every enabled group once, honouring the
     /// shared concurrency limit. Resolves when the whole sweep is done, so a
-    /// manual 测速 is one atomic operation instead of N futures the caller
+    /// manual speed test is one atomic operation instead of N futures the caller
     /// has to count.
     pub async fn probe_sweep(self: &Arc<Self>) {
         // Single-flight with join: a sweep arriving while another runs waits
@@ -1120,6 +1140,29 @@ impl HakimiRuntime {
                         "catalog refresh finished"
                     ),
                     Err(error) => tracing::warn!(error = %error, "catalog refresh failed"),
+                }
+            }
+        });
+
+        // Mirror list: once at startup, then every six hours. Sites go offline
+        // routinely and the list expires before the binary does, so this runs in
+        // the background and never blocks startup.
+        let runtime = self.clone();
+        let mut receiver = shutdown.subscribe();
+        self.spawn(async move {
+            tokio::select! {
+                _ = receiver.changed() => return,
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
+            loop {
+                match runtime.refresh_mirrors().await {
+                    Ok(0) => {}
+                    Ok(count) => tracing::info!(mirrors = count, "mirror list refreshed"),
+                    Err(error) => tracing::warn!(error = %error, "mirror list refresh failed"),
+                }
+                tokio::select! {
+                    _ = receiver.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(6 * 3600)) => {}
                 }
             }
         });

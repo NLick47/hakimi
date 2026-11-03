@@ -60,6 +60,7 @@ async fn serves_pac_and_status_endpoints() {
         resolver,
         tls,
         upstream,
+        Arc::new(hakimi_core::mirror::MirrorList::load(None)),
         status_json,
         Arc::new(move || {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

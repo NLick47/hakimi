@@ -84,9 +84,20 @@ pub(crate) enum UpstreamResponseBody {
     Limited(LimitedBody),
 }
 
+impl UpstreamResponseBody {
+    /// Splits out the underlying stream plus any attached concurrency permit.
+    /// Segmented downloads use the first upstream stream as segment 0.
+    pub(crate) fn into_incoming(self) -> (Incoming, Option<OwnedSemaphorePermit>) {
+        match self {
+            UpstreamResponseBody::Plain(body) => (body, None),
+            UpstreamResponseBody::Limited(limited) => (limited.inner, Some(limited.permit)),
+        }
+    }
+}
+
 pub(crate) struct LimitedBody {
     inner: Incoming,
-    _permit: OwnedSemaphorePermit,
+    permit: OwnedSemaphorePermit,
 }
 
 impl Body for UpstreamResponseBody {
@@ -743,7 +754,7 @@ impl UpstreamPool {
                 let body = match permit {
                     Some(permit) => UpstreamResponseBody::Limited(LimitedBody {
                         inner: body,
-                        _permit: permit,
+                        permit: permit,
                     }),
                     None => UpstreamResponseBody::Plain(body),
                 };
@@ -1026,6 +1037,16 @@ impl UpstreamPool {
     /// to age out. In-flight requests keep their sockets.
     pub(crate) fn retire_host(&self, host: &str) {
         self.mark_rejected(host);
+    }
+
+    /// Dials a fresh HTTP/1.1-only connection through the route, never pooled.
+    /// Segment connections use it: one connection each, bypassing h2 multiplexing.
+    pub(crate) async fn dial_http1(&self, uri: Uri) -> Result<TokioIo<PooledIo>, String> {
+        let connector = self.http1_connector.clone();
+        connector
+            .connect(uri)
+            .await
+            .map_err(|error| format!("{error:#}"))
     }
 
     fn host_slots(&self, host: &str) -> Arc<Semaphore> {
@@ -1842,7 +1863,7 @@ fn describe_discovery_failure(diagnostics: &DomainDiagnostics) -> String {
     format!("route discovery failed: {reason}; attempts: {attempts}")
 }
 
-struct PooledIo {
+pub(crate) struct PooledIo {
     io: Transport,
     h2: bool,
 }

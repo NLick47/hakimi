@@ -2,9 +2,10 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use bytes::Bytes;
 use http::uri::{Authority, PathAndQuery, Scheme, Uri};
-use http::{header, HeaderMap, HeaderName, Request, Response, StatusCode};
-use http_body_util::Either;
+use http::{header, HeaderMap, HeaderName, Method, Request, Response, StatusCode};
+use http_body_util::{Either, Full};
 use hyper::body::Incoming;
 use hyper::upgrade::{self, OnUpgrade};
 use hyper_util::rt::TokioIo;
@@ -404,21 +405,67 @@ async fn forward_with_uri(
     upgrade_requested: bool,
     client_upgrade: Option<OnUpgrade>,
 ) -> std::result::Result<Response<ProxyBody>, String> {
+    let is_get = req.method() == Method::GET;
+    let has_range = req.headers().contains_key(header::RANGE);
+    let rule_uri = upstream_uri;
+    // cheap pre-filter first: only download URLs pay for the config snapshot
+    let plan = if super::download::mirror_candidate(&rule_uri) {
+        super::download::mirror_origins(
+            &ctx.config.snapshot().advanced.download,
+            &ctx.download.mirrors,
+            req.method(),
+            &rule_uri,
+        )
+    } else {
+        None
+    };
+    let mirrored = plan.is_some();
     let (mut parts, body) = req.into_parts();
     sanitize_request_headers(&mut parts.headers, upgrade_requested);
-    parts.uri = upstream_uri;
-    // Keep a cheap `Uri` handle for the response body's error logger. Cloning the
-    // parsed URI shares its `Bytes`; allocating a fresh host String per response is
-    // not necessary on this hot path.
-    let response_uri = parts.uri.clone();
-    parts.version = http::Version::HTTP_11;
-    let upstream_request = Request::from_parts(parts, Either::Left(body) as UpstreamBody);
+    // a mirror that fails is re-sent unchanged, so keep the headers from before
+    // the credentials are stripped
+    let retry = mirrored.then(|| (parts.method.clone(), parts.headers.clone()));
+    if mirrored {
+        // a third-party mirror neither needs nor deserves the user's GitHub session
+        parts.headers.remove(header::COOKIE);
+        parts.headers.remove(header::AUTHORIZATION);
+    }
 
-    let mut response = ctx
-        .upstream
-        .send_with_uri(upstream_request, upgrade_requested, &response_uri)
-        .await
-        .map_err(|error| format!("upstream request to {host}:{port} failed: {error}"))?;
+    let response_uri;
+    let mut response;
+    let mut served_by_mirror = false;
+    if let Some(plan) = plan {
+        let (method, headers) = retry.expect("a mirror plan implies a retry snapshot");
+        match try_mirrors(ctx, &plan, &method, &headers, upgrade_requested).await {
+            Some((mirrored_response, uri, prefix)) => {
+                tracing::debug!(mirror = %prefix, path = %rule_uri.path(), "served through a mirror");
+                response = mirrored_response;
+                response_uri = uri;
+                served_by_mirror = true;
+            }
+            None => {
+                tracing::info!(
+                    path = %rule_uri.path(),
+                    "every mirror failed, serving direct"
+                );
+                response = send_once(ctx, &method, &headers, &rule_uri, upgrade_requested).await?;
+                response_uri = rule_uri.clone();
+            }
+        }
+    } else {
+        parts.uri = rule_uri.clone();
+        // Keep a cheap `Uri` handle for the response body's error logger. Cloning
+        // the parsed URI shares its `Bytes`; allocating a fresh host String per
+        // response is not necessary on this hot path.
+        response_uri = rule_uri.clone();
+        parts.version = http::Version::HTTP_11;
+        let upstream_request = Request::from_parts(parts, Either::Left(body) as UpstreamBody);
+        response = ctx
+            .upstream
+            .send_with_uri(upstream_request, upgrade_requested, &response_uri)
+            .await
+            .map_err(|error| format!("upstream request to {host}:{port} failed: {error}"))?;
+    }
 
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         if let Some(client_upgrade) = client_upgrade {
@@ -447,9 +494,95 @@ async fn forward_with_uri(
                 }
             });
         }
+        return Ok(into_proxy_response(response, response_uri));
+    }
+
+    if super::download::segment_eligible(ctx, &rule_uri, is_get, has_range, &response) {
+        return Ok(super::download::segment(ctx, response_uri, response, served_by_mirror).await);
     }
 
     Ok(into_proxy_response(response, response_uri))
+}
+
+/// First-byte budget for one mirror. A hung mirror must not hold the download
+/// for the global header timeout.
+const MIRROR_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Walks the candidate prefixes in order. A failing mirror is cooled down and the
+/// next one is tried; `None` means none of them worked.
+async fn try_mirrors(
+    ctx: &ProxyContext,
+    plan: &super::download::MirrorPlan,
+    method: &Method,
+    headers: &HeaderMap,
+    upgrade_requested: bool,
+) -> Option<(Response<UpstreamResponseBody>, Uri, String)> {
+    for prefix in &plan.candidates {
+        let Some(uri) = plan.rewrite(prefix) else {
+            continue;
+        };
+        let attempt = tokio::time::timeout(
+            MIRROR_BUDGET,
+            send_once(ctx, method, headers, &uri, upgrade_requested),
+        )
+        .await;
+        match attempt {
+            Ok(Ok(response)) if !mirror_failed(response.status()) => {
+                ctx.download.mirrors.note_success(prefix);
+                return Some((response, uri, prefix.clone()));
+            }
+            Ok(Ok(response)) => {
+                if mirror_blame(response.status()) {
+                    ctx.download.mirrors.cool_down(prefix);
+                }
+                tracing::info!(
+                    status = %response.status(),
+                    mirror = %prefix,
+                    "mirror refused the download"
+                );
+            }
+            Ok(Err(error)) => {
+                ctx.download.mirrors.cool_down(prefix);
+                tracing::info!(error = %error, mirror = %prefix, "mirror request failed");
+            }
+            Err(_) => {
+                ctx.download.mirrors.cool_down(prefix);
+                tracing::info!(mirror = %prefix, "mirror did not answer in time");
+            }
+        }
+    }
+    None
+}
+
+fn mirror_failed(status: StatusCode) -> bool {
+    status.is_client_error() || status.is_server_error()
+}
+
+/// Whether the mirror itself is at fault. A 404 or 410 on a valid release URL
+/// means the file is gone, so cooling the mirror would punish it for a dead link
+/// and, over a few of them, switch the whole list off.
+fn mirror_blame(status: StatusCode) -> bool {
+    status != StatusCode::NOT_FOUND && status != StatusCode::GONE
+}
+
+/// Sends a bodyless request to `uri`; mirror attempts and the direct retry are
+/// both bodyless, so nothing has to be buffered.
+async fn send_once(
+    ctx: &ProxyContext,
+    method: &Method,
+    headers: &HeaderMap,
+    uri: &Uri,
+    upgrade_requested: bool,
+) -> std::result::Result<Response<UpstreamResponseBody>, String> {
+    let mut request = Request::new(Either::Right(Full::new(Bytes::new())) as UpstreamBody);
+    *request.method_mut() = method.clone();
+    *request.uri_mut() = uri.clone();
+    *request.headers_mut() = headers.clone();
+    *request.version_mut() = http::Version::HTTP_11;
+    ctx.upstream
+        .send_with_uri(request, upgrade_requested, uri)
+        .await
+        .map_err(|error| format!("request to {} failed: {error}", uri.path()))
 }
 
 fn into_proxy_response(
@@ -535,7 +668,7 @@ fn sanitize_request_headers(headers: &mut HeaderMap, upgrade: bool) {
     sanitize_hop_by_hop(headers, upgrade, true);
 }
 
-fn sanitize_response_headers(headers: &mut HeaderMap, upgrade: bool) {
+pub(super) fn sanitize_response_headers(headers: &mut HeaderMap, upgrade: bool) {
     sanitize_hop_by_hop(headers, upgrade, false);
 }
 

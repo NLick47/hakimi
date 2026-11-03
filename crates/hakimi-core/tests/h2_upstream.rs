@@ -186,6 +186,7 @@ async fn spawn_proxy(
         resolver,
         tls,
         upstream,
+        Arc::new(hakimi_core::mirror::MirrorList::load(None)),
         status_json,
         Arc::new(|| {}),
     );

@@ -29,6 +29,9 @@ pub const DEFAULT_CATALOG_IP: &str = "https://gitee.com/mom09/hakimi/raw/master/
 /// Default remote DoH catalog, shared by the desktop and Android builds.
 pub const DEFAULT_CATALOG_DOH: &str = "https://gitee.com/mom09/hakimi/raw/master/doh.json";
 
+/// Default source of the download mirror list, shared by every build.
+pub const DEFAULT_MIRROR_SOURCE: &str = "https://gitee.com/mom09/hakimi/raw/master/mirrors.json";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppConfig {
@@ -211,6 +214,47 @@ pub struct AdvancedConfig {
     /// the streamed body. Guards against half-dead connections that accept the request
     /// but never answer.
     pub upstream_header_timeout_secs: u64,
+    /// Segmented downloads for large files (release assets, source archives)
+    pub download: DownloadConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DownloadConfig {
+    pub enabled: bool,
+    /// Responses below this size stay on one connection
+    pub min_size_bytes: u64,
+    /// Segment connections, clamped to 2..=8 at use
+    pub segments: usize,
+    /// Dynamic chunk size: a slow connection simply claims fewer chunks
+    pub chunk_bytes: u64,
+    /// A read with no progress for this long is abandoned and re-dialled
+    pub stall_timeout_secs: u64,
+    /// Process-wide segment connection cap, shared by concurrent downloads
+    pub max_conns: usize,
+    /// Remote JSON listing the mirror prefixes. Empty disables mirroring;
+    /// a failed fetch falls back to the last good cache, then the built-in one.
+    /// See [`crate::mirror`]
+    pub mirror_source: String,
+}
+
+impl Default for DownloadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // a few MB on a slow link takes minutes on one connection
+            min_size_bytes: 2 * 1024 * 1024,
+            // the first chunk streams single-connection for about one chunk
+            // duration, so a smaller chunk shortens the 1x phase; a larger one
+            // makes completion arrive in sparse bursts and the progress bar
+            // oscillates between 0 and a jump
+            segments: 6,
+            chunk_bytes: 128 * 1024,
+            stall_timeout_secs: 20,
+            max_conns: 32,
+            mirror_source: DEFAULT_MIRROR_SOURCE.to_string(),
+        }
+    }
 }
 
 impl Default for AdvancedConfig {
@@ -231,8 +275,9 @@ impl Default for AdvancedConfig {
             upstream_idle_secs: 120,
             upstream_max_idle_per_host: 8,
             http1_hosts: vec![
-                // i.pximg.net 与 booth.pximg.net 是图片 CDN 并行 h1 聚合带宽
-                // s.pximg.net 承载 JS/CSS 走 h2 多路复用省掉握手风暴
+                // i.pximg.net and booth.pximg.net are image CDNs: parallel h1
+                // connections aggregate bandwidth, while s.pximg.net serves
+                // JS/CSS and stays on h2 to avoid a handshake storm
                 "i.pximg.net".to_string(),
                 "booth.pximg.net".to_string(),
                 "img.poipiku.com".to_string(),
@@ -240,6 +285,7 @@ impl Default for AdvancedConfig {
             ],
             http1_max_concurrent: 32,
             upstream_header_timeout_secs: 60,
+            download: DownloadConfig::default(),
         }
     }
 }
@@ -832,6 +878,12 @@ impl AppConfig {
                 normalize_hostname(candidate)
                     .with_context(|| format!("invalid fake SNI candidate `{candidate}`"))?;
             }
+        }
+        if !self.advanced.download.mirror_source.trim().is_empty() {
+            validate_catalog_url(
+                &self.advanced.download.mirror_source,
+                "advanced.download.mirrorSource",
+            )?;
         }
 
         validate_doh_url(&self.doh.primary, "doh.primary")?;
@@ -1459,7 +1511,7 @@ mod tests {
             .http1_hosts
             .iter()
             .any(|pattern| pattern == "i.pximg.net"));
-        // s.pximg.net 承载 JS/CSS 必须留在 h2 池
+        // s.pximg.net serves JS/CSS and must stay in the h2 pool
         assert!(config
             .advanced
             .http1_hosts
@@ -1966,7 +2018,7 @@ mod tests {
             manager.snapshot().advanced.http1_hosts,
             AdvancedConfig::default().http1_hosts
         );
-        // 重新落盘后默认字段不再出现
+        // default fields disappear once the file is written again
         manager.update(manager.snapshot().as_ref().clone()).unwrap();
         let text = std::fs::read_to_string(paths.config_file()).unwrap();
         assert!(!text.contains("http1Hosts"));
@@ -2040,7 +2092,7 @@ mod tests {
         let paths = Paths::new(dir.path());
         let mut legacy = AppConfig::default();
         legacy.schema_version = 0;
-        // 模拟旧模板：裸域规则没有自己的 route
+        // an old template: the bare-domain rule has no route of its own
         legacy
             .group_mut("poipiku")
             .unwrap()
@@ -2058,7 +2110,7 @@ mod tests {
             Some(RoutePolicy::sni(vec![String::new()]))
         );
         assert_eq!(snapshot.schema_version, SCHEMA_VERSION);
-        // 迁移结果已落盘
+        // the migration result is written back
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(paths.config_file()).unwrap()).unwrap();
         assert_eq!(parsed.get("schemaVersion"), Some(&serde_json::json!(2)));

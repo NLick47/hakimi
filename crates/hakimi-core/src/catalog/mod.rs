@@ -27,7 +27,7 @@ const MAX_SIGNATURE_BYTES: usize = 4096;
 /// A source can omit `Content-Length` and keep a chunked body open. Buffering
 /// it with `Response::bytes()` would let that source grow the process until the
 /// request timeout, then allocate the whole body before the old size check.
-async fn read_limited_body(
+pub(crate) async fn read_limited_body(
     mut response: reqwest::Response,
     max: usize,
     label: &str,
@@ -442,8 +442,9 @@ impl CatalogManager {
                         catalog_version: version,
                         warnings: warnings.clone(),
                     };
-                    // 写盘含 fsync，目录体最大 2MB。挪到 blocking 线程，
-                    // worker 与 refresh_lock 的其它等待者不被磁盘卡住。
+                    // the write includes fsync and the body can reach 2MB, so it
+                    // goes to a blocking thread and the worker plus every other
+                    // refresh_lock waiter keep running
                     let ip_file = self.paths.catalog_ip_file();
                     let meta_file = self.paths.catalog_ip_meta_file();
                     let meta_for_disk = meta.clone();
@@ -600,7 +601,7 @@ impl CatalogManager {
                         catalog_version: version,
                         warnings: Vec::new(),
                     };
-                    // 同 refresh_ip：写盘含 fsync，移到 blocking 线程。
+                    // same as refresh_ip: the write includes fsync, move it off
                     let doh_file = self.paths.catalog_doh_file();
                     let meta_file = self.paths.catalog_doh_meta_file();
                     let meta_for_disk = meta.clone();

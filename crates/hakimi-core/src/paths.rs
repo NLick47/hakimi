@@ -97,6 +97,10 @@ impl Paths {
         self.cache_dir().join("catalog-doh.meta.json")
     }
 
+    pub fn mirror_list_file(&self) -> PathBuf {
+        self.cache_dir().join("mirrors.json")
+    }
+
     pub fn state_dir(&self) -> PathBuf {
         self.root.join("state")
     }
