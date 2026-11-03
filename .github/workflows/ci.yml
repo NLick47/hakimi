@@ -2,10 +2,9 @@ name: CI
 
 # The release pipeline only builds Windows, macOS and Android. This job exists
 # so the Linux code paths (CA trust store, `hakimi env`) are compiled and
-# tested on every push, which is the only place they run before a release.
+# tested — but only on demand: pushes and PRs stay green without waiting for
+# a runner, so CI can be run manually before a release.
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
 jobs:
