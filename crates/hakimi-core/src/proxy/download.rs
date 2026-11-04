@@ -31,7 +31,12 @@ const BACKLOG_CHUNKS: usize = 8;
 /// Per-chunk attempt cap; a re-dial can pick a different IP
 const MAX_ATTEMPTS: u32 = 3;
 /// A range probe must not hold the browser's first byte for long
-const RANGE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const RANGE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// The streaming worker owns this chunk: its bytes start at file offset 0.
+const STREAM_CHUNK: u64 = 0;
+/// The shared counter starts after [`STREAM_CHUNK`] so no other worker can
+/// claim the streaming chunk out from under the stream.
+const NEXT_AFTER_STREAM_CHUNK: u64 = STREAM_CHUNK + 1;
 
 pub struct DownloadManager {
     slots: Arc<Semaphore>,
@@ -137,6 +142,26 @@ fn range_request_headers(base: &HeaderMap, response: &HeaderMap) -> HeaderMap {
         headers.insert(header::IF_RANGE, validator.clone());
     }
     headers
+}
+
+/// The `Host` header for a request sent on hyper's raw `client::conn` API.
+///
+/// That API never synthesizes `Host` ("req must have a Host header", hyper's
+/// own docs); only `hyper_util`'s legacy client adds it, which the main pool
+/// uses and the segment/probe paths bypass. An HTTP/1.1 origin must answer
+/// 400 without one (nginx does by default), so every range request would fail.
+fn host_header(uri: &Uri) -> Option<HeaderValue> {
+    let host = uri.host()?;
+    let default = if uri.scheme_str() == Some("https") {
+        443
+    } else {
+        80
+    };
+    let value = match uri.port_u16() {
+        Some(port) if port != default => format!("{host}:{port}"),
+        _ => host.to_string(),
+    };
+    HeaderValue::from_str(&value).ok()
 }
 
 /// Built-in download host rules (hardcoded in v1)
@@ -488,10 +513,20 @@ impl Worker {
             let Some(_backlog) = self.wait_backlog().await else {
                 return;
             };
-            let Some(index) = claim(&self.shared.next, self.shared.chunks_total) else {
-                return;
-            };
+            // The response stream starts at file offset 0, so its worker owns
+            // chunk 0 no matter when the runtime schedules it. Letting it race
+            // for the shared counter let a tail worker claim chunk 0 first and
+            // the stream then filed file-head bytes under a later index —
+            // reassembly is ordered by index, so the corruption was silent.
             let streaming = matches!(self.source, Source::Stream(_));
+            let index = if streaming {
+                STREAM_CHUNK
+            } else {
+                let Some(index) = claim(&self.shared.next, self.shared.chunks_total) else {
+                    return;
+                };
+                index
+            };
             if let Err(reason) = self.fill_chunk(index).await {
                 self.shared.set_fatal(&reason);
                 return;
@@ -673,6 +708,9 @@ async fn read_dialed(
     };
     let mut headers = shared.headers.clone();
     headers.insert(header::RANGE, range);
+    if let Some(host) = host_header(&shared.uri) {
+        headers.insert(header::HOST, host);
+    }
     let mut request = match Request::builder()
         .method(Method::GET)
         .uri(shared.uri.clone())
@@ -735,9 +773,15 @@ async fn read_dialed(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok())
     {
-        if len != expected as u64 {
+        // The request already asked for the remaining span
+        // (`range_start..=range_end`, shrunk by the bytes `got`), so a resumed
+        // chunk expects the shorter length the server correctly answers with.
+        // Comparing against the full chunk rejected every resume and, after
+        // three attempts, aborted the whole download.
+        let wanted = range_end - range_start + 1;
+        if len != wanted {
             return ReadOutcome::SourceDead(format!(
-                "range response length {len}, expected {expected}"
+                "range response length {len}, expected {wanted}"
             ));
         }
     }
@@ -867,6 +911,9 @@ async fn probe_range(
         .body(Full::new(Bytes::new()))
         .map_err(|error| format!("request build failed: {error}"))?;
     *request.headers_mut() = headers.clone();
+    if let Some(host) = host_header(uri) {
+        request.headers_mut().entry(header::HOST).or_insert(host);
+    }
     request
         .headers_mut()
         .insert(header::RANGE, HeaderValue::from_static("bytes=0-0"));
@@ -1032,7 +1079,7 @@ pub(crate) async fn segment(
         pool: ctx.upstream.clone(),
         slots: ctx.download.slots.clone(),
         headers: range_headers,
-        next: AtomicU64::new(0),
+        next: AtomicU64::new(NEXT_AFTER_STREAM_CHUNK),
         chunks_total,
         chunk_len,
         total_len,
@@ -1127,14 +1174,35 @@ impl hyper::body::Body for SegmentedBody {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_uri, claim, content_encoded, expected_chunk_len, headers_eligible,
+        candidate_uri, claim, content_encoded, expected_chunk_len, headers_eligible, host_header,
         mirror_candidate, mirror_origins, parse_content_range, range_request_headers, signed_url,
-        MIB,
+        Shared, Source, Worker, MIB, NEXT_AFTER_STREAM_CHUNK,
     };
-    use crate::config::DownloadConfig;
+    use crate::cache::{CacheManager, LastGoodEntry};
+    use crate::catalog::RemoteIpProvider;
+    use crate::config::{ConfigManager, DomainRule, DownloadConfig, GroupConfig, RoutePolicy};
+    use crate::decision::DecisionEngine;
+    use crate::ip_tester::TlsContext;
     use crate::mirror::{MirrorList, BUILTIN_MIRRORS};
-    use http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
-    use std::sync::atomic::AtomicU64;
+    use crate::paths::Paths;
+    use crate::resolver::{DohResolution, EchOutcome, IpResolver};
+    use crate::status::StatusStore;
+    use crate::strategy::IpSource;
+    use crate::util::now;
+    use bytes::Bytes;
+    use http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
+    use http_body_util::Full;
+    use hyper::body::Incoming;
+    use hyper_util::rt::TokioIo;
+    use std::future::Future;
+    use std::net::IpAddr;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{mpsc, watch, Semaphore};
 
     fn builtin_mirrors() -> MirrorList {
         MirrorList::load(None)
@@ -1472,5 +1540,222 @@ mod tests {
         assert_eq!(sum, total);
         assert_eq!(expected_chunk_len(4, chunks_total, chunk_len, total), 1);
         assert_eq!(expected_chunk_len(0, chunks_total, chunk_len, total), 2);
+    }
+
+    #[test]
+    fn the_shared_counter_skips_the_streaming_chunk() {
+        let next = AtomicU64::new(NEXT_AFTER_STREAM_CHUNK);
+        assert_eq!(claim(&next, 4).unwrap(), 1);
+        assert_eq!(claim(&next, 4).unwrap(), 2);
+        assert_eq!(claim(&next, 4).unwrap(), 3);
+        assert!(claim(&next, 4).is_none());
+    }
+
+    #[test]
+    fn host_header_matches_the_legacy_client() {
+        let uri: Uri = "http://example.com/x".parse().unwrap();
+        assert_eq!(host_header(&uri).unwrap(), "example.com");
+        let uri: Uri = "http://example.com:8080/x".parse().unwrap();
+        assert_eq!(host_header(&uri).unwrap(), "example.com:8080");
+        // The default port stays implicit, like hyper_util's `set_host`.
+        let uri: Uri = "https://example.com:443/x".parse().unwrap();
+        assert_eq!(host_header(&uri).unwrap(), "example.com");
+        let uri: Uri = "https://example.com:8443/x".parse().unwrap();
+        assert_eq!(host_header(&uri).unwrap(), "example.com:8443");
+    }
+
+    struct NoDoh;
+
+    #[async_trait::async_trait]
+    impl IpResolver for NoDoh {
+        async fn doh_ips(&self, _domain: &str) -> anyhow::Result<DohResolution> {
+            Err(anyhow::anyhow!("no DoH in this test"))
+        }
+
+        async fn doh_ech_config(
+            &self,
+            _domain: &str,
+            _allow_shared: bool,
+        ) -> anyhow::Result<EchOutcome> {
+            Err(anyhow::anyhow!("no ECH in this test"))
+        }
+    }
+
+    struct NoRemote;
+
+    impl RemoteIpProvider for NoRemote {
+        fn remote_ips(&self, _domain: &str) -> Option<Arc<[IpAddr]>> {
+            None
+        }
+
+        fn has_ip_catalog(&self) -> bool {
+            false
+        }
+    }
+
+    /// A pool whose `upstream.test` route points at loopback, so a segment
+    /// worker's dial goes somewhere the test controls.
+    fn segment_pool(dir: &std::path::Path) -> Arc<crate::proxy::UpstreamPool> {
+        let paths = Paths::new(dir);
+        paths.ensure().unwrap();
+        let config = Arc::new(ConfigManager::load_or_create(&paths).unwrap());
+        config
+            .upsert_group(GroupConfig {
+                id: "test".into(),
+                name: "Test".into(),
+                domains: vec![DomainRule::new("upstream.test")],
+                enabled: true,
+                homepage: None,
+                default_route: RoutePolicy::direct(),
+            })
+            .unwrap();
+        let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
+        cache.put_last_good(LastGoodEntry {
+            domain: "upstream.test".into(),
+            ip: "127.0.0.1".parse().unwrap(),
+            source: IpSource::Cache,
+            saved_at: now(),
+            catalog_version: 0,
+        });
+        let tls = TlsContext::new().unwrap();
+        let status = Arc::new(StatusStore::new());
+        let engine = DecisionEngine::new(
+            config.clone(),
+            cache,
+            Arc::new(NoRemote),
+            Arc::new(NoDoh),
+            tls.clone(),
+            status,
+        );
+        crate::proxy::UpstreamPool::new(engine, tls, &config.snapshot())
+    }
+
+    /// A local origin that answers exactly once with the full body, giving the
+    /// test a real `hyper::body::Incoming` for the streaming worker.
+    async fn stream_incoming(payload: &[u8]) -> Incoming {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = payload.to_vec();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..read]);
+                if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&payload).await.unwrap();
+        });
+        let io = TokioIo::new(TcpStream::connect(addr).await.unwrap());
+        let (mut tx, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        tx.ready().await.unwrap();
+        let request = Request::builder()
+            .uri("http://stream.test/chunked")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        tx.send_request(request).await.unwrap().into_body()
+    }
+
+    /// Reproduces the claim race deterministically: `run()` lets every worker
+    /// claim any chunk from one shared counter, so a tail worker polled first
+    /// takes chunk 0 and the streaming worker (whose bytes start at file
+    /// offset 0) labels file-head data with a later chunk index. The merger
+    /// reorders strictly by index, so the wrong bytes are spliced at the right
+    /// length — silent corruption.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stream_worker_fills_chunk_zero_even_when_a_tail_claims_first() {
+        let chunk_len = 4096u64;
+        let chunks_total = 4u64;
+        let payload: Vec<u8> = (0..(chunk_len * chunks_total) as usize)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let incoming = stream_incoming(&payload).await;
+
+        // Completes the TCP handshake but never answers: the tail worker
+        // claims its chunk and then parks on the range response.
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        let _dead = dead;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pool = segment_pool(dir.path());
+        let (order_tx, mut order_rx) = mpsc::channel(16);
+        let (fatal_tx, fatal_rx) = watch::channel(false);
+        let shared = Arc::new(Shared {
+            uri: format!("http://upstream.test:{}/chunked", dead_addr.port())
+                .parse::<Uri>()
+                .unwrap(),
+            pool,
+            slots: Arc::new(Semaphore::new(8)),
+            headers: HeaderMap::new(),
+            chunks_total,
+            chunk_len,
+            total_len: chunk_len * chunks_total,
+            stall: Duration::from_secs(5),
+            header_wait: Duration::from_secs(60),
+            backlog: Arc::new(Semaphore::new(8)),
+            order_tx,
+            next: AtomicU64::new(0),
+            fatal_tx,
+            fatal_rx,
+            reason: Mutex::new(None),
+            delivered: AtomicU64::new(0),
+            finished: Arc::new(AtomicU64::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            started: Instant::now(),
+            host: "upstream.test".into(),
+        });
+
+        // The tail worker runs first — exactly like a spawner thread that is
+        // preempted right after `tokio::spawn`.
+        let mut tail = Box::pin(
+            Worker {
+                shared: shared.clone(),
+                source: Source::None,
+                carry: None,
+                _upstream_permit: None,
+            }
+            .run(),
+        );
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            matches!(tail.as_mut().poll(&mut cx), Poll::Pending),
+            "the tail worker parks on the unanswered range request"
+        );
+
+        tokio::spawn(
+            Worker {
+                shared: shared.clone(),
+                source: Source::Stream(incoming),
+                carry: None,
+                _upstream_permit: None,
+            }
+            .run(),
+        );
+
+        let (index, head) = tokio::time::timeout(Duration::from_secs(10), order_rx.recv())
+            .await
+            .expect("the stream worker must publish a chunk")
+            .expect("the order channel must stay open");
+        assert_eq!(
+            index, 0,
+            "the streaming connection starts at file offset 0, so it must fill chunk 0"
+        );
+        assert_eq!(&head[..], &payload[..chunk_len as usize]);
     }
 }

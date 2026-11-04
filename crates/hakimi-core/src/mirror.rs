@@ -150,17 +150,15 @@ impl MirrorList {
     }
 
     /// Fetch the remote list and persist it. An empty source means mirrors are off.
+    ///
+    /// The cache write is best-effort: a full or read-only disk must not
+    /// throw away the list this call just fetched.
     pub async fn refresh(&self, source: &str) -> Result<usize> {
         let source = source.trim();
         if source.is_empty() {
             bail!("no mirror list source configured");
         }
-        let client = reqwest::Client::builder()
-            .user_agent(format!("hakimi/{}", crate::VERSION))
-            // the list must not loop back through our own system proxy
-            .no_proxy()
-            .build()
-            .context("building mirror list HTTP client")?;
+        let client = list_client()?;
         let response = client
             .get(source)
             .timeout(Duration::from_secs(10))
@@ -182,7 +180,16 @@ impl MirrorList {
                 version: 1,
                 mirrors: mirrors.clone(),
             };
-            atomic_write_json(path, &file).context("writing mirror list cache")?;
+            if let Err(error) = atomic_write_json(path, &file) {
+                // The fetch succeeded. A cache write failure (read-only disk,
+                // full volume) must not abort the refresh and drop the list
+                // this process just pulled; the next refresh retries the write.
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    path = %path.display(),
+                    "writing mirror list cache failed; keeping the fetched list in memory"
+                );
+            }
         }
         let count = mirrors.len();
         *self.mirrors.write() = Arc::new(mirrors);
@@ -192,6 +199,26 @@ impl MirrorList {
         self.range_ok.write().clear();
         Ok(count)
     }
+}
+
+/// The list fetch shares one HTTP client per process: a `reqwest::Client`
+/// owns a connection pool and the TLS root store, and `refresh` runs on
+/// startup, on every source change, and on the periodic sweep — rebuilding
+/// it each time threw that away for a single request.
+fn list_client() -> Result<reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
+        .user_agent(format!("hakimi/{}", crate::VERSION))
+        // the list must not loop back through our own system proxy
+        .no_proxy()
+        .build()
+        .context("building mirror list HTTP client")?;
+    // A refresh that raced us to the slot keeps its client; both callers get
+    // a usable one and every later refresh shares the winner.
+    Ok(CLIENT.get_or_init(|| client).clone())
 }
 
 fn normalize(entries: Vec<String>) -> Vec<String> {
@@ -276,6 +303,47 @@ mod tests {
             "https://b.example".into(),
         ]);
         assert_eq!(list, vec!["https://a.example", "https://b.example"]);
+    }
+
+    /// A cache write failure (read-only disk, full volume) must not fail the
+    /// refresh: the fetched list is the deliverable, the cache only warms the
+    /// next start.
+    #[tokio::test]
+    async fn a_cache_write_failure_keeps_the_fetched_list() {
+        crate::util::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("mirror-list.json");
+        // A directory in the cache's place makes the atomic rename fail.
+        std::fs::create_dir(&cache).unwrap();
+        let mirrors = MirrorList::load(Some(cache));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await;
+            let body = r#"{"version":1,"mirrors":["https://mirror.example/gh/"]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let count = mirrors
+            .refresh(&format!("http://{addr}/list.json"))
+            .await
+            .expect("a cache write failure must not fail the refresh");
+        assert_eq!(count, 1);
+        assert_eq!(
+            mirrors.all(),
+            vec!["https://mirror.example/gh".to_string()],
+            "the fetched list must be live in memory"
+        );
     }
 
     #[test]

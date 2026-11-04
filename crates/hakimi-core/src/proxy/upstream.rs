@@ -425,14 +425,21 @@ async fn forward_with_uri(
     // Keep the browser's headers for the direct retry and for the range
     // requests of a direct download: a private codeload archive needs its
     // cookies on every chunk. A mirror never sees them.
-    let direct_headers = parts.headers.clone();
-    if mirrored {
+    let (direct_headers, mirror_headers) = if mirrored {
+        let direct_headers = parts.headers.clone();
         // A third-party mirror neither needs nor deserves the user's GitHub
         // session.
         parts.headers.remove(header::COOKIE);
         parts.headers.remove(header::AUTHORIZATION);
-    }
-    let mirror_headers = parts.headers.clone();
+        // The mirrored path never reads `parts.headers` again, so the mirror
+        // copy moves instead of cloning the whole map a second time.
+        (direct_headers, std::mem::take(&mut parts.headers))
+    } else {
+        // No mirror runs on this request: only the segment base can still
+        // need a copy of the browser's headers, and the mirror copy is never
+        // read on this path.
+        (parts.headers.clone(), HeaderMap::new())
+    };
 
     let response_uri;
     let mut response;
@@ -542,13 +549,26 @@ async fn forward_with_uri(
                     mirror_prefix.as_deref(),
                     ctx.download.mirrors.available(),
                 );
+                // Every candidate below gets its own send and probe budget, so
+                // a long list could stall the browser far past
+                // MIRROR_TOTAL_BUDGET (it was only enforced inside
+                // `try_mirrors`). One shared deadline restores the invariant.
+                let deadline = tokio::time::Instant::now() + MIRROR_TOTAL_BUDGET;
                 for prefix in tail {
                     let Some(uri) = mirror_plan.as_ref().and_then(|plan| plan.rewrite(&prefix))
                     else {
                         continue;
                     };
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        tracing::info!(
+                            path = %rule_uri.path(),
+                            "mirror failover budget spent; serving the origin response"
+                        );
+                        break;
+                    }
                     let attempt = tokio::time::timeout(
-                        MIRROR_BUDGET,
+                        MIRROR_BUDGET.min(remaining),
                         send_once(ctx, &method, &mirror_headers, &uri, upgrade_requested),
                     )
                     .await;
@@ -579,6 +599,13 @@ async fn forward_with_uri(
                             continue;
                         }
                     };
+                    if deadline.saturating_duration_since(tokio::time::Instant::now())
+                        < super::download::RANGE_PROBE_TIMEOUT
+                    {
+                        // Not enough budget left to prove the candidate honours
+                        // ranges; keep the browser moving instead.
+                        break;
+                    }
                     if super::download::mirror_range_ok(
                         ctx,
                         &uri,
@@ -740,6 +767,25 @@ const HOP_PROXY_CONNECTION: u16 = 1 << 9;
 /// Remove hop-by-hop headers in one pass over the existing names. The old
 /// implementation issued ten hash lookups per request even when none of these
 /// headers were present, which is the normal browser case.
+/// Tokens in a `Connection` value that only ever name a header the fixed
+/// removals below already handle (`close` names no header at all). Skipping
+/// them keeps the ubiquitous `Connection: keep-alive` allocation-free.
+fn is_standard_hop_token(token: &str) -> bool {
+    const STANDARD: [&str; 10] = [
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "close",
+        "upgrade",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "proxy-authenticate",
+        "proxy-authorization",
+    ];
+    STANDARD.iter().any(|name| token.eq_ignore_ascii_case(name))
+}
+
 fn sanitize_hop_by_hop(headers: &mut HeaderMap, upgrade: bool, remove_host: bool) {
     let mut present = 0u16;
     for name in headers.keys() {
@@ -757,8 +803,35 @@ fn sanitize_hop_by_hop(headers: &mut HeaderMap, upgrade: bool, remove_host: bool
             _ => 0,
         };
     }
-    if present & HOP_CONNECTION != 0 && !upgrade {
-        headers.remove(header::CONNECTION);
+    if present & HOP_CONNECTION != 0 {
+        // RFC 7230 §6.1: a header field named in Connection is hop-by-hop too
+        // and must not be forwarded. The value is read before Connection is
+        // dropped below; the standard tokens are already covered by the fixed
+        // removals, so the usual `Connection: keep-alive` costs no allocation.
+        let mut listed: Option<Vec<HeaderName>> = None;
+        for value in headers.get_all(header::CONNECTION) {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            for token in value.split(',') {
+                let token = token.trim();
+                if token.is_empty() || is_standard_hop_token(token) {
+                    continue;
+                }
+                let Ok(name) = HeaderName::from_bytes(token.to_ascii_lowercase().as_bytes()) else {
+                    continue;
+                };
+                listed.get_or_insert_with(Vec::new).push(name);
+            }
+        }
+        if let Some(listed) = listed {
+            for name in listed {
+                headers.remove(&name);
+            }
+        }
+        if !upgrade {
+            headers.remove(header::CONNECTION);
+        }
     }
     if present & HOP_PROXY_AUTHENTICATE != 0 {
         headers.remove(header::PROXY_AUTHENTICATE);
@@ -957,7 +1030,7 @@ mod tests {
         Target,
     };
     use http::uri::{PathAndQuery, Scheme};
-    use http::{HeaderMap, Request, Uri};
+    use http::{header, HeaderMap, Request, Uri};
 
     fn host_of(target: &Target) -> &str {
         target_host(
@@ -1050,6 +1123,43 @@ mod tests {
         sanitize_response_headers(&mut response, true);
         assert!(response.contains_key("connection"));
         assert!(response.contains_key("upgrade"));
+    }
+
+    #[test]
+    fn headers_named_in_connection_are_hop_by_hop_too() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONNECTION,
+            "keep-alive, X-Smuggled".parse().unwrap(),
+        );
+        headers.insert("x-smuggled", "leak".parse().unwrap());
+        headers.insert("x-end-to-end", "kept".parse().unwrap());
+        sanitize_request_headers(&mut headers, false);
+        assert!(
+            !headers.contains_key("x-smuggled"),
+            "a header named in Connection must not be forwarded"
+        );
+        assert!(headers.contains_key("x-end-to-end"));
+        assert!(!headers.contains_key(header::CONNECTION));
+
+        // An upgrade keeps Connection/Upgrade for the handshake, but a custom
+        // header listed next to them is still hop-by-hop.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, "Upgrade, X-Smuggled".parse().unwrap());
+        headers.insert(header::UPGRADE, "websocket".parse().unwrap());
+        headers.insert("x-smuggled", "leak".parse().unwrap());
+        sanitize_request_headers(&mut headers, true);
+        assert!(headers.contains_key(header::CONNECTION));
+        assert!(headers.contains_key(header::UPGRADE));
+        assert!(!headers.contains_key("x-smuggled"));
+
+        // The response direction strips them too.
+        let mut response = HeaderMap::new();
+        response.insert(header::CONNECTION, "close, X-Trace".parse().unwrap());
+        response.insert("x-trace", "internal".parse().unwrap());
+        sanitize_response_headers(&mut response, false);
+        assert!(!response.contains_key("x-trace"));
+        assert!(!response.contains_key(header::CONNECTION));
     }
 
     #[test]

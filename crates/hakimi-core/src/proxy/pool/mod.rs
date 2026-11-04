@@ -585,9 +585,19 @@ impl UpstreamPool {
         let permit = if !upgrade && is_http1_host {
             let host = host.expect("is_http1_host requires a host");
             let semaphore = self.host_slots(host);
-            match semaphore.acquire_owned().await {
-                Ok(permit) => Some(permit),
-                Err(_) => return Err("image connection limiter is closed".into()),
+            // The permit is held until the response body finishes, so a single
+            // stalled origin can pin every slot of an image host. The queue
+            // wait is part of the header wait: without a bound here a parked
+            // request outlived every configured timeout.
+            match tokio::time::timeout(self.header_timeout, semaphore.acquire_owned()).await {
+                Ok(Ok(permit)) => Some(permit),
+                Ok(Err(_)) => return Err("image connection limiter is closed".into()),
+                Err(_) => {
+                    return Err(format!(
+                        "image connection limiter queue for {host} timed out after {:?}",
+                        self.header_timeout
+                    ));
+                }
             }
         } else {
             None
@@ -895,10 +905,12 @@ impl UpstreamPool {
                             error = %format!("{error:#}"),
                             "upstream request failed; replaying once on a fresh connection"
                         );
-                        // The original attempt is over, so the replay runs on
-                        // its own: a plain header deadline, no hedge window.
+                        // The replay shares the original deadline: the config
+                        // promises one absolute header timeout, and a fresh
+                        // window let a late error double it (up to 2x for
+                        // image hosts, whose hedge never fires first).
                         let replay = recovery.request(replayed(parts));
-                        return match tokio::time::timeout(header_timeout, replay).await {
+                        return match tokio::time::timeout_at(deadline, replay).await {
                             Ok(result) => SendOutcome::Response(result),
                             Err(_) => SendOutcome::HeaderTimeout,
                         };

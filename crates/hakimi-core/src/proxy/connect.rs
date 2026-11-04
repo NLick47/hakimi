@@ -308,14 +308,12 @@ async fn tunnel_direct_group(
         // The cached route is seeded into the race, not generated again.
         cursor.skip_plan(plan);
     }
-    let timeout = Duration::from_millis(
-        ctx.config
-            .snapshot()
-            .advanced
-            .ip_timeout_ms
-            .clamp(500, 10_000),
-    );
-    match race_tcp_plans(&mut cursor, cached_plan, timeout).await {
+    let snapshot = ctx.config.snapshot();
+    let timeout = Duration::from_millis(snapshot.advanced.ip_timeout_ms.clamp(500, 10_000));
+    // The DoH expansion between candidate waves is bounded by the resolver;
+    // hand that bound to the race so the whole attempt has one deadline.
+    let doh_budget = crate::resolver::doh_lookup_budget(snapshot.catalogs.timeout_secs);
+    match race_tcp_plans(&mut cursor, cached_plan, timeout, doh_budget).await {
         Some((plan, stream, latency)) => {
             let _ = cursor.note_success(plan, latency);
             tunnel_connect(req, stream, TunnelInfo::new(host, port, "raw-direct"))
@@ -338,11 +336,21 @@ async fn tunnel_direct_group(
 /// raced in a rolling window instead of being tried one at a time. Non-direct
 /// plans are skipped (the caller's browser performs the real TLS handshake, so a
 /// direct candidate is the only usable one here).
+///
+/// `doh_budget` bounds one DoH expansion between candidate waves; the whole
+/// race gets a single wall-clock deadline built from it and `timeout`.
 pub(super) async fn race_tcp_plans(
     cursor: &mut RouteCursor,
     cached_plan: Option<Arc<ConnectPlan>>,
     timeout: Duration,
+    doh_budget: Duration,
 ) -> Option<(Arc<ConnectPlan>, TcpStream, u64)> {
+    // Two per-candidate windows — the initial candidates and the DoH wave
+    // after the expansion — plus two lookup budgets, because a single-flight
+    // queue behind another task's query doubles the expansion. Without one
+    // deadline the browser's CONNECT stacked every per-candidate timeout and
+    // a stalled DoH expansion on itself.
+    let deadline = tokio::time::Instant::now() + (timeout + doh_budget) * 2;
     type RaceResult =
         Result<(Arc<ConnectPlan>, TcpStream, u64), (Arc<ConnectPlan>, FailureReason, String)>;
     enum Event {
@@ -397,9 +405,13 @@ pub(super) async fn race_tcp_plans(
             tokio::select! {
                 plan = cursor.next_plan() => Event::Plan(plan.map(Arc::new)),
                 Some(result) = pending.next(), if !pending.is_empty() => Event::Result(result),
+                _ = tokio::time::sleep_until(deadline) => return None,
             }
         } else if !pending.is_empty() {
-            Event::Result(pending.next().await.expect("pending is not empty"))
+            match tokio::time::timeout_at(deadline, pending.next()).await {
+                Ok(Some(result)) => Event::Result(result),
+                Ok(None) | Err(_) => return None,
+            }
         } else {
             return None;
         };

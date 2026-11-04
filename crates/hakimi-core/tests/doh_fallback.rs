@@ -903,3 +903,67 @@ async fn two_stalled_endpoints_cannot_hold_the_race_past_the_deadline() {
         "the race deadline must cap the stall below the request timeout, took {elapsed:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_race_does_not_black_hole_the_domain() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // Two endpoints that never answer: the race deadline cancels both
+    // queries while they are still in flight. No endpoint was defeated, so
+    // the outcome must not be remembered — the negative entry used to fail
+    // every lookup for ten seconds even after the endpoint recovered.
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    paths.ensure().unwrap();
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    let roots = dir.path().join("extra-root.pem");
+    std::fs::write(&roots, ca.ca_pem()).unwrap();
+    std::env::set_var("HAKIMI_EXTRA_ROOT_CA", &roots);
+
+    let tls = ca.server_config("127.0.0.1").unwrap();
+    let stalled = DohServer::spawn_mode(tls.clone(), DohMode::Stall).await;
+    let stalled_peer = DohServer::spawn_mode(tls.clone(), DohMode::Stall).await;
+
+    let config = Arc::new(ConfigManager::load_or_create(&paths).unwrap());
+    config
+        .mutate(|config| {
+            config.doh.primary = format!("https://127.0.0.1:{}/dns-query", stalled.addr.port());
+            config.doh.fallback =
+                format!("https://127.0.0.1:{}/dns-query", stalled_peer.addr.port());
+            config.catalogs.timeout_secs = 4;
+            Ok(())
+        })
+        .unwrap();
+    let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
+    let catalogs = CatalogManager::load(&paths, config.clone(), cache.clone()).unwrap();
+    let resolver = Resolver::new(cache.clone(), config.clone(), catalogs);
+    std::mem::forget(dir);
+
+    resolver
+        .resolve_ips("example.com")
+        .await
+        .expect_err("nothing answers");
+    assert!(
+        !cache.doh_negative("example.com", TYPE_A),
+        "a race cancellation is not an endpoint failure and must not be cached as one"
+    );
+
+    // The endpoint recovers: the next lookup must query it instead of
+    // short-circuiting on a remembered failure.
+    let healthy = DohServer::spawn_mode(tls, DohMode::Answer([9, 9, 9, 9])).await;
+    config
+        .mutate(|config| {
+            let url = format!("https://127.0.0.1:{}/dns-query", healthy.addr.port());
+            config.doh.primary = url.clone();
+            config.doh.fallback = url;
+            Ok(())
+        })
+        .unwrap();
+    let resolution = resolver
+        .resolve_ips("example.com")
+        .await
+        .expect("a recovered endpoint must serve the next lookup immediately");
+    assert_eq!(
+        resolution.ips,
+        vec!["9.9.9.9".parse::<std::net::IpAddr>().unwrap()]
+    );
+}

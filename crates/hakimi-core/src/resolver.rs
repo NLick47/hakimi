@@ -63,6 +63,16 @@ const EMPTY_ANSWER_GRACE: Duration = Duration::from_millis(1500);
 /// still eight times that, and never below the configured per-request timeout.
 const RACE_DEADLINE: Duration = Duration::from_millis(2500);
 
+/// The upper bound of one live `doh_ips` call, excluding the single-flight
+/// queue wait: the raced pair's deadline plus the serial fallback waves.
+/// Callers that await a lookup inside a larger budget — the raw connect race
+/// sizes its whole wall-clock budget with this — use it instead of
+/// re-deriving the constants.
+pub(crate) fn doh_lookup_budget(catalog_timeout_secs: u64) -> Duration {
+    let request = Duration::from_secs(catalog_timeout_secs.max(1));
+    RACE_DEADLINE.min(request) + request * FALLBACK_WAVES
+}
+
 #[derive(Debug, Clone)]
 pub struct EffectiveEndpoint {
     pub name: String,
@@ -1142,6 +1152,14 @@ impl Resolver {
             .map(|attempt| format!("{}: {}", attempt.endpoint, attempt.error))
             .collect::<Vec<_>>()
             .join("; ");
+        if attempts.is_empty() {
+            // Nothing failed: the race (or fallback) deadline cancelled every
+            // query while it was still in flight. Caching that as a hard
+            // failure black-holed the domain for NEGATIVE_FAILURE_SECS even
+            // though a healthy-but-slow endpoint would answer the next
+            // attempt, and the joined detail was an empty string.
+            bail!("all DoH endpoints silent: race deadline exceeded before any answered");
+        }
         self.cache
             .put_doh_negative(domain, qtype, NEGATIVE_FAILURE_SECS, false);
         bail!("all DoH endpoints failed: {detail}")

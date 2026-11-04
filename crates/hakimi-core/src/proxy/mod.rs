@@ -6,6 +6,8 @@ mod response;
 mod upstream;
 
 #[cfg(test)]
+mod segment_tests;
+#[cfg(test)]
 mod tests;
 
 pub(crate) use connect::{clear_dns_cache, upstream_failure};
@@ -259,6 +261,11 @@ pub async fn start(ctx: Arc<ProxyContext>, bind: SocketAddr) -> Result<ProxyHand
     let pac_url = format!("http://{local_addr}/proxy.pac");
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let task = tokio::spawn(async move {
+        // Backoff for persistent accept errors. `accept()` reports EMFILE /
+        // ENFILE as an immediately-ready error, so without a sleep the
+        // `select!` loop spins at 100% CPU — exactly when the process is
+        // already out of file descriptors — and floods the log.
+        let mut backoff = Duration::from_millis(50);
         loop {
             tokio::select! {
                 changed = shutdown_rx.changed() => {
@@ -269,6 +276,7 @@ pub async fn start(ctx: Arc<ProxyContext>, bind: SocketAddr) -> Result<ProxyHand
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _peer)) => {
+                            backoff = Duration::from_millis(50);
                             let _ = stream.set_nodelay(true);
                             // A browser or tunnel client can disappear without a
                             // FIN (Wi-Fi drop, killed app). TCP keepalive lets the
@@ -284,6 +292,8 @@ pub async fn start(ctx: Arc<ProxyContext>, bind: SocketAddr) -> Result<ProxyHand
                         }
                         Err(error) => {
                             tracing::warn!(error = %error, "proxy accept failed");
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(Duration::from_secs(1));
                         }
                     }
                 }

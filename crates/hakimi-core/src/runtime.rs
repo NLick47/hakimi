@@ -1135,7 +1135,12 @@ impl HakimiRuntime {
                     }
                 }
             }
-            runtime.warm_groups().await;
+            // Warm-up runs resolves and connects; a shutdown that lands
+            // mid-warm must not hold stop() for the full per-task timeout.
+            tokio::select! {
+                _ = receiver.changed() => return,
+                _ = runtime.warm_groups() => {}
+            }
             tokio::select! {
                 _ = receiver.changed() => {}
                 _ = health => {}
@@ -1180,7 +1185,13 @@ impl HakimiRuntime {
                 _ = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
             loop {
-                match runtime.refresh_mirrors().await {
+                // The fetch can sit on a stalled source for its full HTTP
+                // timeout; shutdown must not queue behind it.
+                let refreshed = tokio::select! {
+                    _ = receiver.changed() => break,
+                    refreshed = runtime.refresh_mirrors() => refreshed,
+                };
+                match refreshed {
                     Ok(0) => {}
                     Ok(count) => tracing::info!(mirrors = count, "mirror list refreshed"),
                     Err(error) => tracing::warn!(error = %error, "mirror list refresh failed"),
@@ -1205,7 +1216,10 @@ impl HakimiRuntime {
                     _ = receiver.changed() => break,
                     _ = interval.tick() => {}
                 }
-                runtime.engine.reprobe_failed_ips(16).await;
+                tokio::select! {
+                    _ = receiver.changed() => break,
+                    _ = runtime.engine.reprobe_failed_ips(16) => {}
+                }
                 let stats = runtime.upstream.stats_json();
                 // A periodic snapshot, not an event. It repeats every minute
                 // with mostly unchanged numbers and would otherwise be the
@@ -1243,9 +1257,15 @@ impl HakimiRuntime {
                     runtime.upstream.retire_pools();
                     // Cached resolver answers belong to the old network
                     crate::proxy::clear_dns_cache();
-                    let _ = runtime.resolver.health_check().await;
+                    tokio::select! {
+                        _ = receiver.changed() => break,
+                        _ = runtime.resolver.health_check() => {}
+                    }
                     runtime.warm_backoff.lock().clear();
-                    runtime.warm_groups().await;
+                    tokio::select! {
+                        _ = receiver.changed() => break,
+                        _ = runtime.warm_groups() => {}
+                    }
                 }
             }
         });
@@ -1266,7 +1286,11 @@ impl HakimiRuntime {
                 if runtime.status.paused() {
                     continue;
                 }
-                for plan in runtime.engine.recheck_routes(1).await {
+                let plans = tokio::select! {
+                    _ = receiver.changed() => break,
+                    plans = runtime.engine.recheck_routes(1) => plans,
+                };
+                for plan in plans {
                     runtime
                         .engine
                         .forget_plan(&plan.domain, plan.port, plan.tls);
@@ -1827,6 +1851,56 @@ mod status_snapshot_tests {
         assert_eq!(
             after_second, after_first,
             "a deferred domain must not be warmed again while backed off"
+        );
+    }
+
+    /// Stop must not queue behind a background fetch that ignores the
+    /// shutdown signal. The mirror refresh holds its HTTP timeout for ten
+    /// seconds against a stalled source, and stop() gives each task two
+    /// seconds before detaching it anyway — waiting bought nothing but a
+    /// two-second shutdown stall.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_returns_while_a_background_fetch_is_stuck() {
+        let dir = tempfile::tempdir().unwrap();
+        // A mirror source that accepts the connection and never answers: the
+        // first refresh stays in flight until the client's ten-second timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let runtime = HakimiRuntime::new(Some(dir.path().to_path_buf())).unwrap();
+        runtime
+            .config
+            .mutate(|config| {
+                // Off means no port to bind and no OS proxy to touch.
+                config.proxy.mode = ProxyMode::Off;
+                // Everything else that reaches for the network in the
+                // background stays off, so only the mirror fetch can be in
+                // flight when stop() runs.
+                config.groups.clear();
+                config.catalogs.ip.clear();
+                config.catalogs.ip_mirrors.clear();
+                config.catalogs.doh.clear();
+                config.catalogs.doh_mirrors.clear();
+                config.advanced.download.mirror_source = format!("http://{stalled}/mirrors.json");
+                Ok(())
+            })
+            .unwrap();
+        runtime.start_without_takeover().await.unwrap();
+        // The mirror task sleeps 500 ms before its first refresh; by now the
+        // fetch is parked on the stalled socket.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+
+        let started = Instant::now();
+        runtime.stop().await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "stop() must not wait for the stuck mirror refresh, took {elapsed:?}"
         );
     }
 }

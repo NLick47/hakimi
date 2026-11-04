@@ -155,6 +155,26 @@ impl IpResolver for SlowEchResolver {
     }
 }
 
+/// A DoH expansion that outlives any sane race budget: the initial
+/// candidates fail fast, then the last-resort lookup stalls.
+struct SlowDohResolver;
+
+#[async_trait::async_trait]
+impl IpResolver for SlowDohResolver {
+    async fn doh_ips(&self, _domain: &str) -> anyhow::Result<DohResolution> {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        Err(anyhow::anyhow!("slow DoH resolver intentionally failed"))
+    }
+
+    async fn doh_ech_config(
+        &self,
+        _domain: &str,
+        _allow_shared: bool,
+    ) -> anyhow::Result<EchOutcome> {
+        Err(anyhow::anyhow!("no ech in this test"))
+    }
+}
+
 /// An ECH-first route with a Direct fallback must not keep the cursor from
 /// starting the fallback while the HTTPS RR lookup is slow. The ECH plan is
 /// still offered on the next round, so both can race.
@@ -327,7 +347,7 @@ async fn raw_tunnel_races_past_a_blackholed_candidate() {
     let serial_elapsed = serial_started.elapsed();
 
     let started = Instant::now();
-    let result = race_tcp_plans(&mut cursor, None, Duration::from_secs(1)).await;
+    let result = race_tcp_plans(&mut cursor, None, Duration::from_secs(1), Duration::ZERO).await;
     let elapsed = started.elapsed();
     println!("serial fallback took {serial_elapsed:?}; raw candidate race finished in {elapsed:?}");
     let (plan, _stream, _) = result.expect("the reachable candidate must win");
@@ -335,6 +355,50 @@ async fn raw_tunnel_races_past_a_blackholed_candidate() {
     assert!(
         elapsed < Duration::from_millis(800),
         "serial fallback would wait for the black-holed candidate; elapsed={elapsed:?}"
+    );
+}
+
+/// The raw race has no natural end: every candidate may burn a full
+/// per-candidate timeout, and the DoH expansion between waves waits out its
+/// own lookup budget. One wall-clock deadline of its own keeps the browser's
+/// CONNECT from being held open for the sum of all of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_tunnel_race_stops_at_its_overall_deadline() {
+    // Nothing listens on this port: the only candidate is refused instantly
+    // and the race falls through to the stalled DoH expansion.
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_for_test(
+        dir.path(),
+        RoutePolicy::direct(),
+        "127.0.0.1".parse().unwrap(),
+        Vec::new(),
+        Arc::new(SlowDohResolver),
+    );
+    let mut cursor = match engine.route("upstream.test", port, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+
+    let started = Instant::now();
+    let result = race_tcp_plans(
+        &mut cursor,
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(1),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    assert!(result.is_none(), "no candidate is reachable");
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "the race must stop at its deadline instead of waiting out the stalled \
+         DoH expansion (took {elapsed:?})"
     );
 }
 
@@ -360,7 +424,7 @@ async fn raw_tunnel_releases_hedge_after_refusal() {
     };
 
     let started = Instant::now();
-    let result = race_tcp_plans(&mut cursor, None, Duration::from_secs(1)).await;
+    let result = race_tcp_plans(&mut cursor, None, Duration::from_secs(1), Duration::ZERO).await;
     let elapsed = started.elapsed();
     let (plan, _stream, _) = result.expect("the reachable candidate must win");
     assert_eq!(plan.ip.to_string(), "127.0.0.1");
@@ -404,7 +468,13 @@ async fn raw_cached_plan_releases_hedge_after_refusal() {
     cursor.skip_plan(&cached);
 
     let started = Instant::now();
-    let result = race_tcp_plans(&mut cursor, Some(cached), Duration::from_secs(1)).await;
+    let result = race_tcp_plans(
+        &mut cursor,
+        Some(cached),
+        Duration::from_secs(1),
+        Duration::ZERO,
+    )
+    .await;
     let elapsed = started.elapsed();
     let (plan, _stream, _) = result.expect("the reachable catalog candidate must win");
     assert_eq!(plan.ip.to_string(), "127.0.0.1");
