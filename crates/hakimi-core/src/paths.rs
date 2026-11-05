@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 /// cache/catalog-ip.json, cache/catalog-ip.meta.json
 /// cache/catalog-doh.json, cache/catalog-doh.meta.json
 /// state/system-proxy.json
-/// logs/hakimi.log
+/// logs/hakimi.log (release), logs/hakimi-dev.log (debug)
 /// ```
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -114,6 +114,37 @@ impl Paths {
     }
 
     pub fn log_file(&self) -> PathBuf {
-        self.logs_dir().join("hakimi.log")
+        self.logs_dir().join(log_file_name(cfg!(debug_assertions)))
+    }
+}
+
+/// Debug builds keep their own log so a development run cannot overwrite the
+/// production log a release build is writing.
+fn log_file_name(debug: bool) -> &'static str {
+    if debug {
+        "hakimi-dev.log"
+    } else {
+        "hakimi.log"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_and_debug_logs_never_share_a_file() {
+        assert_eq!(log_file_name(false), "hakimi.log");
+        assert_eq!(log_file_name(true), "hakimi-dev.log");
+        assert_ne!(log_file_name(true), log_file_name(false));
+    }
+
+    #[test]
+    fn a_debug_build_points_at_its_own_log() {
+        let paths = Paths::new("/tmp/hakimi");
+        assert_eq!(
+            paths.log_file().file_name().unwrap(),
+            log_file_name(cfg!(debug_assertions))
+        );
     }
 }
