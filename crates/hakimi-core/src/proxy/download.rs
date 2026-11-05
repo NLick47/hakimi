@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 use super::pool::UpstreamResponse;
+use super::upstream::strip_mirror_cookies;
 use super::ProxyBody;
 use crate::config::AppConfig;
 use http_body_util::BodyExt;
@@ -112,10 +113,10 @@ fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
     Some((start, end, total))
 }
 
-/// Headers for the range requests that fill the later chunks. The base is the
-/// browser's request with credentials already stripped when the response came
-/// from a mirror, so a third party never sees the GitHub session.
-fn range_request_headers(base: &HeaderMap, response: &HeaderMap) -> HeaderMap {
+/// The small subset of browser headers a range request needs. A segmented
+/// download re-sends these on every chunk, so keeping only them avoids
+/// carrying (and deep-cloning) the whole `HeaderMap` on the hot path.
+pub(crate) fn credential_headers(base: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for name in [
         header::USER_AGENT,
@@ -127,6 +128,14 @@ fn range_request_headers(base: &HeaderMap, response: &HeaderMap) -> HeaderMap {
             headers.insert(name, value.clone());
         }
     }
+    headers
+}
+
+/// Headers for the range requests that fill the later chunks. The base is the
+/// browser's request with credentials already stripped when the response came
+/// from a mirror, so a third party never sees the GitHub session.
+fn range_request_headers(base: &HeaderMap, response: &HeaderMap) -> HeaderMap {
+    let mut headers = credential_headers(base);
     headers.insert(header::ACCEPT, HeaderValue::from_static("*/*"));
     headers.insert(
         header::ACCEPT_ENCODING,
@@ -464,20 +473,34 @@ struct Worker {
 }
 
 impl Worker {
-    async fn wait_backlog(&self) -> Option<OwnedSemaphorePermit> {
+    /// Reserve one slot in the "downloaded but not yet delivered" window.
+    ///
+    /// The permit is intentionally forgotten instead of dropped: it represents
+    /// a chunk the merger has not handed to the browser yet, so `run_merger` is
+    /// the single place that returns it (`add_permits(1)` when a chunk is
+    /// delivered). Dropping it here would return the permit as soon as the chunk
+    /// is *downloaded* rather than *delivered*, and two returns per chunk would
+    /// make the semaphore grow without bound so `wait_backlog` never blocks.
+    async fn wait_backlog(&self) -> bool {
         loop {
             if *self.shared.fatal_rx.borrow() {
-                return None;
+                return false;
             }
             let mut fatal_rx = self.shared.fatal_rx.clone();
             tokio::select! {
                 changed = fatal_rx.changed() => {
                     if changed.is_err() {
-                        return None;
+                        return false;
                     }
                 }
                 permit = self.shared.backlog.clone().acquire_owned() => {
-                    return permit.ok();
+                    return match permit {
+                        Ok(permit) => {
+                            permit.forget();
+                            true
+                        }
+                        Err(_) => false,
+                    };
                 }
             }
         }
@@ -510,9 +533,9 @@ impl Worker {
             if *self.shared.fatal_rx.borrow() {
                 return;
             }
-            let Some(_backlog) = self.wait_backlog().await else {
+            if !self.wait_backlog().await {
                 return;
-            };
+            }
             // The response stream starts at file offset 0, so its worker owns
             // chunk 0 no matter when the runtime schedules it. Letting it race
             // for the shared counter let a tail worker claim chunk 0 first and
@@ -523,11 +546,19 @@ impl Worker {
                 STREAM_CHUNK
             } else {
                 let Some(index) = claim(&self.shared.next, self.shared.chunks_total) else {
+                    // No chunk was claimed, so the reserved delivery slot is
+                    // unused. `wait_backlog` forgot its permit (the merger is
+                    // the single return point for delivered chunks), so put it
+                    // back to keep the semaphore balanced.
+                    self.shared.backlog.add_permits(1);
                     return;
                 };
                 index
             };
             if let Err(reason) = self.fill_chunk(index).await {
+                // The chunk will never be delivered, so release its reserved
+                // slot before aborting the whole download.
+                self.shared.backlog.add_permits(1);
                 self.shared.set_fatal(&reason);
                 return;
             }
@@ -1023,7 +1054,7 @@ pub(crate) fn probe_headers(base: &HeaderMap, response: &UpstreamResponse) -> He
 pub(crate) async fn segment(
     ctx: &super::ProxyContext,
     uri: Uri,
-    response: UpstreamResponse,
+    mut response: UpstreamResponse,
     mirrored: bool,
     base_headers: &HeaderMap,
     mirror_prefix: Option<&str>,
@@ -1039,6 +1070,11 @@ pub(crate) async fn segment(
     let range_headers = range_request_headers(base_headers, response.headers());
 
     if mirrored {
+        // A mirror response must never plant cookies on the origin the browser
+        // thinks it is talking to. Both the single-stream fallback below and
+        // the segmented path go through here; the failover path in upstream.rs
+        // hands us a raw mirror response that was never stripped.
+        strip_mirror_cookies(response.headers_mut());
         let prefix = mirror_prefix.unwrap_or_default();
         if prefix.is_empty() || !mirror_range_ok(ctx, &uri, &range_headers, &response, prefix).await
         {
@@ -1174,9 +1210,10 @@ impl hyper::body::Body for SegmentedBody {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_uri, claim, content_encoded, expected_chunk_len, headers_eligible, host_header,
-        mirror_candidate, mirror_origins, parse_content_range, range_request_headers, signed_url,
-        Shared, Source, Worker, MIB, NEXT_AFTER_STREAM_CHUNK,
+        candidate_uri, claim, content_encoded, credential_headers, expected_chunk_len,
+        headers_eligible, host_header, mirror_candidate, mirror_origins, parse_content_range,
+        range_request_headers, run_merger,
+        signed_url, Shared, Source, Worker, MIB, NEXT_AFTER_STREAM_CHUNK,
     };
     use crate::cache::{CacheManager, LastGoodEntry};
     use crate::catalog::RemoteIpProvider;
@@ -1312,6 +1349,31 @@ mod tests {
         );
         assert!(!content_encoded(&headers));
         assert!(!content_encoded(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn a_reduced_credential_base_yields_the_same_range_headers() {
+        // `segment()` receives only the small credential subset from the
+        // direct path. Range requests must be identical to those built from
+        // the full browser HeaderMap, or the copy-depth optimisation would
+        // silently change what the upstream sees.
+        let mut full = HeaderMap::new();
+        full.insert(header::USER_AGENT, HeaderValue::from_static("browser"));
+        full.insert(header::REFERER, HeaderValue::from_static("https://ref/"));
+        full.insert(header::COOKIE, HeaderValue::from_static("session=1"));
+        full.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer x"));
+        full.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        full.insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en"));
+        let mut response = HeaderMap::new();
+        response.insert(header::ETAG, HeaderValue::from_static("\"v1\""));
+
+        let from_full = range_request_headers(&full, &response);
+        let reduced = credential_headers(&full);
+        // The reduced base must carry none of the irrelevant headers.
+        assert!(reduced.get(header::CACHE_CONTROL).is_none());
+        assert_eq!(reduced.len(), 4);
+        let from_reduced = range_request_headers(&reduced, &response);
+        assert_eq!(from_full, from_reduced);
     }
 
     #[test]
@@ -1549,6 +1611,167 @@ mod tests {
         assert_eq!(claim(&next, 4).unwrap(), 2);
         assert_eq!(claim(&next, 4).unwrap(), 3);
         assert!(claim(&next, 4).is_none());
+    }
+
+    /// The `backlog` semaphore caps chunks that are downloaded but not yet
+    /// handed to the browser: a worker reserves one permit before filling a
+    /// chunk and the merger returns it once that chunk is delivered. The old
+    /// code returned the permit both when the worker's `OwnedSemaphorePermit`
+    /// was dropped at the end of the loop iteration and in `run_merger`'s
+    /// `add_permits(1)`, so every delivered chunk left one extra permit behind
+    /// and `wait_backlog()` stopped blocking entirely.
+    #[tokio::test]
+    async fn delivering_a_chunk_does_not_leak_a_backlog_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunk_len = 4096u64;
+        let chunks_total = 2u64;
+        let backlog = Arc::new(Semaphore::new(4));
+        let (order_tx, order_rx) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<Result<Bytes, String>>(8);
+        let (fatal_tx, fatal_rx) = watch::channel(false);
+        let shared = Arc::new(Shared {
+            uri: "http://upstream.test/chunked".parse().unwrap(),
+            pool: segment_pool(dir.path()),
+            slots: Arc::new(Semaphore::new(8)),
+            headers: HeaderMap::new(),
+            chunks_total,
+            chunk_len,
+            total_len: chunk_len * chunks_total,
+            stall: Duration::from_secs(5),
+            header_wait: Duration::from_secs(60),
+            backlog: backlog.clone(),
+            order_tx,
+            next: AtomicU64::new(NEXT_AFTER_STREAM_CHUNK),
+            fatal_tx,
+            fatal_rx: fatal_rx.clone(),
+            reason: Mutex::new(None),
+            delivered: AtomicU64::new(0),
+            finished: Arc::new(AtomicU64::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            started: Instant::now(),
+            host: "upstream.test".into(),
+        });
+
+        // A worker that will never dial: only its wait_backlog() is driven.
+        let worker = Worker {
+            shared: shared.clone(),
+            source: Source::None,
+            carry: None,
+            _upstream_permit: None,
+        };
+        let merger = tokio::spawn(run_merger(shared.clone(), order_rx, out_tx));
+
+        assert!(worker.wait_backlog().await, "a permit must be available");
+        assert_eq!(
+            backlog.available_permits(),
+            3,
+            "reserving a chunk must consume exactly one permit"
+        );
+        // Deliver chunk 0 to the browser. `wait_backlog` forgets its permit, so
+        // the merger's add_permits(1) is the only thing returning it.
+        shared
+            .order_tx
+            .send((0, Bytes::from(vec![7u8; chunk_len as usize])))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("the merger must deliver the chunk")
+            .expect("the output channel must stay open")
+            .expect("the chunk must not be an error");
+        assert_eq!(frame.len(), chunk_len as usize);
+
+        // One permit reserved, one chunk delivered: back to the starting
+        // balance. The double-return bug left 5 here instead of 4.
+        assert_eq!(
+            backlog.available_permits(),
+            4,
+            "each delivered chunk must release exactly one backlog permit"
+        );
+
+        // Finish the download so the merger exits cleanly.
+        assert!(worker.wait_backlog().await, "a permit must be available");
+        shared
+            .order_tx
+            .send((1, Bytes::from(vec![8u8; chunk_len as usize])))
+            .await
+            .unwrap();
+        while out_rx.recv().await.is_some() {}
+        let _ = merger.await;
+        // The whole download delivered exactly as many chunks as permits it
+        // reserved: the semaphore ends at its starting balance.
+        assert_eq!(backlog.available_permits(), 4);
+    }
+
+    /// With the double-return fixed, a full delivery window must actually stop
+    /// the workers. The old bug let every delivered chunk add a permit, so this
+    /// `wait_backlog` returned immediately instead of waiting for a delivery.
+    #[tokio::test]
+    async fn a_full_delivery_window_blocks_the_next_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunk_len = 4096u64;
+        let chunks_total = 4u64;
+        let backlog = Arc::new(Semaphore::new(2));
+        let (order_tx, order_rx) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<Result<Bytes, String>>(8);
+        let (fatal_tx, fatal_rx) = watch::channel(false);
+        let shared = Arc::new(Shared {
+            uri: "http://upstream.test/chunked".parse().unwrap(),
+            pool: segment_pool(dir.path()),
+            slots: Arc::new(Semaphore::new(8)),
+            headers: HeaderMap::new(),
+            chunks_total,
+            chunk_len,
+            total_len: chunk_len * chunks_total,
+            stall: Duration::from_secs(5),
+            header_wait: Duration::from_secs(60),
+            backlog: backlog.clone(),
+            order_tx,
+            next: AtomicU64::new(0),
+            fatal_tx,
+            fatal_rx: fatal_rx.clone(),
+            reason: Mutex::new(None),
+            delivered: AtomicU64::new(0),
+            finished: Arc::new(AtomicU64::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            started: Instant::now(),
+            host: "upstream.test".into(),
+        });
+        let worker = Worker {
+            shared: shared.clone(),
+            source: Source::None,
+            carry: None,
+            _upstream_permit: None,
+        };
+        let merger = tokio::spawn(run_merger(shared.clone(), order_rx, out_tx));
+
+        // Reserve the whole window without delivering anything.
+        assert!(worker.wait_backlog().await);
+        assert!(worker.wait_backlog().await);
+        assert_eq!(backlog.available_permits(), 0);
+
+        // A third reserve must not succeed while the window is full.
+        let blocked = tokio::time::timeout(Duration::from_millis(100), worker.wait_backlog()).await;
+        assert!(
+            blocked.is_err(),
+            "wait_backlog must block until a chunk is delivered to the browser"
+        );
+
+        // Delivering chunk 0 releases one slot and unblocks the waiter.
+        shared
+            .order_tx
+            .send((0, Bytes::from(vec![1u8; chunk_len as usize])))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("chunk 0 must be delivered");
+        let acquired = tokio::time::timeout(Duration::from_secs(5), worker.wait_backlog()).await;
+        assert!(matches!(acquired, Ok(true)), "a delivered slot must free a worker");
+        assert_eq!(backlog.available_permits(), 0);
+
+        shared.set_fatal("stop test merger");
+        let _ = merger.await;
     }
 
     #[test]
