@@ -1048,9 +1048,13 @@ impl HakimiRuntime {
                     != config.advanced.upstream_max_idle_per_host
                 || current.advanced.http1_hosts != config.advanced.http1_hosts
                 || current.advanced.http1_max_concurrent != config.advanced.http1_max_concurrent
+                // `DownloadManager` builds its connection semaphore once, at
+                // construction. Accepting a new cap here would report success
+                // while the old one keeps running.
+                || current.advanced.download.max_conns != config.advanced.download.max_conns
             {
                 anyhow::bail!(
-                    "upstream pool idle settings require a restart; stop the runtime first"
+                    "upstream pool and download connection limits require a restart; stop the runtime first"
                 );
             }
         }
