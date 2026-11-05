@@ -1,3 +1,5 @@
+社区交流：[linux.do](https://linux.do)
+
 <p align="center">
   <img src="crates/hakimi-ui/assets/app-icon.png" width="128" height="128" alt="hakimi">
 </p>
