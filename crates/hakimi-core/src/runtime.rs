@@ -568,8 +568,16 @@ impl HakimiRuntime {
         self.proxy_running.store(false, Ordering::SeqCst);
         *self.proxy_listen.write() = None;
         let tasks: Vec<JoinHandle<()>> = std::mem::take(&mut *self.tasks.lock());
-        for task in tasks {
-            let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        for mut task in tasks {
+            // Dropping a JoinHandle on timeout merely detaches the task. Abort
+            // it explicitly so a slow sweep cannot keep running (and rewriting
+            // status/cache) after the runtime has stopped.
+            if tokio::time::timeout(Duration::from_secs(2), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
         }
         // Always restore: a previous process may have crashed while the OS proxy pointed at us.
         if let Err(error) = self.restore_system_proxy() {
@@ -1336,8 +1344,11 @@ impl HakimiRuntime {
 
     fn note_warm_failure(&self, domain: &str) {
         let mut map = self.warm_backoff.lock();
-        let consecutive = map.get(domain).map_or(0, |(n, _)| *n) + 1;
-        let delay = 300u64.saturating_mul(1u64 << (consecutive - 1).min(4));
+        let consecutive = map
+            .get(domain)
+            .map_or(0, |(n, _)| *n)
+            .saturating_add(1);
+        let delay = 300u64.saturating_mul(1u64 << consecutive.saturating_sub(1).min(4));
         let next = Instant::now() + Duration::from_secs(delay.min(Self::WARM_BACKOFF_MAX_SECS));
         map.insert(domain.to_string(), (consecutive, next));
     }
@@ -1901,6 +1912,37 @@ mod status_snapshot_tests {
         assert!(
             elapsed < Duration::from_millis(1500),
             "stop() must not wait for the stuck mirror refresh, took {elapsed:?}"
+        );
+    }
+
+    /// A background task that ignores the 2s join timeout must be aborted, not
+    /// detached. Dropping a `JoinHandle` lets the task keep running and
+    /// rewriting status/cache after the runtime has stopped.
+    #[tokio::test]
+    async fn stop_aborts_a_background_task_that_outlives_the_join_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = HakimiRuntime::new(Some(dir.path().to_path_buf())).unwrap();
+
+        let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let task = {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+        };
+        runtime.tasks.lock().push(task);
+
+        runtime.stop().await.unwrap();
+
+        let after_stop = ticks.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            ticks.load(Ordering::Relaxed),
+            after_stop,
+            "a timed-out background task must be aborted, not left running"
         );
     }
 }

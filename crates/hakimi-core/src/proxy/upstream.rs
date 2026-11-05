@@ -26,6 +26,11 @@ table{border-collapse:collapse;width:100%;margin:12px 0}th,td{text-align:left;bo
 code{background:#171a21;padding:1px 5px;border-radius:4px}ul{padding-left:20px}.warn{color:#ffcc66}.bad{color:#ff7a7a}.good{color:#7ee2a8}
 </style>"#;
 
+/// Both halves of a WebSocket upgrade must be awaited concurrently and bounded:
+/// a client that stalls after asking for an upgrade must not leave a spawned
+/// task holding the upstream `OnUpgrade` forever.
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) async fn handle_forward(
     req: Request<Incoming>,
     ctx: Arc<ProxyContext>,
@@ -435,10 +440,14 @@ async fn forward_with_uri(
         // copy moves instead of cloning the whole map a second time.
         (direct_headers, std::mem::take(&mut parts.headers))
     } else {
-        // No mirror runs on this request: only the segment base can still
-        // need a copy of the browser's headers, and the mirror copy is never
-        // read on this path.
-        (parts.headers.clone(), HeaderMap::new())
+        // No mirror runs on this request, and the direct retry below is only
+        // reachable from the mirrored branch. The segment base needs just the
+        // handful of credential headers, so keep that small subset instead of
+        // deep-cloning the whole browser HeaderMap on every request.
+        (
+            super::download::credential_headers(&parts.headers),
+            HeaderMap::new(),
+        )
     };
 
     let response_uri;
@@ -463,8 +472,7 @@ async fn forward_with_uri(
                 tracing::debug!(mirror = %prefix, path = %rule_uri.path(), "served through a mirror");
                 // The browser sees this response as github.com, so a mirror
                 // must not be able to plant cookies on that origin.
-                mirrored_response.headers_mut().remove(header::SET_COOKIE);
-                mirrored_response.headers_mut().remove(&SET_COOKIE2);
+                strip_mirror_cookies(mirrored_response.headers_mut());
                 response = mirrored_response;
                 response_uri = uri;
                 served_by_mirror = true;
@@ -499,8 +507,16 @@ async fn forward_with_uri(
         if let Some(client_upgrade) = client_upgrade {
             let server_upgrade = upgrade::on(&mut response);
             tokio::spawn(async move {
-                match (client_upgrade.await, server_upgrade.await) {
-                    (Ok(client), Ok(server)) => {
+                // A tuple `(a.await, b.await)` polls `a` to completion before
+                // even touching `b`, so a half-open client would strand the
+                // upstream upgrade future. `try_join!` drives both at once and
+                // the timeout bounds how long the task can live.
+                let paired = tokio::time::timeout(UPGRADE_TIMEOUT, async {
+                    tokio::try_join!(client_upgrade, server_upgrade)
+                })
+                .await;
+                match paired {
+                    Ok(Ok((client, server))) => {
                         let mut client = TokioIo::new(client);
                         let mut server = TokioIo::new(server);
                         if let Err(error) = tokio::io::copy_bidirectional_with_sizes(
@@ -514,11 +530,11 @@ async fn forward_with_uri(
                             tracing::debug!(error = %error, "websocket tunnel closed");
                         }
                     }
-                    (client, server) => tracing::debug!(
-                        client_ok = client.is_ok(),
-                        server_ok = server.is_ok(),
+                    Ok(Err(error)) => tracing::debug!(
+                        error = %error,
                         "websocket upgrade failed"
                     ),
+                    Err(_) => tracing::debug!("websocket upgrade timed out"),
                 }
             });
         }
@@ -870,6 +886,18 @@ pub(super) fn sanitize_response_headers(headers: &mut HeaderMap, upgrade: bool) 
     sanitize_hop_by_hop(headers, upgrade, false);
 }
 
+/// Strip set-cookie headers from a response served through a third-party
+/// mirror. The browser sees this response as the original origin (e.g.
+/// github.com), so a mirror must not be able to plant cookies on it. This is
+/// applied at the single point a mirror response is turned into a proxy
+/// response, so every path — the primary `try_mirrors` result, a failover
+/// candidate that takes over a segmented download, and the single-stream
+/// fallback — is covered.
+pub(crate) fn strip_mirror_cookies(headers: &mut HeaderMap) {
+    headers.remove(header::SET_COOKIE);
+    headers.remove(&SET_COOKIE2);
+}
+
 fn authority(host: &str, port: u16, https: bool) -> Cow<'_, str> {
     let default = if https { 443 } else { 80 };
     if host.contains(':') {
@@ -1026,8 +1054,8 @@ fn attempt_row(attempt: &AttemptRecord) -> String {
 mod tests {
     use super::{
         authority, build_mitm_uri, build_upstream_uri, host_header_name, is_upgrade, same_host,
-        sanitize_request_headers, sanitize_response_headers, target_host, target_of, MitmTarget,
-        Target,
+        sanitize_request_headers, sanitize_response_headers, strip_mirror_cookies, target_host,
+        target_of, MitmTarget, Target,
     };
     use http::uri::{PathAndQuery, Scheme};
     use http::{header, HeaderMap, Request, Uri};
@@ -1037,6 +1065,24 @@ mod tests {
             target.normalized_host.as_deref(),
             target.upstream_uri.as_ref(),
         )
+    }
+
+    #[test]
+    fn mirror_cookies_are_stripped_but_other_headers_survive() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::SET_COOKIE, "session=mirror".parse().unwrap());
+        headers.append(header::SET_COOKIE, "pref=mirror2".parse().unwrap());
+        headers.insert("set-cookie2", "legacy=mirror".parse().unwrap());
+        headers.insert(header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+        headers.insert(header::CONTENT_LENGTH, "42".parse().unwrap());
+
+        strip_mirror_cookies(&mut headers);
+
+        assert!(!headers.contains_key(header::SET_COOKIE));
+        assert!(!headers.contains_key("set-cookie2"));
+        // End-to-end headers the browser needs must be left intact.
+        assert_eq!(headers[header::CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(headers[header::CONTENT_LENGTH], "42");
     }
 
     #[test]

@@ -967,8 +967,19 @@ fn platform_restore(state: &SavedState) -> Result<()> {
         ProxyMode::Http => {
             if state.mac_http.is_empty() {
                 for service in &state.mac_services {
-                    let _ = run_networksetup(&["-setwebproxystate", service, "off"]);
-                    let _ = run_networksetup(&["-setsecurewebproxystate", service, "off"]);
+                    // These must be reported like every other restore command:
+                    // a swallowed failure would leave the OS proxy pointing at
+                    // a port nothing listens on while claiming success.
+                    if let Err(error) =
+                        run_networksetup(&["-setwebproxystate", service, "off"])
+                    {
+                        failed.push(format!("{service}: {error:#}"));
+                    }
+                    if let Err(error) =
+                        run_networksetup(&["-setsecurewebproxystate", service, "off"])
+                    {
+                        failed.push(format!("{service}: {error:#}"));
+                    }
                 }
             } else {
                 for http in &state.mac_http {
