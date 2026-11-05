@@ -56,6 +56,15 @@ const FALLBACK_WAVES: u32 = 2;
 /// discarded their answers. Capped by `catalogs.timeoutSecs`.
 const ENDPOINT_WINDOW: Duration = Duration::from_secs(4);
 
+/// How long an AAAA query may hold a resolution that already has IPv4
+/// addresses. A slow IPv6 answer is additive, not the only route, so it keeps
+/// running in the background instead of delaying the first connection.
+const FAMILY_GRACE: Duration = Duration::from_secs(1);
+
+/// Background AAAA lookups that may run at once. A page full of IPv4-only
+/// names must not spawn one query each while their IPv4 answers come back.
+const FAMILY_REFRESH_SLOTS: usize = 8;
+
 /// How long the first endpoint gets before the second is dialled as well. The
 /// second is a hedge, not a second racer: a healthy endpoint answers in a few
 /// hundred milliseconds, and racing both from t=0 sent every queried name to
@@ -353,6 +362,8 @@ pub struct Resolver {
     /// Config/catalog revisions plus the derived endpoint list. A DoH query
     /// used to rebuild and re-clone this list on every cache miss.
     endpoint_cache: Arc<RwLock<EndpointCache>>,
+    /// Permits for AAAA lookups that continue after the resolution returned.
+    family_refresh_slots: Arc<tokio::sync::Semaphore>,
 }
 
 async fn read_limited_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
@@ -396,6 +407,7 @@ impl Resolver {
             query_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             stale_refresh_after: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             endpoint_cache: Arc::new(RwLock::new(None)),
+            family_refresh_slots: Arc::new(tokio::sync::Semaphore::new(FAMILY_REFRESH_SLOTS)),
         })
     }
 
@@ -747,13 +759,51 @@ impl Resolver {
         // path at one round trip, and it is the only way a dual-stack host gets an IPv6
         // candidate: the old "AAAA only when A came back empty" rule quietly made every
         // host with an A record IPv4-only, even when IPv4 was the filtered family.
-        let (a_result, aaaa_result) = tokio::join!(
-            self.query_one_type(domain, TYPE_A),
-            self.query_one_type(domain, TYPE_AAAA)
-        );
+        let a = self.query_one_type(domain, TYPE_A);
+        tokio::pin!(a);
+        let aaaa = self.query_one_type(domain, TYPE_AAAA);
+        tokio::pin!(aaaa);
+        let mut a_result: Option<Result<TypeQuery>> = None;
+        let mut aaaa_result: Option<Result<TypeQuery>> = None;
+        tokio::select! {
+            result = &mut a => a_result = Some(result),
+            result = &mut aaaa => aaaa_result = Some(result),
+        }
+        // The A answer is never shortened: a v6-only resolution is not the
+        // fallback this proxy wants on an IPv4-first network.
+        if a_result.is_none() {
+            a_result = Some((&mut a).await);
+        }
+        if aaaa_result.is_none() {
+            // IPv4 is already usable, so an unfinished AAAA only adds
+            // candidates. Waiting for a slow answer (or a NODATA confirmation)
+            // must not hold the whole resolution; the query keeps running in
+            // the background and fills the cache.
+            let a_has_addresses = matches!(
+                a_result.as_ref(),
+                Some(Ok(query)) if !query.answer.ips.is_empty()
+            );
+            if a_has_addresses {
+                match tokio::time::timeout(FAMILY_GRACE, &mut aaaa).await {
+                    Ok(result) => aaaa_result = Some(result),
+                    Err(_) => {
+                        tracing::debug!(
+                            domain = %domain,
+                            grace_ms = FAMILY_GRACE.as_millis() as u64,
+                            "AAAA is still pending; answering with IPv4 and finishing it in the background"
+                        );
+                        self.spawn_family_refresh(domain, TYPE_AAAA);
+                    }
+                }
+            } else {
+                aaaa_result = Some((&mut aaaa).await);
+            }
+        }
         // IPv4 answers stay first: they are still the better path on networks without
         // working IPv6, and the engine reorders candidates by history anyway.
-        for result in [a_result, aaaa_result] {
+        for result in std::iter::once(a_result.expect("the A query always resolves"))
+            .chain(aaaa_result)
+        {
             match result {
                 Ok(query) => {
                     if endpoint.is_empty() {
@@ -822,6 +872,29 @@ impl Resolver {
                 )
             }
         )
+    }
+
+    /// Finish an AAAA lookup the IPv4 answer did not wait for. The result lands
+    /// in the cache, so the next resolution (and later connections) see the
+    /// IPv6 candidates. Bounded by a semaphore: one slow IPv6 path must not
+    /// turn a page full of IPv4-only names into a query burst.
+    fn spawn_family_refresh(&self, domain: &str, qtype: u16) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let Ok(permit) = self.family_refresh_slots.clone().try_acquire_owned() else {
+            tracing::debug!(
+                domain = %domain,
+                "background AAAA refresh skipped; the slots are busy"
+            );
+            return;
+        };
+        let resolver = self.clone();
+        let domain = domain.to_string();
+        handle.spawn(async move {
+            let _permit = permit;
+            let _ = resolver.query_one_type(&domain, qtype).await;
+        });
     }
 
     /// Fetch the ECHConfigList from the domain's HTTPS RR. A fresh cached config wins; on a

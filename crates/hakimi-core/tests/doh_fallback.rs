@@ -1413,3 +1413,57 @@ async fn a_stalled_hedge_does_not_block_the_catalog() {
         "a stalled hedge must not occupy the catalog lanes"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_aaaa_does_not_hold_the_ipv4_answer() {
+    install_logs();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // A is complete in milliseconds; the AAAA confirmation never arrives. The
+    // resolution must return the IPv4 candidates after the short window
+    // instead of waiting out the endpoint window.
+    let (resolver, servers) = resolver_with_timeout(&[DohMode::V4Only, DohMode::Stall], 8).await;
+
+    let started = std::time::Instant::now();
+    let resolution = resolver.resolve_ips("example.com").await.unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(resolution.ips.len(), 2, "the IPv4 answer is complete");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(900),
+        "the AAAA query must get its short window, took {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(2_000),
+        "the AAAA confirmation must not hold the resolution, took {elapsed:?}"
+    );
+    assert!(
+        servers[1].requests.load(Ordering::Relaxed) >= 1,
+        "the AAAA query was actually attempted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_aaaa_answer_is_cached_after_the_short_window() {
+    install_logs();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // The IPv6 answer arrives after the short window. It must not be lost: the
+    // query continues in the background, so the next resolution has it.
+    let (resolver, _servers) =
+        resolver_with_timeout(&[DohMode::V4Only, DohMode::SlowWide(2000)], 8).await;
+
+    let first = resolver.resolve_ips("example.com").await.unwrap();
+    assert_eq!(first.ips.len(), 2, "IPv4 answers first");
+    assert!(first.ips.iter().all(std::net::IpAddr::is_ipv4));
+
+    // The background query hits the same slow peer and finishes around 2 s
+    // after the first answer.
+    tokio::time::sleep(std::time::Duration::from_millis(2_800)).await;
+    let second = resolver.resolve_ips("example.com").await.unwrap();
+    assert_eq!(
+        second.ips.len(),
+        4,
+        "the slow AAAA answer must reach the cache"
+    );
+    assert!(second.ips.iter().any(std::net::IpAddr::is_ipv6));
+    assert_eq!(second.source, DohSource::Cache);
+}
