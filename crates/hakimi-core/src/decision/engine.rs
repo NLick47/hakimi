@@ -870,9 +870,12 @@ impl DecisionEngine {
                 map.clear();
             }
         }
-        let consecutive = map.get(&(domain.to_string(), ip)).map_or(0, |(n, _)| *n) + 1;
+        let consecutive = map
+            .get(&(domain.to_string(), ip))
+            .map_or(0, |(n, _)| *n)
+            .saturating_add(1);
         let delay_secs = 60u64
-            .saturating_mul(1u64 << (consecutive - 1).min(5))
+            .saturating_mul(1u64 << consecutive.saturating_sub(1).min(5))
             .min(PROBE_BACKOFF_MAX.as_secs());
         map.insert(
             (domain.to_string(), ip),
@@ -992,7 +995,7 @@ impl DecisionEngine {
             let entry = by_ip.entry(ip).or_default();
             let degraded;
             if failed {
-                entry.failures += 1;
+                entry.failures = entry.failures.saturating_add(1);
                 entry.ewma_ms = if entry.ewma_ms == 0.0 {
                     10_000.0
                 } else {
@@ -1000,7 +1003,7 @@ impl DecisionEngine {
                 };
                 degraded = false;
             } else {
-                entry.successes += 1;
+                entry.successes = entry.successes.saturating_add(1);
                 // Pay down the failure history with each real success. Without
                 // this an IP that ever failed stays in `reprobe_failed_ips`
                 // forever, so the same addresses get re-probed every minute for

@@ -1265,11 +1265,20 @@ impl ConfigManager {
                 Err(error) => {
                     // The schema changed while the app is still unreleased. Keep
                     // the old file for inspection instead of refusing to start.
+                    // If the backup cannot be made we must NOT fall through and
+                    // overwrite the user's file with defaults: that would
+                    // silently discard every customised setting.
                     let backup = path.with_file_name(format!(
                         "config.invalid-{}.json",
                         now().format("%Y%m%d-%H%M%S")
                     ));
-                    let _ = std::fs::rename(&path, &backup);
+                    std::fs::rename(&path, &backup).with_context(|| {
+                        format!(
+                            "could not back up the unreadable config to {}; \
+                             leaving the original in place so it can be recovered",
+                            backup.display()
+                        )
+                    })?;
                     tracing::warn!(
                         error = %error,
                         backup = %backup.display(),
@@ -2196,5 +2205,38 @@ mod tests {
         assert_eq!(matcher.match_host("accounts.pixiv.net"), Some("pixiv"));
         assert_eq!(matcher.match_host("oauth.secure.pixiv.net"), Some("pixiv"));
         assert_eq!(matcher.match_host("app-api.pixiv.net"), Some("pixiv"));
+    }
+
+    #[test]
+    fn a_failed_backup_never_overwrites_a_corrupt_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        paths.ensure().unwrap();
+        let corrupt = b"{ this is not valid json";
+        std::fs::write(paths.config_file(), corrupt).unwrap();
+
+        // Force the backup `rename` to fail while keeping the parent writable:
+        // pre-create directories at the timestamped backup names. The old code
+        // swallowed the rename error and then overwrote the user's file with
+        // defaults, losing every customised setting. Creating a small window of
+        // names covers a second boundary during the test.
+        let base = now();
+        for offset in -2i64..=2 {
+            let stamp = (base + chrono::Duration::seconds(offset)).format("%Y%m%d-%H%M%S");
+            let _ = std::fs::create_dir(
+                paths.root().join(format!("config.invalid-{stamp}.json")),
+            );
+        }
+
+        let result = ConfigManager::load_or_create(&paths);
+        assert!(
+            result.is_err(),
+            "a failed backup must be reported, not silently recovered"
+        );
+        assert_eq!(
+            std::fs::read(paths.config_file()).unwrap(),
+            corrupt,
+            "the original config must be left untouched for manual recovery"
+        );
     }
 }

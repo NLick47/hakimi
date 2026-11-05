@@ -59,6 +59,21 @@ pub struct CachedAnswer {
     pub fetched_at: DateTime<Utc>,
 }
 
+/// Whether `saved_at` is at most `max_age_days` old relative to `now`.
+///
+/// The persisted timestamps are wall-clock (`Utc::now()`), so a clock step
+/// backwards can make `now - saved_at` negative. Such a "future" entry must be
+/// treated as untrusted rather than as permanently fresh: otherwise it is
+/// never expired and can pin a stale route or SNI choice indefinitely. A small
+/// tolerance absorbs sub-second jitter between two `Utc::now()` reads within
+/// one run; a real clock correction is far larger.
+fn within_age(now: DateTime<Utc>, saved_at: DateTime<Utc>, max_age_days: i64) -> bool {
+    const FUTURE_TOLERANCE_SECS: i64 = 1;
+    let age = now.signed_duration_since(saved_at);
+    age >= Duration::seconds(-FUTURE_TOLERANCE_SECS)
+        && age <= Duration::days(max_age_days)
+}
+
 impl CachedAnswer {
     pub fn is_fresh(&self, now: DateTime<Utc>) -> bool {
         if self.ttl_secs == 0 {
@@ -69,8 +84,7 @@ impl CachedAnswer {
     }
 
     pub fn is_usable(&self, now: DateTime<Utc>) -> bool {
-        let age = now.signed_duration_since(self.fetched_at);
-        age <= Duration::days(MAX_STALE_AGE_DAYS)
+        within_age(now, self.fetched_at, MAX_STALE_AGE_DAYS)
     }
 }
 
@@ -503,17 +517,12 @@ impl CacheManager {
 
     fn expire(data: &mut CacheData, now: DateTime<Utc>) {
         data.doh.retain(|_, answer| answer.is_usable(now));
-        data.ech.retain(|_, ech| {
-            now.signed_duration_since(ech.fetched_at) <= Duration::days(MAX_STALE_AGE_DAYS)
-        });
-        data.sni.retain(|_, sni| {
-            now.signed_duration_since(sni.saved_at) <= Duration::days(MAX_SNI_AGE_DAYS)
-        });
+        data.ech.retain(|_, ech| within_age(now, ech.fetched_at, MAX_STALE_AGE_DAYS));
+        data.sni.retain(|_, sni| within_age(now, sni.saved_at, MAX_SNI_AGE_DAYS));
         // The routes and SNI maps reach disk; the rest are runtime hints, so
         // aged entries are dropped here to keep a long session bounded.
-        data.last_good.retain(|_, entry| {
-            now.signed_duration_since(entry.saved_at) <= Duration::days(MAX_LAST_GOOD_AGE_DAYS)
-        });
+        data.last_good
+            .retain(|_, entry| within_age(now, entry.saved_at, MAX_LAST_GOOD_AGE_DAYS));
     }
 
     /// Drop the oldest entries until the map is back under its cap.
@@ -545,7 +554,7 @@ impl CacheManager {
     pub fn last_good(&self, domain: &str, max_age_days: i64) -> Option<LastGoodEntry> {
         let now = now();
         let entry = self.data.read().last_good.get(domain).cloned()?;
-        if now.signed_duration_since(entry.saved_at) <= Duration::days(max_age_days) {
+        if within_age(now, entry.saved_at, max_age_days) {
             Some(entry)
         } else {
             None
@@ -558,8 +567,7 @@ impl CacheManager {
         let now = now();
         let data = self.data.read();
         let entry = data.last_good.get(domain)?;
-        (now.signed_duration_since(entry.saved_at) <= Duration::days(max_age_days))
-            .then_some(entry.ip)
+        within_age(now, entry.saved_at, max_age_days).then_some(entry.ip)
     }
 
     /// One read-lock acquisition for the two pieces of route state a new cursor
@@ -570,8 +578,7 @@ impl CacheManager {
         let data = self.data.read();
         let skip_once = data.skip_once.contains(domain);
         let last_good = data.last_good.get(domain).and_then(|entry| {
-            (now.signed_duration_since(entry.saved_at) <= Duration::days(max_age_days))
-                .then_some(entry.ip)
+            within_age(now, entry.saved_at, max_age_days).then_some(entry.ip)
         });
         (skip_once, last_good)
     }
@@ -597,10 +604,12 @@ impl CacheManager {
 
     fn route_is_fresh(data: &CacheData, entry: &LastGoodEntry, timestamp: DateTime<Utc>) -> bool {
         data.last_good.get(&entry.domain).is_some_and(|existing| {
+            let age = timestamp.signed_duration_since(existing.saved_at);
             existing.ip == entry.ip
                 && existing.source == entry.source
                 && existing.catalog_version == entry.catalog_version
-                && timestamp.signed_duration_since(existing.saved_at) < Duration::seconds(60)
+                && age >= Duration::seconds(-1)
+                && age < Duration::seconds(60)
         })
     }
 
@@ -611,9 +620,7 @@ impl CacheManager {
         let stale: Vec<String> = data
             .last_good
             .iter()
-            .filter(|(_, entry)| {
-                now.signed_duration_since(entry.saved_at) > Duration::days(MAX_LAST_GOOD_AGE_DAYS)
-            })
+            .filter(|(_, entry)| !within_age(now, entry.saved_at, MAX_LAST_GOOD_AGE_DAYS))
             .map(|(domain, _)| domain.clone())
             .collect();
         for domain in stale {
@@ -641,9 +648,7 @@ impl CacheManager {
         let mut hosts: Vec<(chrono::DateTime<chrono::Utc>, String)> = data
             .last_good
             .iter()
-            .filter(|(_, entry)| {
-                now.signed_duration_since(entry.saved_at) <= Duration::days(MAX_LAST_GOOD_AGE_DAYS)
-            })
+            .filter(|(_, entry)| within_age(now, entry.saved_at, MAX_LAST_GOOD_AGE_DAYS))
             .map(|(domain, entry)| (entry.saved_at, domain.clone()))
             .collect();
         hosts.sort_by(|a, b| b.0.cmp(&a.0));
@@ -771,7 +776,7 @@ impl CacheManager {
     pub fn ech(&self, domain: &str, only_fresh: bool) -> Option<CachedEch> {
         let now = now();
         let entry = self.data.read().ech.get(domain).cloned()?;
-        if now.signed_duration_since(entry.fetched_at) > Duration::days(MAX_STALE_AGE_DAYS) {
+        if !within_age(now, entry.fetched_at, MAX_STALE_AGE_DAYS) {
             return None;
         }
         if only_fresh && !entry.is_fresh(now) {
@@ -798,17 +803,15 @@ impl CacheManager {
             .sni
             .get(&sni_key(group, domain, network_id))
             .cloned()?;
-        (now.signed_duration_since(entry.saved_at) <= Duration::days(MAX_SNI_AGE_DAYS))
-            .then_some(entry)
+        within_age(now, entry.saved_at, MAX_SNI_AGE_DAYS).then_some(entry)
     }
 
     pub fn put_sni(&self, entry: CachedSni) {
         let mut data = self.data.write();
         let key = sni_key(&entry.group, &entry.domain, &entry.network_id);
         if let Some(existing) = data.sni.get(&key) {
-            if existing.sni == entry.sni
-                && now().signed_duration_since(existing.saved_at) < Duration::seconds(60)
-            {
+            let age = now().signed_duration_since(existing.saved_at);
+            if existing.sni == entry.sni && age >= Duration::seconds(-1) && age < Duration::seconds(60) {
                 return;
             }
         }
@@ -1127,6 +1130,29 @@ mod tests {
     }
 
     #[test]
+    fn a_future_timestamp_is_not_treated_as_a_fresh_stale_answer() {
+        // A wall-clock step backwards (NTP correction, user changing the time,
+        // sleep/wake) can leave `now` behind `fetched_at`. A negative age must
+        // not make a stale answer usable forever.
+        let now = Utc::now();
+        let mut answer = CachedAnswer {
+            domain: "example.com".into(),
+            qtype: 1,
+            ips: vec!["1.2.3.4".parse().unwrap()],
+            hints: vec![],
+            ech_config: None,
+            ttl_secs: 0,
+            fetched_at: now,
+        };
+        assert!(answer.is_usable(now));
+        answer.fetched_at = now + Duration::days(1);
+        assert!(
+            !answer.is_usable(now),
+            "a fetched_at in the future must not be usable"
+        );
+    }
+
+    #[test]
     fn doh_fresh_and_stale() {
         let (_dir, cache) = manager();
         cache.put_doh_answer(CachedAnswer {
@@ -1261,6 +1287,21 @@ mod tests {
         let cache = CacheManager::load(&path).unwrap();
         assert!(cache.last_good("github.com", 30).is_none());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn expire_drops_a_future_dated_route() {
+        // A clock step backwards leaves `saved_at` in the future. It must be
+        // dropped rather than kept alive forever and never pruned.
+        let now = now();
+        let mut data = CacheData::default();
+        let mut future = sample_entry("future.example", "203.0.113.9");
+        future.saved_at = now + Duration::days(1);
+        data.last_good.insert(future.domain.clone(), future);
+
+        CacheManager::expire(&mut data, now);
+
+        assert!(!data.last_good.contains_key("future.example"));
     }
 
     #[test]

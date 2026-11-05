@@ -22,7 +22,9 @@ impl IpScore {
         if self.successes == 0 && self.failures == 0 {
             return UNSEEN_RANK;
         }
-        let total = (self.successes + self.failures) as f64;
+        // Widen before adding: both counters are u32 and `successes` grows
+        // monotonically, so their sum can exceed u32::MAX in a long session.
+        let total = self.successes as f64 + self.failures as f64;
         let fail_rate = self.failures as f64 / total;
         let base = if self.successes == 0 {
             10_000.0
@@ -36,6 +38,23 @@ impl IpScore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saturated_counter_does_not_overflow_the_rank() {
+        // `successes` grows monotonically over a long session. Adding it to
+        // `failures` as u32 used to panic in debug and wrap to a bogus (tiny)
+        // total in release, distorting the failure rate.
+        let score = IpScore {
+            ewma_ms: 100.0,
+            successes: u32::MAX,
+            failures: 1,
+        };
+        let rank = score.rank();
+        assert!(
+            rank.is_finite() && rank > 0.0,
+            "a saturated counter must still produce a sane rank, got {rank}"
+        );
+    }
 
     #[test]
     fn unseen_addresses_rank_between_healthy_and_never_working() {
