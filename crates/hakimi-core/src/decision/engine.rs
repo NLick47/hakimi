@@ -45,8 +45,9 @@ pub struct DecisionEngine {
     /// a full-map sum there would put an O(cache size) scan under an exclusive
     /// lock on the success path.
     plan_cache_count: AtomicUsize,
-    /// Routes that produced an HTTP rejection (403/421/451). Keyed by
-    /// `domain|mode`; entries expire after [`ROUTE_REJECTION_TTL`].
+    /// Routes that produced an HTTP rejection. A 421 rejects the route of
+    /// every group; 403/451 do so only for groups that opt in (GitHub). Keyed
+    /// by `domain|mode`; entries expire after [`ROUTE_REJECTION_TTL`].
     pub(super) route_rejections: parking_lot::RwLock<HashMap<String, Instant>>,
     /// Individual IPs that returned an abuse/block page for a domain. Unlike
     /// `route_rejections`, only the address is dropped; other IPs on the same
@@ -649,8 +650,8 @@ impl DecisionEngine {
         }
     }
 
-    /// True while an HTTP rejection (403/421/451) keeps this mode out of the
-    /// candidate set for the domain.
+    /// True while an HTTP rejection (421 anywhere, 403/451 for GitHub) keeps
+    /// this mode out of the candidate set for the domain.
     pub(super) fn route_rejected(&self, domain: &str, mode: TlsMode) -> bool {
         // The overwhelmingly common case is an empty rejection map. Check it
         // under a shared lock before formatting a key or taking the exclusive
@@ -683,11 +684,20 @@ impl DecisionEngine {
     }
 
     /// Called after an upstream response with a status that indicates the route
-    /// itself was rejected. A TLS handshake is not enough: Pixiv's fake-SNI
-    /// route completes TLS and then returns 403 from nginx. Drop that route and
-    /// let the next connection try the next configured attempt.
+    /// itself was rejected. A TLS handshake is not enough: GitHub's edge answers
+    /// a valid route with a block page, which makes that route unusable.
     ///
-    /// Every action here is mode-scoped, never IP-scoped: a route-level 403
+    /// 421 is a verdict on the route for every group: the origin answered a
+    /// request whose Host does not match the SNI, so the mismatch is in the
+    /// route, not in the site. 403/451 are only routed verdicts for groups that
+    /// opt in ([`GroupConfig::rejects_blocked_routes`], currently GitHub). A
+    /// Cloudflare challenge or a WAF 403 is a content-level answer: Linux.do
+    /// returns 403 for `/favicon.ico` and challenge pages through the very ECH
+    /// or fake-SNI route that is the only one passing network filtering. Treating
+    /// those as route verdicts left the domain with Direct only for five minutes,
+    /// which turned one blocked path into a dead domain.
+    ///
+    /// Every action here is mode-scoped, never IP-scoped: a route-level verdict
     /// says nothing about the address (the same policy as
     /// [`Self::note_blocked_candidate`]), so a route rejection must not touch
     /// `ip_scores`. The plan comes from the cache — a pooled response cannot
@@ -713,6 +723,21 @@ impl DecisionEngine {
         };
         if plan.mode == TlsMode::Direct {
             return false;
+        }
+        if status != StatusCode::MISDIRECTED_REQUEST {
+            let config = self.config.snapshot();
+            let route_level = config
+                .group(&plan.group_id)
+                .is_some_and(|group| group.rejects_blocked_routes());
+            if !route_level {
+                tracing::debug!(
+                    domain = %plan.domain,
+                    mode = %plan.mode,
+                    status = status.as_u16(),
+                    "content-level block status; keeping the route"
+                );
+                return false;
+            }
         }
         tracing::warn!(
             domain = %plan.domain,

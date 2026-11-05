@@ -805,7 +805,7 @@ fn cached_fake_sni_plan_follows_the_configured_route_sni() {
 }
 
 #[test]
-fn http_rejection_drops_the_cached_route() {
+fn misdirected_request_drops_the_cached_route() {
     let h = harness(
         &["example.com"],
         RoutePolicy::sni(vec!["www.baidu.com".into()]),
@@ -815,8 +815,12 @@ fn http_rejection_drops_the_cached_route() {
     assert!(h.engine.cached_plan("example.com", 443, true).is_some());
 
     assert!(
-        h.engine
-            .note_http_rejection("example.com", 443, true, http::StatusCode::FORBIDDEN),
+        h.engine.note_http_rejection(
+            "example.com",
+            443,
+            true,
+            http::StatusCode::MISDIRECTED_REQUEST
+        ),
         "the cached fake-SNI route must be rejected"
     );
 
@@ -922,6 +926,8 @@ async fn traffic_path_block_pages_retire_without_penalizing_the_ip() {
 
 #[test]
 fn real_traffic_block_pages_use_candidate_recovery_for_opted_groups() {
+    // A custom group's 403 is content-level: the route must survive, or a
+    // Cloudflare challenge would blacklist the only route that works.
     let h = harness(
         &["example.com"],
         RoutePolicy::sni(vec!["www.baidu.com".into()]),
@@ -929,11 +935,12 @@ fn real_traffic_block_pages_use_candidate_recovery_for_opted_groups() {
     h.engine
         .remember_plan_arc(Arc::new(test_plan(TlsMode::FakeSni, Some("www.baidu.com"))));
     assert!(
-        h.engine
+        !h.engine
             .note_upstream_response("example.com", 443, true, http::StatusCode::FORBIDDEN),
-        "the route-level rejection must be reported to the pool"
+        "a content-level 403 must not invalidate the route"
     );
-    assert!(h.engine.route_rejected("example.com", TlsMode::FakeSni));
+    assert!(!h.engine.route_rejected("example.com", TlsMode::FakeSni));
+    assert!(h.engine.cached_plan("example.com", 443, true).is_some());
 
     let bad: IpAddr = "1.1.1.1".parse().unwrap();
     let mut github_plan = test_plan(TlsMode::Direct, None);
@@ -957,6 +964,124 @@ fn real_traffic_block_pages_use_candidate_recovery_for_opted_groups() {
     // plan (the cache may hold a newer generation), so the IP-level penalty
     // is left to the warm-up, which dials fresh.
     assert!(!h.engine.ip_rejected("github.com", bad));
+
+    // GitHub's 403 on a masked-SNI route *is* a route verdict.
+    let mut masked = test_plan(TlsMode::FakeSni, None);
+    masked.domain = "api.github.com".into();
+    masked.group_id = "github".into();
+    h.engine.remember_plan_arc(Arc::new(masked));
+    assert!(
+        h.engine
+            .note_upstream_response("api.github.com", 443, true, http::StatusCode::FORBIDDEN),
+        "GitHub's block page must still retire the route"
+    );
+    assert!(h.engine.route_rejected("api.github.com", TlsMode::FakeSni));
+}
+
+/// Linux.do's exact regression: a Cloudflare 403 arrives through the very ECH
+/// or fake-SNI route that passes network filtering. Both routes must stay in
+/// the plan cache and in the cursor; rejecting them left the domain with
+/// Direct only, which is the route the network reset.
+#[tokio::test]
+async fn a_custom_group_keeps_ech_and_sni_after_block_statuses() {
+    let h = harness(&["example.com"], RoutePolicy::auto());
+    *h.remote.catalog.lock() = true;
+    *h.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::Ech, None)));
+    assert!(
+        !h.engine
+            .note_upstream_response("example.com", 443, true, http::StatusCode::FORBIDDEN),
+        "an ECH route must survive a content-level 403"
+    );
+    assert!(!h.engine.route_rejected("example.com", TlsMode::Ech));
+    assert!(h.engine.cached_plan("example.com", 443, true).is_some());
+
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::FakeSni, None)));
+    assert!(
+        !h.engine
+            .note_upstream_response("example.com", 443, true, http::StatusCode::FORBIDDEN),
+        "a fake-SNI route must survive a content-level 403"
+    );
+    assert!(!h.engine.route_rejected("example.com", TlsMode::FakeSni));
+    assert!(h.engine.cached_plan("example.com", 443, true).is_some());
+
+    let mut cursor = match h.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let mut modes = Vec::new();
+    while let Some(plan) = cursor.next_plan().await {
+        modes.push(plan.mode);
+    }
+    assert!(
+        modes.contains(&TlsMode::FakeSni),
+        "the fake-SNI attempt must stay in the ladder: {modes:?}"
+    );
+
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::FakeSni, None)));
+    assert!(
+        !h.engine.note_http_rejection(
+            "example.com",
+            443,
+            true,
+            http::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
+        ),
+        "451 is content-level outside GitHub"
+    );
+    assert!(!h.engine.route_rejected("example.com", TlsMode::FakeSni));
+}
+
+/// 403 is a route verdict for GitHub only. Pixiv used to be the motivating
+/// case for the old rule; its fake-SNI route must now keep the route.
+#[test]
+fn a_pixiv_403_is_content_level() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let mut plan = test_plan(TlsMode::FakeSni, None);
+    plan.domain = "i.pximg.net".into();
+    plan.group_id = "pixiv".into();
+    h.engine.remember_plan_arc(Arc::new(plan));
+
+    assert!(!h
+        .engine
+        .note_http_rejection("i.pximg.net", 443, true, http::StatusCode::FORBIDDEN));
+    assert!(!h.engine.route_rejected("i.pximg.net", TlsMode::FakeSni));
+    assert!(h.engine.cached_plan("i.pximg.net", 443, true).is_some());
+}
+
+#[test]
+fn a_github_403_still_rejects_the_route() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let mut plan = test_plan(TlsMode::FakeSni, None);
+    plan.domain = "github.com".into();
+    plan.group_id = "github".into();
+    h.engine.remember_plan_arc(Arc::new(plan));
+
+    assert!(h
+        .engine
+        .note_http_rejection("github.com", 443, true, http::StatusCode::FORBIDDEN));
+    assert!(h.engine.cached_plan("github.com", 443, true).is_none());
+    assert!(h.engine.route_rejected("github.com", TlsMode::FakeSni));
+}
+
+/// 421 is a real SNI/Host mismatch and stays a route verdict for every group,
+/// including custom ones.
+#[test]
+fn a_misdirected_request_rejects_a_custom_group_route() {
+    let h = harness(&["example.com"], RoutePolicy::auto());
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::Ech, None)));
+
+    assert!(h.engine.note_http_rejection(
+        "example.com",
+        443,
+        true,
+        http::StatusCode::MISDIRECTED_REQUEST
+    ));
+    assert!(h.engine.route_rejected("example.com", TlsMode::Ech));
 }
 
 #[tokio::test]
@@ -1996,36 +2121,41 @@ fn bench_wide_group_plan_cache_lookup() {
     });
 }
 
-/// Regression test (audit finding 5, fixed): a route-level 403 retires the
-/// route only and never records an IP failure. A masked-SNI request rejected
-/// by the origin says something about the name, not the address — the same
-/// policy as note_blocked_candidate. The old behavior pulled the healthy
+/// Regression test (audit finding 5, fixed): a route-level rejection retires
+/// the route only and never records an IP failure. A masked-SNI request
+/// rejected by the origin says something about the name, not the address — the
+/// same policy as note_blocked_candidate. The old behavior pulled the healthy
 /// IP's ewma toward 10s and degraded its direct-mode ranking.
+///
+/// GitHub is the only group where a 403 is a route verdict, so it is the only
+/// one that can exercise this path now.
 #[tokio::test]
 async fn route_level_403_keeps_the_ip_unpunished() {
-    let h = harness(
-        &["example.com"],
-        RoutePolicy::sni(vec!["www.baidu.com".into()]),
-    );
+    let h = harness(&["example.com"], RoutePolicy::direct());
     let ip: IpAddr = "1.1.1.1".parse().unwrap();
-    h.engine
-        .remember_plan_arc(Arc::new(test_plan(TlsMode::FakeSni, Some("www.baidu.com"))));
+    let mut plan = test_plan(TlsMode::FakeSni, None);
+    plan.domain = "api.github.com".into();
+    plan.group_id = "github".into();
+    h.engine.remember_plan_arc(Arc::new(plan));
 
     assert!(h
         .engine
-        .note_http_rejection("example.com", 443, true, http::StatusCode::FORBIDDEN));
+        .note_http_rejection("api.github.com", 443, true, http::StatusCode::FORBIDDEN));
 
     assert!(
-        h.engine.cached_plan("example.com", 443, true).is_none(),
+        h.engine.cached_plan("api.github.com", 443, true).is_none(),
         "the rejected route is forgotten"
     );
     assert!(
-        h.engine.route_rejected("example.com", TlsMode::FakeSni),
+        h.engine.route_rejected("api.github.com", TlsMode::FakeSni),
         "the mode is still retired"
     );
     let scores = h.engine.ip_scores.read();
     assert!(
-        scores.get("example.com").and_then(|by_ip| by_ip.get(&ip)).is_none(),
+        scores
+            .get("api.github.com")
+            .and_then(|by_ip| by_ip.get(&ip))
+            .is_none(),
         "a route-level rejection must not write a failure record for the address"
     );
 }
@@ -2037,30 +2167,32 @@ async fn route_level_403_keeps_the_ip_unpunished() {
 /// touched no matter which plan the cache returns.
 #[tokio::test]
 async fn plan_cache_overwrite_does_not_penalize_either_ip() {
-    let h = harness(
-        &["example.com"],
-        RoutePolicy::sni(vec!["www.baidu.com".into()]),
-    );
+    let h = harness(&["example.com"], RoutePolicy::direct());
     let real_offender: IpAddr = "203.0.113.50".parse().unwrap();
     let innocent: IpAddr = "203.0.113.51".parse().unwrap();
 
-    let mut plan = test_plan(TlsMode::FakeSni, Some("www.baidu.com"));
+    let mut plan = test_plan(TlsMode::FakeSni, None);
+    plan.domain = "api.github.com".into();
+    plan.group_id = "github".into();
     plan.ip = real_offender;
     h.engine.remember_plan_arc(Arc::new(plan));
 
     // Connection B succeeds with a different ip and overwrites the plan cache.
-    let mut other = test_plan(TlsMode::FakeSni, Some("www.baidu.com"));
+    let mut other = test_plan(TlsMode::FakeSni, None);
+    other.domain = "api.github.com".into();
+    other.group_id = "github".into();
     other.ip = innocent;
     h.engine.remember_plan_arc(Arc::new(other));
 
-    // Connection A's 403 arrives now.
+    // Connection A's 403 arrives now. GitHub is the only group where that is
+    // still a route-level rejection.
     assert!(h
         .engine
-        .note_http_rejection("example.com", 443, true, http::StatusCode::FORBIDDEN));
+        .note_http_rejection("api.github.com", 443, true, http::StatusCode::FORBIDDEN));
 
     let scores = h.engine.ip_scores.read();
     assert!(
-        scores.get("example.com").is_none(),
+        scores.get("api.github.com").is_none(),
         "no ip may gain a failure record from a route-level rejection"
     );
 }

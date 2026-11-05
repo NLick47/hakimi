@@ -686,9 +686,9 @@ impl UpstreamPool {
         };
         match outcome {
             SendOutcome::Response(Ok(response)) => {
-                // A completed TLS handshake does not prove the route is usable:
-                // a fake-SNI request can reach nginx and get a 403. Feed the
-                // status back so the next connection drops that route.
+                // A completed TLS handshake does not prove the route is usable.
+                // A 421 blames the route everywhere; 403/451 only where the
+                // engine's group policy asks for it (GitHub block pages).
                 let status = response.status();
                 let status_code = status.as_u16();
                 let version = response.version();

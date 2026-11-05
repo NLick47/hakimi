@@ -551,6 +551,15 @@ impl GroupConfig {
         self.id == "github"
     }
 
+    /// Whether an HTTP 403/451 on a non-Direct route is a verdict on the route
+    /// mode. Only GitHub opts in: its edge returns block pages that make the
+    /// current route unusable. Every other site treats 403/451 as content-level,
+    /// because a Cloudflare challenge or WAF 403 must not blacklist the only
+    /// route that passes network filtering.
+    pub fn rejects_blocked_routes(&self) -> bool {
+        self.id == "github"
+    }
+
     pub fn patterns(&self) -> impl Iterator<Item = &str> {
         self.domains.iter().map(|rule| rule.pattern.as_str())
     }
@@ -1880,6 +1889,25 @@ mod tests {
                 "{id} must keep the normal warm-up behavior"
             );
         }
+    }
+
+    #[test]
+    fn only_github_rejects_blocked_routes() {
+        let config = AppConfig::default();
+        assert!(config.group("github").unwrap().rejects_blocked_routes());
+        for id in [
+            "pixiv", "ao3", "eh", "hitomi", "hanime", "steam", "poipiku", "hf",
+        ] {
+            assert!(
+                !config.group(id).unwrap().rejects_blocked_routes(),
+                "{id} must treat 403/451 as a content-level response"
+            );
+        }
+        let custom = GroupConfig {
+            id: "custom".into(),
+            ..GroupConfig::default()
+        };
+        assert!(!custom.rejects_blocked_routes());
     }
 
     /// The relay is opt-in. A default config must not carry a listener, and a
