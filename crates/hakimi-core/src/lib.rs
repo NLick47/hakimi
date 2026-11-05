@@ -38,6 +38,10 @@ pub mod mirror;
 pub mod pac;
 pub mod paths;
 pub mod proxy;
+/// Raw-TCP relay for clients that cannot use an HTTP proxy. Disabled unless
+/// `advanced.relay.enabled` is set; Android does not build it.
+#[cfg(not(target_os = "android"))]
+pub mod relay;
 pub mod resolver;
 pub mod runtime;
 pub mod status;

@@ -182,6 +182,11 @@ pub struct HakimiRuntime {
     proxy_error: Arc<RwLock<Option<String>>>,
     proxy_applied: Arc<RwLock<Option<bool>>>,
     handle: RwLock<Option<ProxyHandle>>,
+    /// Raw relay listener, present only while `advanced.relay.enabled` is set.
+    /// Kept separate from `handle` so the proxy stop path is untouched when the
+    /// feature is off.
+    #[cfg(not(target_os = "android"))]
+    relay: RwLock<Option<crate::relay::RelayHandle>>,
     shutdown: RwLock<Option<watch::Sender<bool>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     started: AtomicBool,
@@ -326,6 +331,8 @@ impl HakimiRuntime {
             proxy_error,
             proxy_applied,
             handle: RwLock::new(None),
+            #[cfg(not(target_os = "android"))]
+            relay: RwLock::new(None),
             shutdown: RwLock::new(None),
             tasks: Mutex::new(Vec::new()),
             started: AtomicBool::new(false),
@@ -540,6 +547,22 @@ impl HakimiRuntime {
             );
         }
 
+        // Off unless the user turned it on. A failure here is reported but must
+        // not stop the proxy: the relay is an auxiliary path, and a bad target
+        // should not take browsing down with it.
+        #[cfg(not(target_os = "android"))]
+        if config.advanced.relay.enabled {
+            match crate::relay::start(&config.advanced.relay, Some(self.resolver.clone())).await {
+                Ok(handle) => {
+                    tracing::info!(addr = %handle.local_addr(), "raw relay started");
+                    *self.relay.write() = Some(handle);
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "failed to start the raw relay");
+                }
+            }
+        }
+
         self.spawn_background_tasks(shutdown_tx);
         self.started.store(true, Ordering::SeqCst);
         tracing::info!(
@@ -564,6 +587,15 @@ impl HakimiRuntime {
         let handle = self.handle.write().take();
         if let Some(handle) = handle {
             handle.stop().await;
+        }
+        // `take()` on an absent relay is a no-op, so the default build pays one
+        // uncontended lock and nothing else.
+        #[cfg(not(target_os = "android"))]
+        {
+            let relay = self.relay.write().take();
+            if let Some(relay) = relay {
+                relay.stop().await;
+            }
         }
         self.proxy_running.store(false, Ordering::SeqCst);
         *self.proxy_listen.write() = None;
@@ -1943,6 +1975,85 @@ mod status_snapshot_tests {
             ticks.load(Ordering::Relaxed),
             after_stop,
             "a timed-out background task must be aborted, not left running"
+        );
+    }
+
+    /// The relay is opt-in. A default runtime must not open the relay port at
+    /// all — this is the guarantee that makes the feature free when unused.
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disabled_relay_binds_no_extra_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = HakimiRuntime::new(Some(dir.path().to_path_buf())).unwrap();
+
+        // Pick a free port, then hand it to the relay while leaving it off.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        runtime
+            .config()
+            .mutate(|config| {
+                config.proxy.mode = ProxyMode::Off;
+                config.advanced.relay.listen = Some(([127, 0, 0, 1], port).into());
+                config.advanced.relay.target = Some("127.0.0.1:7844".to_string());
+                // enabled stays false
+                Ok(())
+            })
+            .unwrap();
+
+        runtime.start().await.unwrap();
+        assert!(runtime.relay.read().is_none(), "no relay handle when disabled");
+        // Nothing may be listening on the reserved port.
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+            "the relay port must stay free while the feature is off"
+        );
+
+        runtime.stop().await.unwrap();
+    }
+
+    /// Enabling the relay opens the port and stopping releases it.
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_enabled_relay_listens_and_stop_releases_the_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = HakimiRuntime::new(Some(dir.path().to_path_buf())).unwrap();
+
+        // A closed loopback port: the relay resolves its candidate list up
+        // front, so give it an explicit address instead of a hostname.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let listen = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen_port = listen.local_addr().unwrap().port();
+        drop(listen);
+
+        runtime
+            .config()
+            .mutate(|config| {
+                config.proxy.mode = ProxyMode::Off;
+                config.advanced.relay.enabled = true;
+                config.advanced.relay.listen = Some(([127, 0, 0, 1], listen_port).into());
+                config.advanced.relay.target = Some(format!("127.0.0.1:{upstream_port}"));
+                config.advanced.relay.candidates = vec![std::net::IpAddr::from([127, 0, 0, 1])];
+                config.advanced.relay.use_doh = false;
+                Ok(())
+            })
+            .unwrap();
+
+        runtime.start().await.unwrap();
+        assert!(runtime.relay.read().is_some(), "the relay must be running");
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", listen_port)).is_err(),
+            "the relay must hold its listen port while enabled"
+        );
+
+        runtime.stop().await.unwrap();
+        assert!(runtime.relay.read().is_none());
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", listen_port)).is_ok(),
+            "stop must release the relay port"
         );
     }
 }
