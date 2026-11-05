@@ -140,6 +140,7 @@ mod tests {
             ech_config: None,
             tls: true,
             source: IpSource::Remote,
+            rule_index: None,
         }
     }
 

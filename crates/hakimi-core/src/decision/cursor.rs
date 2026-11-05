@@ -632,6 +632,7 @@ impl RouteCursor {
             ech_config: ech,
             tls: self.tls,
             source: candidate.source,
+            rule_index: Some(self.rule_index),
         }
     }
 
@@ -827,6 +828,7 @@ impl RouteCursor {
         let diagnostics = self.engine.failure_diagnostics(
             self.group(),
             &self.domain,
+            self.rule_index,
             &self.config,
             reason,
             attempts,

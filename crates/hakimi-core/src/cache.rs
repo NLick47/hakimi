@@ -51,8 +51,6 @@ pub struct CachedAnswer {
     pub qtype: u16,
     #[serde(default)]
     pub ips: Vec<IpAddr>,
-    #[serde(default)]
-    pub hints: Vec<IpAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ech_config: Option<String>,
     pub ttl_secs: u32,
@@ -142,8 +140,11 @@ const MAX_SKIP_ONCE: usize = 4096;
 struct CacheData {
     last_good: HashMap<String, LastGoodEntry>,
     skip_once: HashSet<String>,
-    doh: HashMap<String, CachedAnswer>,
-    doh_negative: HashMap<String, CachedNegative>,
+    /// Bucketed by qtype so a lookup borrows the domain directly instead of
+    /// formatting a `"{domain}|{qtype}"` key on every cache probe — that
+    /// probe sits on every DNS resolution.
+    doh: HashMap<u16, HashMap<String, CachedAnswer>>,
+    doh_negative: HashMap<u16, HashMap<String, CachedNegative>>,
     ech: HashMap<String, CachedEch>,
     sni: HashMap<String, CachedSni>,
 }
@@ -516,7 +517,18 @@ impl CacheManager {
     }
 
     fn expire(data: &mut CacheData, now: DateTime<Utc>) {
-        data.doh.retain(|_, answer| answer.is_usable(now));
+        data.doh.retain(|_, bucket| {
+            bucket.retain(|_, answer| answer.is_usable(now));
+            !bucket.is_empty()
+        });
+        // The negative answers are checked for freshness on every read, so a
+        // past-TTL entry only wastes memory — but it must still be dropped
+        // here, or a long session keeps every NODATA/failure it ever saw
+        // until the insert-time cap evicts them.
+        data.doh_negative.retain(|_, bucket| {
+            bucket.retain(|_, entry| entry.is_fresh(now));
+            !bucket.is_empty()
+        });
         data.ech.retain(|_, ech| within_age(now, ech.fetched_at, MAX_STALE_AGE_DAYS));
         data.sni.retain(|_, sni| within_age(now, sni.saved_at, MAX_SNI_AGE_DAYS));
         // The routes and SNI maps reach disk; the rest are runtime hints, so
@@ -546,6 +558,41 @@ impl CacheManager {
         let overflow = map.len() - to;
         for (key, _) in by_age.into_iter().take(overflow) {
             map.remove(&key);
+        }
+    }
+
+    /// [`Self::prune_by_age`] for the qtype-bucketed DoH maps: the cap and
+    /// the oldest-first order apply to the *total* entry count across every
+    /// bucket, not per bucket.
+    fn prune_doh<V>(
+        map: &mut HashMap<u16, HashMap<String, V>>,
+        max: usize,
+        to: usize,
+        at: impl Fn(&V) -> DateTime<Utc>,
+    ) {
+        let total: usize = map.values().map(|bucket| bucket.len()).sum();
+        if total <= max {
+            return;
+        }
+        let at = &at;
+        let mut by_age: Vec<(u16, String, DateTime<Utc>)> = map
+            .iter()
+            .flat_map(|(qtype, bucket)| {
+                bucket
+                    .iter()
+                    .map(move |(domain, value)| (*qtype, domain.clone(), at(value)))
+            })
+            .collect();
+        by_age.sort_by_key(|(_, _, at)| *at);
+        let overflow = total - to;
+        for (qtype, domain, _) in by_age.into_iter().take(overflow) {
+            let empty = map.get_mut(&qtype).is_some_and(|bucket| {
+                bucket.remove(&domain);
+                bucket.is_empty()
+            });
+            if empty {
+                map.remove(&qtype);
+            }
         }
     }
 
@@ -706,15 +753,20 @@ impl CacheManager {
 
     pub fn doh_answer(&self, domain: &str, qtype: u16) -> Option<CachedAnswer> {
         let now = now();
-        let answer = self.data.read().doh.get(&doh_key(domain, qtype)).cloned()?;
-        answer.is_usable(now).then_some(answer)
+        let data = self.data.read();
+        let answer = data.doh.get(&qtype)?.get(domain)?;
+        // Look before you clone: a miss and the common stale hit both skip
+        // the Vec/String deep copy this used to pay unconditionally.
+        answer.is_usable(now).then(|| answer.clone())
     }
 
     pub fn put_doh_answer(&self, answer: CachedAnswer) {
         let mut data = self.data.write();
         data.doh
-            .insert(doh_key(&answer.domain, answer.qtype), answer);
-        Self::prune_by_age(&mut data.doh, MAX_DOH_ANSWERS, DOH_PRUNE_TO, |answer| {
+            .entry(answer.qtype)
+            .or_default()
+            .insert(answer.domain.clone(), answer);
+        Self::prune_doh(&mut data.doh, MAX_DOH_ANSWERS, DOH_PRUNE_TO, |answer| {
             answer.fetched_at
         });
     }
@@ -725,7 +777,8 @@ impl CacheManager {
         self.data
             .read()
             .doh_negative
-            .get(&doh_key(domain, qtype))
+            .get(&qtype)
+            .and_then(|bucket| bucket.get(domain))
             .is_some_and(|entry| entry.is_fresh(now))
     }
 
@@ -736,7 +789,8 @@ impl CacheManager {
         self.data
             .read()
             .doh_negative
-            .get(&doh_key(domain, qtype))
+            .get(&qtype)
+            .and_then(|bucket| bucket.get(domain))
             .is_some_and(|entry| entry.authoritative && entry.is_fresh(now))
     }
 
@@ -751,15 +805,18 @@ impl CacheManager {
             return;
         }
         let mut data = self.data.write();
-        data.doh_negative.insert(
-            doh_key(domain, qtype),
-            CachedNegative {
-                ttl_secs,
-                authoritative,
-                fetched_at: now(),
-            },
-        );
-        Self::prune_by_age(
+        data.doh_negative
+            .entry(qtype)
+            .or_default()
+            .insert(
+                domain.to_string(),
+                CachedNegative {
+                    ttl_secs,
+                    authoritative,
+                    fetched_at: now(),
+                },
+            );
+        Self::prune_doh(
             &mut data.doh_negative,
             MAX_DOH_NEGATIVE,
             DOH_NEGATIVE_PRUNE_TO,
@@ -768,7 +825,15 @@ impl CacheManager {
     }
 
     pub fn clear_doh_negative(&self, domain: &str, qtype: u16) {
-        self.data.write().doh_negative.remove(&doh_key(domain, qtype));
+        let mut data = self.data.write();
+        let mut empty_bucket = false;
+        if let Some(bucket) = data.doh_negative.get_mut(&qtype) {
+            bucket.remove(domain);
+            empty_bucket = bucket.is_empty();
+        }
+        if empty_bucket {
+            data.doh_negative.remove(&qtype);
+        }
     }
 
     // ---- ECH -------------------------------------------------------------
@@ -838,7 +903,7 @@ impl CacheManager {
         CacheStats {
             last_good: data.last_good.len(),
             skip_once: data.skip_once.len(),
-            doh_answers: data.doh.len(),
+            doh_answers: data.doh.values().map(|bucket| bucket.len()).sum(),
             ech_configs: data.ech.len(),
             fake_sni: data.sni.len(),
         }
@@ -851,10 +916,6 @@ impl CacheManager {
         self.mark_sni_dirty();
         Ok(())
     }
-}
-
-fn doh_key(domain: &str, qtype: u16) -> String {
-    format!("{domain}|{qtype}")
 }
 
 fn sni_key(group: &str, domain: &str, network_id: &str) -> String {
@@ -955,7 +1016,6 @@ mod tests {
                 domain: domain.clone(),
                 qtype: 1,
                 ips: vec!["93.184.216.34".parse().unwrap()],
-                hints: Vec::new(),
                 ech_config: None,
                 ttl_secs: 300,
                 fetched_at: now(),
@@ -1139,7 +1199,6 @@ mod tests {
             domain: "example.com".into(),
             qtype: 1,
             ips: vec!["1.2.3.4".parse().unwrap()],
-            hints: vec![],
             ech_config: None,
             ttl_secs: 0,
             fetched_at: now,
@@ -1159,7 +1218,6 @@ mod tests {
             domain: "example.com".into(),
             qtype: 1,
             ips: vec!["1.1.1.1".parse().unwrap()],
-            hints: vec![],
             ech_config: None,
             ttl_secs: 60,
             fetched_at: now(),
@@ -1170,7 +1228,6 @@ mod tests {
             domain: "example.com".into(),
             qtype: 1,
             ips: vec!["1.1.1.1".parse().unwrap()],
-            hints: vec![],
             ech_config: None,
             ttl_secs: 60,
             fetched_at: now() - Duration::hours(1),
@@ -1230,7 +1287,6 @@ mod tests {
                 domain: "example.com".into(),
                 qtype: 1,
                 ips: vec!["1.1.1.1".parse().unwrap()],
-                hints: vec![],
                 ech_config: None,
                 ttl_secs: 300,
                 fetched_at: now(),

@@ -31,8 +31,6 @@ pub struct HttpsRecord {
     pub alpn: Vec<String>,
     pub no_default_alpn: bool,
     pub port: Option<u16>,
-    pub ipv4_hints: Vec<Ipv4Addr>,
-    pub ipv6_hints: Vec<Ipv6Addr>,
     pub ech: Option<Vec<u8>>,
 }
 
@@ -91,14 +89,15 @@ impl DnsResponse {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedAnswer {
     pub ips: Vec<IpAddr>,
-    pub hints: Vec<IpAddr>,
     pub ech: Option<Vec<u8>>,
     pub ttl: u32,
     pub cname: Option<String>,
     pub https_present: bool,
 }
 
-/// Build a recursive query. `name` must already be ASCII (IDNA-normalized).
+/// Build a recursive query. `name` must already be ASCII (IDNA-normalized);
+/// anything else is rejected here rather than written to the wire as raw
+/// UTF-8 bytes the resolver cannot answer.
 pub fn build_query(name: &str, qtype: u16, id: u16) -> Result<Vec<u8>> {
     let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
     if name.is_empty() || name.len() > 253 {
@@ -114,6 +113,16 @@ pub fn build_query(name: &str, qtype: u16, id: u16) -> Result<Vec<u8>> {
 
     for label in name.split('.') {
         if label.is_empty() || label.len() > 63 {
+            bail!("invalid DNS label in `{name}`");
+        }
+        // The wire format is defined over ASCII. IDNA should have punycoded
+        // the name upstream; a label with raw UTF-8 (or `*`, spaces, …) would
+        // only produce a query no resolver can answer, so fail locally with
+        // the offending name instead.
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
             bail!("invalid DNS label in `{name}`");
         }
         out.push(label.len() as u8);
@@ -245,8 +254,6 @@ fn read_https(bytes: &[u8], start: usize, end: usize) -> Result<HttpsRecord> {
         alpn: Vec::new(),
         no_default_alpn: false,
         port: None,
-        ipv4_hints: Vec::new(),
-        ipv6_hints: Vec::new(),
         ech: None,
     };
     while pos < end {
@@ -285,31 +292,15 @@ fn read_https(bytes: &[u8], start: usize, end: usize) -> Result<HttpsRecord> {
                 }
                 record.port = Some(u16::from_be_bytes([value[0], value[1]]));
             }
-            4 => {
-                if value.len() % 4 != 0 {
-                    bail!("HTTPS ipv4hint is malformed");
-                }
-                for chunk in value.chunks_exact(4) {
-                    record
-                        .ipv4_hints
-                        .push(Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]));
-                }
-            }
             5 => {
                 if !value.is_empty() {
                     record.ech = Some(value.to_vec());
                 }
             }
-            6 => {
-                if value.len() % 16 != 0 {
-                    bail!("HTTPS ipv6hint is malformed");
-                }
-                for chunk in value.chunks_exact(16) {
-                    let mut octets = [0u8; 16];
-                    octets.copy_from_slice(chunk);
-                    record.ipv6_hints.push(Ipv6Addr::from(octets));
-                }
-            }
+            // 4 (ipv4hint) and 6 (ipv6hint) carry addresses nothing consumes.
+            // They fall through so an unused param can never fail the record
+            // — the old validation rejected a whole valid ECH config because
+            // an unrelated hint was malformed.
             _ => {}
         }
         pos = value_end;
@@ -322,7 +313,10 @@ fn read_name(bytes: &[u8], pos: &mut usize) -> Result<String> {
     let mut cursor = start;
     let mut jumped = false;
     let mut hops = 0usize;
-    let mut labels: Vec<String> = Vec::new();
+    // One buffer for the whole name. A response carries a name on every
+    // record, and the old Vec<String> plus a separately lowercased String per
+    // label (then a `join`) allocated once per label on top of that.
+    let mut name = String::new();
     loop {
         let len = *bytes
             .get(cursor)
@@ -355,18 +349,24 @@ fn read_name(bytes: &[u8], pos: &mut usize) -> Result<String> {
                 if end > bytes.len() {
                     bail!("DNS label extends past the message");
                 }
-                let label = std::str::from_utf8(&bytes[cursor..end])
-                    .context("DNS label is not ASCII")?
-                    .to_ascii_lowercase();
+                let label = &bytes[cursor..end];
+                if !label.is_ascii() {
+                    bail!("DNS label is not ASCII");
+                }
                 if !label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
                 {
                     bail!("DNS label contains unsupported characters");
                 }
-                labels.push(label);
+                if !name.is_empty() {
+                    name.push('.');
+                }
+                name.extend(label.iter().map(|&b| b.to_ascii_lowercase() as char));
                 cursor = end;
-                if labels.iter().map(|l| l.len() + 1).sum::<usize>() > 254 {
+                // Same rule as before: every label counts one extra byte for
+                // its length octet, which is `name.len() + 1` including dots.
+                if name.len() > 253 {
                     bail!("DNS name is too long");
                 }
             }
@@ -376,7 +376,7 @@ fn read_name(bytes: &[u8], pos: &mut usize) -> Result<String> {
     if !jumped {
         *pos = cursor;
     }
-    Ok(labels.join("."))
+    Ok(name)
 }
 
 fn read_u16(bytes: &[u8], pos: &mut usize) -> Result<u16> {
@@ -458,18 +458,6 @@ pub fn extract_answer(response: &DnsResponse, name: &str, qtype: u16) -> Resolve
                         continue;
                     }
                     take_ttl(&mut ttl);
-                    for ip in &https.ipv4_hints {
-                        let ip = IpAddr::V4(*ip);
-                        if !result.hints.contains(&ip) {
-                            result.hints.push(ip);
-                        }
-                    }
-                    for ip in &https.ipv6_hints {
-                        let ip = IpAddr::V6(*ip);
-                        if !result.hints.contains(&ip) {
-                            result.hints.push(ip);
-                        }
-                    }
                     if result.ech.is_none() {
                         result.ech = https.ech.clone();
                     }
@@ -572,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_https_ech_and_hints() {
+    fn parses_https_ech_and_skips_unused_params() {
         let query = build_query("pixiv.net", TYPE_HTTPS, 7).unwrap();
         let mut answers = Vec::new();
         push_name(&mut answers, "pixiv.net");
@@ -587,7 +575,8 @@ mod tests {
         rdata.extend_from_slice(&3u16.to_be_bytes());
         rdata.push(2);
         rdata.extend_from_slice(b"h2");
-        // ipv4hint 203.0.113.1 (catalog validation is separate; wire parser accepts it)
+        // ipv4hint: nothing consumes it, so it must be skipped without
+        // failing the record (or the valid ECH config after it).
         rdata.extend_from_slice(&4u16.to_be_bytes());
         rdata.extend_from_slice(&4u16.to_be_bytes());
         rdata.extend_from_slice(&[203, 0, 113, 1]);
@@ -603,7 +592,6 @@ mod tests {
         let answer = extract_answer(&response, "pixiv.net", TYPE_HTTPS);
         assert!(answer.https_present);
         assert_eq!(answer.ech.as_deref(), Some(ech.as_slice()));
-        assert_eq!(answer.hints, vec!["203.0.113.1".parse::<IpAddr>().unwrap()]);
         assert_eq!(answer.ttl, 600);
     }
 

@@ -575,6 +575,7 @@ fn test_plan(mode: TlsMode, sni: Option<&str>) -> ConnectPlan {
         ech_config: None,
         tls: true,
         source: IpSource::Remote,
+        rule_index: None,
     }
 }
 
@@ -586,7 +587,6 @@ async fn duplicate_addresses_from_catalog_and_doh_are_merged() {
     h.resolver.answers.lock().push_back(Ok(DohResolution {
         // The first address is already known from the catalog.
         ips: vec!["1.1.1.1".parse().unwrap(), "2.2.2.2".parse().unwrap()],
-        hints: Vec::new(),
         source: DohSource::Primary,
         endpoint: "primary".into(),
         stale: false,
@@ -1087,7 +1087,6 @@ async fn doh_is_used_after_initial_candidates_fail() {
         .insert("9.9.9.9".parse().unwrap());
     harness.resolver.answers.lock().push_back(Ok(DohResolution {
         ips: vec!["9.9.9.9".parse().unwrap()],
-        hints: Vec::new(),
         source: DohSource::Primary,
         endpoint: "primary".into(),
         stale: false,
@@ -1119,7 +1118,6 @@ async fn doh_is_used_when_the_catalog_fills_the_candidate_cap() {
         .insert("9.9.9.9".parse().unwrap());
     harness.resolver.answers.lock().push_back(Ok(DohResolution {
         ips: vec!["9.9.9.9".parse().unwrap()],
-        hints: Vec::new(),
         source: DohSource::Primary,
         endpoint: "primary".into(),
         stale: false,
@@ -1171,7 +1169,6 @@ async fn every_doh_address_is_tried_after_a_full_catalog_fails() {
     harness.prober.working.lock().insert(working_doh);
     harness.resolver.answers.lock().push_back(Ok(DohResolution {
         ips: vec![first_doh, working_doh],
-        hints: Vec::new(),
         source: DohSource::Primary,
         endpoint: "primary".into(),
         stale: false,
@@ -1213,7 +1210,6 @@ async fn doh_fallback_works_for_every_catalog_and_cap_combination() {
             harness.prober.working.lock().insert(doh_ip);
             harness.resolver.answers.lock().push_back(Ok(DohResolution {
                 ips: vec![doh_ip],
-                hints: Vec::new(),
                 source: DohSource::Primary,
                 endpoint: "primary".into(),
                 stale: false,
@@ -2444,7 +2440,6 @@ async fn a_doh_only_domain_still_gets_an_opponent() {
         domain: "example.com".into(),
         qtype: 1,
         ips: vec![doh],
-        hints: Vec::new(),
         ech_config: None,
         ttl_secs: 300,
         fetched_at: now(),

@@ -15,6 +15,10 @@ use crate::util::now;
 /// status map bounded so a crawler cannot turn the UI snapshot into a
 /// multi-megabyte clone every second.
 const MAX_STATUS_DOMAINS: usize = 4096;
+/// Failure evidence outranks a success of the same age for this long. Past
+/// the window a record competes by age alone, so a graveyard of old failures
+/// cannot outlive every fresh success.
+const FAILURE_PRUNE_GRACE_DAYS: i64 = 7;
 /// Evict in bulk so crossing the cap does not sort the map on every insert.
 const STATUS_PRUNE_TO: usize = MAX_STATUS_DOMAINS * 3 / 4;
 
@@ -30,7 +34,7 @@ pub enum State {
     Failed,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttemptRecord {
     pub strategy: TlsMode,
@@ -218,7 +222,7 @@ impl StatusStore {
     /// a deep clone of attempts/suggestions.
     pub(crate) fn record_arc(&self, diagnostics: Arc<DomainDiagnostics>) {
         let mut map = self.domains.write();
-        let mut unchanged_checking = false;
+        let mut unchanged = false;
         let mut state_change: Option<(State, State)> = None;
         // Keep the log payload out of the map write guard. `tracing` may block
         // on the log writer, and status readers must not wait for it.
@@ -231,10 +235,13 @@ impl StatusStore {
             if existing.last_check > diagnostics.last_check {
                 return;
             }
-            // Re-marking an already-checking domain is the common cold-connect
-            // path. It changes no visible state, so do not wake every UI poller.
-            unchanged_checking =
-                existing.state == State::Checking && diagnostics.state == State::Checking;
+            // Re-recording identical content is the common cold-connect path
+            // for Checking marks — and, for every bypass state (Paused,
+            // Disabled, uncovered Direct), happens on *each* reconnect while
+            // nothing about the domain changed. Refresh the record (its
+            // timestamp carries activity and prune recency) but do not wake
+            // every UI poller for it.
+            unchanged = same_visible_content(existing, &diagnostics);
             // A state flip is the single most useful troubleshooting signal:
             // it tells whether a site just broke or just recovered, and when.
             // `Checking` is a transient marker, not a real transition — logging
@@ -270,9 +277,9 @@ impl StatusStore {
         }
         // The record is in the map now: publish the change to pollers. Doing
         // it after the write (and after the early return above) means a
-        // revision bump always corresponds to a visible change. Re-marking an
-        // already-checking domain is not a visible change.
-        if !unchanged_checking {
+        // revision bump always corresponds to a visible change. Re-recording
+        // the same content is not a visible change.
+        if !unchanged {
             self.revision.fetch_add(1, Ordering::SeqCst);
         }
         drop(map);
@@ -504,6 +511,65 @@ impl StatusStore {
     }
 }
 
+/// Whether two records show the same thing to a poller — every field except
+/// the observation timestamp. Destructured exhaustively on purpose: adding a
+/// field to [`DomainDiagnostics`] fails to compile here until it is listed,
+/// so a visible change can never be silently swallowed by the debounce in
+/// `record_arc`.
+fn same_visible_content(a: &DomainDiagnostics, b: &DomainDiagnostics) -> bool {
+    let DomainDiagnostics {
+        group,
+        domain,
+        state,
+        strategy,
+        configured_modes,
+        ip,
+        ip_source,
+        doh_source,
+        latency_ms,
+        last_check: _,
+        catalog_version,
+        cache,
+        error,
+        detail,
+        attempts,
+        suggestions,
+    } = a;
+    let DomainDiagnostics {
+        group: b_group,
+        domain: b_domain,
+        state: b_state,
+        strategy: b_strategy,
+        configured_modes: b_configured_modes,
+        ip: b_ip,
+        ip_source: b_ip_source,
+        doh_source: b_doh_source,
+        latency_ms: b_latency_ms,
+        last_check: _,
+        catalog_version: b_catalog_version,
+        cache: b_cache,
+        error: b_error,
+        detail: b_detail,
+        attempts: b_attempts,
+        suggestions: b_suggestions,
+    } = b;
+    group == b_group
+        && domain == b_domain
+        && state == b_state
+        && strategy == b_strategy
+        && configured_modes == b_configured_modes
+        && ip == b_ip
+        && ip_source == b_ip_source
+        && doh_source == b_doh_source
+        && latency_ms == b_latency_ms
+        && catalog_version == b_catalog_version
+        && cache == b_cache
+        && error == b_error
+        && detail == b_detail
+        && attempts == b_attempts
+        && suggestions == b_suggestions
+}
+
 fn counts_for(map: &HashMap<String, Arc<DomainDiagnostics>>) -> StatusCounts {
     let mut counts = StatusCounts {
         total: map.len(),
@@ -515,22 +581,32 @@ fn counts_for(map: &HashMap<String, Arc<DomainDiagnostics>>) -> StatusCounts {
     counts
 }
 
-/// Keep failure evidence longer than ordinary success records. If every entry
-/// is failed/degraded, the oldest failures are evicted as a last resort.
+/// Keep failure evidence longer than ordinary success records — but only for
+/// [`FAILURE_PRUNE_GRACE_DAYS`]. The absolute policy this replaces evicted
+/// successes first no matter how old the failures were: once failures filled
+/// the target, every overflow wiped *all* successes, including the record
+/// that just triggered the prune, and the list locked into a graveyard of
+/// failures. With the grace window, a fresh success survives any failure
+/// older than the window, while a failure still outlives a success of the
+/// same age. If every entry is failed/degraded, the oldest failures are
+/// evicted as a last resort (the shift is uniform, so their order is kept).
 fn prune_status_domains(map: &mut HashMap<String, Arc<DomainDiagnostics>>) {
-    let mut candidates: Vec<(String, DateTime<Utc>, bool)> = map
+    let grace = chrono::Duration::days(FAILURE_PRUNE_GRACE_DAYS);
+    let mut candidates: Vec<(String, DateTime<Utc>)> = map
         .iter()
         .map(|(domain, entry)| {
-            (
-                domain.clone(),
-                entry.last_check,
-                matches!(entry.state, State::Failed | State::Degraded),
-            )
+            let mut evict_at = entry.last_check;
+            if matches!(entry.state, State::Failed | State::Degraded) {
+                // Treat the failure as if it were checked later, so it leaves
+                // the map later than a success of the same age.
+                evict_at += grace;
+            }
+            (domain.clone(), evict_at)
         })
         .collect();
-    candidates.sort_by_key(|(_, last_check, protected)| (*protected, *last_check));
+    candidates.sort_by_key(|(_, evict_at)| *evict_at);
     let excess = map.len().saturating_sub(STATUS_PRUNE_TO);
-    for (domain, _, _) in candidates.into_iter().take(excess) {
+    for (domain, _) in candidates.into_iter().take(excess) {
         map.remove(&domain);
     }
 }
@@ -717,6 +793,33 @@ mod tests {
         assert!(store.revision() > paused, "a domain record must publish");
     }
 
+    /// Regression test (audit finding 12): every bypass reconnect (Paused,
+    /// Disabled, uncovered Direct) rebuilds its record with a fresh
+    /// timestamp, and the old Checking-only debounce let it bump the revision
+    /// once per request — waking every UI poller to re-clone the snapshot for
+    /// content that had not changed. Identical content must stay silent; a
+    /// visible change in the same state must still publish.
+    #[test]
+    fn re_recording_identical_content_stays_silent() {
+        let store = StatusStore::new();
+        store.record(report("quiet.example", State::Paused));
+        let revision = store.revision();
+
+        // Exactly what each reconnect while paused produces.
+        store.record(report("quiet.example", State::Paused));
+        assert_eq!(
+            store.revision(),
+            revision,
+            "re-recording the same content must not wake pollers"
+        );
+
+        // Same state, different content — still a visible change.
+        let mut changed = report("quiet.example", State::Paused);
+        changed.detail = Some("a different reason".into());
+        store.record(changed);
+        assert!(store.revision() > revision, "a visible change must publish");
+    }
+
     #[test]
     fn counts_follow_transitions_and_clear() {
         let store = StatusStore::new();
@@ -812,6 +915,35 @@ mod tests {
             snapshot.len() < MAX_STATUS_DOMAINS,
             "the bulk prune should leave headroom below the cap"
         );
+    }
+
+    /// Regression test (audit finding 11): once failures alone filled the
+    /// target, the old policy (successes evicted first, unconditionally)
+    /// wiped *every* success on each overflow — including the record that
+    /// just triggered the prune — and the list locked into a graveyard of
+    /// failures. A failure past its grace window must lose to a fresh success.
+    #[test]
+    fn pruning_spares_a_fresh_success_over_an_ancient_failure() {
+        let store = StatusStore::new();
+        let old = now() - chrono::Duration::days(30);
+        for index in 0..(STATUS_PRUNE_TO + 512) {
+            let mut failed = report(&format!("fail{index}.example"), State::Failed);
+            failed.last_check = old;
+            store.record(failed);
+        }
+        for index in 0..512 {
+            let mut success = report(&format!("ok{index}.example"), State::Normal);
+            success.last_check = old;
+            store.record(success);
+        }
+        // At the cap without a prune; this insert is what overflows it.
+        store.record(report("fresh.example", State::Normal));
+
+        assert!(
+            store.get("fresh.example").is_some(),
+            "a fresh success must not be evicted by month-old failures"
+        );
+        assert_eq!(store.counts().total, STATUS_PRUNE_TO);
     }
 
     /// The snapshot the UI polls: a clone of every domain record plus the counts.

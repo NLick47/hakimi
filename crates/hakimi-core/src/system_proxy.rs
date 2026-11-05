@@ -119,7 +119,19 @@ impl SystemProxyManager {
         if !self.state_path.exists() {
             return Ok(false);
         }
-        let state: SavedState = read_json(&self.state_path).unwrap_or_default();
+        // A snapshot that cannot be read must never be treated as "the user
+        // had no proxy": the user's own settings exist only in this file, so
+        // restoring an empty state would delete them from the OS and then
+        // delete the file itself, making the loss permanent. A read failure
+        // can also be transient (a locked file), so keep the snapshot and let
+        // the caller retry or fall back to switching our takeover off — that
+        // leaves the system working without destroying anything.
+        let state: SavedState = read_json(&self.state_path).with_context(|| {
+            format!(
+                "reading the system proxy snapshot {}; refusing to restore an empty state",
+                self.state_path.display()
+            )
+        })?;
         platform_restore(&state)?;
         std::fs::remove_file(&self.state_path).ok();
         Ok(true)
@@ -1308,6 +1320,29 @@ mod verification_tests {
             back.mac_pac[0].url.as_deref(),
             Some("http://127.0.0.1:9999/original.pac")
         );
+    }
+
+    /// A corrupt snapshot must not be restored as an empty state: that would
+    /// delete the user's own proxy settings from the OS and then delete the
+    /// snapshot, losing them for good. The failure has to surface and the
+    /// file has to survive so it can be retried or repaired.
+    #[test]
+    fn a_corrupt_snapshot_is_never_restored_as_empty() {
+        let dir = std::env::temp_dir().join(format!("hakimi-restore-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("system-proxy.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        let manager = SystemProxyManager::new(&path);
+        let result = manager.restore();
+        assert!(result.is_err(), "a corrupt snapshot must surface an error");
+        assert!(
+            path.exists(),
+            "a failed restore must keep the snapshot for recovery"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

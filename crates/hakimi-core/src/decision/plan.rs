@@ -24,6 +24,11 @@ pub struct ConnectPlan {
     pub tls: bool,
     /// Which candidate list produced this IP.
     pub source: IpSource,
+    /// The group rule index `DomainMatcher` resolved at decision time. The
+    /// success diagnostics read the configured modes with an index lookup
+    /// instead of rescanning every rule of the group on each connection.
+    /// `None` only for hand-built plans; consumers fall back to the scan.
+    pub rule_index: Option<usize>,
 }
 
 impl ConnectPlan {

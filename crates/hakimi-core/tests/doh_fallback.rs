@@ -679,7 +679,6 @@ async fn stale_answers_do_not_spawn_one_refresh_per_connection() {
         domain: "stale.example".into(),
         qtype: TYPE_A,
         ips: vec!["203.0.113.9".parse().unwrap()],
-        hints: Vec::new(),
         ech_config: None,
         ttl_secs: 30,
         fetched_at: now() - chrono::Duration::seconds(40),

@@ -64,27 +64,46 @@ impl DownloadManager {
     }
 }
 
-/// Header-only gate: status, size floor, range support
+/// Header-only gate: status, size floor, range support. Returns the body
+/// length when the response can be sliced into byte ranges.
 fn headers_eligible(
     status: StatusCode,
     content_length: Option<&str>,
     accept_ranges: Option<&str>,
     min_size: u64,
-) -> bool {
+) -> Option<u64> {
     if status != StatusCode::OK {
-        return false;
+        return None;
     }
-    let Some(len) = content_length.and_then(|value| value.trim().parse::<u64>().ok()) else {
-        return false;
-    };
+    let len: u64 = content_length?.trim().parse().ok()?;
     if len < min_size.max(MIB) {
-        return false;
+        return None;
     }
-    accept_ranges.is_some_and(|value| {
-        value
-            .split(',')
-            .any(|token| token.trim().eq_ignore_ascii_case("bytes"))
-    })
+    accept_ranges?
+        .split(',')
+        .any(|token| token.trim().eq_ignore_ascii_case("bytes"))
+        .then_some(len)
+}
+
+/// Response-header gate shared by [`segment_eligible`] and the mirror
+/// failover: a body can only be sliced when it is a plain 200 with a usable
+/// Content-Length, advertised byte ranges and no content encoding. Returns
+/// the body length when the response qualifies.
+pub(crate) fn response_eligible<B>(response: &http::Response<B>) -> Option<u64> {
+    let headers = response.headers();
+    if content_encoded(headers) {
+        return None;
+    }
+    headers_eligible(
+        response.status(),
+        headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get(header::ACCEPT_RANGES)
+            .and_then(|value| value.to_str().ok()),
+        MIB,
+    )
 }
 
 /// A response that carries a content encoding cannot be sliced by byte offset:
@@ -313,31 +332,15 @@ pub(crate) fn segment_eligible(
     if !is_get || has_range {
         return false;
     }
-    let headers = response.headers();
-    if content_encoded(headers) {
-        return false;
-    }
-    let len = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    let ranges = headers
-        .get(header::ACCEPT_RANGES)
-        .and_then(|value| value.to_str().ok());
     // a 1 MiB hard floor rejects most traffic before the config snapshot is paid for
-    if !headers_eligible(
-        response.status(),
-        len.map(|len| len.to_string()).as_deref(),
-        ranges,
-        MIB,
-    ) {
+    let Some(len) = response_eligible(response) else {
         return false;
-    }
+    };
     let config = &ctx.config.snapshot().advanced.download;
     if !config.enabled || ctx.status.paused() {
         return false;
     }
-    if len.is_none_or(|len| len < config.min_size_bytes) {
+    if len < config.min_size_bytes {
         return false;
     }
     candidate_uri(rule_uri)
@@ -1075,17 +1078,41 @@ pub(crate) async fn segment(
         // the segmented path go through here; the failover path in upstream.rs
         // hands us a raw mirror response that was never stripped.
         strip_mirror_cookies(response.headers_mut());
-        let prefix = mirror_prefix.unwrap_or_default();
-        if prefix.is_empty() || !mirror_range_ok(ctx, &uri, &range_headers, &response, prefix).await
-        {
-            tracing::info!(
-                host = uri.host().unwrap_or(""),
-                "mirror does not support ranges, falling back to single stream"
-            );
-            let (mut parts, body) = response.into_parts();
-            super::upstream::sanitize_response_headers(&mut parts.headers, false);
-            return Response::from_parts(parts, ProxyBody::upstream(body, uri, StatusCode::OK));
-        }
+    }
+
+    // The sliced path needs a body it can actually cut into byte ranges.
+    // Without a known, non-zero length the chunk math collapses (one empty
+    // chunk, no tail workers): the stream worker completes its zero-length
+    // chunk without emitting anything, the merger then waits forever for
+    // chunks that can never arrive — pinning `download.active` — while the
+    // browser is handed an empty body. Anything unsuitable for slicing is
+    // served as the single stream it already is.
+    let prefix = mirror_prefix.unwrap_or_default();
+    let sliceable = total_len > 0
+        && response.status() == StatusCode::OK
+        && !content_encoded(response.headers());
+    let ranges_ok = sliceable
+        && if mirrored {
+            !prefix.is_empty()
+                && mirror_range_ok(ctx, &uri, &range_headers, &response, prefix).await
+        } else {
+            // The direct path only reaches `segment` through
+            // `segment_eligible`, which already proved the headers.
+            true
+        };
+    if !ranges_ok {
+        tracing::info!(
+            host = uri.host().unwrap_or(""),
+            reason = if mirrored {
+                "mirror does not support ranges or the body is not sliceable"
+            } else {
+                "response is not sliceable"
+            },
+            "falling back to a single stream"
+        );
+        let (mut parts, body) = response.into_parts();
+        super::upstream::sanitize_response_headers(&mut parts.headers, false);
+        return Response::from_parts(parts, ProxyBody::upstream(body, uri, StatusCode::OK));
     }
 
     let chunk_len = download.chunk_bytes.max(64 * 1024);
@@ -1212,7 +1239,7 @@ mod tests {
     use super::{
         candidate_uri, claim, content_encoded, credential_headers, expected_chunk_len,
         headers_eligible, host_header, mirror_candidate, mirror_origins, parse_content_range,
-        range_request_headers, run_merger,
+        range_request_headers, response_eligible, run_merger,
         signed_url, Shared, Source, Worker, MIB, NEXT_AFTER_STREAM_CHUNK,
     };
     use crate::cache::{CacheManager, LastGoodEntry};
@@ -1227,7 +1254,7 @@ mod tests {
     use crate::strategy::IpSource;
     use crate::util::now;
     use bytes::Bytes;
-    use http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
+    use http::{header, HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
     use http_body_util::Full;
     use hyper::body::Incoming;
     use hyper_util::rt::TokioIo;
@@ -1501,45 +1528,67 @@ mod tests {
 
     #[test]
     fn headers_gate_blocks_wrong_status_size_and_missing_ranges() {
+        assert_eq!(
+            headers_eligible(StatusCode::OK, Some("1048576"), Some("bytes"), MIB),
+            Some(1048576)
+        );
         assert!(headers_eligible(
-            StatusCode::OK,
-            Some("1048576"),
-            Some("bytes"),
-            MIB
-        ));
-        assert!(!headers_eligible(
             StatusCode::PARTIAL_CONTENT,
             Some("1048576"),
             Some("bytes"),
             MIB
-        ));
-        assert!(!headers_eligible(StatusCode::OK, None, Some("bytes"), MIB));
-        assert!(!headers_eligible(
-            StatusCode::OK,
-            Some("1024"),
-            Some("bytes"),
-            MIB
-        ));
-        assert!(!headers_eligible(
-            StatusCode::OK,
-            Some("1048576"),
-            Some("none"),
-            MIB
-        ));
-        assert!(!headers_eligible(
-            StatusCode::OK,
-            Some("abc"),
-            Some("bytes"),
-            MIB
-        ));
+        )
+        .is_none());
+        assert!(headers_eligible(StatusCode::OK, None, Some("bytes"), MIB).is_none());
+        assert!(headers_eligible(StatusCode::OK, Some("1024"), Some("bytes"), MIB).is_none());
+        assert!(headers_eligible(StatusCode::OK, Some("1048576"), Some("none"), MIB).is_none());
+        assert!(headers_eligible(StatusCode::OK, Some("abc"), Some("bytes"), MIB).is_none());
         // below the configured threshold but above the 1 MiB floor: the caller
         // applies the config on top
-        assert!(!headers_eligible(
-            StatusCode::OK,
-            Some("2097152"),
-            Some("bytes"),
-            4 * MIB
-        ));
+        assert!(headers_eligible(StatusCode::OK, Some("2097152"), Some("bytes"), 4 * MIB).is_none());
+    }
+
+    /// The mirror failover hands its candidate straight to `segment()`; a
+    /// response that cannot be sliced must be rejected there, or the download
+    /// would end up empty while the merger waits for chunks that never come.
+    #[test]
+    fn response_eligible_requires_a_sliceable_body() {
+        let build = |status: StatusCode, len: Option<&str>, ranges: Option<&str>, encoding: &str| {
+            let mut response = Response::new(Full::new(Bytes::new()));
+            *response.status_mut() = status;
+            if let Some(len) = len {
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_LENGTH, len.parse().unwrap());
+            }
+            if let Some(ranges) = ranges {
+                response
+                    .headers_mut()
+                    .insert(header::ACCEPT_RANGES, ranges.parse().unwrap());
+            }
+            if !encoding.is_empty() {
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_ENCODING, encoding.parse().unwrap());
+            }
+            response
+        };
+        let ok = build(StatusCode::OK, Some("1048576"), Some("bytes"), "");
+        assert_eq!(response_eligible(&ok), Some(1048576));
+        // A mirror that answers without Content-Length (or with a redirect or
+        // a content encoding) must never reach the segmented path.
+        assert_eq!(
+            response_eligible(&build(StatusCode::OK, None, Some("bytes"), "")),
+            None
+        );
+        assert_eq!(
+            response_eligible(&build(StatusCode::MOVED_PERMANENTLY, Some("1048576"), Some("bytes"), "")),
+            None
+        );
+        assert_eq!(
+            response_eligible(&build(StatusCode::OK, Some("1048576"), Some("bytes"), "gzip")),
+            None
+        );
     }
 
     #[test]

@@ -30,7 +30,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::ca::CertificateAuthority;
@@ -45,6 +45,13 @@ use crate::util::host_header_name;
 
 use self::connect::handle_connect;
 use self::pool::UpstreamResponseBody;
+
+/// Proxy connections served at once. A local flood (broken PAC loop, hostile
+/// local process) otherwise dials upstream and buffers bodies for every
+/// accepted socket simultaneously. The wait lives inside the spawned task so
+/// the accept loop keeps servicing shutdown; queued waiters hold only their
+/// already-accepted socket.
+const MAX_CONCURRENT_CONNECTIONS: usize = 512;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -260,6 +267,7 @@ pub async fn start(ctx: Arc<ProxyContext>, bind: SocketAddr) -> Result<ProxyHand
     let _ = ctx.proxy_addr.set(local_addr);
     let pac_url = format!("http://{local_addr}/proxy.pac");
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let gate = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     let task = tokio::spawn(async move {
         // Backoff for persistent accept errors. `accept()` reports EMFILE /
         // ENFILE as an immediately-ready error, so without a sleep the
@@ -284,7 +292,14 @@ pub async fn start(ctx: Arc<ProxyContext>, bind: SocketAddr) -> Result<ProxyHand
                             // waiting for the OS default, which can be hours.
                             crate::util::apply_tcp_keepalive(&stream);
                             let ctx = ctx.clone();
+                            let gate = gate.clone();
                             tokio::spawn(async move {
+                                // Queue for a slot before serving so a local
+                                // flood cannot start one upstream dial and
+                                // body buffer per accepted socket at once.
+                                let Ok(_permit) = gate.acquire_owned().await else {
+                                    return;
+                                };
                                 if let Err(error) = serve_connection(stream, ctx).await {
                                     tracing::debug!(error = %error, "proxy connection closed");
                                 }

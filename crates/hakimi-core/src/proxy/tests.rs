@@ -464,6 +464,7 @@ async fn raw_cached_plan_releases_hedge_after_refusal() {
         ech_config: None,
         tls: true,
         source: IpSource::Cache,
+        rule_index: None,
     });
     cursor.skip_plan(&cached);
 

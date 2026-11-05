@@ -615,6 +615,20 @@ async fn forward_with_uri(
                             continue;
                         }
                     };
+                    // This candidate replaces a response that did pass
+                    // `segment_eligible`, so it has to pass the same header
+                    // gate: a redirect, an encoded body or a missing
+                    // Content-Length would reach `segment()` with nothing to
+                    // slice — an empty file plus a merger that waits forever
+                    // for chunks that can never arrive.
+                    if super::download::response_eligible(&response).is_none() {
+                        tracing::info!(
+                            status = %response.status(),
+                            mirror = %prefix,
+                            "mirror response cannot be segmented, trying the next mirror"
+                        );
+                        continue;
+                    }
                     if deadline.saturating_duration_since(tokio::time::Instant::now())
                         < super::download::RANGE_PROBE_TIMEOUT
                     {

@@ -1702,35 +1702,25 @@ impl RouteConnector {
         );
         // Staggered race across resolved addresses (Happy-Eyeballs style): a black-holed
         // IPv6 route no longer delays the IPv4 fallback by a full timeout.
-        let mut index = 0;
+        //
+        // The window slides as soon as a candidate finishes. Draining a whole
+        // batch first let one black-holed address hold its batch until the
+        // deadline and starve every address behind it, even healthy ones that
+        // still had time to connect.
+        type BypassResult = Result<PooledIo, String>;
+        let mut pending =
+            FuturesUnordered::<Pin<Box<dyn Future<Output = BypassResult> + Send>>>::new();
+        let (failure_tx, failure_rx) = tokio::sync::watch::channel(false);
+        let mut next = 0usize;
         let mut last_error: Option<String> = None;
+
         loop {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(anyhow!(
-                    "{}",
-                    last_error.unwrap_or_else(|| format!("connecting to {host} timed out"))
-                ));
-            }
-            let batch: Vec<std::net::IpAddr> = addresses
-                .iter()
-                .skip(index)
-                .take(RACE_SIZE)
-                .copied()
-                .collect();
-            index += batch.len();
-            if batch.is_empty() {
-                return Err(anyhow!(
-                    "{}",
-                    last_error.unwrap_or_else(|| format!("no address found for {host}"))
-                ));
-            }
-            type BypassResult = Result<PooledIo, String>;
-            let mut pending =
-                FuturesUnordered::<Pin<Box<dyn Future<Output = BypassResult> + Send>>>::new();
-            let (failure_tx, failure_rx) = tokio::sync::watch::channel(false);
-            for (i, address) in batch.iter().enumerate() {
+            // Fill every free slot with the next untried address.
+            while next < addresses.len() && pending.len() < RACE_SIZE {
                 let this = self.clone();
-                let address = *address;
+                let address = addresses[next];
+                let ordinal = next;
+                next += 1;
                 let host = host.to_string();
                 let force = force_http1;
                 let mut failure_rx = failure_rx.clone();
@@ -1739,7 +1729,7 @@ impl RouteConnector {
                     // the group race): a linear ramp would make the 8th address
                     // of a blackholed host wait over a second before trying.
                     // A fast failure releases the head-start immediately.
-                    if i > 0 && !*failure_rx.borrow() {
+                    if ordinal > 0 && !*failure_rx.borrow() {
                         let head_start = deadline
                             .saturating_duration_since(tokio::time::Instant::now())
                             .min(RACE_STAGGER);
@@ -1779,17 +1769,22 @@ impl RouteConnector {
                     }
                 }));
             }
-            while let Some(result) = pending.next().await {
-                match result {
-                    Ok(io) => return Ok(io),
-                    Err(detail) => {
-                        last_error = Some(detail);
-                        let _ = failure_tx.send(true);
-                    }
+            let Some(result) = pending.next().await else {
+                // Every address was tried and none connected.
+                break;
+            };
+            match result {
+                Ok(io) => return Ok(io),
+                Err(detail) => {
+                    last_error = Some(detail);
+                    let _ = failure_tx.send(true);
                 }
             }
-            // The whole batch failed; try the next one.
         }
+        Err(anyhow!(
+            "{}",
+            last_error.unwrap_or_else(|| format!("no address found for {host}"))
+        ))
     }
 }
 

@@ -104,7 +104,6 @@ pub struct DohHealth {
 #[derive(Debug, Clone)]
 pub struct DohResolution {
     pub ips: Vec<IpAddr>,
-    pub hints: Vec<IpAddr>,
     pub source: DohSource,
     pub endpoint: String,
     pub stale: bool,
@@ -126,6 +125,12 @@ pub struct TypeQuery {
     endpoint: String,
     attempts: Vec<DohAttemptError>,
     fallback_used: bool,
+    /// Whether the answer may be trusted without further confirmation. A
+    /// useful answer always is; an empty (NODATA) answer only when every
+    /// endpoint consulted for the query actually answered — a raced endpoint
+    /// cancelled by the grace window never confirmed the silence, so it must
+    /// not be cached as authoritative NODATA.
+    authoritative: bool,
 }
 
 /// Resolver surface used by the decision engine; wrapped behind a trait so tests never need
@@ -173,7 +178,6 @@ pub struct Resolver {
     catalogs: Arc<CatalogManager>,
     clients: Arc<RwLock<HashMap<String, CachedDohClient>>>,
     health: Arc<RwLock<HashMap<String, DohHealth>>>,
-    shared_ech_lock: Arc<tokio::sync::Mutex<()>>,
     query_locks: Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// One stale-answer refresh attempt per domain per window. The map is
     /// bounded like the query locks; entries are cheap and expire quickly.
@@ -221,7 +225,6 @@ impl Resolver {
             catalogs,
             clients: Arc::new(RwLock::new(HashMap::new())),
             health: Arc::new(RwLock::new(HashMap::new())),
-            shared_ech_lock: Arc::new(tokio::sync::Mutex::new(())),
             query_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             stale_refresh_after: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             endpoint_cache: Arc::new(RwLock::new(None)),
@@ -337,7 +340,6 @@ impl Resolver {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Option<DohResolution> {
         let mut ips = Vec::new();
-        let mut hints = Vec::new();
         let mut ttl = u32::MAX;
         for qtype in [TYPE_A, TYPE_AAAA] {
             let Some(answer) = self.cache.doh_answer(domain, qtype) else {
@@ -352,18 +354,12 @@ impl Resolver {
                     ips.push(ip);
                 }
             }
-            for hint in answer.hints {
-                if !hints.contains(&hint) {
-                    hints.push(hint);
-                }
-            }
         }
         if ips.is_empty() {
             return None;
         }
         Some(DohResolution {
             ips,
-            hints,
             source: DohSource::Cache,
             endpoint: "cache".to_string(),
             stale: false,
@@ -384,7 +380,6 @@ impl Resolver {
         extra_secs: Option<i64>,
     ) -> Option<DohResolution> {
         let mut ips = Vec::new();
-        let mut hints = Vec::new();
         for qtype in [TYPE_A, TYPE_AAAA] {
             let Some(answer) = self.cache.doh_answer(domain, qtype) else {
                 continue;
@@ -406,18 +401,12 @@ impl Resolver {
                     ips.push(ip);
                 }
             }
-            for hint in answer.hints {
-                if !hints.contains(&hint) {
-                    hints.push(hint);
-                }
-            }
         }
         if ips.is_empty() {
             return None;
         }
         Some(DohResolution {
             ips,
-            hints,
             source: DohSource::Cache,
             endpoint: "stale-cache".to_string(),
             stale: true,
@@ -582,7 +571,6 @@ impl Resolver {
         let mut fallback_used = false;
         let mut last_error: Option<anyhow::Error> = None;
         let mut ips = Vec::new();
-        let mut hints = Vec::new();
         let mut ttl = u32::MAX;
         let mut source = DohSource::Primary;
         let mut endpoint = String::new();
@@ -616,11 +604,6 @@ impl Resolver {
                             ips.push(ip);
                         }
                     }
-                    for hint in query.answer.hints {
-                        if !hints.contains(&hint) {
-                            hints.push(hint);
-                        }
-                    }
                 }
                 Err(error) => {
                     if last_error.is_none() {
@@ -633,7 +616,6 @@ impl Resolver {
         if !ips.is_empty() {
             return Ok(DohResolution {
                 ips,
-                hints,
                 source,
                 endpoint,
                 stale: false,
@@ -703,14 +685,18 @@ impl Resolver {
         match self.query_one_type(&domain, TYPE_HTTPS).await {
             Ok(query) => {
                 // A successful NODATA answer is authoritative when every
-                // endpoint agreed. If another endpoint failed, keep the stale
-                // config as a last resort, matching the documented policy.
-                live_failed |= !query.attempts.is_empty();
+                // endpoint agreed. If another endpoint failed or was cut off
+                // before answering, keep the stale config as a last resort,
+                // matching the documented policy.
+                live_failed |= !query.authoritative;
                 if let Some(ech) = query.answer.ech {
                     self.cache.put_ech(CachedEch {
                         domain: domain.clone(),
                         ech_config: ech.clone(),
-                        ttl_secs: query.answer.ttl,
+                        // Same floor as the address cache: a zero-TTL HTTPS
+                        // RR must not turn every handshake into a live race
+                        // (RFC 8767).
+                        ttl_secs: query.answer.ttl.max(MIN_CACHE_TTL_SECS),
                         fetched_at: now(),
                     });
                     return Ok(EchOutcome {
@@ -781,7 +767,16 @@ impl Resolver {
     /// Piku pins AliDNS; we first try the configured DoH pool (CleanBrowsing serves it too)
     /// and then AliDNS as a fallback.
     async fn shared_cloudflare_ech(&self) -> Result<EchOutcome> {
-        let _guard = self.shared_ech_lock.lock().await;
+        // Join the resolver's per-key single-flight instead of using a
+        // second, ad-hoc global mutex. `ech_config("cloudflare-ech.com")`
+        // queries this very name under `ech|{SHARED_ECH_DOMAIN}`; the two
+        // paths guarded the same query through unrelated locks, so they
+        // could race duplicate live lookups for it. Waiter semantics are
+        // unchanged: the first caller queries, everyone else joins the same
+        // queue and re-checks the cache afterwards.
+        let _guard = self
+            .query_lock(format!("ech|{}", SHARED_ECH_DOMAIN))
+            .await;
         if let Some(cached) = self.cache.ech(SHARED_ECH_DOMAIN, true) {
             let config = cached.ech_config;
             return Ok(EchOutcome {
@@ -795,7 +790,7 @@ impl Resolver {
         let mut live_failed = false;
         match self.query_one_type(SHARED_ECH_DOMAIN, TYPE_HTTPS).await {
             Ok(query) => {
-                live_failed |= !query.attempts.is_empty();
+                live_failed |= !query.authoritative;
                 if let Some(ech) = query.answer.ech {
                     self.cache.put_ech(CachedEch {
                         domain: SHARED_ECH_DOMAIN.to_string(),
@@ -931,6 +926,13 @@ impl Resolver {
             }
         };
         let mut empty_answer: Option<(usize, ResolvedAnswer)> = None;
+        // Per-endpoint outcome of this query: None until the endpoint
+        // produced a result. `attempts` only records failures, so a raced
+        // endpoint cut off by the grace window used to look like full
+        // agreement — this is what the authoritative-NODATA decision reads.
+        let mut outcome: Vec<Option<bool>> = vec![None; endpoints.len()];
+        // Every endpoint pushed into a race/fallback wave, in push order.
+        let mut pushed: Vec<usize> = Vec::new();
 
         // Primary and fallback race each other: the first successful answer wins, so a
         // dead or slow primary costs nothing on cache misses instead of a full timeout.
@@ -952,6 +954,7 @@ impl Resolver {
                     self.query_endpoint(&endpoints[1], domain, qtype).await,
                 )
             }));
+            pushed.extend([0, 1]);
             // Once a raced endpoint answered without a usable address, the other
             // one only gets this long to produce one. Without the grace window a
             // stalled primary holds the whole race — and every request parked
@@ -975,6 +978,7 @@ impl Resolver {
                 let endpoint = &endpoints[index];
                 match result {
                     Ok(answer) => {
+                        outcome[index] = Some(true);
                         self.record_health(endpoint, true, started.elapsed(), None);
                         if useful_answer(&answer) {
                             self.store_answer(domain, qtype, &answer);
@@ -984,6 +988,7 @@ impl Resolver {
                                 endpoint: endpoint.name.clone(),
                                 fallback_used: index != 0,
                                 attempts,
+                                authoritative: true,
                             });
                         }
                         // Keep waiting for the other endpoint; if neither has
@@ -997,6 +1002,7 @@ impl Resolver {
                         }
                     }
                     Err(error) => {
+                        outcome[index] = Some(false);
                         self.record_health(
                             endpoint,
                             false,
@@ -1015,9 +1021,12 @@ impl Resolver {
                             source: endpoint.source,
                             error: format!("{error:#}"),
                         });
-                        if grace_deadline.is_none() {
-                            grace_deadline = Some(tokio::time::Instant::now() + EMPTY_ANSWER_GRACE);
-                        }
+                        // No grace here: the window exists so a non-usable
+                        // *answer* does not cancel the other endpoint's
+                        // in-flight query. An error is not an answer — the
+                        // healthy side keeps the full race deadline instead
+                        // of being cut short after someone else's fast
+                        // failure.
                     }
                 }
             }
@@ -1033,14 +1042,28 @@ impl Resolver {
         // to every cold ECH route. They are only consulted when the raced
         // pair did not produce any answer at all.
         let pair_answered_empty = endpoints.len() >= 2 && empty_answer.is_some();
+        // What to consult after the race. Besides the remaining endpoints
+        // (skipped for HTTPS/ECH while the pair already answered), a raced
+        // pair member that was cut off without ever answering joins again:
+        // the grace window fires as soon as the other member returns NODATA,
+        // so a slow-but-healthy fallback could be cancelled mid-flight — and
+        // skipping it forever made the query fail identically on every
+        // retry, a permanent failure for the domain. A pair that produced no
+        // answer at all already spent the whole race deadline and is not
+        // started over; only a pair that answered justifies the second
+        // attempt.
+        let mut consult: Vec<usize> = Vec::new();
+        if empty_answer.is_some() {
+            consult.extend((0..endpoints.len().min(2)).filter(|&index| outcome[index].is_none()));
+        }
         if !(qtype == TYPE_HTTPS && pair_answered_empty) {
+            consult.extend((if endpoints.len() >= 2 { 2 } else { 0 })..endpoints.len());
+        }
+        if !consult.is_empty() {
             let timeout =
                 Duration::from_secs(self.config.snapshot().catalogs.timeout_secs.max(1));
             let budget = tokio::time::Instant::now() + timeout * FALLBACK_WAVES;
-            let mut remaining = endpoints
-                .iter()
-                .enumerate()
-                .skip(if endpoints.len() >= 2 { 2 } else { 0 });
+            let mut remaining = consult.into_iter();
             let mut pending: FuturesUnordered<
                 futures_util::future::BoxFuture<
                     '_,
@@ -1048,10 +1071,11 @@ impl Resolver {
                 >,
             > = FuturesUnordered::new();
             for _ in 0..FALLBACK_LANES {
-                let Some((index, endpoint)) = remaining.next() else {
+                let Some(index) = remaining.next() else {
                     break;
                 };
-                let endpoint = endpoint.clone();
+                let endpoint = endpoints[index].clone();
+                pushed.push(index);
                 pending.push(Box::pin(async move {
                     let queued = Instant::now();
                     let result = self.query_endpoint(&endpoint, domain, qtype).await;
@@ -1072,6 +1096,7 @@ impl Resolver {
                 let endpoint = &endpoints[index];
                 match result {
                     Ok(answer) => {
+                        outcome[index] = Some(true);
                         self.record_health(endpoint, true, queued.elapsed(), None);
                         if useful_answer(&answer) {
                             self.store_answer(domain, qtype, &answer);
@@ -1081,6 +1106,7 @@ impl Resolver {
                                 endpoint: endpoint.name.clone(),
                                 fallback_used: index != 0 || !attempts.is_empty(),
                                 attempts,
+                                authoritative: true,
                             });
                         }
                         if empty_answer.is_none() {
@@ -1088,6 +1114,7 @@ impl Resolver {
                         }
                     }
                     Err(error) => {
+                        outcome[index] = Some(false);
                         self.record_health(
                             endpoint,
                             false,
@@ -1108,8 +1135,9 @@ impl Resolver {
                         });
                     }
                 }
-                if let Some((next_index, next_endpoint)) = remaining.next() {
-                    let next_endpoint = next_endpoint.clone();
+                if let Some(next_index) = remaining.next() {
+                    pushed.push(next_index);
+                    let next_endpoint = endpoints[next_index].clone();
                     pending.push(Box::pin(async move {
                         let queued = Instant::now();
                         let result = self
@@ -1127,8 +1155,15 @@ impl Resolver {
         if let Some((index, answer)) = empty_answer {
             let endpoint = &endpoints[index];
             // An authoritative empty answer repeats for every cold connection:
-            // remember it so the next query skips the endpoint race entirely
-            let authoritative = attempts.is_empty();
+            // remember it so the next query skips the endpoint race entirely.
+            // It is only authoritative when every endpoint we asked actually
+            // answered: `attempts` records failures only, so a raced endpoint
+            // cut off by the grace window (or a fallback wave dropped by its
+            // budget) used to pass this check — its silence was cached as
+            // NODATA for a full DNS window even though the other endpoint
+            // still had the address.
+            let authoritative =
+                !pushed.is_empty() && pushed.iter().all(|&asked| outcome[asked] == Some(true));
             let ttl = if authoritative && qtype == TYPE_HTTPS {
                 NEGATIVE_HTTPS_NODATA_SECS
             } else if authoritative {
@@ -1144,6 +1179,7 @@ impl Resolver {
                 endpoint: endpoint.name.clone(),
                 fallback_used: index != 0 || !attempts.is_empty(),
                 attempts,
+                authoritative,
             });
         }
 
@@ -1174,7 +1210,6 @@ impl Resolver {
                 domain: domain.to_string(),
                 qtype,
                 ips: answer.ips.clone(),
-                hints: answer.hints.clone(),
                 ech_config: answer
                     .ech
                     .as_ref()
@@ -1191,7 +1226,10 @@ impl Resolver {
                 self.cache.put_ech(CachedEch {
                     domain: domain.to_string(),
                     ech_config: ech.clone(),
-                    ttl_secs: answer.ttl,
+                    // Same floor as the A/AAAA path above: a zero-TTL HTTPS
+                    // RR would otherwise never count as fresh and re-query
+                    // the endpoints on every cold handshake.
+                    ttl_secs: answer.ttl.max(MIN_CACHE_TTL_SECS),
                     fetched_at: now(),
                 });
             }
@@ -1292,7 +1330,6 @@ impl Resolver {
             qtype,
             elapsed_ms = started.elapsed().as_millis() as u64,
             ips = %format_ips(&answer.ips),
-            hints = %format_ips(&answer.hints),
             ttl_secs = answer.ttl,
             "doh query answered"
         );
@@ -1451,11 +1488,6 @@ fn merge_cached_resolutions(
             }
             v4.extend(v6);
             fresh.ips = v4;
-            for hint in stale.hints {
-                if !fresh.hints.contains(&hint) {
-                    fresh.hints.push(hint);
-                }
-            }
             fresh.stale = true;
             Some(fresh)
         }
@@ -1657,7 +1689,6 @@ mod tests {
             domain: "github.com".into(),
             qtype: TYPE_A,
             ips: vec!["20.205.243.166".parse().unwrap()],
-            hints: Vec::new(),
             ech_config: None,
             ttl_secs: 60,
             fetched_at: now(),
@@ -1681,7 +1712,6 @@ mod tests {
             domain: "github.com".into(),
             qtype: TYPE_A,
             ips: vec![v4],
-            hints: Vec::new(),
             ech_config: None,
             ttl_secs: 60,
             fetched_at: now(),
@@ -1690,7 +1720,6 @@ mod tests {
             domain: "github.com".into(),
             qtype: TYPE_AAAA,
             ips: vec![v6],
-            hints: Vec::new(),
             ech_config: None,
             ttl_secs: 300,
             fetched_at: now(),
@@ -1730,7 +1759,6 @@ mod tests {
             domain: "github.com".into(),
             qtype: TYPE_A,
             ips: vec![v4],
-            hints: Vec::new(),
             ech_config: None,
             ttl_secs: 60,
             fetched_at: now() - chrono::Duration::seconds(90),
@@ -1739,7 +1767,6 @@ mod tests {
             domain: "github.com".into(),
             qtype: TYPE_AAAA,
             ips: vec![v6],
-            hints: Vec::new(),
             ech_config: None,
             ttl_secs: 300,
             fetched_at: now(),
@@ -1775,7 +1802,6 @@ mod tests {
             domain: domain.into(),
             qtype,
             ips: vec![ip],
-            hints: Vec::new(),
             ech_config: None,
             ttl_secs: 60,
             fetched_at,
@@ -1824,7 +1850,6 @@ mod tests {
             domain: "github.com".into(),
             qtype: TYPE_A,
             ips: vec!["20.205.243.166".parse().unwrap()],
-            hints: Vec::new(),
             ech_config: None,
             ttl_secs: 60,
             fetched_at: now() - chrono::Duration::seconds(90),
@@ -1931,7 +1956,6 @@ mod tests {
             domain: "github.com".into(),
             qtype: TYPE_A,
             ips: vec!["20.205.243.166".parse().unwrap()],
-            hints: Vec::new(),
             ech_config: None,
             ttl_secs: 60,
             fetched_at: now() - chrono::Duration::seconds(90),
@@ -1965,7 +1989,6 @@ mod tests {
         let (_, cache, resolver) = resolver(dir.path());
         let answer = ResolvedAnswer {
             ips: Vec::new(),
-            hints: vec!["203.0.113.9".parse().unwrap()],
             ech: Some(vec![1, 2, 3, 4]),
             ttl: 60,
             cname: None,

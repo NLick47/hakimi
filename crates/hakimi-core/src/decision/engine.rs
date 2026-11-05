@@ -167,6 +167,33 @@ impl DeadAddresses {
     }
 }
 
+/// Scope guard for the warmup window opened by [`DecisionEngine::begin_warmup`].
+///
+/// Dropping the guard while it is still armed finishes the window, so a
+/// warm-up future cancelled mid-flight (it runs inside a shutdown `select!`)
+/// cannot leave the engine warming forever — every later probe would then
+/// stay provisional.
+pub struct WarmupGuard<'a> {
+    engine: &'a DecisionEngine,
+    armed: bool,
+}
+
+impl WarmupGuard<'_> {
+    /// Hand the finish to a later task (the warm-up summary). The guard then
+    /// stays silent when it drops.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WarmupGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.engine.finish_warmup();
+        }
+    }
+}
+
 impl DecisionEngine {
     pub fn new(
         config: Arc<ConfigManager>,
@@ -245,8 +272,18 @@ impl DecisionEngine {
     /// Mark the start of the initial warmup. Probe failures stay in Checking
     /// until [`Self::finish_warmup`] so a first attempt that is immediately
     /// retried does not publish Failed and then Normal.
-    pub fn begin_warmup(&self) {
+    ///
+    /// The returned guard finishes the window on drop unless it is
+    /// [`WarmupGuard::disarm`]ed: the warm-up future runs inside a
+    /// shutdown `select!`, and a cancellation between here and the summary
+    /// task would otherwise leave the engine warming forever — every later
+    /// probe would then stay provisional.
+    pub fn begin_warmup(&self) -> WarmupGuard<'_> {
         self.warming.store(true, Ordering::SeqCst);
+        WarmupGuard {
+            engine: self,
+            armed: true,
+        }
     }
 
     /// End the warmup window. The runtime also settles any probe that is still
@@ -416,6 +453,7 @@ impl DecisionEngine {
             return Route::Bypass(self.state_only(
                 group,
                 &normalized,
+                rule_index,
                 &config,
                 State::Disabled,
                 "group is disabled; traffic is not intercepted",
@@ -425,6 +463,7 @@ impl DecisionEngine {
             return Route::Bypass(self.state_only(
                 group,
                 &normalized,
+                rule_index,
                 &config,
                 State::Paused,
                 "hakimi is paused; traffic is not intercepted",
@@ -897,14 +936,20 @@ impl DecisionEngine {
 
     /// Forget all observations tied to the previous local network. The
     /// remembered last-good entry is intentionally kept (the fresh race still
-    /// tests it first), but route decisions, rejection timers and quality
-    /// rankings were learned on a path that may no longer exist.
+    /// tests it first), but route decisions, rejection timers, quality
+    /// rankings and the route-change log stamps were learned on a path that
+    /// may no longer exist.
     pub fn on_network_change(&self) {
         self.forget_all_plans();
         self.clear_route_rejections();
         self.ip_rejections.write().clear();
         self.sni_rejections.write().clear();
         self.probe_backoff.lock().clear();
+        // The stamp is (ip, mode) from the old network. Keeping it would
+        // suppress the first "resolved connection strategy" line after the
+        // switch whenever the new race lands on the same tuple — exactly the
+        // line that shows what the new network picked.
+        self.logged_routes.write().clear();
         // The live plans were measured on the old network, so their quality
         // entries are not evidence for the new one.
         self.route_quality.write().clear();
@@ -1320,11 +1365,12 @@ impl DecisionEngine {
         }
         // Domains whose addresses only come from DoH still need an opponent.
         // The cached answers cost nothing to read, unlike a fresh query.
-        for qtype in [1, 65] {
-            if let Some(answer) = self.cache.doh_answer(domain, qtype) {
-                ips.extend(answer.ips);
-                ips.extend(answer.hints);
-            }
+        // Cached DoH answers still provide an opponent. Only A/AAAA ever
+        // enter the answer cache (HTTPS RRs feed the ECH cache alone), so a
+        // single address-answer lookup replaces the old `[1, 65]` pair —
+        // qtype 65 could never hit, and its hints were never stored anyway.
+        if let Some(answer) = self.cache.doh_answer(domain, 1) {
+            ips.extend(answer.ips);
         }
         if let Some(ip) = self
             .cache
@@ -1432,24 +1478,30 @@ impl DecisionEngine {
     /// again. A temporary block (GFW reset, network flap) should not bury a
     /// working address under its failure score forever.
     pub async fn reprobe_failed_ips(self: &Arc<Self>, limit: usize) -> usize {
-        let candidates: Vec<(String, IpAddr)> = {
+        // Snapshot the failing scores under the read lock and apply the
+        // backoff filter after releasing it: `probe_backoff_ready` takes
+        // another lock and allocates a key per entry, while the request path
+        // writes scores under this same lock — a once-per-minute sweep must
+        // not stall it for the whole scan.
+        let mut list: Vec<(String, IpAddr, u32)> = {
             let scores = self.ip_scores.read();
-            let mut list: Vec<(&str, IpAddr, u32)> = scores
+            scores
                 .iter()
                 .flat_map(|(domain, by_ip)| {
                     by_ip
                         .iter()
                         .filter(|(_, score)| score.failures > 0)
-                        .map(|(ip, score)| (domain.as_str(), *ip, score.failures))
+                        .map(|(ip, score)| (domain.clone(), *ip, score.failures))
                 })
-                .filter(|(domain, ip, _)| self.probe_backoff_ready(domain, *ip))
-                .collect();
-            list.sort_by(|a, b| b.2.cmp(&a.2));
-            list.truncate(limit);
-            list.into_iter()
-                .map(|(domain, ip, _)| (domain.to_string(), ip))
                 .collect()
         };
+        list.retain(|(domain, ip, _)| self.probe_backoff_ready(domain, *ip));
+        list.sort_by(|a, b| b.2.cmp(&a.2));
+        list.truncate(limit);
+        let candidates: Vec<(String, IpAddr)> = list
+            .into_iter()
+            .map(|(domain, ip, _)| (domain, ip))
+            .collect();
         if candidates.is_empty() {
             return 0;
         }
@@ -1546,7 +1598,13 @@ impl DecisionEngine {
             strategy: Some(plan.mode),
             configured_modes: config
                 .group(&plan.group_id)
-                .map(|group| group.route_modes(&plan.domain))
+                .map(|group| match plan.rule_index {
+                    // Index lookup for the common (matched) plan: the same
+                    // route as `route_for`, without scanning every rule of
+                    // the group on every successful connection.
+                    Some(rule_index) => group.route_modes_at(rule_index),
+                    None => group.route_modes(&plan.domain),
+                })
                 .unwrap_or_default(),
             ip: Some(plan.ip),
             ip_source: Some(plan.source),
@@ -1608,6 +1666,7 @@ impl DecisionEngine {
         &self,
         group: &GroupConfig,
         domain: &str,
+        rule_index: usize,
         config: &AppConfig,
         reason: FailureReason,
         attempts: Vec<AttemptRecord>,
@@ -1635,7 +1694,9 @@ impl DecisionEngine {
                 State::Failed
             },
             strategy: None,
-            configured_modes: group.route_modes(domain),
+            // The cursor already matched the rule; index lookup instead of
+            // rescanning the group's rules on every total failure.
+            configured_modes: group.route_modes_at(rule_index),
             ip: None,
             ip_source: None,
             doh_source: doh.source,
@@ -1662,7 +1723,7 @@ impl DecisionEngine {
             group = %group.id,
             domain = %domain,
             reason = %reason,
-            modes = %format_modes(&group.route_modes(domain)),
+            modes = %format_modes(&diagnostics.configured_modes),
             candidates = %format_candidates(candidates),
             doh_source = %format_optional(doh.source.map(|source| source.as_str())),
             // The error and the detail contain spaces, so they are recorded in
@@ -1697,7 +1758,6 @@ impl DecisionEngine {
         match self.resolver.doh_ips(domain).await {
             Ok(DohResolution {
                 ips,
-                hints,
                 source,
                 endpoint,
                 stale,
@@ -1710,7 +1770,7 @@ impl DecisionEngine {
                     IpSource::Doh
                 };
                 let before = candidates.len();
-                for ip in ips.iter().copied().chain(hints.iter().copied()) {
+                for ip in ips.iter().copied() {
                     if candidates.len() >= limit {
                         break;
                     }
@@ -1743,7 +1803,6 @@ impl DecisionEngine {
                         endpoint = %endpoint,
                         stale,
                         answered_ips = %format_ips(&ips),
-                        hints = %format_ips(&hints),
                         added = candidates.len() - before,
                         elapsed_ms = elapsed,
                         "doh expansion was slow"
@@ -1755,7 +1814,6 @@ impl DecisionEngine {
                         endpoint = %endpoint,
                         stale,
                         answered_ips = %format_ips(&ips),
-                        hints = %format_ips(&hints),
                         added = candidates.len() - before,
                         elapsed_ms = elapsed,
                         "doh expansion"
@@ -1820,6 +1878,7 @@ impl DecisionEngine {
         &self,
         group: &GroupConfig,
         domain: &str,
+        rule_index: usize,
         config: &AppConfig,
         state: State,
         detail: &str,
@@ -1829,7 +1888,9 @@ impl DecisionEngine {
             domain: domain.to_string(),
             state,
             strategy: None,
-            configured_modes: group.route_modes(domain),
+            // The caller already matched the rule; index lookup instead of
+            // rescanning the group on every bypass connection.
+            configured_modes: group.route_modes_at(rule_index),
             ip: None,
             ip_source: None,
             doh_source: None,

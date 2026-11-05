@@ -1475,6 +1475,7 @@ async fn concurrent_cold_connections_share_one_discovery() {
         ech_config: None,
         tls: true,
         source: IpSource::Cache,
+        rule_index: None,
     });
     engine.note_tunnel_success(&cached, 5);
 

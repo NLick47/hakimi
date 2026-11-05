@@ -574,8 +574,14 @@ pub(super) async fn connect_host_staggered(
     race_tcp_addresses(addresses, remaining).await
 }
 
-/// Connect the first address that answers, in rolling staggered batches. Every attempt
-/// shares one overall deadline, so a batch of black-holed candidates cannot extend the
+/// Connect the first address that answers, racing a rolling window of
+/// staggered candidates.
+///
+/// The window slides the moment a candidate finishes instead of waiting for a
+/// whole batch to drain: with batch-at-a-time draining, one black-holed
+/// address pinned its batch until the deadline and every address after the
+/// first batch lost its chance to race while time was still left. Every
+/// attempt shares one overall deadline, so no candidate can extend the
 /// caller's timeout.
 pub(super) async fn race_tcp_addresses(
     addresses: Vec<SocketAddr>,
@@ -584,64 +590,107 @@ pub(super) async fn race_tcp_addresses(
     type ConnectResult = Result<TcpStream, (bool, String)>;
 
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut index = 0usize;
+    let mut next = 0usize;
     let mut timed_out = false;
     let mut last_error = String::from("no address available");
+    let mut first_start: Option<tokio::time::Instant> = None;
+    let mut pending: FuturesUnordered<Pin<Box<dyn Future<Output = ConnectResult> + Send>>> =
+        FuturesUnordered::new();
+    // One channel for the whole race: a failure releases the stagger of every
+    // candidate that joins afterwards, so a refused first address never adds
+    // 150 ms to a healthy fallback.
+    let (failure_tx, failure_rx) = tokio::sync::watch::channel(false);
 
-    while index < addresses.len() {
-        let end = (index + RAW_RACE_SIZE).min(addresses.len());
-        let mut pending: FuturesUnordered<Pin<Box<dyn Future<Output = ConnectResult> + Send>>> =
-            FuturesUnordered::new();
-        // Release the hedge sleep as soon as one address fails, so a refused
-        // first address does not add 150 ms to a healthy fallback.
-        let (failure_tx, failure_rx) = tokio::sync::watch::channel(false);
-        for (offset, address) in addresses[index..end].iter().copied().enumerate() {
-            let mut failure_rx = failure_rx.clone();
-            pending.push(Box::pin(async move {
-                // Give the preferred address a head start; the rest follow together
-                // after one stagger instead of a linear ramp.
-                if offset > 0 && !*failure_rx.borrow() {
-                    tokio::select! {
-                        _ = tokio::time::sleep(RAW_RACE_STAGGER) => {}
-                        _ = failure_rx.changed() => {}
-                    }
-                }
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    return Err((true, format!("connecting to {address} timed out")));
-                }
-                match tokio::time::timeout(remaining, TcpStream::connect(address)).await {
-                    Ok(Ok(stream)) => {
-                        // Same socket tuning as every other upstream path: Nagle adds
-                        // latency to interactive tunnels (SSH/WebSocket), and keepalive
-                        // lets a dead peer release the tunnel instead of hanging it.
-                        let _ = stream.set_nodelay(true);
-                        crate::util::apply_tcp_keepalive(&stream);
-                        Ok(stream)
-                    }
-                    Ok(Err(error)) => {
-                        Err((false, format!("connecting to {address} failed: {error}")))
-                    }
-                    Err(_) => Err((true, format!("connecting to {address} timed out"))),
-                }
-            }));
-        }
-        while let Some(result) = pending.next().await {
-            match result {
-                Ok(stream) => return Ok(stream),
-                Err((hit_timeout, detail)) => {
-                    timed_out |= hit_timeout;
-                    last_error = detail;
-                    let _ = failure_tx.send(true);
-                }
+    // Seed the window; later candidates join through the same push as slots
+    // free up.
+    while next < addresses.len() && pending.len() < RAW_RACE_SIZE {
+        push_race_candidate(&mut pending, addresses[next], deadline, &mut first_start, &failure_rx);
+        next += 1;
+    }
+
+    while let Some(result) = pending.next().await {
+        match result {
+            Ok(stream) => return Ok(stream),
+            Err((hit_timeout, detail)) => {
+                timed_out |= hit_timeout;
+                last_error = detail;
+                let _ = failure_tx.send(true);
             }
         }
-        index = end;
-        if tokio::time::Instant::now() >= deadline {
-            break;
+        // Slide the window: the address behind a finished candidate joins the
+        // race at once rather than waiting for the rest of its batch.
+        if next < addresses.len() {
+            push_race_candidate(
+                &mut pending,
+                addresses[next],
+                deadline,
+                &mut first_start,
+                &failure_rx,
+            );
+            next += 1;
         }
     }
     Err((timed_out, last_error))
+}
+
+#[allow(clippy::type_complexity)]
+fn push_race_candidate(
+    pending: &mut FuturesUnordered<
+        Pin<Box<dyn Future<Output = Result<TcpStream, (bool, String)>> + Send>>,
+    >,
+    address: SocketAddr,
+    deadline: tokio::time::Instant,
+    first_start: &mut Option<tokio::time::Instant>,
+    failure_rx: &tokio::sync::watch::Receiver<bool>,
+) {
+    // The first candidate starts immediately; the rest follow together after
+    // one stagger instead of a linear ramp. Candidates that join after the
+    // stagger instant (a slot freed by a slow failure) start right away.
+    let wake_at = match first_start {
+        None => {
+            *first_start = Some(tokio::time::Instant::now());
+            None
+        }
+        Some(start) => Some(*start + RAW_RACE_STAGGER),
+    };
+    pending.push(Box::pin(race_one_address(
+        address,
+        deadline,
+        wake_at,
+        failure_rx.clone(),
+    )));
+}
+
+async fn race_one_address(
+    address: SocketAddr,
+    deadline: tokio::time::Instant,
+    wake_at: Option<tokio::time::Instant>,
+    mut failure_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<TcpStream, (bool, String)> {
+    if let Some(wake_at) = wake_at {
+        if !*failure_rx.borrow() {
+            tokio::select! {
+                _ = tokio::time::sleep_until(wake_at) => {}
+                _ = failure_rx.changed() => {}
+            }
+        }
+    }
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err((true, format!("connecting to {address} timed out")));
+    }
+    match tokio::time::timeout(remaining, TcpStream::connect(address)).await {
+        Ok(Ok(stream)) => {
+            // Same socket tuning as every other upstream path: Nagle adds
+            // latency to interactive tunnels (SSH/WebSocket), and keepalive
+            // lets a dead peer release the tunnel instead of hanging it.
+            let _ = stream.set_nodelay(true);
+            crate::util::apply_tcp_keepalive(&stream);
+            Ok(stream)
+        }
+        Ok(Err(error)) => Err((false, format!("connecting to {address} failed: {error}"))),
+        Err(_) => Err((true, format!("connecting to {address} timed out"))),
+    }
 }
 
 async fn tunnel_to_host(

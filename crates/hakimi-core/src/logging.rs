@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
@@ -63,6 +63,13 @@ pub fn init_with(
     options: LoggingOptions,
 ) -> Result<()> {
     paths.ensure()?;
+    if initialized() {
+        // A host that owns its own logging (the CLI) installs the subscriber
+        // first and keeps the runtime from doing it again. Spawning a writer
+        // thread here would only open a second file handle whose sink is
+        // dropped as soon as the duplicate install fails.
+        return Ok(());
+    }
     let log_path = paths.log_file();
     if let Ok(metadata) = fs::metadata(&log_path) {
         if metadata.len() > MAX_LOG_BYTES {
@@ -309,11 +316,39 @@ fn spawn_log_writer(mut file: File, path: PathBuf) -> io::Result<LogSink> {
         .name("hakimi-log".to_string())
         .spawn(move || {
             let mut written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+            // Whether the handle has already been reopened for the current
+            // streak of write failures.
+            let mut reopened = false;
             for bytes in rx {
-                if file.write_all(&bytes).is_err() {
-                    break;
+                let mut result = file.write_all(&bytes);
+                if result.is_err() && !reopened {
+                    // One failed write (a full disk, a locked file) must not
+                    // stop logging for the rest of the session: reopen the
+                    // handle once per failure streak and retry the record.
+                    // The queue keeps draining either way — a writer thread
+                    // that gave up at the first error would leave every later
+                    // event stuck behind it.
+                    reopened = true;
+                    let _ = file.flush();
+                    drop(file);
+                    file = open_log_file(&path);
+                    written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+                    result = file.write_all(&bytes);
                 }
-                written = written.saturating_add(bytes.len() as u64);
+                match result {
+                    Ok(()) => {
+                        reopened = false;
+                        written = written.saturating_add(bytes.len() as u64);
+                    }
+                    Err(error) => {
+                        // Still failing after the reopen: drop this record
+                        // and keep draining. `eprintln!` bypasses the tracing
+                        // subscriber this thread services, so it cannot
+                        // recurse back into the queue.
+                        DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("hakimi: dropping log records: {error}");
+                    }
+                }
                 // Rotate while the process runs, not only at the next launch:
                 // per-connection INFO lines can fill the cap during one session.
                 if written > MAX_LOG_BYTES {
@@ -359,10 +394,44 @@ fn rotate_logs(log_path: &Path) {
     let _ = fs::rename(log_path, backup(1));
 }
 
+/// The last `max_lines` lines of the log file.
+///
+/// Reads a bounded window from the end instead of the whole file: the log is
+/// rotated at 10 MiB, and a diagnostics export must not pull all of it into
+/// memory (or lose the tail entirely because of one invalid UTF-8 byte).
 pub fn log_file_tail(path: &Path, max_lines: usize) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+    let Ok(mut file) = File::open(path) else {
         return Vec::new();
     };
+    let Ok(len) = file.seek(SeekFrom::End(0)) else {
+        return Vec::new();
+    };
+    // Far more than the tail needs (300 lines) even with pathological line
+    // lengths, while capping the read at a fixed cost.
+    const WINDOW: u64 = 4 * 1024 * 1024;
+    let start = len.saturating_sub(WINDOW);
+    // The length probe left the cursor at EOF; rewind to the window start
+    // (byte 0 for a file smaller than the window) before reading.
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut bytes = Vec::with_capacity((len - start) as usize);
+    if file.read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    if start > 0 {
+        // The window begins in the middle of a line; drop that fragment.
+        match bytes.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => {
+                bytes.drain(..=newline);
+            }
+            None => return Vec::new(),
+        }
+    }
+    let text = String::from_utf8_lossy(&bytes);
     let mut lines: VecDeque<String> = VecDeque::with_capacity(max_lines);
     for line in text.lines() {
         if lines.len() == max_lines {
@@ -557,6 +626,26 @@ mod tests {
         let path = dir.path().join("hakimi.log");
         std::fs::write(&path, "a\nb\nc\nd\n").unwrap();
         assert_eq!(log_file_tail(&path, 2), vec!["c", "d"]);
+    }
+
+    /// The window path: past the window size the tail must come from the end
+    /// of the file, with the window's leading partial line dropped — neither
+    /// a fragment nor the whole 6 MiB file pulled into memory.
+    #[test]
+    fn tail_windows_past_the_window_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hakimi.log");
+        let mut content = "old-000000000\n".repeat(400_000); // 6 MiB > 4 MiB window
+        content.push_str("penultimate\nlast\n");
+        std::fs::write(&path, content).unwrap();
+
+        let tail = log_file_tail(&path, 400_002);
+        assert_eq!(
+            tail.first().map(String::as_str),
+            Some("old-000000000"),
+            "the window's leading partial line must be dropped, not returned"
+        );
+        assert_eq!(tail.last().map(String::as_str), Some("last"));
     }
 
     /// The backup series is named after the live file, not after a hardcoded

@@ -511,7 +511,12 @@ impl HakimiRuntime {
         }
 
         if config.proxy.mode == ProxyMode::Off {
-            let _ = self.restore_system_proxy();
+            // The restore runs OS commands with polling sleeps (up to seconds
+            // per hung child); `spawn_blocking` keeps that off the async
+            // worker while still settling the OS state before start returns,
+            // so a following apply cannot race the snapshot removal.
+            let this = Arc::clone(self);
+            let _ = tokio::task::spawn_blocking(move || this.restore_system_proxy()).await;
         } else {
             match policy {
                 // The caller (the UI state machine) owns OS-proxy policy; the
@@ -520,7 +525,8 @@ impl HakimiRuntime {
                 // (post-bind).
                 StartPolicy::Release => {
                     tracing::info!("started without applying the system proxy");
-                    self.release_system_proxy();
+                    let this = Arc::clone(self);
+                    let _ = tokio::task::spawn_blocking(move || this.release_system_proxy()).await;
                 }
                 StartPolicy::Skip => {
                     tracing::info!("started without touching the system proxy");
@@ -529,8 +535,19 @@ impl HakimiRuntime {
                 StartPolicy::Apply => {
                     if config.proxy.takeover {
                         // The apply records `proxy_applied`/`proxy_error` itself.
-                        if let Err(error) = self.apply_system_proxy() {
-                            tracing::error!(error = %error, "failed to apply the system proxy");
+                        // It spawns child processes and polls their exit with a
+                        // 20 ms sleep, so it belongs on the blocking pool —
+                        // awaiting it keeps the ordering without starving the
+                        // worker thread.
+                        let this = Arc::clone(self);
+                        match tokio::task::spawn_blocking(move || this.apply_system_proxy()).await {
+                            Ok(Err(error)) => {
+                                tracing::error!(error = %error, "failed to apply the system proxy");
+                            }
+                            Err(error) => {
+                                tracing::error!(error = %error, "system proxy apply task failed");
+                            }
+                            Ok(Ok(_)) => {}
                         }
                     } else {
                         *self.proxy_applied.write() = None;
@@ -612,7 +629,18 @@ impl HakimiRuntime {
             }
         }
         // Always restore: a previous process may have crashed while the OS proxy pointed at us.
-        if let Err(error) = self.restore_system_proxy() {
+        // Same pattern as the flush below: the restore spawns and polls child
+        // processes, so it runs on the blocking pool — awaiting it still
+        // guarantees the OS state is settled before the caller proceeds.
+        let restore = Arc::clone(self);
+        if let Err(error) = async {
+            tokio::task::spawn_blocking(move || restore.restore_system_proxy())
+                .await
+                .map_err(anyhow::Error::from)?
+                .map_err(anyhow::Error::from)
+        }
+        .await
+        {
             tracing::warn!(error = %error, "failed to restore the system proxy");
         }
         // Final flush so the routes since the last checkpoint survive shutdown.
@@ -1366,6 +1394,10 @@ impl HakimiRuntime {
 
     /// Cap for the warm-up backoff of domains whose warm-up keeps failing.
     const WARM_BACKOFF_MAX_SECS: u64 = 1800;
+    /// Cap on the backoff map. Entries only clear on the next success, so
+    /// without a bound a long session with catalog churn would accumulate a
+    /// stale domain per failure forever.
+    const WARM_BACKOFF_MAX_ENTRIES: usize = 4096;
 
     /// Whether `domain` is due for another warm attempt.
     fn warm_backoff_ready(&self, domain: &str) -> bool {
@@ -1383,6 +1415,18 @@ impl HakimiRuntime {
         let delay = 300u64.saturating_mul(1u64 << consecutive.saturating_sub(1).min(4));
         let next = Instant::now() + Duration::from_secs(delay.min(Self::WARM_BACKOFF_MAX_SECS));
         map.insert(domain.to_string(), (consecutive, next));
+        if map.len() > Self::WARM_BACKOFF_MAX_ENTRIES {
+            // Evict the most overdue entry: its backoff has long passed, so it
+            // is retried on the next warm-up either way — only its failure
+            // counter resets, which simply restarts its backoff ramp.
+            let stale = map
+                .iter()
+                .min_by_key(|(_, entry)| entry.1)
+                .map(|(key, _)| key.clone());
+            if let Some(key) = stale {
+                map.remove(&key);
+            }
+        }
     }
 
     fn note_warm_success(&self, domain: &str) {
@@ -1462,7 +1506,11 @@ impl HakimiRuntime {
             concurrency = limit,
             "warming upstream routes"
         );
-        self.engine.begin_warmup();
+        // The guard closes the warm-up window if this future is cancelled
+        // between here and the summary task — both call sites run it inside a
+        // shutdown `select!`, and a dropped future would otherwise leave the
+        // engine warming forever, keeping every later probe provisional.
+        let mut warmup = self.engine.begin_warmup();
 
         // Prefetch shared ECH configs so the first browser request does not pay the
         // HTTPS-RR DoH query inside the CONNECT path.
@@ -1553,6 +1601,9 @@ impl HakimiRuntime {
                 "upstream warmup finished"
             );
         });
+        // The summary task owns the finish from here on; disarm the guard so
+        // this function returning does not close the window early.
+        warmup.disarm();
     }
 }
 
