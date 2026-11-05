@@ -1169,6 +1169,15 @@ fn apply_ui_update(
         if changed(|s| &s.mirror_source) {
             app.set_cfg_mirror_source(SharedString::from(settings.mirror_source.clone()));
         }
+        if old.is_none_or(|prev| prev.relay_enabled != settings.relay_enabled) {
+            app.set_cfg_relay_enabled(settings.relay_enabled);
+        }
+        if changed(|s| &s.relay_listen) {
+            app.set_cfg_relay_listen(SharedString::from(settings.relay_listen.clone()));
+        }
+        if changed(|s| &s.relay_target) {
+            app.set_cfg_relay_target(SharedString::from(settings.relay_target.clone()));
+        }
     }
 
     if prev.as_ref().map(|state| state.ca) != Some(ca) {
@@ -1271,6 +1280,9 @@ pub(crate) struct SettingsValues {
     pub catalog_doh: String,
     pub mirror_source: String,
     pub download_mirror: bool,
+    pub relay_enabled: bool,
+    pub relay_listen: String,
+    pub relay_target: String,
 }
 
 pub(crate) fn settings_values(config: &Value) -> SettingsValues {
@@ -1286,6 +1298,14 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
         .and_then(|advanced| advanced.get("download"))
         .map(|download| text(download, "mirrorSource"))
         .unwrap_or_default();
+    let relay = config
+        .get("advanced")
+        .and_then(|advanced| advanced.get("relay"));
+    let relay_field = |key: &str| {
+        relay
+            .map(|value| text(value, key))
+            .unwrap_or_default()
+    };
     SettingsValues {
         proxy_port: field("proxy", "port"),
         doh_primary: field("doh", "primary"),
@@ -1294,6 +1314,12 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
         catalog_doh: field("catalogs", "doh"),
         download_mirror: !mirror_source.trim().is_empty(),
         mirror_source,
+        relay_enabled: relay
+            .and_then(|value| value.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        relay_listen: relay_field("listen"),
+        relay_target: relay_field("target"),
     }
 }
 
@@ -1318,6 +1344,27 @@ fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Opti
             "catalogs.doh" => config.catalogs.doh = value.to_string(),
             "advanced.download.mirrorSource" => {
                 config.advanced.download.mirror_source = value.to_string()
+            }
+            "advanced.relay.listen" => {
+                // Empty clears the field; an enabled relay then fails
+                // validation, which is the message the user needs.
+                config.advanced.relay.listen = if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(
+                        value
+                            .trim()
+                            .parse()
+                            .context("监听地址需为 IP:端口，例如 127.0.0.1:17844")?,
+                    )
+                };
+            }
+            "advanced.relay.target" => {
+                config.advanced.relay.target = if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value.trim().to_string())
+                };
             }
             other => bail!("未知设置项 {other}"),
         }
@@ -1348,6 +1395,22 @@ fn apply_setting_bool(runtime: &HakimiRuntime, key: &str, value: bool) -> Option
                 } else {
                     String::new()
                 };
+            }
+            "advanced.relay.enabled" => {
+                config.advanced.relay.enabled = value;
+                // Turning it on without a usable address is a validation error
+                // the user can fix; turning it on with the fields still blank
+                // is the common first click, so seed the usual defaults.
+                if value {
+                    if config.advanced.relay.listen.is_none() {
+                        config.advanced.relay.listen =
+                            Some(std::net::SocketAddr::from(([127, 0, 0, 1], 17844)));
+                    }
+                    if config.advanced.relay.target.is_none() {
+                        config.advanced.relay.target =
+                            Some("region1.v2.argotunnel.com:7844".to_string());
+                    }
+                }
             }
             other => bail!("未知设置项 {other}"),
         }
@@ -1755,6 +1818,9 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     app.set_cfg_catalog_doh(SharedString::from(settings.catalog_doh.clone()));
     app.set_cfg_download_mirror(settings.download_mirror);
     app.set_cfg_mirror_source(SharedString::from(settings.mirror_source.clone()));
+    app.set_cfg_relay_enabled(settings.relay_enabled);
+    app.set_cfg_relay_listen(SharedString::from(settings.relay_listen.clone()));
+    app.set_cfg_relay_target(SharedString::from(settings.relay_target.clone()));
     app.set_cfg_data_dir(SharedString::from("~/Library/Application Support/hakimi"));
     app.set_cfg_version(SharedString::from(env!("CARGO_PKG_VERSION")));
     app.set_cfg_core_version(SharedString::from(hakimi_core::VERSION));

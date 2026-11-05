@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -216,6 +216,45 @@ pub struct AdvancedConfig {
     pub upstream_header_timeout_secs: u64,
     /// Segmented downloads for large files (release assets, source archives)
     pub download: DownloadConfig,
+    /// Local raw-TCP relay for clients that cannot use an HTTP proxy, such as
+    /// `cloudflared`. Off by default: when disabled the runtime binds no port
+    /// and spawns no task.
+    pub relay: RelayConfig,
+}
+
+/// Local raw-TCP relay settings.
+///
+/// Bytes are copied verbatim, so the client still performs (and validates) its
+/// own TLS handshake against the real upstream. This exists because some
+/// clients — `cloudflared` in particular — dial out directly, ignore
+/// `HTTPS_PROXY`, and need a reachable edge address even when the system
+/// resolver is broken.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RelayConfig {
+    pub enabled: bool,
+    /// Local address the relay listens on. Required when `enabled`.
+    pub listen: Option<SocketAddr>,
+    /// Upstream `host:port`. The port defaults to 7844, the tunnel port.
+    pub target: Option<String>,
+    /// Explicit upstream addresses, tried in order before any lookup. Empty
+    /// means "resolve `target`", which is the usual case for a hostname whose
+    /// system-resolver answer is what is broken.
+    pub candidates: Vec<IpAddr>,
+    /// Resolve `target` over DoH before falling back to the system resolver.
+    pub use_doh: bool,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: None,
+            target: None,
+            candidates: Vec::new(),
+            use_doh: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -286,6 +325,7 @@ impl Default for AdvancedConfig {
             http1_max_concurrent: 32,
             upstream_header_timeout_secs: 60,
             download: DownloadConfig::default(),
+            relay: RelayConfig::default(),
         }
     }
 }
@@ -899,6 +939,44 @@ impl AppConfig {
         }
         if !(1..=3600).contains(&self.advanced.download.stall_timeout_secs) {
             bail!("advanced.download.stallTimeoutSecs must be between 1 and 3600");
+        }
+
+        // A disabled relay is validated only for shape: a half-written entry
+        // must not stop the proxy from starting, since nothing uses it.
+        if self.advanced.relay.enabled {
+            let listen = self
+                .advanced
+                .relay
+                .listen
+                .context("advanced.relay.listen is required when the relay is enabled")?;
+            if !listen.ip().is_loopback() {
+                bail!(
+                    "advanced.relay.listen must be a loopback address ({} is not)",
+                    listen.ip()
+                );
+            }
+            if listen.port() == 0 {
+                bail!("advanced.relay.listen must not use port 0");
+            }
+            if listen.port() == self.proxy.port && listen.ip() == self.proxy.bind {
+                bail!("advanced.relay.listen must differ from the proxy address");
+            }
+            let target = self
+                .advanced
+                .relay
+                .target
+                .as_deref()
+                .map(str::trim)
+                .filter(|target| !target.is_empty())
+                .context("advanced.relay.target is required when the relay is enabled")?;
+            let (host, port) = crate::util::parse_authority(target, 7844)
+                .with_context(|| format!("invalid advanced.relay.target `{target}`"))?;
+            if host.is_empty() || port == 0 {
+                bail!("invalid advanced.relay.target `{target}`");
+            }
+            if self.advanced.relay.candidates.len() > 64 {
+                bail!("advanced.relay.candidates supports at most 64 entries");
+            }
         }
 
         validate_doh_url(&self.doh.primary, "doh.primary")?;
@@ -1804,11 +1882,53 @@ mod tests {
         }
     }
 
+    /// The relay is opt-in. A default config must not carry a listener, and a
+    /// half-written relay block must not stop the proxy from starting.
+    #[test]
+    fn the_relay_is_off_by_default_and_tolerates_a_partial_entry() {
+        let config = AppConfig::default();
+        assert!(!config.advanced.relay.enabled);
+        assert!(config.advanced.relay.listen.is_none());
+        assert!(config.advanced.relay.target.is_none());
+        // Enabled but empty: validation must reject it.
+        let mut enabled = AppConfig::default();
+        enabled.advanced.relay.enabled = true;
+        assert!(enabled.validate().is_err());
+        // Disabled with garbage: still valid, because nothing uses the fields.
+        let mut disabled = AppConfig::default();
+        disabled.advanced.relay.target = Some("not a host:port".to_string());
+        disabled.advanced.relay.listen = Some("0.0.0.0:7844".parse().unwrap());
+        assert!(disabled.validate().is_ok());
+    }
+
+    /// An enabled relay has to point somewhere reachable and must not collide
+    /// with the proxy listener.
+    #[test]
+    fn an_enabled_relay_is_validated() {
+        let mut config = AppConfig::default();
+        config.advanced.relay.enabled = true;
+        config.advanced.relay.listen = Some("127.0.0.1:7844".parse().unwrap());
+        config.advanced.relay.target = Some("region1.v2.argotunnel.com:7844".to_string());
+        assert!(config.validate().is_ok());
+
+        // A non-loopback bind would expose an open relay to the LAN.
+        config.advanced.relay.listen = Some("0.0.0.0:7844".parse().unwrap());
+        assert!(config.validate().is_err());
+
+        config.advanced.relay.listen = Some("127.0.0.1:7844".parse().unwrap());
+        // The default proxy port is 8443, so this collides only if moved.
+        config.proxy.port = 7844;
+        assert!(config.validate().is_err());
+
+        config.proxy.port = 8443;
+        config.advanced.relay.target = Some("   ".to_string());
+        assert!(config.validate().is_err());
+    }
+
     /// One rung per filter class, and no duplicates. The ladder is also what
     /// the plan cache validates against, so the two must be the same list.
     #[test]
-    fn the_global_sni_ladder_covers_each_class_exactly_once() {
-        let configured = vec!["www.bing.com".to_string()];
+    fn the_global_sni_ladder_covers_each_class_exactly_once() {        let configured = vec!["www.bing.com".to_string()];
         assert_eq!(
             global_sni_ladder("Example.COM", &configured),
             vec![
