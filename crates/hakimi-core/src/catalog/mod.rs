@@ -133,7 +133,7 @@ pub struct CatalogManager {
     config: Arc<ConfigManager>,
     cache: Arc<CacheManager>,
     client: reqwest::Client,
-    ip_catalog: RwLock<Option<IpCatalog>>,
+    ip_catalog: RwLock<Option<Arc<IpCatalog>>>,
     ip_meta: RwLock<Option<CatalogMeta>>,
     doh_catalog: RwLock<Option<Vec<DohEndpoint>>>,
     doh_meta: RwLock<Option<CatalogMeta>>,
@@ -235,7 +235,7 @@ impl CatalogManager {
             config,
             cache,
             client,
-            ip_catalog: RwLock::new(ip_catalog),
+            ip_catalog: RwLock::new(ip_catalog.map(Arc::new)),
             ip_meta: RwLock::new(ip_meta),
             doh_catalog: RwLock::new(doh_catalog),
             doh_meta: RwLock::new(doh_meta),
@@ -248,7 +248,7 @@ impl CatalogManager {
         self.revision.load(Ordering::Relaxed)
     }
 
-    pub fn ip_catalog(&self) -> Option<IpCatalog> {
+    pub fn ip_catalog(&self) -> Option<Arc<IpCatalog>> {
         self.ip_catalog.read().clone()
     }
 
@@ -305,8 +305,11 @@ impl CatalogManager {
                 .unwrap_or(0),
             ip_source: ip_meta.as_ref().map(|meta| meta.source.clone()),
             ip_fetched_at: ip_meta.as_ref().map(|meta| meta.fetched_at),
-            ip_domains: ip.as_ref().map(IpCatalog::domain_count).unwrap_or(0),
-            ip_ips: ip.as_ref().map(IpCatalog::ip_count).unwrap_or(0),
+            ip_domains: ip
+                .as_ref()
+                .map(|catalog| catalog.domain_count())
+                .unwrap_or(0),
+            ip_ips: ip.as_ref().map(|catalog| catalog.ip_count()).unwrap_or(0),
             ip_warnings: ip_meta
                 .as_ref()
                 .map(|meta| meta.warnings.clone())
@@ -429,7 +432,7 @@ impl CatalogManager {
                     let old = self.ip_catalog.read().clone();
                     let cached_domains = self.cache.last_good_domains();
                     let affected =
-                        ip::affected_domains(old.as_ref(), &validated, &config, &cached_domains);
+                        ip::affected_domains(old.as_deref(), &validated, &config, &cached_domains);
                     let version = config.catalog_version.saturating_add(1);
                     let warnings = validated.warnings.clone();
 
@@ -455,7 +458,7 @@ impl CatalogManager {
                     .await
                     .context("catalog write task failed")??;
                     *self.ip_meta.write() = Some(meta);
-                    *self.ip_catalog.write() = Some(validated);
+                    *self.ip_catalog.write() = Some(Arc::new(validated));
                     self.revision.fetch_add(1, Ordering::Relaxed);
                     if let Err(error) = self.config.set_catalog_version(version) {
                         tracing::warn!(error = %error, "failed to persist catalog version");
