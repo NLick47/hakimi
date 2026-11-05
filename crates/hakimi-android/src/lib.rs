@@ -80,8 +80,11 @@ fn initialize(data_dir: &str) -> Result<()> {
         .update_config(config)
         .context("configuring the local probe proxy")?;
 
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get().clamp(2, 4))
+        .unwrap_or(2);
     let tokio = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(workers)
         .enable_all()
         .build()
         .context("building the tokio runtime")?;
