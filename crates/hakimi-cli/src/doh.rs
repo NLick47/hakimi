@@ -47,9 +47,59 @@ pub async fn run(runtime: &HakimiRuntime, args: DohCommand, out: Output) -> Resu
     }
     // A health check that finds every endpoint down must fail the command,
     // so scripted `doh health && notify_ok` cannot report a false positive.
-    Ok(if health.iter().any(|item| !item.healthy) {
+    // A single unhealthy endpoint among several is not a failure: the resolver
+    // races endpoints, so one timeout does not mean name resolution is down.
+    Ok(health_exit_code(health.iter().map(|item| item.healthy)))
+}
+
+/// `doh health` fails only when there is at least one endpoint and all of them
+/// are down. An empty list means "nothing was checked", which must not be
+/// reported as a healthy success either.
+fn health_exit_code(states: impl IntoIterator<Item = bool>) -> ExitCode {
+    let mut any = false;
+    let mut any_healthy = false;
+    for healthy in states {
+        any = true;
+        any_healthy |= healthy;
+    }
+    // Only an all-down (and non-empty) result fails. An empty check is
+    // inconclusive and must not be a green light for `doh health && ...`.
+    if !any || !any_healthy {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
-    })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::health_exit_code;
+    use std::process::ExitCode;
+
+    fn ok(code: ExitCode) -> bool {
+        code == ExitCode::SUCCESS
+    }
+
+    #[test]
+    fn one_down_endpoint_among_healthy_ones_still_succeeds() {
+        // The old `any(|!healthy)` logic failed the whole command here.
+        assert!(ok(health_exit_code([true, false, true])));
+        assert!(ok(health_exit_code([false, true])));
+    }
+
+    #[test]
+    fn every_endpoint_down_fails() {
+        assert!(!ok(health_exit_code([false, false])));
+        assert!(!ok(health_exit_code([false])));
+    }
+
+    #[test]
+    fn all_healthy_succeeds() {
+        assert!(ok(health_exit_code([true, true])));
+    }
+
+    #[test]
+    fn an_empty_check_is_not_reported_as_healthy() {
+        assert!(!ok(health_exit_code([])));
+    }
 }

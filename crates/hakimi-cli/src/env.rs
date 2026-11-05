@@ -19,17 +19,7 @@ const NO_PROXY: &str = "localhost,127.0.0.1,::1";
 pub fn run(runtime: &HakimiRuntime, args: EnvArgs, out: Output) -> Result<()> {
     let config = runtime.config().snapshot();
     if out.is_json() {
-        let value = if config.proxy.mode == ProxyMode::Off {
-            serde_json::json!({ "mode": "off" })
-        } else {
-            let proxy = dial_url(config.proxy.bind, config.proxy.port);
-            serde_json::json!({
-                "httpProxy": proxy,
-                "httpsProxy": proxy,
-                "allProxy": proxy,
-                "noProxy": NO_PROXY,
-            })
-        };
+        let value = env_json(config.proxy.mode, config.proxy.bind, config.proxy.port, args.unset);
         return out.json(&value);
     }
     let proxy = dial_url(config.proxy.bind, config.proxy.port);
@@ -37,6 +27,25 @@ pub fn run(runtime: &HakimiRuntime, args: EnvArgs, out: Output) -> Result<()> {
         println!("{line}");
     }
     Ok(())
+}
+
+/// The machine-readable form of `hakimi env`. `--unset` must mean the same
+/// thing here as in the shell form: the consumer should clear the proxy
+/// variables, not set them.
+fn env_json(mode: ProxyMode, bind: IpAddr, port: u16, unset: bool) -> serde_json::Value {
+    if unset {
+        return serde_json::json!({ "mode": "unset" });
+    }
+    if mode == ProxyMode::Off {
+        return serde_json::json!({ "mode": "off" });
+    }
+    let proxy = dial_url(bind, port);
+    serde_json::json!({
+        "httpProxy": proxy,
+        "httpsProxy": proxy,
+        "allProxy": proxy,
+        "noProxy": NO_PROXY,
+    })
 }
 
 /// The lines `hakimi env` prints. An `Off` mode exports nothing: the proxy
@@ -69,8 +78,37 @@ pub(crate) fn dial_host(bind: IpAddr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{dial_host, shell_lines};
+    use super::{dial_host, env_json, shell_lines};
     use hakimi_core::config::ProxyMode;
+    use std::net::IpAddr;
+
+    fn bind() -> IpAddr {
+        "127.0.0.1".parse().unwrap()
+    }
+
+    #[test]
+    fn unset_in_json_mode_does_not_tell_the_consumer_to_set_a_proxy() {
+        let value = env_json(ProxyMode::Pac, bind(), 8443, true);
+        assert_eq!(value["mode"], "unset");
+        assert!(
+            value.get("httpProxy").is_none(),
+            "--unset --json must not still hand out a proxy to set: {value}"
+        );
+    }
+
+    #[test]
+    fn off_mode_has_no_proxy_to_set() {
+        let value = env_json(ProxyMode::Off, bind(), 8443, false);
+        assert_eq!(value["mode"], "off");
+        assert!(value.get("httpProxy").is_none());
+    }
+
+    #[test]
+    fn a_running_proxy_is_exported_in_json() {
+        let value = env_json(ProxyMode::Pac, bind(), 8443, false);
+        assert_eq!(value["httpProxy"], "http://127.0.0.1:8443");
+        assert_eq!(value["noProxy"], "localhost,127.0.0.1,::1");
+    }
 
     #[test]
     fn bind_addresses_become_dial_addresses() {

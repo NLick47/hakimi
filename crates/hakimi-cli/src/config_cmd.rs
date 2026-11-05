@@ -116,7 +116,12 @@ fn update(runtime: &HakimiRuntime, file: Option<&Path>) -> Result<()> {
     let mut merged = serde_json::to_value(&*current)?;
     merge(&mut merged, patch);
     let config: AppConfig =
-        serde_json::from_value(merged).context("invalid configuration after merge")?;
+        serde_json::from_value(merged.clone()).context("invalid configuration after merge")?;
+    // `AppConfig` uses serde defaults, so a typo in the patch would silently
+    // vanish at deserialization and `update` would still report success.
+    if let Some(key) = first_unknown_key(&merged, &config)? {
+        bail!("unknown setting `{key}` in the configuration patch");
+    }
     runtime.update_config(config)?;
     let applied = runtime.config().snapshot();
     println!("{}", serde_json::to_string_pretty(&*applied)?);
@@ -197,10 +202,116 @@ fn merge(base: &mut Value, patch: Value) {
     }
 }
 
+/// The dotted path of the first key in `merged` that `AppConfig` would ignore.
+///
+/// `AppConfig` deserializes with `#[serde(default)]` and no
+/// `deny_unknown_fields`, so unknown keys are dropped without an error.
+/// Serializing the deserialized config back yields exactly the recognised keys,
+/// so comparing the two trees detects typos without tightening
+/// deserialization for config files, remote catalogs or FFI callers that may
+/// carry extra fields.
+///
+/// Only object-keyed paths are checked: arrays (`groups`, per-group `domains`)
+/// are replaced wholesale by `merge`, so their element keys are validated by
+/// serde itself and do not need a separate key check. A `null` value carries no
+/// nested keys, so it short-circuits here as well.
+fn first_unknown_key(merged: &Value, config: &AppConfig) -> Result<Option<String>> {
+    let canonical = serde_json::to_value(config)?;
+    Ok(find_unknown(merged, &canonical, String::new()))
+}
+
+fn find_unknown(value: &Value, schema: &Value, path: String) -> Option<String> {
+    // A scalar/null child or an array has no object keys to validate, so there
+    // is nothing to flag at this level. Array elements are handled by serde.
+    let (Value::Object(map), Value::Object(schema)) = (value, schema) else {
+        return None;
+    };
+    for (key, child) in map {
+        let child_path = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        match schema.get(key) {
+            None => return Some(child_path),
+            Some(schema_child) => {
+                if let Some(found) = find_unknown(child, schema_child, child_path) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{assign, lookup, merge};
+    use super::{assign, first_unknown_key, lookup, merge};
+    use hakimi_core::config::AppConfig;
     use serde_json::json;
+
+    fn check_unknown(merged: &serde_json::Value) -> Option<String> {
+        let config: AppConfig = serde_json::from_value(merged.clone()).unwrap();
+        first_unknown_key(merged, &config).unwrap()
+    }
+
+    #[test]
+    fn an_unknown_key_in_a_patch_is_detected() {
+        // `AppConfig` has no deny_unknown_fields, so this typo deserializes
+        // fine and the old `update` reported success while changing nothing.
+        let mut base = serde_json::to_value(AppConfig::default()).unwrap();
+        merge(&mut base, json!({"proxy": {"prt": 9999}}));
+        assert_eq!(check_unknown(&base).as_deref(), Some("proxy.prt"));
+    }
+
+    #[test]
+    fn a_known_optional_field_is_not_flagged() {
+        // An Option field is present in the canonical tree (as `null` or a
+        // value), so setting it must not be mistaken for an unknown key.
+        let mut base = serde_json::to_value(AppConfig::default()).unwrap();
+        merge(&mut base, json!({"catalogs": {"signaturePublicKey": "abc"}}));
+        assert_eq!(check_unknown(&base), None);
+    }
+
+    #[test]
+    fn a_valid_patch_has_no_unknown_keys() {
+        let mut base = serde_json::to_value(AppConfig::default()).unwrap();
+        merge(&mut base, json!({"proxy": {"port": 9000}}));
+        assert_eq!(check_unknown(&base), None);
+    }
+
+    #[test]
+    fn clearing_an_optional_field_with_null_is_not_flagged() {
+        // Assigning `null` to clear an Option field is a valid patch. A null
+        // child has no nested keys, so it short-circuits instead of being
+        // compared against the (equally null) canonical value.
+        let mut base = serde_json::to_value(AppConfig::default()).unwrap();
+        merge(&mut base, json!({"catalogs": {"signaturePublicKey": null}}));
+        assert_eq!(check_unknown(&base), None);
+    }
+
+    #[test]
+    fn an_unknown_key_beside_a_null_one_is_still_detected() {
+        // The null short-circuit must not mask a genuine typo in a sibling key.
+        let mut base = serde_json::to_value(AppConfig::default()).unwrap();
+        merge(
+            &mut base,
+            json!({"catalogs": {"signaturePublicKey": null, "sigPublicKeyTypo": "x"}}),
+        );
+        assert_eq!(
+            check_unknown(&base).as_deref(),
+            Some("catalogs.sigPublicKeyTypo")
+        );
+    }
+
+    #[test]
+    fn array_valued_patches_have_no_false_positives() {
+        // Arrays are replaced wholesale by `merge` and their element keys are
+        // validated by serde, so `find_unknown` must not invent index keys.
+        let mut base = serde_json::to_value(AppConfig::default()).unwrap();
+        merge(&mut base, json!({"groups": [{"id": "g", "name": "G", "domains": [], "enabled": true}]}));
+        assert_eq!(check_unknown(&base), None);
+    }
 
     #[test]
     fn untouched_keys_survive_a_patch() {
