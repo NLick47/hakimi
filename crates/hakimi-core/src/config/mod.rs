@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{normalize_hostname, DomainMatcher, DomainPattern};
@@ -269,7 +269,9 @@ pub struct DownloadConfig {
     pub chunk_bytes: u64,
     /// A read with no progress for this long is abandoned and re-dialled
     pub stall_timeout_secs: u64,
-    /// Process-wide segment connection cap, shared by concurrent downloads
+    /// Process-wide segment connection cap, shared by concurrent downloads.
+    /// Values below 4 are raised to 4 when the manager is built, and the cap is
+    /// fixed for the lifetime of a running proxy.
     pub max_conns: usize,
     /// Remote JSON listing the mirror prefixes. Empty disables mirroring;
     /// a failed fetch falls back to the last good cache, then the built-in one.
@@ -1207,6 +1209,11 @@ pub fn validate_catalog_url(raw: &str, label: &str) -> Result<()> {
 pub struct ConfigManager {
     path: PathBuf,
     inner: RwLock<Inner>,
+    /// Serializes the read-modify-write of a mutation. Kept separate from
+    /// `inner` so the disk write — the expensive part — does not block
+    /// readers: every new connection takes `inner.read()`, and holding the
+    /// write lock across a `sync_all` stalled all of them for the whole flush.
+    write_gate: Mutex<()>,
     revision: AtomicU64,
 }
 
@@ -1413,6 +1420,7 @@ impl ConfigManager {
                 config: Arc::new(config),
                 matcher,
             }),
+            write_gate: Mutex::new(()),
             revision: AtomicU64::new(1),
         })
     }
@@ -1457,12 +1465,12 @@ impl ConfigManager {
         config.canonicalize();
         config.validate()?;
         let matcher = Arc::new(config.matcher()?);
-        // The disk write and the pointer swap share one write lock, so disk
-        // and memory can never disagree. Callers pass a complete config:
-        // concurrent mutate changes between the caller's snapshot and this
-        // call are overwritten — inherent to full-config overwrite semantics.
-        let mut guard = self.inner.write();
+        // One writer at a time, so disk order and memory order agree. Readers
+        // are not gated: they keep using the previous snapshot until the swap.
+        let _gate = self.write_gate.lock();
+        // Disk first: a failed write leaves memory untouched, exactly as before.
         atomic_write_json(&self.path, &sanitized_persisted_value(&config))?;
+        let mut guard = self.inner.write();
         guard.config = Arc::new(config);
         guard.matcher = matcher;
         // Publish the revision while the new config is still write-locked, so
@@ -1477,19 +1485,24 @@ impl ConfigManager {
     where
         F: FnOnce(&mut AppConfig) -> Result<()>,
     {
-        // Snapshot-modify-overwrite must hold the write lock as a whole, or two
-        // concurrent writers lose each other's changes. The closure must not
-        // call back into ConfigManager (the write lock is not reentrant).
-        let mut guard = self.inner.write();
-        let mut config = (*guard.config).clone();
+        // Snapshot-modify-overwrite must be serialized as a whole, or two
+        // concurrent writers lose each other's changes. The gate — not the
+        // RwLock — provides that: the closure and the disk write below run
+        // without blocking readers. The closure must not call back into
+        // ConfigManager (the gate is not reentrant).
+        let _gate = self.write_gate.lock();
+        let mut config = (*self.inner.read().config).clone();
         f(&mut config)?;
         config.canonicalize();
         config.validate()?;
         let matcher = Arc::new(config.matcher()?);
         atomic_write_json(&self.path, &sanitized_persisted_value(&config))?;
-        guard.config = Arc::new(config.clone());
-        guard.matcher = matcher;
-        self.revision.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut guard = self.inner.write();
+            guard.config = Arc::new(config.clone());
+            guard.matcher = matcher;
+            self.revision.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(config)
     }
 
