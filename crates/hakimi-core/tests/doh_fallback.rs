@@ -31,8 +31,23 @@ use hakimi_core::util::now;
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const TYPE_A: u16 = 1;
+const TYPE_AAAA: u16 = 28;
 const TYPE_HTTPS: u16 = 65;
 const CLASS_IN: u16 = 1;
+
+/// Two addresses per family, so an answer is already wide enough to stop
+/// collecting from further endpoints.
+const WIDE_V4: [[u8; 4]; 2] = [[93, 184, 216, 34], [93, 184, 216, 35]];
+const WIDE_V6: [[u8; 16]; 2] = [
+    [
+        0x26, 0x06, 0x28, 0x00, 0x02, 0x20, 0x00, 0x01, 0x02, 0x48, 0x18, 0x93, 0x25, 0xc8, 0x19,
+        0x46,
+    ],
+    [
+        0x26, 0x06, 0x28, 0x00, 0x02, 0x20, 0x00, 0x01, 0x02, 0x48, 0x18, 0x93, 0x25, 0xc8, 0x19,
+        0x47,
+    ],
+];
 
 fn push_name(out: &mut Vec<u8>, name: &str) {
     for label in name.split('.').filter(|label| !label.is_empty()) {
@@ -52,6 +67,38 @@ fn answer_a(name: &str, ttl: u32, ip: [u8; 4]) -> Vec<u8> {
     out.extend_from_slice(&4u16.to_be_bytes());
     out.extend_from_slice(&ip);
     out
+}
+
+/// A DNS answer for `name` with one AAAA record.
+fn answer_aaaa(name: &str, ttl: u32, ip: [u8; 16]) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_name(&mut out, name);
+    out.extend_from_slice(&TYPE_AAAA.to_be_bytes());
+    out.extend_from_slice(&CLASS_IN.to_be_bytes());
+    out.extend_from_slice(&ttl.to_be_bytes());
+    out.extend_from_slice(&16u16.to_be_bytes());
+    out.extend_from_slice(&ip);
+    out
+}
+
+/// The queried type, decoded from the wire format.
+fn qtype_from_query(query: &[u8]) -> u16 {
+    let mut index = 12;
+    while index < query.len() {
+        let len = query[index] as usize;
+        index += 1;
+        if len == 0 {
+            break;
+        }
+        if len > 63 || index + len > query.len() {
+            return 0;
+        }
+        index += len;
+    }
+    match query.get(index..index + 2) {
+        Some(bytes) => u16::from_be_bytes([bytes[0], bytes[1]]),
+        None => 0,
+    }
 }
 
 /// A DNS answer for `name` with one HTTPS record carrying an ECHConfigList.
@@ -100,6 +147,14 @@ fn name_from_query(query: &[u8]) -> String {
 #[derive(Clone)]
 enum DohMode {
     Answer([u8; 4]),
+    /// Two A records for an A query and two AAAA records for an AAAA query:
+    /// an answer wide enough to stop collection.
+    Wide,
+    /// Two A records, no AAAA: the common IPv4-only host.
+    V4Only,
+    /// Like `Wide`, but the answer arrives late enough to outlive the grace
+    /// window: a slow but healthy peer.
+    SlowWide(u64),
     /// A valid HTTP/DNS response with NOERROR and one HTTPS/ECH answer.
     HttpsEch(Vec<u8>),
     /// A valid HTTP/DNS response with NOERROR and no answer records.
@@ -183,15 +238,23 @@ impl DohServer {
                                         .unwrap(),
                                 );
                             };
+                            if let DohMode::SlowWide(delay_ms) = &mode {
+                                tokio::time::sleep(std::time::Duration::from_millis(*delay_ms))
+                                    .await;
+                            }
                             // Echo the id and the question of the query.
+                            let qtype = qtype_from_query(&query);
                             let mut response = Vec::new();
                             response.extend_from_slice(&query[0..2]);
                             response.extend_from_slice(&0x8180u16.to_be_bytes());
                             response.extend_from_slice(&1u16.to_be_bytes());
-                            let answers = u16::from(matches!(
-                                &mode,
-                                DohMode::Answer(_) | DohMode::HttpsEch(_)
-                            ));
+                            let answers: u16 = match &mode {
+                                DohMode::Answer(_) | DohMode::HttpsEch(_) => 1,
+                                DohMode::Wide | DohMode::SlowWide(_)
+                                    if matches!(qtype, TYPE_A | TYPE_AAAA) => 2,
+                                DohMode::V4Only if qtype == TYPE_A => 2,
+                                _ => 0,
+                            };
                             response.extend_from_slice(&answers.to_be_bytes());
                             response.extend_from_slice(&0u16.to_be_bytes());
                             response.extend_from_slice(&0u16.to_be_bytes());
@@ -200,6 +263,31 @@ impl DohServer {
                                 DohMode::Answer(ip) => {
                                     let name = name_from_query(&query);
                                     response.extend_from_slice(&answer_a(&name, 300, *ip));
+                                }
+                                DohMode::Wide | DohMode::SlowWide(_) => {
+                                    let name = name_from_query(&query);
+                                    match qtype {
+                                        TYPE_A => {
+                                            for ip in WIDE_V4 {
+                                                response.extend_from_slice(&answer_a(&name, 300, ip));
+                                            }
+                                        }
+                                        TYPE_AAAA => {
+                                            for ip in WIDE_V6 {
+                                                response
+                                                    .extend_from_slice(&answer_aaaa(&name, 300, ip));
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                DohMode::V4Only => {
+                                    if qtype == TYPE_A {
+                                        let name = name_from_query(&query);
+                                        for ip in WIDE_V4 {
+                                            response.extend_from_slice(&answer_a(&name, 300, ip));
+                                        }
+                                    }
                                 }
                                 DohMode::HttpsEch(ech) => {
                                     let name = name_from_query(&query);
@@ -235,7 +323,8 @@ impl DohServer {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_primary_endpoint_wins_and_the_answer_is_cached() {
+async fn a_thin_primary_answer_is_widened_and_cached() {
+    install_logs();
     let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::new(dir.path());
@@ -262,50 +351,59 @@ async fn the_primary_endpoint_wins_and_the_answer_is_cached() {
     let resolver = Resolver::new(cache.clone(), config.clone(), catalogs.clone());
 
     let resolution = resolver.resolve_ips("example.com").await.unwrap();
-    // Primary and fallback are both healthy and race each other: the first
-    // useful answer wins, so which endpoint supplies the address is a
-    // genuine coin flip between two local servers. The resolver guarantees
-    // that the winner's answer is the one returned and named; the cases
-    // where the primary is unusable are covered by the dedicated scenarios
-    // below.
+    // One address is a single point of failure, so the primary's thin answer
+    // is widened with the fallback's instead of being accepted as-is.
     let primary_ip: std::net::IpAddr = "93.184.216.34".parse().unwrap();
     let fallback_ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
-    assert!(
-        resolution.ips == vec![primary_ip] || resolution.ips == vec![fallback_ip],
-        "the answer must come from one of the raced endpoints, got {:?}",
-        resolution.ips
+    assert_eq!(resolution.source, DohSource::Primary);
+    assert_eq!(
+        resolution.ips,
+        vec![primary_ip, fallback_ip],
+        "the union keeps the primary's answer first"
     );
-    match resolution.source {
-        DohSource::Primary => assert_eq!(resolution.ips, vec![primary_ip]),
-        DohSource::Fallback => {
-            assert_eq!(resolution.ips, vec![fallback_ip]);
-            assert!(resolution.fallback_used);
-        }
-        other => panic!("a raced pair must answer from primary or fallback, got {other:?}"),
-    }
-    // One query per record type: the resolver asks A and AAAA together so a
-    // dual-stack host still gets an IPv6 candidate when IPv4 is filtered.
-    // The AAAA race always drains (neither endpoint has an AAAA record), so
-    // both endpoints see that query; the A race stops at the first address,
-    // so the losing endpoint may not finish its request. Either endpoint
-    // therefore ends up with one or two queries, never more.
+    assert!(resolution.fallback_used, "a second endpoint was involved");
+    // A: primary + widened fallback. AAAA: neither has a record, and the
+    // second NODATA confirms the first.
     let primary_requests = primary.requests.load(Ordering::Relaxed);
     let fallback_requests = fallback.requests.load(Ordering::Relaxed);
-    assert!(
-        (1..=2).contains(&primary_requests) && (1..=2).contains(&fallback_requests),
-        "each endpoint answers at most once per record type, got primary={primary_requests} fallback={fallback_requests}"
+    assert_eq!(primary_requests, 2, "one query per record type");
+    assert_eq!(
+        fallback_requests, 2,
+        "the thin A answer and the empty AAAA answer each need a peer"
     );
 
-    // The second query is answered from the cache.
+    // The second query is answered from the cache, union included.
     let again = resolver.resolve_ips("example.com").await.unwrap();
     assert_eq!(
         again.ips, resolution.ips,
-        "the cached answer is the one that won"
+        "the cached answer is the one that was collected"
     );
     assert_eq!(again.source, DohSource::Cache);
-    // The cached answer is not refetched.
     assert_eq!(primary.requests.load(Ordering::Relaxed), primary_requests);
     assert_eq!(fallback.requests.load(Ordering::Relaxed), fallback_requests);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_https_answer_behind_a_failed_peer_is_still_found() {
+    install_logs();
+    // primary NODATA + fallback failure is one conclusion, not two. The walk
+    // must continue to the catalog instead of caching "this domain has no ECH"
+    // — the old pair-only shortcut did exactly that.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (resolver, servers) = resolver_with(&[
+        DohMode::Empty,
+        DohMode::Fail,
+        DohMode::HttpsEch(vec![9, 9, 9]),
+    ])
+    .await;
+
+    let outcome = resolver.ech_config("example.com", false).await.unwrap();
+    assert_eq!(outcome.config, vec![9, 9, 9]);
+    assert_eq!(outcome.source, DohSource::Custom);
+    assert!(
+        servers[2].requests.load(Ordering::Relaxed) >= 1,
+        "a failed peer does not confirm NODATA"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -857,28 +955,24 @@ async fn an_answer_in_the_second_wave_is_still_reached() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_empty_answer_cuts_a_stalled_peer_short() {
-    // One endpoint answers NOERROR with no records, the other stalls until its
-    // full request timeout. The race must stop after the grace window instead
-    // of holding the answer (and every request parked behind the resolver's
-    // single-flight lock) until the stalled endpoint times out: the 2026-11-01
-    // incident measured exactly this as a silent five-second connect stall.
+    // One endpoint answers NOERROR with no records, the other stalls. The
+    // query must stop at the endpoint window instead of holding every request
+    // parked behind the single-flight lock until the client timeout.
     let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let (resolver, servers) = resolver_with_timeout(&[DohMode::Empty, DohMode::Stall], 4).await;
+    let (resolver, servers) = resolver_with_timeout(&[DohMode::Empty, DohMode::Stall], 8).await;
 
     let started = std::time::Instant::now();
     let outcome = resolver.resolve_ips("example.com").await;
     let elapsed = started.elapsed();
-    // Neither endpoint has an address: an error, not a four-second wait.
+    // Neither endpoint has an address: an error, not an eight-second wait.
     assert!(outcome.is_err(), "no endpoint has an address");
     assert!(
-        elapsed >= std::time::Duration::from_millis(1_200),
-        "the grace window must not cut off the peer before it had a fair chance, took {elapsed:?}"
+        elapsed >= std::time::Duration::from_millis(3_000),
+        "a slow peer must get its full window, took {elapsed:?}"
     );
-    // Strictly below the 2.5 s race deadline: the grace window (empty at
-    // ~50 ms + 1.5 s) must end the race before the overall deadline would.
     assert!(
-        elapsed < std::time::Duration::from_millis(2_200),
-        "an empty answer must not wait out the stalled peer's full timeout, took {elapsed:?}"
+        elapsed < std::time::Duration::from_millis(5_000),
+        "an empty answer must not wait out the client timeout, took {elapsed:?}"
     );
     // The empty endpoint answered; the stalled one got its query too.
     assert!(servers[0].requests.load(Ordering::Relaxed) >= 1);
@@ -887,19 +981,18 @@ async fn an_empty_answer_cuts_a_stalled_peer_short() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_stalled_endpoints_cannot_hold_the_race_past_the_deadline() {
-    // When neither endpoint answers at all there is no first result to start
-    // the grace window from; the race deadline ends the wait instead. Without
-    // it the pair runs until the request timeout of the slower endpoint.
+    // With no answer at all, the endpoint window ends the wait instead of
+    // letting the pair run until the client timeout of the slower endpoint.
     let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let (resolver, _servers) = resolver_with_timeout(&[DohMode::Stall, DohMode::Stall], 4).await;
+    let (resolver, _servers) = resolver_with_timeout(&[DohMode::Stall, DohMode::Stall], 8).await;
 
     let started = std::time::Instant::now();
     let outcome = resolver.resolve_ips("example.com").await;
     let elapsed = started.elapsed();
     assert!(outcome.is_err(), "nothing answers");
     assert!(
-        elapsed < std::time::Duration::from_millis(3_500),
-        "the race deadline must cap the stall below the request timeout, took {elapsed:?}"
+        elapsed < std::time::Duration::from_millis(5_000),
+        "the endpoint window must cap the stall below the client timeout, took {elapsed:?}"
     );
 }
 
@@ -928,7 +1021,7 @@ async fn a_cancelled_race_does_not_black_hole_the_domain() {
             config.doh.primary = format!("https://127.0.0.1:{}/dns-query", stalled.addr.port());
             config.doh.fallback =
                 format!("https://127.0.0.1:{}/dns-query", stalled_peer.addr.port());
-            config.catalogs.timeout_secs = 4;
+            config.catalogs.timeout_secs = 8;
             Ok(())
         })
         .unwrap();
@@ -964,5 +1057,359 @@ async fn a_cancelled_race_does_not_black_hole_the_domain() {
     assert_eq!(
         resolution.ips,
         vec!["9.9.9.9".parse::<std::net::IpAddr>().unwrap()]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenarios for the collector contract: wide answers stop early, thin answers
+// are widened, a stalled peer is hedged, and a repeatedly failing endpoint
+// leaves the hot path. Run with `--nocapture` to read the decision log.
+// ---------------------------------------------------------------------------
+
+fn install_logs() {
+    use std::sync::Once;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    static LOGS: Once = Once::new();
+    LOGS.call_once(|| {
+        // INFO shows every answered/failed query and the cooldown transitions.
+        // `HAKIMI_TEST_LOG=debug` also shows the hedge and widening decisions.
+        // Only this crate's events are kept; hyper's h2 frame spam would bury
+        // them at DEBUG.
+        let level = match std::env::var("HAKIMI_TEST_LOG").as_deref() {
+            Ok("debug") => tracing::Level::DEBUG,
+            _ => tracing::Level::INFO,
+        };
+        let filter = tracing_subscriber::filter::Targets::new()
+            .with_target("hakimi_core", level)
+            .with_default(tracing::Level::WARN);
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_target(false),
+            )
+            .try_init();
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wide_answer_never_dials_a_second_endpoint() {
+    install_logs();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (resolver, servers) = resolver_with(&[DohMode::Wide, DohMode::Wide]).await;
+
+    let started = std::time::Instant::now();
+    let resolution = resolver.resolve_ips("example.com").await.unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        resolution.ips,
+        vec![
+            "93.184.216.34".parse::<std::net::IpAddr>().unwrap(),
+            "93.184.216.35".parse::<std::net::IpAddr>().unwrap(),
+            "2606:2800:220:1:248:1893:25c8:1946"
+                .parse::<std::net::IpAddr>()
+                .unwrap(),
+            "2606:2800:220:1:248:1893:25c8:1947"
+                .parse::<std::net::IpAddr>()
+                .unwrap(),
+        ],
+        "both families are collected and kept in order"
+    );
+    assert!(!resolution.fallback_used);
+    assert_eq!(
+        servers[0].requests.load(Ordering::Relaxed),
+        2,
+        "one query per record type, no widening"
+    );
+    assert_eq!(
+        servers[1].requests.load(Ordering::Relaxed),
+        0,
+        "a wide answer must not dial the second endpoint"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(800),
+        "a local answer must not wait for a hedge, took {elapsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_primary_is_hedged_and_the_peer_merged() {
+    install_logs();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // A four-second client timeout, so waiting for the stalled primary would
+    // take the 2.5 s stage deadline. The hedge must answer far sooner.
+    let (resolver, servers) = resolver_with_timeout(&[DohMode::Stall, DohMode::Wide], 4).await;
+
+    let started = std::time::Instant::now();
+    let resolution = resolver.resolve_ips("example.com").await.unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(resolution.ips.len(), 4, "the peer's answer is collected");
+    assert!(resolution.fallback_used);
+    assert!(
+        elapsed < std::time::Duration::from_millis(1200),
+        "the hedge must answer before the stage deadline, took {elapsed:?}"
+    );
+    assert_eq!(
+        servers[0].requests.load(Ordering::Relaxed),
+        2,
+        "both record types reached the stalled primary"
+    );
+    assert_eq!(
+        servers[1].requests.load(Ordering::Relaxed),
+        2,
+        "both record types were hedged to the peer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_configured_ech_answer_stops_without_a_second_endpoint() {
+    install_logs();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (resolver, servers) = resolver_with(&[
+        DohMode::HttpsEch(vec![1, 2, 3]),
+        DohMode::HttpsEch(vec![9, 9]),
+    ])
+    .await;
+
+    let outcome = resolver.ech_config("example.com", false).await.unwrap();
+    assert_eq!(outcome.config, vec![1, 2, 3], "the first config is the answer");
+    assert_eq!(
+        servers[0].requests.load(Ordering::Relaxed),
+        1,
+        "ECH is one domain-level value, so one query is enough"
+    );
+    assert_eq!(
+        servers[1].requests.load(Ordering::Relaxed),
+        0,
+        "a second ECH copy would be the same value"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeatedly_failing_endpoint_is_skipped_once_it_cools() {
+    install_logs();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (resolver, servers) =
+        resolver_with(&[DohMode::Fail, DohMode::HttpsEch(vec![7])]).await;
+
+    for domain in ["one.example", "two.example", "three.example"] {
+        let outcome = resolver.ech_config(domain, false).await.unwrap();
+        assert_eq!(outcome.config, vec![7]);
+    }
+    assert_eq!(
+        servers[0].requests.load(Ordering::Relaxed),
+        3,
+        "one failed probe per query before the cooldown"
+    );
+
+    // The third failure armed the cooldown: the next query must skip it.
+    let outcome = resolver.ech_config("four.example", false).await.unwrap();
+    assert_eq!(outcome.config, vec![7]);
+    assert_eq!(
+        servers[0].requests.load(Ordering::Relaxed),
+        3,
+        "a cooling endpoint is not dialled"
+    );
+    assert_eq!(servers[1].requests.load(Ordering::Relaxed), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_total_nodata_is_negative_cached_and_not_requeried() {
+    install_logs();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (resolver, servers) = resolver_with(&[DohMode::Empty, DohMode::Empty]).await;
+
+    let first = resolver.resolve_ips("example.com").await;
+    assert!(first.is_err(), "two NODATA answers cannot produce a route");
+    let requests: usize = servers
+        .iter()
+        .map(|server| server.requests.load(Ordering::Relaxed))
+        .sum();
+    assert_eq!(
+        requests, 4,
+        "A and AAAA each need the pair to confirm the silence"
+    );
+
+    let second = resolver.resolve_ips("example.com").await;
+    let error = format!("{:#}", second.unwrap_err());
+    assert!(
+        error.contains("cached negative answer"),
+        "the second lookup must be served by the negative cache: {error}"
+    );
+    let after: usize = servers
+        .iter()
+        .map(|server| server.requests.load(Ordering::Relaxed))
+        .sum();
+    assert_eq!(after, requests, "a cached NODATA must not re-query");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ipv4_only_domain_does_not_walk_the_catalog() {
+    install_logs();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // The catalog endpoints would answer A if asked. An IPv4-only name must not
+    // pay one query per endpoint just because its AAAA record does not exist —
+    // two independent NODATA answers are the conclusion.
+    let (resolver, servers) = resolver_with(&[
+        DohMode::V4Only,
+        DohMode::V4Only,
+        DohMode::Wide,
+        DohMode::Wide,
+    ])
+    .await;
+
+    let resolution = resolver.resolve_ips("example.com").await.unwrap();
+    assert_eq!(resolution.ips.len(), 2, "only the A records exist");
+    assert_eq!(
+        servers[0].requests.load(Ordering::Relaxed),
+        2,
+        "the primary answers A and confirms the empty AAAA"
+    );
+    assert_eq!(
+        servers[1].requests.load(Ordering::Relaxed),
+        1,
+        "one confirmation is enough to conclude the AAAA is absent"
+    );
+    assert_eq!(
+        servers[2].requests.load(Ordering::Relaxed),
+        0,
+        "an empty answer must not walk the catalog"
+    );
+    assert_eq!(servers[3].requests.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identical_answers_stop_after_the_second_endpoint() {
+    install_logs();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let same = [93, 184, 216, 34];
+    let (resolver, servers) = resolver_with(&[
+        DohMode::Answer(same),
+        DohMode::Answer(same),
+        DohMode::Answer(same),
+        DohMode::Answer(same),
+    ])
+    .await;
+
+    let resolution = resolver.resolve_ips("example.com").await.unwrap();
+    assert_eq!(
+        resolution.ips,
+        vec!["93.184.216.34".parse::<std::net::IpAddr>().unwrap()],
+        "the repeated answer is the only candidate"
+    );
+    assert_eq!(servers[0].requests.load(Ordering::Relaxed), 2);
+    assert_eq!(servers[1].requests.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        servers[2].requests.load(Ordering::Relaxed),
+        0,
+        "a repeated answer must not walk the catalog"
+    );
+    assert_eq!(servers[3].requests.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_hedged_peer_is_not_discarded_before_the_window_ends() {
+    install_logs();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (resolver, servers) =
+        resolver_with_timeout(&[DohMode::Empty, DohMode::SlowWide(1750)], 4).await;
+
+    let resolution = resolver.resolve_ips("example.com").await.unwrap();
+    assert_eq!(resolution.ips.len(), 4, "A and AAAA from the slow peer");
+    assert_eq!(servers[1].requests.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_nodata_peer_does_not_stop_the_widening_walk() {
+    install_logs();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // The second endpoint says nothing about the address, so the walk must
+    // still reach the third one, which carries the extra candidate.
+    let (resolver, servers) = resolver_with(&[
+        DohMode::Answer([93, 184, 216, 34]),
+        DohMode::Empty,
+        DohMode::Answer([203, 0, 113, 7]),
+        DohMode::Empty,
+    ])
+    .await;
+
+    let resolution = resolver.resolve_ips("example.com").await.unwrap();
+    assert!(resolution
+        .ips
+        .contains(&"93.184.216.34".parse::<std::net::IpAddr>().unwrap()));
+    assert!(resolution
+        .ips
+        .contains(&"203.0.113.7".parse::<std::net::IpAddr>().unwrap()));
+    assert!(
+        servers[2].requests.load(Ordering::Relaxed) >= 1,
+        "a NODATA peer is not a redundant answer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_hedge_wins_before_empty_catalog_endpoints() {
+    install_logs();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // The catalog would confirm NODATA immediately. The slow healthy peer must
+    // get its full window before those empty answers close the query.
+    let (resolver, servers) = resolver_with_timeout(
+        &[
+            DohMode::Empty,
+            DohMode::SlowWide(1750),
+            DohMode::Empty,
+            DohMode::Empty,
+        ],
+        4,
+    )
+    .await;
+
+    let resolution = resolver.resolve_ips("example.com").await.unwrap();
+    assert_eq!(resolution.ips.len(), 4, "A and AAAA from the slow peer");
+    assert_eq!(
+        servers[2].requests.load(Ordering::Relaxed),
+        0,
+        "the catalog must not answer before the hedge finishes"
+    );
+    assert_eq!(servers[3].requests.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_foreign_endpoint_gets_its_full_window() {
+    install_logs();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // Endpoints abroad regularly take a few seconds. Dropping one before it
+    // answers leaves the domain without any route.
+    let (resolver, servers) =
+        resolver_with_timeout(&[DohMode::Empty, DohMode::SlowWide(3200)], 6).await;
+
+    let resolution = resolver.resolve_ips("example.com").await.unwrap();
+    assert_eq!(resolution.ips.len(), 4, "A and AAAA from the slow endpoint");
+    assert_eq!(servers[1].requests.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_hedge_does_not_block_the_catalog() {
+    install_logs();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (resolver, servers) = resolver_with_timeout(
+        &[
+            DohMode::Stall,
+            DohMode::Stall,
+            DohMode::Wide,
+            DohMode::Wide,
+        ],
+        1,
+    )
+    .await;
+
+    let resolution = resolver.resolve_ips("example.com").await.unwrap();
+    assert_eq!(resolution.ips.len(), 4, "the catalog endpoints still answer");
+    assert!(
+        servers[2].requests.load(Ordering::Relaxed) >= 1,
+        "a stalled hedge must not occupy the catalog lanes"
     );
 }

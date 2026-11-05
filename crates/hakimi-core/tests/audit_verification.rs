@@ -194,13 +194,15 @@ async fn ttl_zero_answers_are_cached_with_a_minimum_ttl() {
     .await;
 
     let first = resolver.resolve_ips("example.com").await.unwrap();
-    // Which endpoint wins the race is a coin flip; the answer must come from
-    // one of them.
-    assert!(
-        first.ips == vec!["203.0.113.7".parse::<std::net::IpAddr>().unwrap()]
-            || first.ips == vec!["203.0.113.8".parse::<std::net::IpAddr>().unwrap()],
-        "the answer must come from a raced endpoint, got {:?}",
-        first.ips
+    // A single address is widened with the next endpoint's answer, so the
+    // collected set carries both.
+    assert_eq!(
+        first.ips,
+        vec![
+            "203.0.113.7".parse::<std::net::IpAddr>().unwrap(),
+            "203.0.113.8".parse::<std::net::IpAddr>().unwrap(),
+        ],
+        "the thin answers are merged, primary first"
     );
     let requests_after_first: usize = servers
         .iter()

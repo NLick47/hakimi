@@ -32,45 +32,65 @@ const STALE_WHILE_REVALIDATE_SECS: i64 = 60;
 /// the failure traffic; keep one attempt per domain per window instead.
 const STALE_REFRESH_BACKOFF: Duration = Duration::from_secs(5);
 const STALE_REFRESH_BACKOFF_MAX: usize = 1024;
-/// Negative-answer TTLs. An authoritative empty answer is trusted for a full
-/// DNS window; a total endpoint failure only backs off briefly so a flapping
-/// endpoint recovers on the next attempt.
-const NEGATIVE_NODATA_SECS: u32 = 60;
-const NEGATIVE_HTTPS_NODATA_SECS: u32 = 300;
+/// Negative-answer TTLs. These are deliberately short: a resolver that filters
+/// a domain answers NODATA, and caching that for a full DNS window kept the
+/// domain unroutable long after another endpoint would have answered. A total
+/// endpoint failure only backs off briefly so a flapping endpoint recovers on
+/// the next attempt.
+const NEGATIVE_NODATA_SECS: u32 = 20;
+const NEGATIVE_HTTPS_NODATA_SECS: u32 = 60;
 const NEGATIVE_FAILURE_SECS: u32 = 10;
 /// RFC 8767: a zero-TTL answer gets a small minimum cache time, or every new
 /// connection pays a full endpoint race for the same domain.
 const MIN_CACHE_TTL_SECS: u32 = 5;
-/// Lanes and budget for the endpoints after the raced primary/fallback pair.
-/// The remote catalog decides how many there are (up to 64), and one timeout
-/// each would let a silent list stretch every cold lookup to minutes. Two
-/// lanes avoid queueing behind one dead endpoint; the budget is two client
-/// timeouts so the second wave can still find an answer behind a stalled
-/// first. `FALLBACK_LANES * FALLBACK_WAVES` bounds the per-query worst case.
+/// Lanes and budget for the endpoints after the first two. The remote catalog
+/// decides how many there are (up to 64), and one timeout each would let a
+/// silent list stretch every cold lookup to minutes. Two lanes avoid queueing
+/// behind one dead endpoint; the budget is two client timeouts so the second
+/// wave can still find an answer behind a stalled first.
 const FALLBACK_LANES: usize = 2;
 const FALLBACK_WAVES: u32 = 2;
 
-/// How long the other raced endpoint may keep answering after one of them
-/// returned no usable address. Covers a normal query several times over;
-/// caps the cost of a stalled endpoint below its full request timeout.
-const EMPTY_ANSWER_GRACE: Duration = Duration::from_millis(1500);
+/// How long every dialled endpoint gets to answer before the query gives up
+/// on it. DoH providers abroad often need a few seconds; a shorter window
+/// discarded their answers. Capped by `catalogs.timeoutSecs`.
+const ENDPOINT_WINDOW: Duration = Duration::from_secs(4);
 
-/// Hard ceiling for the raced pair itself. When both endpoints stall without
-/// answering anything there is no first result to start the grace window from,
-/// and the race used to run until the request timeout of the slower endpoint —
-/// parking every connection behind the resolver's single-flight lock for that
-/// long. A healthy endpoint answers in a few hundred milliseconds; 2.5 s is
-/// still eight times that, and never below the configured per-request timeout.
-const RACE_DEADLINE: Duration = Duration::from_millis(2500);
+/// How long the first endpoint gets before the second is dialled as well. The
+/// second is a hedge, not a second racer: a healthy endpoint answers in a few
+/// hundred milliseconds, and racing both from t=0 sent every queried name to
+/// two providers on every cache miss.
+const PRIMARY_HEDGE: Duration = Duration::from_millis(250);
+
+/// Distinct addresses an A/AAAA answer must carry before the query stops
+/// collecting. One address is a single point of failure — and exactly what a
+/// filtering resolver hands back — so a thin answer is widened with the next
+/// ranked endpoint instead of being accepted as-is.
+const MIN_ADDRESS_CANDIDATES: usize = 2;
+/// Endpoints that contributed data to one query before collection stops. A
+/// failure is not a contribution, so a dead endpoint still lets the walk reach
+/// the next one.
+const MAX_ANSWER_SOURCES: usize = 3;
+/// Independent empty answers needed before a query concludes that the record
+/// does not exist. One endpoint saying "no records" can be a filter; two are
+/// not. Without this, every IPv4-only host walked the whole catalog for its
+/// (always empty) AAAA query — a query storm on the most common case.
+const EMPTY_CONFIRMATIONS: usize = 2;
+/// Consecutive failures before an endpoint is skipped for a while. One failure
+/// already triggers the hedge, but a single bad round trip must not demote the
+/// endpoint the user configured first.
+const ENDPOINT_FAILURE_THRESHOLD: u32 = 3;
+const ENDPOINT_COOLDOWN_BASE: Duration = Duration::from_secs(30);
+const ENDPOINT_COOLDOWN_MAX: Duration = Duration::from_secs(10 * 60);
 
 /// The upper bound of one live `doh_ips` call, excluding the single-flight
-/// queue wait: the raced pair's deadline plus the serial fallback waves.
-/// Callers that await a lookup inside a larger budget — the raw connect race
-/// sizes its whole wall-clock budget with this — use it instead of
-/// re-deriving the constants.
+/// queue wait: one endpoint window plus the serial fallback waves. Callers
+/// that await a lookup inside a larger budget — the raw connect race sizes
+/// its whole wall-clock budget with this — use it instead of re-deriving the
+/// constants.
 pub(crate) fn doh_lookup_budget(catalog_timeout_secs: u64) -> Duration {
     let request = Duration::from_secs(catalog_timeout_secs.max(1));
-    RACE_DEADLINE.min(request) + request * FALLBACK_WAVES
+    ENDPOINT_WINDOW.min(request) + request * FALLBACK_WAVES
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +119,41 @@ pub struct DohHealth {
     pub latency_ms: Option<u64>,
     pub last_error: Option<String>,
     pub checked_at: chrono::DateTime<chrono::Utc>,
+    /// Consecutive failures. Drives the endpoint order; reset by a success.
+    #[serde(skip)]
+    failures: u32,
+    /// While this is in the future the endpoint is skipped by new queries.
+    /// Kept out of the serialized snapshot: the UI shows the last observation,
+    /// not the policy timer.
+    #[serde(skip)]
+    cooldown_until: Option<Instant>,
+}
+
+impl DohHealth {
+    fn cooling(&self, now: Instant) -> bool {
+        self.cooldown_until.is_some_and(|until| until > now)
+    }
+
+    fn new(
+        endpoint: &EffectiveEndpoint,
+        healthy: bool,
+        latency_ms: Option<u64>,
+        last_error: Option<String>,
+        failures: u32,
+        cooldown_until: Option<Instant>,
+    ) -> Self {
+        Self {
+            name: endpoint.name.clone(),
+            url: endpoint.url.clone(),
+            source: endpoint.source,
+            healthy,
+            latency_ms,
+            last_error,
+            checked_at: now(),
+            failures,
+            cooldown_until,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +186,119 @@ pub struct TypeQuery {
     /// cancelled by the grace window never confirmed the silence, so it must
     /// not be cached as authoritative NODATA.
     authoritative: bool,
+}
+
+/// Union of the answers one query collected from several endpoints.
+///
+/// The proxy wants a wide candidate set, not the first reply: a filtering
+/// resolver answers with a subset (or NODATA), and discarding what another
+/// endpoint returned threw away exactly the address that would have worked.
+struct MergedAnswers {
+    address_query: bool,
+    ips: Vec<IpAddr>,
+    ech: Option<Vec<u8>>,
+    ttl: u32,
+    cname: Option<String>,
+    https_present: bool,
+    /// First answer that carried nothing, kept so a total NODATA still has a
+    /// precise `TypeQuery` to return.
+    empty: Option<(usize, ResolvedAnswer)>,
+    /// Endpoints that gave a conclusive answer (data or NODATA).
+    answered: usize,
+    /// Endpoints that contributed data. This is the collection cap; failures
+    /// do not count, so a dead endpoint still lets the walk reach the next one.
+    sources: usize,
+    /// Endpoints that answered with data but added no new address.
+    redundant: usize,
+    /// First endpoint that contributed data, for source attribution.
+    first_source: Option<usize>,
+}
+
+impl MergedAnswers {
+    fn new(address_query: bool) -> Self {
+        Self {
+            address_query,
+            ips: Vec::new(),
+            ech: None,
+            ttl: u32::MAX,
+            cname: None,
+            https_present: false,
+            empty: None,
+            answered: 0,
+            sources: 0,
+            redundant: 0,
+            first_source: None,
+        }
+    }
+
+    fn absorb(&mut self, index: usize, answer: ResolvedAnswer) {
+        self.answered += 1;
+        let before = self.ips.len();
+        let useful = if self.address_query {
+            !answer.ips.is_empty()
+        } else {
+            answer.ech.is_some()
+        };
+        if useful {
+            self.sources += 1;
+            self.first_source.get_or_insert(index);
+        }
+        if answer.ips.is_empty() && answer.ech.is_none() && self.empty.is_none() {
+            self.empty = Some((index, answer.clone()));
+        }
+        if answer.ttl != 0 {
+            self.ttl = self.ttl.min(answer.ttl);
+        }
+        self.https_present |= answer.https_present;
+        if self.cname.is_none() {
+            self.cname = answer.cname.clone();
+        }
+        for ip in answer.ips {
+            if !self.ips.contains(&ip) {
+                self.ips.push(ip);
+            }
+        }
+        if self.address_query && useful && self.ips.len() == before {
+            self.redundant += 1;
+        }
+        if self.ech.is_none() {
+            self.ech = answer.ech;
+        }
+    }
+
+    /// Whether this query has collected enough to stop.
+    fn complete(&self) -> bool {
+        // An empty answer needs as many confirmations as an ECH lookup: the
+        // first NODATA may be a filter, the second makes it a conclusion.
+        let confirmed_empty = self.ips.is_empty() && self.answered >= EMPTY_CONFIRMATIONS;
+        if self.address_query {
+            // Two addresses give the engine a real choice; one is a single
+            // point of failure. A peer repeating that one address has nothing
+            // left to add, so the walk stops instead of querying the catalog.
+            self.ips.len() >= MIN_ADDRESS_CANDIDATES
+                || self.redundant > 0
+                || self.sources >= MAX_ANSWER_SOURCES
+                || confirmed_empty
+        } else {
+            // ECH is a single domain-level value: the first copy is the whole
+            // answer. Without it, a second independent NODATA is required.
+            self.ech.is_some() || self.answered >= EMPTY_CONFIRMATIONS
+        }
+    }
+
+    fn has_data(&self) -> bool {
+        !self.ips.is_empty() || self.ech.is_some()
+    }
+
+    fn into_answer(self) -> ResolvedAnswer {
+        ResolvedAnswer {
+            ips: self.ips,
+            ech: self.ech,
+            ttl: if self.ttl == u32::MAX { 0 } else { self.ttl },
+            cname: self.cname,
+            https_present: self.https_present,
+        }
+    }
 }
 
 /// Resolver surface used by the decision engine; wrapped behind a trait so tests never need
@@ -868,15 +1036,23 @@ impl Resolver {
         let checks = endpoints.iter().map(|endpoint| async move {
             let started = Instant::now();
             let result = self.query_endpoint(endpoint, "example.com", TYPE_A).await;
-            let health = DohHealth {
-                name: endpoint.name.clone(),
-                url: endpoint.url.clone(),
-                source: endpoint.source,
-                healthy: result.is_ok(),
-                latency_ms: Some(started.elapsed().as_millis() as u64),
-                last_error: result.as_ref().err().map(|error| format!("{error:#}")),
-                checked_at: now(),
-            };
+            // A health probe is an observation, not a routing decision: keep
+            // the policy counters a real query produced instead of resetting
+            // them (or counting the probe itself) here.
+            let previous = self
+                .health
+                .read()
+                .get(&endpoint.url)
+                .map(|entry| (entry.failures, entry.cooldown_until))
+                .unwrap_or((0, None));
+            let health = DohHealth::new(
+                endpoint,
+                result.is_ok(),
+                Some(started.elapsed().as_millis() as u64),
+                result.as_ref().err().map(|error| format!("{error:#}")),
+                previous.0,
+                previous.1,
+            );
             (health, result.is_err())
         });
         let results = futures_util::future::join_all(checks).await;
@@ -907,298 +1083,320 @@ impl Resolver {
         if self.cache.doh_negative(domain, qtype) {
             bail!("cached negative answer for `{domain}` qtype {qtype}");
         }
-        let mut attempts = Vec::new();
-        // A NOERROR response with no address records is a successful exchange
-        // but not a usable route. A filtering resolver can return exactly that
-        // while the configured fallback still has the address, so an empty
-        // answer must not win the race and cancel the other endpoint. The same
-        // applies to a missing HTTPS/ECH answer: the fallback may still have
-        // the ECHConfigList that the primary filtered out.
         let address_query = matches!(qtype, TYPE_A | TYPE_AAAA);
-        let useful_answer = |answer: &ResolvedAnswer| {
-            if address_query {
-                !answer.ips.is_empty()
-            } else {
-                // HTTPS RRs are only fetched for ECH here. An empty HTTPS RR
-                // is a valid NODATA answer, but it is not useful while another
-                // endpoint in the primary/fallback pair may still return ECH.
-                answer.ech.is_some()
-            }
-        };
-        let mut empty_answer: Option<(usize, ResolvedAnswer)> = None;
-        // Per-endpoint outcome of this query: None until the endpoint
-        // produced a result. `attempts` only records failures, so a raced
-        // endpoint cut off by the grace window used to look like full
-        // agreement — this is what the authoritative-NODATA decision reads.
+        let timeout = Duration::from_secs(self.config.snapshot().catalogs.timeout_secs.max(1));
+        let endpoint_deadline = tokio::time::Instant::now() + ENDPOINT_WINDOW.min(timeout);
+        // Policy order: a cooling endpoint drops behind the healthy ones; the
+        // user's configured order is kept among equals.
+        let order = self.endpoint_order(&endpoints);
+        let primary = order[0];
+        let mut merged = MergedAnswers::new(address_query);
+        let mut attempts: Vec<DohAttemptError> = Vec::new();
+        // Per-endpoint outcome of this query: None until the endpoint produced
+        // a result. The authoritative-NODATA decision reads it.
         let mut outcome: Vec<Option<bool>> = vec![None; endpoints.len()];
-        // Every endpoint pushed into a race/fallback wave, in push order.
-        let mut pushed: Vec<usize> = Vec::new();
+        // Endpoints actually contacted, in launch order.
+        let mut asked: Vec<usize> = Vec::new();
 
-        // Primary and fallback race each other: the first successful answer wins, so a
-        // dead or slow primary costs nothing on cache misses instead of a full timeout.
-        // The dropped loser gets no health record; periodic health checks cover that.
-        if endpoints.len() >= 2 {
-            let started = Instant::now();
-            let mut pending: FuturesUnordered<
-                futures_util::future::BoxFuture<'_, (usize, Result<ResolvedAnswer>)>,
-            > = FuturesUnordered::new();
-            pending.push(Box::pin(async {
+        // The first two ranked endpoints. The second is a hedge: it joins when
+        // the first fails, answers without enough data, or stalls past
+        // PRIMARY_HEDGE. Racing both from t=0 sent every queried name to two
+        // providers even when the first was healthy.
+        let mut pending: FuturesUnordered<
+            futures_util::future::BoxFuture<'_, (usize, Instant, Result<ResolvedAnswer>)>,
+        > = FuturesUnordered::new();
+        let mut cursor = 1usize;
+        let mut second_started = order.len() < 2;
+        asked.push(primary);
+        {
+            let endpoint = &endpoints[primary];
+            pending.push(Box::pin(async move {
+                let queued = Instant::now();
                 (
-                    0usize,
-                    self.query_endpoint(&endpoints[0], domain, qtype).await,
+                    primary,
+                    queued,
+                    self.query_endpoint(endpoint, domain, qtype).await,
                 )
             }));
-            pending.push(Box::pin(async {
-                (
-                    1usize,
-                    self.query_endpoint(&endpoints[1], domain, qtype).await,
-                )
-            }));
-            pushed.extend([0, 1]);
-            // Once a raced endpoint answered without a usable address, the other
-            // one only gets this long to produce one. Without the grace window a
-            // stalled primary holds the whole race — and every request parked
-            // behind the resolver's single-flight lock — until its full request
-            // timeout, while a healthy retry a second later would succeed.
-            let race_deadline = tokio::time::Instant::now()
-                + RACE_DEADLINE.min(Duration::from_secs(
-                    self.config.snapshot().catalogs.timeout_secs.max(1),
-                ));
-            let mut grace_deadline: Option<tokio::time::Instant> = None;
-            while let Some((index, result)) = {
-                let deadline = match grace_deadline {
-                    Some(grace) if grace < race_deadline => grace,
-                    _ => race_deadline,
-                };
-                tokio::time::timeout_at(deadline, pending.next())
-                    .await
-                    .ok()
-                    .flatten()
-            } {
-                let endpoint = &endpoints[index];
-                match result {
-                    Ok(answer) => {
-                        outcome[index] = Some(true);
-                        self.record_health(endpoint, true, started.elapsed(), None);
-                        if useful_answer(&answer) {
-                            self.store_answer(domain, qtype, &answer);
-                            return Ok(TypeQuery {
-                                answer,
-                                source: endpoint.source,
-                                endpoint: endpoint.name.clone(),
-                                fallback_used: index != 0,
-                                attempts,
-                                authoritative: true,
-                            });
-                        }
-                        // Keep waiting for the other endpoint; if neither has
-                        // an address, the empty answer still lets the caller
-                        // try AAAA and report a precise error.
-                        if empty_answer.is_none() {
-                            empty_answer = Some((index, answer));
-                        }
-                        if grace_deadline.is_none() {
-                            grace_deadline = Some(tokio::time::Instant::now() + EMPTY_ANSWER_GRACE);
-                        }
-                    }
-                    Err(error) => {
-                        outcome[index] = Some(false);
-                        self.record_health(
-                            endpoint,
-                            false,
-                            started.elapsed(),
-                            Some(format!("{error:#}")),
-                        );
+        }
+        let mut hedge_at = if second_started {
+            None
+        } else {
+            Some(tokio::time::Instant::now() + PRIMARY_HEDGE)
+        };
+        let stage_deadline = endpoint_deadline;
+        enum StageEvent {
+            Item(Option<(usize, Instant, Result<ResolvedAnswer>)>),
+            Hedge,
+            Deadline,
+        }
+        loop {
+            if pending.is_empty() {
+                break;
+            }
+            let deadline = stage_deadline;
+            let event = match hedge_at {
+                Some(at) if at < deadline => tokio::select! {
+                    item = pending.next() => StageEvent::Item(item),
+                    _ = tokio::time::sleep_until(at) => StageEvent::Hedge,
+                },
+                _ => match tokio::time::timeout_at(deadline, pending.next()).await {
+                    Ok(item) => StageEvent::Item(item),
+                    Err(_) => StageEvent::Deadline,
+                },
+            };
+            match event {
+                StageEvent::Deadline | StageEvent::Item(None) => break,
+                StageEvent::Hedge => {
+                    hedge_at = None;
+                    if !second_started {
+                        second_started = true;
+                        let index = order[cursor];
+                        cursor += 1;
+                        asked.push(index);
                         tracing::debug!(
-                            endpoint = %redact_url(&endpoint.url),
                             domain = %domain,
                             qtype,
-                            error = %error,
-                            "DoH query failed"
+                            waited_ms = PRIMARY_HEDGE.as_millis() as u64,
+                            next = %endpoints[index].name,
+                            "doh endpoint is slow; running the next one in parallel"
                         );
-                        attempts.push(DohAttemptError {
-                            endpoint: endpoint.name.clone(),
-                            source: endpoint.source,
-                            error: format!("{error:#}"),
-                        });
-                        // No grace here: the window exists so a non-usable
-                        // *answer* does not cancel the other endpoint's
-                        // in-flight query. An error is not an answer — the
-                        // healthy side keeps the full race deadline instead
-                        // of being cut short after someone else's fast
-                        // failure.
+                        let endpoint = &endpoints[index];
+                        pending.push(Box::pin(async move {
+                            let queued = Instant::now();
+                            (
+                                index,
+                                queued,
+                                self.query_endpoint(endpoint, domain, qtype).await,
+                            )
+                        }));
+                    }
+                }
+                StageEvent::Item(Some((index, queued, result))) => {
+                    hedge_at = None;
+                    let endpoint = &endpoints[index];
+                    match result {
+                        Ok(answer) => {
+                            outcome[index] = Some(true);
+                            self.record_health(endpoint, true, queued.elapsed(), None);
+                            merged.absorb(index, answer);
+                            if merged.complete() {
+                                return self.finish_query(
+                                    domain, qtype, &endpoints, primary, merged, attempts, &asked,
+                                    &outcome,
+                                );
+                            }
+                            // A conclusive but insufficient answer means the
+                            // peer still has time to improve on it.
+                            tracing::debug!(
+                                domain = %domain,
+                                qtype,
+                                addresses = merged.ips.len(),
+                                answered = merged.answered,
+                                "doh answer is not enough yet; widening"
+                            );
+                        }
+                        Err(error) => {
+                            outcome[index] = Some(false);
+                            self.record_health(
+                                endpoint,
+                                false,
+                                queued.elapsed(),
+                                Some(format!("{error:#}")),
+                            );
+                            tracing::debug!(
+                                endpoint = %redact_url(&endpoint.url),
+                                domain = %domain,
+                                qtype,
+                                error = %error,
+                                "DoH query failed"
+                            );
+                            attempts.push(DohAttemptError {
+                                endpoint: endpoint.name.clone(),
+                                source: endpoint.source,
+                                error: format!("{error:#}"),
+                            });
+                        }
+                    }
+                    // A failure or a thin answer makes the next ranked
+                    // endpoint cheaper than waiting out the hedge window.
+                    if !second_started && cursor < order.len() {
+                        second_started = true;
+                        let index = order[cursor];
+                        cursor += 1;
+                        asked.push(index);
+                        let endpoint = &endpoints[index];
+                        pending.push(Box::pin(async move {
+                            let queued = Instant::now();
+                            (
+                                index,
+                                queued,
+                                self.query_endpoint(endpoint, domain, qtype).await,
+                            )
+                        }));
                     }
                 }
             }
-            // Both raced endpoints failed (or answered empty); the remaining
-            // endpoints are tried serially below so a custom endpoint can
-            // still supply an address.
         }
-
-        // For an address query, an empty answer is unusable, so trying the
-        // remaining endpoints is worth the latency. For HTTPS/ECH a NODATA
-        // answer from the primary/fallback pair is a usable negative result;
-        // probing every remaining endpoint would add one timeout per endpoint
-        // to every cold ECH route. They are only consulted when the raced
-        // pair did not produce any answer at all.
-        let pair_answered_empty = endpoints.len() >= 2 && empty_answer.is_some();
-        // What to consult after the race. Besides the remaining endpoints
-        // (skipped for HTTPS/ECH while the pair already answered), a raced
-        // pair member that was cut off without ever answering joins again:
-        // the grace window fires as soon as the other member returns NODATA,
-        // so a slow-but-healthy fallback could be cancelled mid-flight — and
-        // skipping it forever made the query fail identically on every
-        // retry, a permanent failure for the domain. A pair that produced no
-        // answer at all already spent the whole race deadline and is not
-        // started over; only a pair that answered justifies the second
-        // attempt.
-        let mut consult: Vec<usize> = Vec::new();
-        if empty_answer.is_some() {
-            consult.extend((0..endpoints.len().min(2)).filter(|&index| outcome[index].is_none()));
-        }
-        if !(qtype == TYPE_HTTPS && pair_answered_empty) {
-            consult.extend((if endpoints.len() >= 2 { 2 } else { 0 })..endpoints.len());
-        }
-        if !consult.is_empty() {
-            let timeout =
-                Duration::from_secs(self.config.snapshot().catalogs.timeout_secs.max(1));
-            let budget = tokio::time::Instant::now() + timeout * FALLBACK_WAVES;
-            let mut remaining = consult.into_iter();
-            let mut pending: FuturesUnordered<
-                futures_util::future::BoxFuture<
-                    '_,
-                    (usize, Instant, Result<ResolvedAnswer>),
-                >,
-            > = FuturesUnordered::new();
-            for _ in 0..FALLBACK_LANES {
-                let Some(index) = remaining.next() else {
-                    break;
-                };
-                let endpoint = endpoints[index].clone();
-                pushed.push(index);
-                pending.push(Box::pin(async move {
-                    let queued = Instant::now();
-                    let result = self.query_endpoint(&endpoint, domain, qtype).await;
-                    (index, queued, result)
-                }));
-            }
-            loop {
-                let next = match tokio::time::timeout_at(budget, pending.next()).await {
-                    Ok(next) => next,
-                    // The shared budget is spent. Queries still in flight are
-                    // dropped and keep no health record this round, the same
-                    // semantics as a dropped race loser.
-                    Err(_) => break,
-                };
-                let Some((index, queued, result)) = next else {
-                    break;
-                };
-                let endpoint = &endpoints[index];
-                match result {
-                    Ok(answer) => {
-                        outcome[index] = Some(true);
-                        self.record_health(endpoint, true, queued.elapsed(), None);
-                        if useful_answer(&answer) {
-                            self.store_answer(domain, qtype, &answer);
-                            return Ok(TypeQuery {
-                                answer,
-                                source: endpoint.source,
-                                endpoint: endpoint.name.clone(),
-                                fallback_used: index != 0 || !attempts.is_empty(),
-                                attempts,
-                                authoritative: true,
-                            });
-                        }
-                        if empty_answer.is_none() {
-                            empty_answer = Some((index, answer));
-                        }
+        // Anything still in flight at the endpoint deadline is dropped
+        // silently instead of being remembered as a failure.
+        let mut tail_deadline = Some(endpoint_deadline);
+        // The rest of the ranked list, two lanes at a time under one budget.
+        // The catalog can be long; the budget bounds it.
+        let budget = tokio::time::Instant::now() + timeout * FALLBACK_WAVES;
+        loop {
+            if tail_deadline.is_none() {
+                while pending.len() < FALLBACK_LANES && cursor < order.len() {
+                    let index = order[cursor];
+                    cursor += 1;
+                    if asked.contains(&index) {
+                        continue;
                     }
-                    Err(error) => {
-                        outcome[index] = Some(false);
-                        self.record_health(
-                            endpoint,
-                            false,
-                            queued.elapsed(),
-                            Some(format!("{error:#}")),
-                        );
-                        tracing::debug!(
-                            endpoint = %redact_url(&endpoint.url),
-                            domain = %domain,
-                            qtype,
-                            error = %error,
-                            "DoH query failed"
-                        );
-                        attempts.push(DohAttemptError {
-                            endpoint: endpoint.name.clone(),
-                            source: endpoint.source,
-                            error: format!("{error:#}"),
-                        });
-                    }
-                }
-                if let Some(next_index) = remaining.next() {
-                    pushed.push(next_index);
-                    let next_endpoint = endpoints[next_index].clone();
+                    asked.push(index);
+                    let endpoint = &endpoints[index];
                     pending.push(Box::pin(async move {
                         let queued = Instant::now();
-                        let result = self
-                            .query_endpoint(&next_endpoint, domain, qtype)
-                            .await;
-                        (next_index, queued, result)
+                        (
+                            index,
+                            queued,
+                            self.query_endpoint(endpoint, domain, qtype).await,
+                        )
                     }));
                 }
             }
-        }
-
-        // Every endpoint answered without an address. Return the empty answer
-        // (instead of "all endpoints failed") so the caller queries AAAA and
-        // reports that DoH had no records, not that DoH was unreachable.
-        if let Some((index, answer)) = empty_answer {
-            let endpoint = &endpoints[index];
-            // An authoritative empty answer repeats for every cold connection:
-            // remember it so the next query skips the endpoint race entirely.
-            // It is only authoritative when every endpoint we asked actually
-            // answered: `attempts` records failures only, so a raced endpoint
-            // cut off by the grace window (or a fallback wave dropped by its
-            // budget) used to pass this check — its silence was cached as
-            // NODATA for a full DNS window even though the other endpoint
-            // still had the address.
-            let authoritative =
-                !pushed.is_empty() && pushed.iter().all(|&asked| outcome[asked] == Some(true));
-            let ttl = if authoritative && qtype == TYPE_HTTPS {
-                NEGATIVE_HTTPS_NODATA_SECS
-            } else if authoritative {
-                NEGATIVE_NODATA_SECS
-            } else {
-                NEGATIVE_FAILURE_SECS
+            let deadline = tail_deadline.unwrap_or(budget).min(budget);
+            let next = match tokio::time::timeout_at(deadline, pending.next()).await {
+                Ok(next) => next,
+                Err(_) if tail_deadline.is_some() => {
+                    pending = FuturesUnordered::new();
+                    tail_deadline = None;
+                    continue;
+                }
+                // The shared budget is spent. Queries still in flight are
+                // dropped and keep no health record this round.
+                Err(_) => break,
             };
-            self.cache
-                .put_doh_negative(domain, qtype, ttl, authoritative);
+            let Some((index, queued, result)) = next else {
+                if tail_deadline.is_some() {
+                    tail_deadline = None;
+                    continue;
+                }
+                break;
+            };
+            let endpoint = &endpoints[index];
+            match result {
+                Ok(answer) => {
+                    outcome[index] = Some(true);
+                    self.record_health(endpoint, true, queued.elapsed(), None);
+                    merged.absorb(index, answer);
+                    if merged.complete() {
+                        return self.finish_query(
+                            domain, qtype, &endpoints, primary, merged, attempts, &asked, &outcome,
+                        );
+                    }
+                }
+                Err(error) => {
+                    outcome[index] = Some(false);
+                    self.record_health(
+                        endpoint,
+                        false,
+                        queued.elapsed(),
+                        Some(format!("{error:#}")),
+                    );
+                    tracing::debug!(
+                        endpoint = %redact_url(&endpoint.url),
+                        domain = %domain,
+                        qtype,
+                        error = %error,
+                        "DoH query failed"
+                    );
+                    attempts.push(DohAttemptError {
+                        endpoint: endpoint.name.clone(),
+                        source: endpoint.source,
+                        error: format!("{error:#}"),
+                    });
+                }
+            }
+        }
+        self.finish_query(
+            domain, qtype, &endpoints, primary, merged, attempts, &asked, &outcome,
+        )
+    }
+
+    /// Turn the collected answers into a `TypeQuery`: the union when there is
+    /// data, an authoritative-NODATA decision when every asked endpoint
+    /// answered, and a precise failure otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_query(
+        &self,
+        domain: &str,
+        qtype: u16,
+        endpoints: &[EffectiveEndpoint],
+        primary: usize,
+        merged: MergedAnswers,
+        attempts: Vec<DohAttemptError>,
+        asked: &[usize],
+        outcome: &[Option<bool>],
+    ) -> Result<TypeQuery> {
+        // `fallback_used` now means what it says: a second endpoint was
+        // involved (as a source or as a failed attempt).
+        let fallback_used =
+            merged.sources > 1 || merged.first_source != Some(primary) || !attempts.is_empty();
+        if merged.has_data() {
+            let first = merged.first_source.unwrap_or(primary);
+            let answer = merged.into_answer();
+            self.store_answer(domain, qtype, &answer);
+            let endpoint = &endpoints[first];
             return Ok(TypeQuery {
                 answer,
                 source: endpoint.source,
                 endpoint: endpoint.name.clone(),
-                fallback_used: index != 0 || !attempts.is_empty(),
+                fallback_used,
                 attempts,
-                authoritative,
+                authoritative: true,
             });
         }
-
-        let detail = attempts
-            .iter()
-            .map(|attempt| format!("{}: {}", attempt.endpoint, attempt.error))
-            .collect::<Vec<_>>()
-            .join("; ");
-        if attempts.is_empty() {
-            // Nothing failed: the race (or fallback) deadline cancelled every
-            // query while it was still in flight. Caching that as a hard
-            // failure black-holed the domain for NEGATIVE_FAILURE_SECS even
-            // though a healthy-but-slow endpoint would answer the next
-            // attempt, and the joined detail was an empty string.
-            bail!("all DoH endpoints silent: race deadline exceeded before any answered");
-        }
+        let Some((index, answer)) = merged.empty else {
+            let detail = attempts
+                .iter()
+                .map(|attempt| format!("{}: {}", attempt.endpoint, attempt.error))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if attempts.is_empty() {
+                // Nothing failed: the deadline cancelled every query while it
+                // was still in flight. Caching that as a hard failure
+                // black-holed the domain for NEGATIVE_FAILURE_SECS even though
+                // a healthy-but-slow endpoint would answer the next attempt.
+                bail!("all DoH endpoints silent: race deadline exceeded before any answered");
+            }
+            self.cache
+                .put_doh_negative(domain, qtype, NEGATIVE_FAILURE_SECS, false);
+            bail!("all DoH endpoints failed: {detail}");
+        };
+        // A NODATA answer repeats for every cold connection, so remember it —
+        // but only as authoritative when every endpoint we asked actually
+        // answered. A peer cut off by the deadline never confirmed the
+        // silence, and caching that would hide a working endpoint.
+        let authoritative =
+            !asked.is_empty() && asked.iter().all(|&asked| outcome[asked] == Some(true));
+        let ttl = if authoritative && qtype == TYPE_HTTPS {
+            NEGATIVE_HTTPS_NODATA_SECS
+        } else if authoritative {
+            NEGATIVE_NODATA_SECS
+        } else {
+            NEGATIVE_FAILURE_SECS
+        };
         self.cache
-            .put_doh_negative(domain, qtype, NEGATIVE_FAILURE_SECS, false);
-        bail!("all DoH endpoints failed: {detail}")
+            .put_doh_negative(domain, qtype, ttl, authoritative);
+        let endpoint = &endpoints[index];
+        Ok(TypeQuery {
+            answer,
+            source: endpoint.source,
+            endpoint: endpoint.name.clone(),
+            fallback_used,
+            attempts,
+            authoritative,
+        })
     }
 
     /// Persist a successful resolution into the answer/ECH caches.
@@ -1330,6 +1528,9 @@ impl Resolver {
             qtype,
             elapsed_ms = started.elapsed().as_millis() as u64,
             ips = %format_ips(&answer.ips),
+            // An HTTPS answer carries no addresses; whether it carried the
+            // ECHConfig is the fact that decides the route.
+            ech = answer.ech.is_some(),
             ttl_secs = answer.ttl,
             "doh query answered"
         );
@@ -1416,23 +1617,61 @@ impl Resolver {
         elapsed: Duration,
         error: Option<String>,
     ) {
-        let previous = {
+        let now = Instant::now();
+        let (previous, entered_cooldown, failures, cooldown_until) = {
             let mut health = self.health.write();
-            let previous = health.get(&endpoint.url).map(|entry| entry.healthy);
+            let previous = health.get(&endpoint.url).map(|entry| {
+                (
+                    entry.healthy,
+                    entry.failures,
+                    entry.cooldown_until,
+                )
+            });
+            let was_cooling = previous
+                .and_then(|entry| entry.2)
+                .is_some_and(|until| until > now);
+            let (previous_healthy, failures, cooldown_until) = match (healthy, previous) {
+                (true, previous) => (previous.map(|entry| entry.0), 0, None),
+                (false, Some((previous_healthy, failures, cooldown_until))) => {
+                    let failures = failures.saturating_add(1);
+                    let cooldown_until = if failures >= ENDPOINT_FAILURE_THRESHOLD {
+                        Some(now + cooldown_delay(failures))
+                    } else {
+                        cooldown_until
+                    };
+                    (Some(previous_healthy), failures, cooldown_until)
+                }
+                (false, None) => (None, 1, None),
+            };
             health.insert(
                 endpoint.url.clone(),
-                DohHealth {
-                    name: endpoint.name.clone(),
-                    url: endpoint.url.clone(),
-                    source: endpoint.source,
+                DohHealth::new(
+                    endpoint,
                     healthy,
-                    latency_ms: Some(elapsed.as_millis() as u64),
-                    last_error: error.clone(),
-                    checked_at: now(),
-                },
+                    Some(elapsed.as_millis() as u64),
+                    error.clone(),
+                    failures,
+                    cooldown_until,
+                ),
             );
-            previous
+            (
+                previous_healthy,
+                !was_cooling && cooldown_until.is_some(),
+                failures,
+                cooldown_until,
+            )
         };
+        if entered_cooldown {
+            tracing::warn!(
+                endpoint = %endpoint.name,
+                url = %redact_url(&endpoint.url),
+                failures,
+                cooldown_secs = cooldown_until
+                    .map(|until| until.saturating_duration_since(now).as_secs())
+                    .unwrap_or(0),
+                "doh endpoint cooling down; skipping it for a while"
+            );
+        }
         // Only transitions are logged: a healthy endpoint answers every query,
         // and one line per query would drown the interesting failures.
         if previous != Some(healthy) {
@@ -1450,12 +1689,44 @@ impl Resolver {
                     url = %redact_url(&endpoint.url),
                     source = %endpoint.source,
                     latency_ms = elapsed.as_millis() as u64,
+                    failures,
+                    cooling_secs = cooldown_until
+                        .map(|until| until.saturating_duration_since(now).as_secs())
+                        .unwrap_or(0),
                     error = error.as_deref().unwrap_or("unknown"),
                     "doh endpoint is unreachable"
                 );
             }
         }
     }
+
+    /// Endpoints in policy order: healthy ones first (the configured order is
+    /// kept among equals), cooling ones last, soonest-to-expire first. A pool
+    /// where every entry is cooling still yields the least-bad endpoint.
+    fn endpoint_order(&self, endpoints: &[EffectiveEndpoint]) -> Vec<usize> {
+        let now = Instant::now();
+        let health = self.health.read();
+        let mut order: Vec<usize> = (0..endpoints.len()).collect();
+        order.sort_by_key(|&index| {
+            match health.get(&endpoints[index].url) {
+                Some(entry) => match entry.cooldown_until {
+                    Some(until) if entry.cooling(now) => (1u8, until, index),
+                    _ => (0u8, now, index),
+                },
+                None => (0u8, now, index),
+            }
+        });
+        order
+    }
+}
+
+/// Cooldown for a consecutive-failure count: 30 s after the third failure,
+/// doubling up to ten minutes.
+fn cooldown_delay(failures: u32) -> Duration {
+    let steps = failures
+        .saturating_sub(ENDPOINT_FAILURE_THRESHOLD)
+        .min(5);
+    (ENDPOINT_COOLDOWN_BASE * 2u32.pow(steps)).min(ENDPOINT_COOLDOWN_MAX)
 }
 
 fn normalize_query_name(domain: &str) -> String {
@@ -2068,5 +2339,60 @@ mod tests {
             .expect("the stale shared config must reach the requesting host");
         assert_eq!(outcome.config, ech_config);
         assert!(outcome.stale);
+    }
+
+    /// The endpoint order is the policy that keeps a blocked primary off the
+    /// hot path. Two failures must not demote it (a single bad round trip is
+    /// noise), the third cools it, a success restores it, and an expired
+    /// cooldown restores it without any traffic.
+    #[test]
+    fn a_failing_endpoint_is_demoted_only_after_the_threshold_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, resolver) = resolver(dir.path());
+        let endpoints = resolver.effective_endpoints();
+        assert!(endpoints.len() >= 2, "the default config has a pair");
+        let first = endpoints[0].clone();
+
+        let fail = || {
+            resolver.record_health(
+                &first,
+                false,
+                Duration::from_millis(1),
+                Some("blocked".into()),
+            )
+        };
+        assert_eq!(resolver.endpoint_order(&endpoints)[0], 0);
+        fail();
+        fail();
+        assert_eq!(
+            resolver.endpoint_order(&endpoints)[0],
+            0,
+            "two failures are noise, not a verdict"
+        );
+        fail();
+        let order = resolver.endpoint_order(&endpoints);
+        assert_eq!(order[0], 1, "the healthy endpoint takes the first slot");
+        assert_eq!(*order.last().unwrap(), 0, "the cooled endpoint sinks");
+
+        // An expired cooldown restores the position without new traffic.
+        {
+            let mut health = resolver.health.write();
+            let entry = health.get_mut(&first.url).unwrap();
+            entry.cooldown_until = Some(Instant::now() - Duration::from_millis(1));
+        }
+        assert_eq!(resolver.endpoint_order(&endpoints)[0], 0);
+
+        // A success resets the failure count and leaves it first even while a
+        // new cooldown is armed.
+        {
+            let mut health = resolver.health.write();
+            health.get_mut(&first.url).unwrap().cooldown_until =
+                Some(Instant::now() + Duration::from_secs(60));
+        }
+        resolver.record_health(&first, true, Duration::from_millis(1), None);
+        let entry = resolver.health.read().get(&first.url).cloned().unwrap();
+        assert_eq!(entry.failures, 0);
+        assert!(entry.cooldown_until.is_none());
+        assert_eq!(resolver.endpoint_order(&endpoints)[0], 0);
     }
 }
