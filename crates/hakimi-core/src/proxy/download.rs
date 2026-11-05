@@ -979,15 +979,17 @@ async fn probe_range(
     Ok(())
 }
 
-/// Whether `prefix` honours byte ranges, probing and remembering it when the
-/// answer is not cached. The probe result is shared through the mirror list,
-/// so one download pays for it and the rest reuse the judgement.
-pub(crate) async fn mirror_range_ok(
+/// Whether the origin honours byte ranges, probed with `bytes=0-0`.
+///
+/// `mirror` is the prefix the verdict is remembered under. `None` is a direct
+/// origin: its answer is not reused, because the next download may land on a
+/// different edge of the same host.
+async fn probe_range_support(
     ctx: &super::ProxyContext,
     uri: &Uri,
     range_headers: &HeaderMap,
     response: &UpstreamResponse,
-    prefix: &str,
+    mirror: Option<&str>,
 ) -> bool {
     let total_len = response
         .headers()
@@ -996,9 +998,6 @@ pub(crate) async fn mirror_range_ok(
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let host = uri.host().unwrap_or("").to_string();
-    if let Some(supported) = ctx.download.mirrors.range_supported(prefix) {
-        return supported;
-    }
     let started = Instant::now();
     let result = match tokio::time::timeout(
         RANGE_PROBE_TIMEOUT,
@@ -1016,20 +1015,38 @@ pub(crate) async fn mirror_range_ok(
         Err(_) => Err("timed out".to_string()),
     };
     let elapsed = started.elapsed().as_millis() as u64;
-    ctx.download.mirrors.note_range(prefix, result.is_ok());
+    if let Some(prefix) = mirror {
+        ctx.download.mirrors.note_range(prefix, result.is_ok());
+    }
     match result {
         Ok(()) => true,
         Err(reason) => {
             tracing::info!(
                 host = %host,
-                mirror = prefix,
+                mirror = mirror.unwrap_or("direct"),
                 elapsed_ms = elapsed,
                 reason = %reason,
-                "mirror range probe failed"
+                "range probe failed"
             );
             false
         }
     }
+}
+
+/// Whether `prefix` honours byte ranges, probing and remembering it when the
+/// answer is not cached. The probe result is shared through the mirror list,
+/// so one download pays for it and the rest reuse the judgement.
+pub(crate) async fn mirror_range_ok(
+    ctx: &super::ProxyContext,
+    uri: &Uri,
+    range_headers: &HeaderMap,
+    response: &UpstreamResponse,
+    prefix: &str,
+) -> bool {
+    if let Some(supported) = ctx.download.mirrors.range_supported(prefix) {
+        return supported;
+    }
+    probe_range_support(ctx, uri, range_headers, response, Some(prefix)).await
 }
 
 /// The mirror candidates to try when the serving mirror does not honour byte
@@ -1096,9 +1113,13 @@ pub(crate) async fn segment(
             !prefix.is_empty()
                 && mirror_range_ok(ctx, &uri, &range_headers, &response, prefix).await
         } else {
-            // The direct path only reaches `segment` through
-            // `segment_eligible`, which already proved the headers.
-            true
+            // `Accept-Ranges` is only an advertisement: a server (or a proxy
+            // in front of it) can answer a range request with the whole body,
+            // and the first such reply aborted the download after chunk 0 was
+            // already on the wire. Probe while the original response is still
+            // unread; a failure falls back to that response as a single stream
+            // below instead of killing it.
+            probe_range_support(ctx, &uri, &range_headers, &response, None).await
         };
     if !ranges_ok {
         tracing::info!(
@@ -1106,7 +1127,7 @@ pub(crate) async fn segment(
             reason = if mirrored {
                 "mirror does not support ranges or the body is not sliceable"
             } else {
-                "response is not sliceable"
+                "the body is not sliceable or the origin did not honour a range probe"
             },
             "falling back to a single stream"
         );
