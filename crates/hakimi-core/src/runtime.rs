@@ -1292,12 +1292,12 @@ impl HakimiRuntime {
                     _ = receiver.changed() => break,
                     _ = runtime.engine.reprobe_failed_ips(16) => {}
                 }
-                let stats = runtime.upstream.stats_json();
                 // A periodic snapshot, not an event. It repeats every minute
                 // with mostly unchanged numbers and would otherwise be the
                 // second largest block in the log.
                 tracing::debug!(
-                    stats = %serde_json::to_string(&stats).unwrap_or_default(),
+                    stats = %serde_json::to_string(&runtime.upstream.stats_json())
+                        .unwrap_or_default(),
                     "pool stats"
                 );
             }
