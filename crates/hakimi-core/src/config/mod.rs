@@ -205,15 +205,8 @@ pub struct AdvancedConfig {
     /// `http1Hosts` use at least `http1MaxConcurrent` instead, so a following
     /// image burst can reuse the connections it just opened.
     pub upstream_max_idle_per_host: usize,
-    /// Host patterns forced to HTTP/1.1 upstream.
-    ///
-    /// Some origins throttle a single TCP connection instead of the aggregate,
-    /// so h2 multiplexing makes every stream share one throttled pipe and the
-    /// responses finish in file-size order. Independent HTTP/1.1 connections
-    /// aggregate the bandwidth instead. Which origins behave that way is a
-    /// property of the site, so the list is the user's to maintain: the defaults
-    /// cover the built-in sites, and the site editor can add or remove entries.
-    /// Patterns use the same rules as group domains (`*.example.com`).
+    /// Host patterns forced to HTTP/1.1 upstream. Patterns use the same rules
+    /// as group domains (`*.example.com`).
     pub http1_hosts: Vec<String>,
     /// Maximum concurrent upstream requests (and therefore connections) per `http1Hosts`
     /// authority. Too many simultaneous TLS connections make image loading worse.
@@ -324,20 +317,10 @@ impl Default for AdvancedConfig {
             upstream_idle_secs: 120,
             upstream_max_idle_per_host: 8,
             http1_hosts: vec![
-                // These hosts throttle per TCP connection, so h2 multiplexing
-                // does not help: every stream shares one throttled pipe and the
-                // responses finish in file-size order at a sum-of-sizes pace.
-                // Independent h1 connections aggregate the bandwidth instead.
-                //
-                // Pixiv only, because that is where the behaviour is measured:
-                // s.pximg.net (JS/CSS) served one page's chunks in 26s over a
-                // single h2 connection versus 7s over h1, and i.pximg.net's
-                // artwork is throttled the same way. Other image hosts are left
-                // alone until they show the same symptom; the setting is the
-                // user's to extend.
                 "i.pximg.net".to_string(),
                 "booth.pximg.net".to_string(),
                 "s.pximg.net".to_string(),
+                "*.githubassets.com".to_string(),
             ],
             http1_max_concurrent: 32,
             upstream_header_timeout_secs: 60,
@@ -1655,13 +1638,16 @@ mod tests {
             .http1_hosts
             .iter()
             .any(|pattern| pattern == "i.pximg.net"));
-        // s.pximg.net is the asset CDN and throttles per connection, so it
-        // belongs on the parallel h1 pool together with the image hosts.
         assert!(config
             .advanced
             .http1_hosts
             .iter()
             .any(|pattern| pattern == "s.pximg.net"));
+        assert!(config
+            .advanced
+            .http1_hosts
+            .iter()
+            .any(|pattern| pattern == "*.githubassets.com"));
         assert_eq!(
             config.group("github").unwrap().primary_domain(),
             Some("github.com")
@@ -2228,6 +2214,38 @@ mod tests {
         manager.update(manager.snapshot().as_ref().clone()).unwrap();
         let text = std::fs::read_to_string(paths.config_file()).unwrap();
         assert!(!text.contains("http1Hosts"));
+    }
+
+    #[test]
+    fn default_http1_hosts_cover_the_measured_cdns() {
+        let config = AppConfig::default();
+        let matcher = crate::domain::DomainMatcher::from_patterns(
+            config
+                .advanced
+                .http1_hosts
+                .iter()
+                .map(|pattern| ("http1", pattern.as_str())),
+        )
+        .unwrap();
+
+        for host in [
+            "s.pximg.net",
+            "i.pximg.net",
+            "booth.pximg.net",
+            "github.githubassets.com",
+            "assets.githubassets.com",
+        ] {
+            assert!(
+                matcher.match_normalized(host).is_some(),
+                "{host} must use the h1 pool"
+            );
+        }
+        for host in ["github.com", "api.github.com", "raw.githubusercontent.com"] {
+            assert!(
+                matcher.match_normalized(host).is_none(),
+                "{host} must stay on h2"
+            );
+        }
     }
 
     #[test]
