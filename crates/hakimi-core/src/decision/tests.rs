@@ -14,7 +14,7 @@ use crate::ip_tester::{ConnectError, ProbeSuccess};
 use crate::paths::Paths;
 use crate::resolver::{DohResolution, EchOutcome, IpResolver};
 use crate::status::{State, StatusStore};
-use crate::strategy::{DohSource, FailureReason, IpSource, TlsMode};
+use crate::strategy::{CacheStatus, DohSource, FailureReason, IpSource, TlsMode};
 use crate::util::{network_id, now};
 use anyhow::Result;
 
@@ -2595,5 +2595,206 @@ async fn a_doh_only_domain_still_gets_an_opponent() {
         retired.len(),
         1,
         "a DoH-only candidate must be usable as the challenger"
+    );
+}
+
+/// The default candidate order: the remembered `last_good` address leads, the
+/// catalog follows. Neither address has a score on a fresh start, so the
+/// insertion order is what the operator observes in the failure trace.
+#[tokio::test]
+async fn default_order_tries_the_last_good_cache_before_the_catalog() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    *h.remote.catalog.lock() = true;
+    let cache_ip: IpAddr = "1.1.1.1".parse().unwrap();
+    let remote_ip: IpAddr = "8.8.8.8".parse().unwrap();
+    *h.remote.ips.lock() = Some(vec![remote_ip]);
+    h.cache.put_last_good(LastGoodEntry {
+        domain: "example.com".into(),
+        ip: cache_ip,
+        source: IpSource::Cache,
+        saved_at: now(),
+        catalog_version: 0,
+    });
+
+    let mut cursor = match h.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let first = cursor.next_plan().await.expect("the cache plan");
+    assert_eq!(
+        (first.ip, first.source),
+        (cache_ip, IpSource::Cache),
+        "the last-good cache must be tried before the catalog"
+    );
+    let second = cursor.next_plan().await.expect("the catalog plan");
+    assert_eq!(
+        (second.ip, second.source),
+        (remote_ip, IpSource::Remote),
+        "the catalog address follows the cached one"
+    );
+    assert!(
+        cursor.next_plan().await.is_none(),
+        "only the cache and the catalog address exist before the DoH expansion"
+    );
+}
+
+/// A remembered route older than `last_good_days` is a hint that expired: it
+/// must not become a candidate, while the catalog still does.
+#[tokio::test]
+async fn an_expired_last_good_is_not_a_candidate() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    *h.remote.catalog.lock() = true;
+    let stale_ip: IpAddr = "1.1.1.1".parse().unwrap();
+    let remote_ip: IpAddr = "8.8.8.8".parse().unwrap();
+    *h.remote.ips.lock() = Some(vec![remote_ip]);
+    // Saved eight days ago; the default `last_good_days` is seven.
+    h.cache.put_last_good(LastGoodEntry {
+        domain: "example.com".into(),
+        ip: stale_ip,
+        source: IpSource::Remote,
+        saved_at: now() - chrono::Duration::days(8),
+        catalog_version: 0,
+    });
+    assert!(
+        h.cache.route_hints("example.com", 7).1.is_none(),
+        "the routes file itself must report the entry as expired"
+    );
+
+    let mut cursor = match h.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let first = cursor
+        .next_plan()
+        .await
+        .expect("the catalog address must still be planned");
+    assert_eq!(
+        (first.ip, first.source),
+        (remote_ip, IpSource::Remote),
+        "an expired last-good address must not be dialled"
+    );
+    assert!(
+        cursor.next_plan().await.is_none(),
+        "the expired cache entry must not reappear as a candidate"
+    );
+}
+
+/// `ip_rejected` is the same verdict for every source: a black-listed address
+/// is out whether the cache, the catalog or DoH offered it.
+#[tokio::test]
+async fn rejected_addresses_are_filtered_from_every_candidate_source() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    *h.remote.catalog.lock() = true;
+    let rejected_cache: IpAddr = "1.1.1.1".parse().unwrap();
+    let rejected_remote: IpAddr = "8.8.8.8".parse().unwrap();
+    let live_remote: IpAddr = "9.9.9.9".parse().unwrap();
+    let rejected_doh: IpAddr = "7.7.7.7".parse().unwrap();
+    let live_doh: IpAddr = "6.6.6.6".parse().unwrap();
+    *h.remote.ips.lock() = Some(vec![rejected_remote, live_remote]);
+    h.cache.put_last_good(LastGoodEntry {
+        domain: "example.com".into(),
+        ip: rejected_cache,
+        source: IpSource::Cache,
+        saved_at: now(),
+        catalog_version: 0,
+    });
+    h.resolver.answers.lock().push_back(Ok(DohResolution {
+        ips: vec![rejected_doh, live_doh],
+        source: DohSource::Primary,
+        endpoint: "primary".into(),
+        stale: false,
+        ttl: 60,
+        fallback_used: false,
+    }));
+    for ip in [rejected_cache, rejected_remote, rejected_doh] {
+        h.engine
+            .ip_rejections
+            .write()
+            .entry("example.com".into())
+            .or_default()
+            .insert(ip, Instant::now());
+    }
+
+    let mut cursor = match h.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let mut seen: Vec<(IpAddr, IpSource)> = Vec::new();
+    while let Some(plan) = cursor.next_plan().await {
+        seen.push((plan.ip, plan.source));
+    }
+    assert_eq!(
+        seen,
+        vec![(live_remote, IpSource::Remote), (live_doh, IpSource::Doh)],
+        "a rejected address must be filtered from the cache, the catalog and DoH alike"
+    );
+}
+
+/// A stale (past-TTL but still usable) DoH answer is a last resort, and the
+/// diagnostics have to say so: `ip_source` is `doh-cache`, not `doh`.
+#[tokio::test]
+async fn a_stale_doh_answer_is_labelled_doh_cache() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    *h.remote.catalog.lock() = true;
+    let dead: IpAddr = "1.1.1.1".parse().unwrap();
+    *h.remote.ips.lock() = Some(vec![dead]);
+    let stale_ip: IpAddr = "9.9.9.9".parse().unwrap();
+    h.prober.working.lock().insert(stale_ip);
+    h.resolver.answers.lock().push_back(Ok(DohResolution {
+        ips: vec![stale_ip],
+        source: DohSource::Primary,
+        endpoint: "primary".into(),
+        stale: true,
+        ttl: 0,
+        fallback_used: false,
+    }));
+
+    let outcome = h.engine.decide_https("example.com").await;
+    let plan = outcome
+        .plan
+        .expect("the stale DoH address must still be usable");
+    assert_eq!(plan.ip, stale_ip);
+    assert_eq!(
+        plan.source,
+        IpSource::DohCache,
+        "a stale answer must be labelled doh-cache"
+    );
+    assert_eq!(outcome.diagnostics.ip_source, Some(IpSource::DohCache));
+    assert_eq!(outcome.diagnostics.cache, CacheStatus::Stale);
+    assert_eq!(outcome.diagnostics.doh_source, Some(DohSource::Primary));
+}
+
+/// After a catalog update the new remote addresses lead even when the cached
+/// route has the better measured score: the score of a remote candidate is
+/// forced to zero for that one connection, otherwise the proven (but possibly
+/// outdated) cache entry would sort ahead of the address the update wants
+/// tried first.
+#[tokio::test]
+async fn skip_once_forces_the_catalog_ahead_of_a_proven_cache_route() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    *h.remote.catalog.lock() = true;
+    let cache_ip: IpAddr = "1.1.1.1".parse().unwrap();
+    let remote_ip: IpAddr = "8.8.8.8".parse().unwrap();
+    *h.remote.ips.lock() = Some(vec![remote_ip]);
+    // The cached route is proven fast on this network; the new catalog
+    // address has never been measured.
+    h.engine.record_ip("example.com", cache_ip, Some(50), false);
+    h.cache.put_last_good(LastGoodEntry {
+        domain: "example.com".into(),
+        ip: cache_ip,
+        source: IpSource::Remote,
+        saved_at: now(),
+        catalog_version: 1,
+    });
+    h.cache.mark_skip_once(["example.com"]);
+    h.prober.working.lock().insert(cache_ip);
+    h.prober.working.lock().insert(remote_ip);
+
+    let outcome = h.engine.decide_https("example.com").await;
+    assert_eq!(
+        outcome.plan.expect("one of the two addresses must win").ip,
+        remote_ip,
+        "the catalog address must lead while the skip-once hint is set, \
+         even though the cached route has the better score"
     );
 }
