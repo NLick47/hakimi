@@ -272,6 +272,10 @@ component FieldRow inherits Rectangle {
     in property <string> error-key;
     // 252px fits a port or a short value; URLs are given the whole row instead
     in property <length> field-width: 252px;
+    /// Width of the label column. The caller passes the page's shared value so
+    /// every row lines up; a label wider than this is elided rather than
+    /// clipped mid-glyph.
+    in property <length> label-width: 132px;
     callback commit(string);
 
     height: root.hint == "" ? 52px : 58px;
@@ -282,7 +286,7 @@ component FieldRow inherits Rectangle {
         spacing: 12px;
 
         VerticalLayout {
-            width: 112px;
+            width: root.label-width;
             alignment: center;
             spacing: 2px;
 
@@ -290,6 +294,7 @@ component FieldRow inherits Rectangle {
                 text: root.label;
                 font-size: 13px;
                 color: #1B1F24;
+                overflow: elide;
             }
             if root.hint != "": Text {
                 text: root.hint;
@@ -730,7 +735,19 @@ export component AppWindow inherits Window {
     // Settings column width, capped so the page stays readable when maximized.
     // URL fields bind to it instead of asking the layout, which would loop.
     property <length> settings-column: min(root.width - 40px, 660px);
-    property <length> settings-field: max(80px, root.settings-column - 168px);
+    // The row is: 16 padding + label + 12 spacing + spacer + 12 spacing +
+    // field + 16 padding. The spacer is the stretch rectangle between the two
+    // columns, so its two gaps are part of the budget — leaving them out made
+    // the content 12px wider than the column and gave the page a horizontal
+    // scrollbar.
+    // The label column fits the longest Chinese label ("独立连接的站点", ~91px at
+    // 13px) and shrinks first on a narrow window, so the input keeps usable
+    // width instead of collapsing to its 80px floor.
+    property <length> settings-label: min(132px, max(96px, root.settings-column * 0.22));
+    // 58 rather than 56: the row sums to exactly the column at 56, and a
+    // one-pixel rounding difference in font metrics is enough to bring the
+    // horizontal scrollbar back.
+    property <length> settings-field: max(80px, root.settings-column - settings-label - 58px);
     in-out property <int> page: 0;
     // Environment check (CA trust + system proxy). The fix page takes over the
     // window until everything passes; the main page shows a warning banner too.
@@ -770,6 +787,8 @@ export component AppWindow inherits Window {
     in-out property <bool> cfg-relay-enabled;
     in-out property <string> cfg-relay-listen;
     in-out property <string> cfg-relay-target;
+    // Hosts that get independent HTTP/1.1 connections, comma separated.
+    in-out property <string> cfg-http1-hosts;
     in property <string> cfg-data-dir;
     in property <string> cfg-version;
     in property <string> cfg-core-version;
@@ -1747,6 +1766,7 @@ export component AppWindow inherits Window {
                                 setting-key: "proxy.port";
                                 error-key: root.cfg-error-key;
                                 placeholder: "8443";
+                                label-width: root.settings-label;
                                 text <=> root.cfg-proxy-port;
                                 commit(value) => { root.save-string("proxy.port", value); }
                             }
@@ -1758,6 +1778,7 @@ export component AppWindow inherits Window {
                                 error-key: root.cfg-error-key;
                                 placeholder: "https://…";
                                 field-width: root.settings-field;
+                                label-width: root.settings-label;
                                 text <=> root.cfg-doh-primary;
                                 commit(value) => { root.save-string("doh.primary", value); }
                             }
@@ -1769,6 +1790,7 @@ export component AppWindow inherits Window {
                                 error-key: root.cfg-error-key;
                                 placeholder: "https://…";
                                 field-width: root.settings-field;
+                                label-width: root.settings-label;
                                 text <=> root.cfg-doh-fallback;
                                 commit(value) => { root.save-string("doh.fallback", value); }
                             }
@@ -1806,9 +1828,41 @@ export component AppWindow inherits Window {
                                 error-key: root.cfg-error-key;
                                 placeholder: "https://…";
                                 field-width: root.settings-field;
+                                label-width: root.settings-label;
                                 text <=> root.cfg-mirror-source;
                                 commit(value) => {
                                     root.save-string("advanced.download.mirrorSource", value);
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- 并发连接 ----
+                    Text {
+                        text: "并发连接";
+                        font-size: 12.5px;
+                        color: #5C6670;
+                    }
+                    Rectangle {
+                        border-radius: 8px;
+                        background: #FFFFFF;
+                        border-width: 1px;
+                        border-color: #E1E4E8;
+
+                        VerticalLayout {
+                            spacing: 0px;
+
+                            FieldRow {
+                                label: "独立连接的站点";
+                                hint: "逗号分隔，留空则关闭";
+                                setting-key: "advanced.http1Hosts";
+                                error-key: root.cfg-error-key;
+                                placeholder: "i.pximg.net, s.pximg.net";
+                                field-width: root.settings-field;
+                                label-width: root.settings-label;
+                                text <=> root.cfg-http1-hosts;
+                                commit(value) => {
+                                    root.save-string("advanced.http1Hosts", value);
                                 }
                             }
                         }
@@ -1840,11 +1894,12 @@ export component AppWindow inherits Window {
                             RowLine { }
                             FieldRow {
                                 label: "监听地址";
-                                hint: "本机回环地址，例如 127.0.0.1:17844";
+                                hint: "如 127.0.0.1:17844";
                                 setting-key: "advanced.relay.listen";
                                 error-key: root.cfg-error-key;
                                 placeholder: "127.0.0.1:17844";
                                 field-width: root.settings-field;
+                                label-width: root.settings-label;
                                 text <=> root.cfg-relay-listen;
                                 commit(value) => {
                                     root.save-string("advanced.relay.listen", value);
@@ -1853,11 +1908,12 @@ export component AppWindow inherits Window {
                             RowLine { }
                             FieldRow {
                                 label: "上游目标";
-                                hint: "host:port，端口省略时为 7844";
+                                hint: "端口默认 7844";
                                 setting-key: "advanced.relay.target";
                                 error-key: root.cfg-error-key;
                                 placeholder: "region1.v2.argotunnel.com:7844";
                                 field-width: root.settings-field;
+                                label-width: root.settings-label;
                                 text <=> root.cfg-relay-target;
                                 commit(value) => {
                                     root.save-string("advanced.relay.target", value);
@@ -1888,6 +1944,7 @@ export component AppWindow inherits Window {
                                 error-key: root.cfg-error-key;
                                 placeholder: "https://…";
                                 field-width: root.settings-field;
+                                label-width: root.settings-label;
                                 text <=> root.cfg-catalog-ip;
                                 commit(value) => { root.save-string("catalogs.ip", value); }
                             }
@@ -1899,6 +1956,7 @@ export component AppWindow inherits Window {
                                 error-key: root.cfg-error-key;
                                 placeholder: "https://…";
                                 field-width: root.settings-field;
+                                label-width: root.settings-label;
                                 text <=> root.cfg-catalog-doh;
                                 commit(value) => { root.save-string("catalogs.doh", value); }
                             }

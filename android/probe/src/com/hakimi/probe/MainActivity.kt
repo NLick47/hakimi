@@ -1033,6 +1033,21 @@ class MainActivity : Activity(), Host {
                         true
                     }
                 }
+                // Comma separated, the same shape the desktop field uses. An
+                // empty list is allowed: it means no host gets its own
+                // connections, which is a legitimate choice.
+                "advanced.http1Hosts" -> {
+                    val hosts = raw.split(',')
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() }
+                    val advanced = next.optJSONObject("advanced")
+                    if (advanced == null) {
+                        showSnack("配置尚未就绪", error = true)
+                        return@input
+                    }
+                    advanced.put("http1Hosts", JSONArray(hosts))
+                    true
+                }
                 else -> false
             }
             if (changed) {

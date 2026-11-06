@@ -1178,6 +1178,9 @@ fn apply_ui_update(
         if changed(|s| &s.relay_target) {
             app.set_cfg_relay_target(SharedString::from(settings.relay_target.clone()));
         }
+        if changed(|s| &s.http1_hosts) {
+            app.set_cfg_http1_hosts(SharedString::from(settings.http1_hosts.clone()));
+        }
     }
 
     if prev.as_ref().map(|state| state.ca) != Some(ca) {
@@ -1283,6 +1286,10 @@ pub(crate) struct SettingsValues {
     pub relay_enabled: bool,
     pub relay_listen: String,
     pub relay_target: String,
+    /// Host patterns forced onto independent HTTP/1.1 connections, joined with
+    /// commas for editing. This list belongs to the user: the defaults cover
+    /// the built-in sites, and an edit applies without a restart.
+    pub http1_hosts: String,
 }
 
 pub(crate) fn settings_values(config: &Value) -> SettingsValues {
@@ -1320,6 +1327,18 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
             .unwrap_or(false),
         relay_listen: relay_field("listen"),
         relay_target: relay_field("target"),
+        http1_hosts: config
+            .get("advanced")
+            .and_then(|advanced| advanced.get("http1Hosts"))
+            .and_then(Value::as_array)
+            .map(|hosts| {
+                hosts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -1366,6 +1385,17 @@ fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Opti
                     Some(value.trim().to_string())
                 };
             }
+            "advanced.http1Hosts" => {
+                // Comma-separated, the same shape the fake-SNI field uses.
+                // Empty is allowed and means "no host gets its own connections",
+                // which is a legitimate choice rather than an error.
+                config.advanced.http1_hosts = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
             other => bail!("未知设置项 {other}"),
         }
         Ok(())
@@ -1373,6 +1403,14 @@ fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Opti
     if result.is_ok() && key == "advanced.download.mirrorSource" {
         // A new list URL must be fetched now, not on the six-hour tick.
         runtime.request_mirror_refresh();
+    }
+    if result.is_ok() && key == "advanced.http1Hosts" {
+        // The pool swaps its matcher in place, so an edited list applies to the
+        // next request. `mutate` only wrote the file; hand the new snapshot to
+        // the runtime so the running proxy sees it without a restart.
+        if let Err(error) = runtime.update_config(runtime.config().snapshot().as_ref().clone()) {
+            return Some(format!("{error:#}"));
+        }
     }
     match result {
         Ok(_) => {
@@ -1821,6 +1859,7 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     app.set_cfg_relay_enabled(settings.relay_enabled);
     app.set_cfg_relay_listen(SharedString::from(settings.relay_listen.clone()));
     app.set_cfg_relay_target(SharedString::from(settings.relay_target.clone()));
+    app.set_cfg_http1_hosts(SharedString::from(settings.http1_hosts.clone()));
     app.set_cfg_data_dir(SharedString::from("~/Library/Application Support/hakimi"));
     app.set_cfg_version(SharedString::from(env!("CARGO_PKG_VERSION")));
     app.set_cfg_core_version(SharedString::from(hakimi_core::VERSION));

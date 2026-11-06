@@ -692,3 +692,30 @@ fn bench_request_target_checks() {
         black_box(matcher.match_normalized("example.test"));
     });
 }
+
+/// Every state-changing endpoint must be listed here.
+///
+/// The list is a security boundary: a path that is not on it is forwarded
+/// upstream as a normal request instead of being handled locally, so a missing
+/// entry makes its CLI command silently fail rather than misbehave loudly. The
+/// `refresh-parallel` endpoint was once added without this list and its command
+/// was dead until a review caught it.
+#[test]
+fn every_control_endpoint_is_listed() {
+    for path in [
+        "/hakimi/pause",
+        "/hakimi/resume",
+        "/hakimi/stop",
+        "/hakimi/refresh-mirrors",
+    ] {
+        assert!(
+            super::is_control_endpoint(path),
+            "{path} must require the control header"
+        );
+    }
+    // Read-only endpoints stay open; they are not control paths.
+    for path in ["/hakimi/health", "/hakimi/status", "/proxy.pac"] {
+        assert!(!super::is_control_endpoint(path), "{path} is read-only");
+    }
+}
+

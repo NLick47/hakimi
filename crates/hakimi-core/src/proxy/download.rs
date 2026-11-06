@@ -66,6 +66,10 @@ impl DownloadManager {
 
 /// Header-only gate: status, size floor, range support. Returns the body
 /// length when the response can be sliced into byte ranges.
+///
+/// `min_size` is the caller's floor, not a suggestion: image CDNs qualify at a
+/// few hundred KiB, and clamping it up to [`MIB`] here silently disabled that
+/// path while every unit test that used the archive floor still passed.
 fn headers_eligible(
     status: StatusCode,
     content_length: Option<&str>,
@@ -76,7 +80,7 @@ fn headers_eligible(
         return None;
     }
     let len: u64 = content_length?.trim().parse().ok()?;
-    if len < min_size.max(MIB) {
+    if len < min_size {
         return None;
     }
     accept_ranges?
@@ -90,6 +94,12 @@ fn headers_eligible(
 /// Content-Length, advertised byte ranges and no content encoding. Returns
 /// the body length when the response qualifies.
 pub(crate) fn response_eligible<B>(response: &http::Response<B>) -> Option<u64> {
+    response_eligible_from(response, MIB)
+}
+
+/// Same gate with a caller-chosen size floor. Image CDNs qualify far below the
+/// archive floor, so the shared helper cannot bake in one MiB.
+pub(crate) fn response_eligible_from<B>(response: &http::Response<B>, min_size: u64) -> Option<u64> {
     let headers = response.headers();
     if content_encoded(headers) {
         return None;
@@ -102,7 +112,7 @@ pub(crate) fn response_eligible<B>(response: &http::Response<B>) -> Option<u64> 
         headers
             .get(header::ACCEPT_RANGES)
             .and_then(|value| value.to_str().ok()),
-        MIB,
+        min_size,
     )
 }
 
@@ -1119,6 +1129,10 @@ pub(crate) async fn segment(
             // already on the wire. Probe while the original response is still
             // unread; a failure falls back to that response as a single stream
             // below instead of killing it.
+            //
+            // Images pay this probe too. It costs one handshake, but a false
+            // positive would fail the whole image once the segmented path
+            // started, and a broken image is worse than a slow one.
             probe_range_support(ctx, &uri, &range_headers, &response, None).await
         };
     if !ranges_ok {
@@ -1260,8 +1274,8 @@ mod tests {
     use super::{
         candidate_uri, claim, content_encoded, credential_headers, expected_chunk_len,
         headers_eligible, host_header, mirror_candidate, mirror_origins, parse_content_range,
-        range_request_headers, response_eligible, run_merger,
-        signed_url, Shared, Source, Worker, MIB, NEXT_AFTER_STREAM_CHUNK,
+        range_request_headers, response_eligible, response_eligible_from, run_merger, signed_url,
+        Shared, Source, Worker, MIB, NEXT_AFTER_STREAM_CHUNK,
     };
     use crate::cache::{CacheManager, LastGoodEntry};
     use crate::catalog::RemoteIpProvider;
@@ -1323,6 +1337,34 @@ mod tests {
         assert!(mirror_origins(&config, &mirrors, &Method::GET, &raw).is_none());
         let page: Uri = "https://github.com/owner/repo".parse().unwrap();
         assert!(mirror_origins(&config, &mirrors, &Method::GET, &page).is_none());
+    }
+
+    /// The shared header gate defaults to one MiB. If the image branch used it,
+    /// every artwork would be rejected before the lower image floor was even
+    /// consulted — which is exactly what happened on the first attempt.
+    #[test]
+    fn the_header_gate_accepts_an_artwork_sized_body() {
+        let build = |len: &str| {
+            let mut response = Response::new(Full::new(Bytes::new()));
+            *response.status_mut() = StatusCode::OK;
+            response
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, len.parse().unwrap());
+            response
+                .headers_mut()
+                .insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+            response
+        };
+        let artwork = 441_990u64;
+        assert!(
+            response_eligible(&build(&artwork.to_string())).is_none(),
+            "the archive floor must still reject a 442 KiB body"
+        );
+        assert_eq!(
+            response_eligible_from(&build(&artwork.to_string()), 256 * 1024),
+            Some(artwork),
+            "the image floor must let the same body through"
+        );
     }
 
     #[test]

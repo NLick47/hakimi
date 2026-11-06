@@ -39,6 +39,7 @@ class SettingsScreen(private val context: Context, private val host: Host) {
     private lateinit var resetCatalogRow: SettingRow
     private lateinit var mirrorRow: SwitchRow
     private lateinit var mirrorSourceRow: SettingRow
+    private lateinit var http1HostsRow: SettingRow
     private lateinit var alwaysOnRow: SettingRow
     private lateinit var batteryRow: SettingRow
     private lateinit var refreshCatalogRow: SettingRow
@@ -141,6 +142,19 @@ class SettingsScreen(private val context: Context, private val host: Host) {
             )
         }
         content.addView(rowsCard(mirrorRow, mirrorSourceRow))
+        content.addView(space(10f))
+
+        content.addView(section("并发连接"))
+        http1HostsRow = SettingRow(context, "独立连接的站点", "按连接限速的站点，逗号分隔")
+        http1HostsRow.clickOnce {
+            host.editSetting(
+                "advanced.http1Hosts",
+                "独立连接的站点",
+                "按连接限速的站点，多个用逗号分隔",
+                http1Hosts()
+            )
+        }
+        content.addView(rowsCard(http1HostsRow))
         content.addView(space(10f))
 
         content.addView(section("后台"))
@@ -394,6 +408,18 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         ?.optJSONObject("download")
         ?.optString("mirrorSource")
         .orEmpty()
+
+    /// Joined for the edit dialog; the same comma-separated shape the desktop
+    /// settings field uses.
+    private fun http1Hosts(): String {
+        val hosts = host.core.configJson
+            .optJSONObject("advanced")
+            ?.optJSONArray("http1Hosts")
+            ?: return ""
+        return (0 until hosts.length())
+            .mapNotNull { hosts.optString(it).takeIf { value -> value.isNotEmpty() } }
+            .joinToString(", ")
+    }
 
     private fun shorten(value: String): String = when {
         value.isEmpty() -> ""

@@ -5,6 +5,12 @@ mod pool;
 mod response;
 mod upstream;
 
+// Image slicing is parked. The design and the measurements behind it live in
+// `docs/image-slicing.md`; the modules stay in the tree so the work is not
+// lost, but nothing compiles them until the open questions there are settled.
+// `mod segment_budget; mod segment_fetch; mod segment_image; mod segment_plan;
+// mod segment_pool;`
+
 #[cfg(test)]
 mod segment_tests;
 #[cfg(test)]
@@ -203,7 +209,8 @@ impl ProxyContext {
         status_json: Arc<dyn Fn(bool) -> serde_json::Value + Send + Sync>,
         on_stop: Arc<dyn Fn() + Send + Sync>,
     ) -> Arc<Self> {
-        let download = Arc::new(download::DownloadManager::new(&config.snapshot(), mirrors));
+        let snapshot = config.snapshot();
+        let download = Arc::new(download::DownloadManager::new(&snapshot, mirrors));
         Arc::new(Self {
             engine,
             ca,
@@ -362,7 +369,10 @@ async fn handle_request(mut req: Request<Incoming>, ctx: Arc<ProxyContext>) -> R
 fn is_control_endpoint(path: &str) -> bool {
     matches!(
         path,
-        "/hakimi/pause" | "/hakimi/resume" | "/hakimi/stop" | "/hakimi/refresh-mirrors"
+        "/hakimi/pause"
+            | "/hakimi/resume"
+            | "/hakimi/stop"
+            | "/hakimi/refresh-mirrors"
     )
 }
 

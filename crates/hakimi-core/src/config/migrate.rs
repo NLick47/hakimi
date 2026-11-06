@@ -7,7 +7,7 @@ use super::{AdvancedConfig, AppConfig, GroupConfig, RoutePolicy};
 
 /// Shape version this build writes. Bump when adding a migration; files
 /// without the field deserialize as 0 and catch up in one load.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 type MigrationFn = fn(&mut AppConfig) -> bool;
 
@@ -39,6 +39,12 @@ static MIGRATIONS: &[Migration] = &[
         describe: "poipiku apex adopts the no-SNI attempt",
         applies_below: Some(2),
         apply: migrate_poipiku_apex,
+    },
+    Migration {
+        version: "0.1.8",
+        describe: "http1Hosts gain the Pixiv asset CDN",
+        applies_below: Some(3),
+        apply: migrate_http1_hosts_asset_cdn,
     },
 ];
 
@@ -97,6 +103,21 @@ fn adopt_route(group: &mut GroupConfig, pattern: &str, route: RoutePolicy) -> bo
 fn migrate_http1_hosts(config: &mut AppConfig) -> bool {
     let old = vec![
         "*.pximg.net".to_string(),
+        "img.poipiku.com".to_string(),
+        "cdn.poipiku.com".to_string(),
+    ];
+    let current = AdvancedConfig::default().http1_hosts;
+    fold_default(&mut config.advanced.http1_hosts, &old, &current)
+}
+
+/// The v2 default list still named only the image CDNs. A file that still
+/// carries it verbatim is a user who never customized the list, so it adopts
+/// the current one — which adds the asset CDN. A list with any other content
+/// is a deliberate choice and is left alone.
+fn migrate_http1_hosts_asset_cdn(config: &mut AppConfig) -> bool {
+    let old = vec![
+        "i.pximg.net".to_string(),
+        "booth.pximg.net".to_string(),
         "img.poipiku.com".to_string(),
         "cdn.poipiku.com".to_string(),
     ];
@@ -178,6 +199,38 @@ mod tests {
         assert!(!run_migrations(&mut config).is_empty());
         assert!(run_migrations(&mut config).is_empty());
         assert_eq!(config.schema_version, SCHEMA_VERSION);
+    }
+
+    /// A file written by the previous release pins the v2 list verbatim. It is
+    /// the default, not a choice, so it must pick up the asset CDN.
+    #[test]
+    fn v2_http1_hosts_adopt_the_asset_cdn() {
+        let mut config = AppConfig::default();
+        config.schema_version = 2;
+        config.advanced.http1_hosts = vec![
+            "i.pximg.net".to_string(),
+            "booth.pximg.net".to_string(),
+            "img.poipiku.com".to_string(),
+            "cdn.poipiku.com".to_string(),
+        ];
+
+        assert!(!run_migrations(&mut config).is_empty());
+        assert!(config
+            .advanced
+            .http1_hosts
+            .iter()
+            .any(|pattern| pattern == "s.pximg.net"));
+    }
+
+    /// Anything that is not the old default is a deliberate list.
+    #[test]
+    fn customized_http1_hosts_are_not_rewritten() {
+        let mut config = AppConfig::default();
+        config.schema_version = 2;
+        config.advanced.http1_hosts = vec!["i.pximg.net".to_string()];
+
+        run_migrations(&mut config);
+        assert_eq!(config.advanced.http1_hosts, vec!["i.pximg.net".to_string()]);
     }
 
     #[test]

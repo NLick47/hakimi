@@ -55,6 +55,7 @@ pub(crate) type UpstreamBody = Either<Incoming, Full<Bytes>>;
 /// short period. New requests then use a fresh, unpooled connection so a single
 /// half-dead HTTP/2 connection cannot delay a whole page load again.
 const SLOW_ROUTE_MARK_MS: u64 = 5_000;
+
 const SLOW_ROUTE_TTL: Duration = Duration::from_secs(60);
 
 /// A safe request that has waited this long for response headers is hedged
@@ -64,6 +65,41 @@ const SLOW_ROUTE_TTL: Duration = Duration::from_secs(60);
 /// request for the same host was healthy). Capped at half the configured
 /// header timeout so a retry always has time to complete.
 const HEDGE_AFTER: Duration = Duration::from_secs(5);
+
+/// In-flight requests per host, counted from send until the response body is
+/// finished or dropped.
+///
+/// A slow response header has two very different causes. On a per-connection
+/// throttled origin the first response's body occupies the whole pipe, so the
+/// next request's headers queue behind it and arrive late — the route is fine
+/// and re-racing its IPs changes nothing. On a half-dead connection the
+/// request is alone and still late. Only the second case is a route problem,
+/// and this counter is what tells them apart.
+///
+/// The guard lives on the response body rather than on the send future: the
+/// body is what holds the pipe, and a request whose headers arrived quickly
+/// still queues the next one for as long as its body streams.
+struct InflightGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Whether a slow response should retire the route.
+///
+/// `in_flight` counts every request for the host, including the one that just
+/// came back late. Above one, this response shared its connection with other
+/// traffic: a per-connection throttle or a busy origin explains the delay, and
+/// re-racing the route's IPs would only pay for a fresh discovery. At one, the
+/// request had the connection to itself and was still late — the half-dead hop
+/// this marker exists for.
+fn blames_route(in_flight: usize) -> bool {
+    in_flight <= 1
+}
 
 /// Browser response bodies stay streaming; the pool only owns the upstream connection.
 pub(crate) type UpstreamResponse = Response<UpstreamResponseBody>;
@@ -80,7 +116,7 @@ enum SendOutcome {
 /// Response body either streams the upstream `Incoming` directly or holds a per-host
 /// concurrency permit until the last byte/frame is dropped.
 pub(crate) enum UpstreamResponseBody {
-    Plain(Incoming),
+    Plain(PlainBody),
     Limited(LimitedBody),
 }
 
@@ -89,15 +125,24 @@ impl UpstreamResponseBody {
     /// Segmented downloads use the first upstream stream as segment 0.
     pub(crate) fn into_incoming(self) -> (Incoming, Option<OwnedSemaphorePermit>) {
         match self {
-            UpstreamResponseBody::Plain(body) => (body, None),
+            UpstreamResponseBody::Plain(body) => (body.inner, None),
             UpstreamResponseBody::Limited(limited) => (limited.inner, Some(limited.permit)),
         }
     }
 }
 
+/// The plain streaming body. The inflight guard is kept as a field rather than
+/// wrapped around the whole enum so `into_incoming` stays a move of `inner`.
+pub(crate) struct PlainBody {
+    inner: Incoming,
+    /// Counted for the whole body lifetime; see [`InflightGuard`].
+    _inflight: Option<InflightGuard>,
+}
+
 pub(crate) struct LimitedBody {
     inner: Incoming,
     permit: OwnedSemaphorePermit,
+    _inflight: Option<InflightGuard>,
 }
 
 impl Body for UpstreamResponseBody {
@@ -109,43 +154,23 @@ impl Body for UpstreamResponseBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match self.get_mut() {
-            UpstreamResponseBody::Plain(body) => Pin::new(body).poll_frame(cx),
-            UpstreamResponseBody::Limited(body) => Pin::new(body).poll_frame(cx),
+            UpstreamResponseBody::Plain(body) => Pin::new(&mut body.inner).poll_frame(cx),
+            UpstreamResponseBody::Limited(body) => Pin::new(&mut body.inner).poll_frame(cx),
         }
     }
 
     fn is_end_stream(&self) -> bool {
         match self {
-            UpstreamResponseBody::Plain(body) => body.is_end_stream(),
-            UpstreamResponseBody::Limited(body) => body.is_end_stream(),
+            UpstreamResponseBody::Plain(body) => body.inner.is_end_stream(),
+            UpstreamResponseBody::Limited(body) => body.inner.is_end_stream(),
         }
     }
 
     fn size_hint(&self) -> SizeHint {
         match self {
-            UpstreamResponseBody::Plain(body) => body.size_hint(),
-            UpstreamResponseBody::Limited(body) => body.size_hint(),
+            UpstreamResponseBody::Plain(body) => body.inner.size_hint(),
+            UpstreamResponseBody::Limited(body) => body.inner.size_hint(),
         }
-    }
-}
-
-impl Body for LimitedBody {
-    type Data = Bytes;
-    type Error = hyper::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
     }
 }
 
@@ -336,12 +361,15 @@ pub struct UpstreamPool {
     /// Lifetime of a rejection marker. It must outlive the idle timeout of the
     /// normal pool so the rejected socket is evicted before the host returns.
     rejection_ttl: Duration,
-    http1_hosts: Arc<DomainMatcher>,
+    http1_hosts: Arc<Http1Hosts>,
     http1_limit: usize,
     /// Deadline for the upstream response headers, never for the streamed body
     header_timeout: Duration,
     /// Read for every image-host request; written only when a new host appears.
     http1_slots: RwLock<HashMap<String, Arc<Semaphore>>>,
+    /// In-flight request count per host; read when a response is slow enough to
+    /// raise the question "is this host busy or is this route dead?".
+    inflight: RwLock<HashMap<String, Arc<AtomicUsize>>>,
     stats: Arc<UpstreamStats>,
 }
 
@@ -360,6 +388,46 @@ const REJECTED_CLIENT_CAP: usize = 32;
 /// share a single probe instead of each racing its own candidate batch.
 struct Discovery {
     inflight: Mutex<HashMap<String, Arc<Inflight>>>,
+}
+
+/// The set of hosts forced onto the parallel HTTP/1.1 pool.
+///
+/// It is a remote list plus the user's own entries, and the remote half can be
+/// refreshed while the proxy runs. The matcher therefore lives behind a lock
+/// that a refresh swaps, instead of being built once at startup: rebuilding the
+/// pool would drop every warm connection, which is the opposite of what this
+/// list is for.
+#[derive(Default)]
+struct Http1Hosts {
+    matcher: RwLock<Arc<DomainMatcher>>,
+}
+
+impl Http1Hosts {
+    fn from_patterns(patterns: &[String]) -> Self {
+        Self {
+            matcher: RwLock::new(Arc::new(build_matcher(patterns))),
+        }
+    }
+
+    /// Replace the set. A failure to parse leaves the previous set in place:
+    /// a bad remote entry must not silently disable the whole feature.
+    fn replace(&self, patterns: &[String]) {
+        let rebuilt = build_matcher(patterns);
+        *self.matcher.write() = Arc::new(rebuilt);
+    }
+
+    fn matches(&self, host: &str) -> bool {
+        self.matcher.read().match_normalized(host).is_some()
+    }
+}
+
+fn build_matcher(patterns: &[String]) -> DomainMatcher {
+    DomainMatcher::from_patterns(
+        patterns
+            .iter()
+            .map(|pattern| ("http1", pattern.as_str())),
+    )
+    .unwrap_or_default()
 }
 
 /// BDP-sized h2 windows: 8 MiB carries ~100 Mbps over a 300 ms RTT. The Android
@@ -460,15 +528,9 @@ impl UpstreamPool {
             Duration::from_secs(config.advanced.upstream_header_timeout_secs.max(1));
         let client_idle = Duration::from_secs(config.advanced.upstream_idle_secs.max(10));
 
-        let http1_hosts = DomainMatcher::from_patterns(
-            config
-                .advanced
-                .http1_hosts
-                .iter()
-                .map(|pattern| ("http1", pattern.as_str())),
-        )
-        .unwrap_or_default();
-        let http1_hosts = Arc::new(http1_hosts);
+        // The remote half of this list is fetched by the runtime; the pool only
+        // receives the union the config snapshot plus the cache produced.
+        let http1_hosts = Arc::new(Http1Hosts::from_patterns(&config.advanced.http1_hosts));
         let discovery = Arc::new(Discovery {
             inflight: Mutex::new(HashMap::new()),
         });
@@ -548,6 +610,7 @@ impl UpstreamPool {
             http1_limit,
             header_timeout,
             http1_slots: RwLock::new(HashMap::new()),
+            inflight: RwLock::new(HashMap::new()),
             stats,
         })
     }
@@ -580,8 +643,7 @@ impl UpstreamPool {
         let host = uri.host();
         // Forwarded URIs are built from an already-normalized host, so the
         // per-request image-host check does not need to normalize again.
-        let is_http1_host = !self.http1_hosts.is_empty()
-            && host.is_some_and(|host| self.http1_hosts.match_normalized(host).is_some());
+        let is_http1_host = host.is_some_and(|host| self.http1_hosts.matches(host));
         let permit = if !upgrade && is_http1_host {
             let host = host.expect("is_http1_host requires a host");
             let semaphore = self.host_slots(host);
@@ -659,6 +721,14 @@ impl UpstreamPool {
         let hedge_enabled = retry_parts.is_some() && !is_http1_host;
         // Only hedge when there is time left for the retry to be useful.
         let hedge_after = HEDGE_AFTER.min(self.header_timeout / 2);
+        // Counted before the send so a response that arrives late sees its own
+        // request in the total. Upgrades are excluded: their tunnel never
+        // competes for a response pipe.
+        let inflight = if upgrade {
+            None
+        } else {
+            self.track_inflight(host)
+        };
         let started = std::time::Instant::now();
         // Only the header wait is bounded: the body keeps streaming afterwards.
         // Hedged requests use one timer for both the hedge delay and the header
@@ -718,13 +788,32 @@ impl UpstreamPool {
                 }
                 if elapsed_ms > SLOW_ROUTE_MARK_MS {
                     if let Some(host) = debug_host {
-                        // The established connection may be half-dead (packet
-                        // loss, a stale h2 stream, or a path change). Do not
-                        // pin the next request to it or to the same cached
-                        // route; use a fresh connection and let the route
-                        // cursor re-race candidates.
-                        self.mark_slow(host);
-                        self.engine.forget_plan(host, port, tls);
+                        // A late header has two very different causes, and only
+                        // one of them is a route problem.
+                        //
+                        // With other requests in flight, this one waited behind
+                        // their response bodies on a shared connection: the
+                        // origin is busy (or throttles per connection), not
+                        // unreachable. Re-racing its IPs would change nothing
+                        // and would pay a fresh discovery for it, so the route
+                        // is left alone.
+                        //
+                        // Alone, the request had the connection to itself and
+                        // still arrived late. That is the half-dead connection
+                        // this marker exists for: retire the route and let the
+                        // next connection re-race candidates.
+                        let concurrent = self.inflight_count(host);
+                        if blames_route(concurrent) {
+                            self.mark_slow(host);
+                            self.engine.forget_plan(host, port, tls);
+                        } else {
+                            tracing::info!(
+                                host,
+                                elapsed_ms,
+                                in_flight = concurrent,
+                                "slow response behind concurrent traffic; keeping the route"
+                            );
+                        }
                     }
                 }
                 if elapsed_ms > 2000 {
@@ -761,12 +850,19 @@ impl UpstreamPool {
                     );
                 }
                 let (parts, body) = response.into_parts();
+                // The guard moves onto the body: the pipe stays occupied until
+                // the last frame, which is exactly the window the next request
+                // queues behind.
                 let body = match permit {
                     Some(permit) => UpstreamResponseBody::Limited(LimitedBody {
                         inner: body,
-                        permit: permit,
+                        permit,
+                        _inflight: inflight,
                     }),
-                    None => UpstreamResponseBody::Plain(body),
+                    None => UpstreamResponseBody::Plain(PlainBody {
+                        inner: body,
+                        _inflight: inflight,
+                    }),
                 };
                 Ok(Response::from_parts(parts, body))
             }
@@ -793,8 +889,21 @@ impl UpstreamPool {
                 // half-dead hop. Drop it and let the next connection re-race
                 self.stats.request_errors.fetch_add(1, Ordering::Relaxed);
                 if let Some(host) = debug_host {
-                    self.mark_slow(host);
-                    self.engine.forget_plan(host, port, tls);
+                    // A header timeout while other requests are in flight can
+                    // simply mean the queue behind their bodies outlasted the
+                    // deadline; the route itself may be fine. Only blame it
+                    // when this request had the connection to itself.
+                    let concurrent = self.inflight_count(host);
+                    if concurrent > 1 {
+                        tracing::warn!(
+                            host,
+                            in_flight = concurrent,
+                            "header timeout behind concurrent traffic; keeping the route"
+                        );
+                    } else {
+                        self.mark_slow(host);
+                        self.engine.forget_plan(host, port, tls);
+                    }
                 }
                 tracing::warn!(
                     request_id,
@@ -1061,6 +1170,16 @@ impl UpstreamPool {
             .map_err(|error| format!("{error:#}"))
     }
 
+    /// Replace the set of hosts forced onto the parallel HTTP/1.1 pool.
+    ///
+    /// Called after the remote list refreshes and after a config change. Warm
+    /// connections stay in their pools: a host that leaves the set simply stops
+    /// being routed here on its next request, and a host that joins it starts
+    /// using independent connections immediately.
+    pub(crate) fn set_http1_hosts(&self, patterns: &[String]) {
+        self.http1_hosts.replace(patterns);
+    }
+
     fn host_slots(&self, host: &str) -> Arc<Semaphore> {
         // Hot path: every image request already has a slot after the first
         // one. Read it without taking the write lock or allocating a key.
@@ -1077,6 +1196,41 @@ impl UpstreamPool {
         let slot = Arc::new(Semaphore::new(self.http1_limit));
         slots.insert(host.to_owned(), slot.clone());
         slot
+    }
+
+    /// Count one request as in flight for `host`, returning a guard that
+    /// decrements on drop. `None` for requests that are not worth counting
+    /// (upgrades tunnel bytes and never compete for a response pipe).
+    fn track_inflight(&self, host: Option<&str>) -> Option<InflightGuard> {
+        let host = host?;
+        // The read guard must not outlive the lookup: `if let Some(..) = map.read()..`
+        // keeps the temporary guard alive for the whole `if` statement, including
+        // the `else` branch, and taking the write lock there deadlocks on the
+        // read lock this thread still holds.
+        let existing = self.inflight.read().get(host).cloned();
+        let counter = match existing {
+            Some(counter) => counter,
+            None => {
+                let mut map = self.inflight.write();
+                if map.len() > 1024 {
+                    map.retain(|_, counter| Arc::strong_count(counter) > 1);
+                }
+                map.entry(host.to_owned())
+                    .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                    .clone()
+            }
+        };
+        counter.fetch_add(1, Ordering::AcqRel);
+        Some(InflightGuard { counter })
+    }
+
+    /// How many requests for `host` are in flight right now, including the
+    /// caller's own.
+    fn inflight_count(&self, host: &str) -> usize {
+        self.inflight
+            .read()
+            .get(host)
+            .map_or(0, |counter| counter.load(Ordering::Acquire))
     }
 
     /// Warm one exact host: a HEAD request makes hyper establish (or reuse) the pooled
@@ -1110,7 +1264,7 @@ impl UpstreamPool {
                 return false;
             }
         };
-        let http1 = self.http1_hosts.match_host(host).is_some();
+        let http1 = self.http1_hosts.matches(host);
         let rejected_client = self
             .is_rejected(host)
             .then(|| self.rejected_client(host, http1));
@@ -1215,7 +1369,7 @@ struct RouteConnector {
     engine: Arc<DecisionEngine>,
     tls: Arc<TlsContext>,
     http1_only: bool,
-    http1_hosts: Arc<DomainMatcher>,
+    http1_hosts: Arc<Http1Hosts>,
     discovery: Arc<Discovery>,
     stats: Arc<UpstreamStats>,
     /// Recovery connectors skip the single-flight discovery: a replay exists
@@ -1280,8 +1434,7 @@ impl RouteConnector {
             Cow::Borrowed(host)
         };
         let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
-        let force_http1 = self.http1_only
-            || (!self.http1_hosts.is_empty() && self.http1_hosts.match_normalized(&host).is_some());
+        let force_http1 = self.http1_only || self.http1_hosts.matches(&host);
         let result = if https {
             self.connect_tls(&host, port, force_http1).await
         } else {
@@ -1430,6 +1583,8 @@ impl RouteConnector {
                 Ok((plan, _)) => Ok(plan.clone()),
                 Err(error) => Err(error.clone()),
             };
+            // `race_plans` records the plan through `cursor.note_success`, so
+            // the cache is warm by the time any follower looks at it.
             *guard.entry.result.lock() = Some(shared);
             drop(guard); // notifies waiters and removes the map entry
             return outcome.map(|(_, io)| io).map_err(anyhow::Error::msg);

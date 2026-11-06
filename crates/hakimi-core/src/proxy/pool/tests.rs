@@ -963,6 +963,76 @@ async fn http1_connections_are_reused() {
     assert_eq!(stats["responsesH1"], 3);
 }
 
+/// The remote list can name a host after the pool already exists. Swapping the
+/// set must take effect on the next request, without rebuilding the pool (which
+/// would drop every warm connection).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_joining_the_parallel_set_switches_transport() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepted = accepts.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            accepted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 8192];
+                loop {
+                    match socket.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                                )
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, config) = engine_for(dir.path());
+    let tls = TlsContext::new().unwrap();
+    // The pool starts with an empty parallel set.
+    let pool = UpstreamPool::new(engine, tls, &config.snapshot());
+    assert!(!pool.http1_hosts.matches("upstream.test"));
+
+    pool.set_http1_hosts(&["upstream.test".to_string()]);
+    assert!(
+        pool.http1_hosts.matches("upstream.test"),
+        "the new set must apply without rebuilding the pool"
+    );
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://upstream.test:{port}/"))
+        .body(Either::Right(Full::new(Bytes::new())))
+        .unwrap();
+    let response = pool.send(request, false).await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"ok");
+    assert_eq!(
+        pool.stats_json()["responsesH1"],
+        1,
+        "the request must have gone through the HTTP/1.1 pool"
+    );
+
+    // Removing the host again must also apply immediately.
+    pool.set_http1_hosts(&[]);
+    assert!(!pool.http1_hosts.matches("upstream.test"));
+}
+
 /// Image hosts are deliberately forced onto HTTP/1.1 so a burst can use
 /// several TCP connections. The pool must keep enough of those connections
 /// idle for the next burst; otherwise every image page pays for fresh TLS
@@ -1633,4 +1703,38 @@ fn bench_slow_host_lookup() {
         elapsed.as_nanos() as f64 / (per_thread * 10) as f64,
         elapsed
     );
+}
+
+
+/// A late response behind other traffic is queueing, not a dead route.
+#[test]
+fn a_slow_response_with_concurrent_traffic_does_not_blame_the_route() {
+    assert!(!blames_route(2), "two in flight: the wait was the queue");
+    assert!(!blames_route(8));
+}
+
+/// A late response with the connection to itself is the half-dead hop the
+/// marker exists for.
+#[test]
+fn a_slow_response_alone_blames_the_route() {
+    assert!(blames_route(1), "one in flight: nothing else explains the delay");
+    assert!(blames_route(0), "no counter entry must not disable the marker");
+}
+
+/// The counter tracks send-to-body-end: every guard drop must return the
+/// count, and the guard must decrement exactly once.
+#[test]
+fn inflight_guards_are_balanced() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let first = InflightGuard { counter: counter.clone() };
+    assert_eq!(counter.load(Ordering::Acquire), 0, "the guard does not count by itself");
+    // The pool increments before handing out the guard; simulate that here.
+    counter.fetch_add(1, Ordering::AcqRel);
+    let second = InflightGuard { counter: counter.clone() };
+    counter.fetch_add(1, Ordering::AcqRel);
+    assert_eq!(counter.load(Ordering::Acquire), 2);
+    drop(second);
+    assert_eq!(counter.load(Ordering::Acquire), 1);
+    drop(first);
+    assert_eq!(counter.load(Ordering::Acquire), 0);
 }

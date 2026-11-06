@@ -621,3 +621,39 @@ fn bench_build_sites_tick() {
         elapsed.as_nanos() as f64 / 200.0
     );
 }
+
+/// The settings page shows the host list as one comma-separated line, the same
+/// shape the fake-SNI field uses.
+#[test]
+fn the_http1_host_list_round_trips_through_the_settings_field() {
+    let mut config = AppConfig::default();
+    config.advanced.http1_hosts = vec![
+        "i.pximg.net".into(),
+        "s.pximg.net".into(),
+        "cdn.example.com".into(),
+    ];
+    let json = serde_json::to_value(&config).unwrap();
+    let values = crate::settings_values(&json);
+    assert_eq!(values.http1_hosts, "i.pximg.net, s.pximg.net, cdn.example.com");
+
+    // The editor parses the same shape back: commas, arbitrary spaces, and an
+    // empty entry from a trailing comma all collapse to the list.
+    let parsed: Vec<String> = " i.pximg.net ,, s.pximg.net , "
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect();
+    assert_eq!(parsed, vec!["i.pximg.net", "s.pximg.net"]);
+}
+
+/// An empty list is a legitimate choice, not an error: it turns the feature off
+/// for every host.
+#[test]
+fn an_empty_http1_host_list_is_accepted() {
+    let mut config = AppConfig::default();
+    config.advanced.http1_hosts = Vec::new();
+    let json = serde_json::to_value(&config).unwrap();
+    assert_eq!(crate::settings_values(&json).http1_hosts, "");
+    assert!(config.validate().is_ok(), "an empty list must validate");
+}

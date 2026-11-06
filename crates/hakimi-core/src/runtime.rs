@@ -968,6 +968,13 @@ impl HakimiRuntime {
         self.mirrors.refresh(&source).await
     }
 
+    /// Push the configured host list into the pool so an edit applies to the
+    /// next request instead of the next restart.
+    fn apply_http1_hosts(&self) {
+        let hosts = self.config.snapshot().advanced.http1_hosts.clone();
+        self.upstream.set_http1_hosts(&hosts);
+    }
+
     /// Wake the background mirror refresh task. Hosts that mutate the config
     /// through [`ConfigManager`] (instead of [`Self::update_config`]) call this
     /// after a source change so the new list is fetched now.
@@ -1046,7 +1053,6 @@ impl HakimiRuntime {
             if current.advanced.upstream_idle_secs != config.advanced.upstream_idle_secs
                 || current.advanced.upstream_max_idle_per_host
                     != config.advanced.upstream_max_idle_per_host
-                || current.advanced.http1_hosts != config.advanced.http1_hosts
                 || current.advanced.http1_max_concurrent != config.advanced.http1_max_concurrent
                 // `DownloadManager` builds its connection semaphore once, at
                 // construction. Accepting a new cap here would report success
@@ -1057,6 +1063,10 @@ impl HakimiRuntime {
                     "upstream pool and download connection limits require a restart; stop the runtime first"
                 );
             }
+            // `http1_hosts` is deliberately absent from that list: the pool
+            // swaps its matcher in place, so an edited list applies to the next
+            // request and keeps every warm connection. It is the one setting in
+            // this section a user is expected to change while the proxy runs.
         }
         // Record which sections changed: settings edits are a common source of
         // "it stopped working" reports, and the diff points straight at cause.
@@ -1077,11 +1087,17 @@ impl HakimiRuntime {
         // the six-hour refresh tick.
         let mirror_source_changed =
             current.advanced.download.mirror_source != config.advanced.download.mirror_source;
+        let http1_hosts_changed = current.advanced.http1_hosts != config.advanced.http1_hosts;
         let result = self.config.update(config);
         if result.is_ok() {
             self.engine.clear_route_rejections();
             if mirror_source_changed {
                 self.mirror_refresh.notify_one();
+            }
+            if http1_hosts_changed {
+                // Apply an edited host list to the running pool: the list is
+                // the user's own, so an edit should not need a restart.
+                self.apply_http1_hosts();
             }
         }
         result
