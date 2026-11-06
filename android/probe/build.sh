@@ -69,8 +69,10 @@ APK_OUT="${APK_OUT:-$ROOT/hakimi-probe.apk}"
 MIN_SDK="${MIN_SDK:-24}"
 TARGET_SDK="${TARGET_SDK:-35}"
 COMPILE_SDK="${COMPILE_SDK:-37}"
-BUILD_TOOLS="${BUILD_TOOLS:-37.0.0}"
-NDK_VERSION="${NDK_VERSION:-27.2.12479018}"
+BUILD_TOOLS="${BUILD_TOOLS:-}"
+# NDK comes from the environment (ANDROID_NDK_HOME) or the newest revision
+# installed under $SDK/ndk; set NDK_VERSION to pin a specific revision.
+NDK_VERSION="${NDK_VERSION:-}"
 
 case "$VERSION_CODE" in
   ''|*[!0-9]*)
@@ -110,7 +112,25 @@ else
   echo "ANDROID_HOME is not set and no default Android SDK was found" >&2
   exit 1
 fi
-BT="${ANDROID_BUILD_TOOLS:-$SDK/build-tools/$BUILD_TOOLS}"
+# Build-tools: ANDROID_BUILD_TOOLS wins, then BUILD_TOOLS, then the newest
+# revision installed. Pin one only when a specific aapt2/d8 is required.
+if [ -n "${ANDROID_BUILD_TOOLS:-}" ]; then
+  BT="$ANDROID_BUILD_TOOLS"
+elif [ -n "$BUILD_TOOLS" ]; then
+  BT="$SDK/build-tools/$BUILD_TOOLS"
+else
+  BT=""
+  for candidate in $(ls -1 "$SDK/build-tools" 2>/dev/null | sort -V -r); do
+    if [ -d "$SDK/build-tools/$candidate" ]; then
+      BT="$SDK/build-tools/$candidate"
+      break
+    fi
+  done
+  if [ -z "$BT" ]; then
+    echo "no build-tools found under $SDK/build-tools; install one with sdkmanager" >&2
+    exit 1
+  fi
+fi
 if [ -e "$SDK/platforms/android-$COMPILE_SDK/android.jar" ]; then
   PLATFORM="$SDK/platforms/android-$COMPILE_SDK/android.jar"
 elif [ -e "$SDK/platforms/android-$COMPILE_SDK.0/android.jar" ]; then
@@ -165,7 +185,30 @@ for tool in "$JAVA" "$JAVAC" "$JAR" "$KEYTOOL" "$KOTLINC" "$KOTLIN_STDLIB"; do
 done
 
 if [ "${SKIP_RUST:-0}" != "1" ]; then
-  NDK_HOME="${ANDROID_NDK_HOME:-$SDK/ndk/$NDK_VERSION}"
+  # Resolution order: explicit NDK_VERSION, then ANDROID_NDK_HOME, then the
+  # newest revision installed under $SDK/ndk. Nothing is pinned here so a
+  # machine with any current NDK builds without extra flags.
+  if [ -n "$NDK_VERSION" ]; then
+    NDK_HOME="$SDK/ndk/$NDK_VERSION"
+    if [ ! -d "$NDK_HOME" ]; then
+      echo "NDK_VERSION=$NDK_VERSION is not installed under $SDK/ndk" >&2
+      exit 1
+    fi
+  elif [ -n "${ANDROID_NDK_HOME:-}" ]; then
+    NDK_HOME="$ANDROID_NDK_HOME"
+  else
+    NDK_HOME=""
+    for candidate in $(ls -1 "$SDK/ndk" 2>/dev/null | sort -V -r); do
+      if [ -f "$SDK/ndk/$candidate/source.properties" ]; then
+        NDK_HOME="$SDK/ndk/$candidate"
+        break
+      fi
+    done
+    if [ -z "$NDK_HOME" ]; then
+      echo "no NDK found under $SDK/ndk; install one with sdkmanager" >&2
+      exit 1
+    fi
+  fi
   export ANDROID_NDK_HOME="$(unixpath "$NDK_HOME")"
   TARGETS=()
   for abi in $ABIS; do
@@ -178,7 +221,9 @@ if [ "${SKIP_RUST:-0}" != "1" ]; then
   # `android-release` is size-first (opt-level=z, fat LTO, stripped) but keeps
   # the unwind panic strategy so the JNI shell's catch_unwind still works.
   # macOS ships bash 3.2, where "${arr[@]}" on an empty array is unbound.
-  (cd "$REPO" && cargo ndk "${TARGETS[@]}" -o "$JNI_DIR" \
+  # Link-time only; keep the unwind panic strategy above intact.
+  (cd "$REPO" && RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-Wl,--icf=safe -C link-arg=-Wl,--pack-dyn-relocs=android" \
+      cargo ndk "${TARGETS[@]}" -o "$JNI_DIR" \
       build -p hakimi-android --profile android-release \
       ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"})
 fi

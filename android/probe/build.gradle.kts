@@ -114,8 +114,31 @@ val sdkDir = System.getenv("ANDROID_HOME")
     ?: System.getenv("ANDROID_SDK_ROOT")
     ?: sdkDirFromProperties()
     ?: File(System.getProperty("user.home"), "AppData/Local/Android/Sdk").absolutePath
+/** Newest NDK revision installed under $SDK/ndk, or null when there is none. */
+fun newestInstalledNdk(): String? {
+    return File(sdkDir, "ndk")
+        .listFiles()
+        ?.filter { it.isDirectory && File(it, "source.properties").exists() }
+        ?.maxWithOrNull(Comparator { a, b ->
+            // Revisions look like 27.3.13750724; compare the numeric parts so
+            // 27.10 sorts after 27.3 instead of before it as a string would.
+            val left = a.name.split('.').mapNotNull { it.toIntOrNull() }
+            val right = b.name.split('.').mapNotNull { it.toIntOrNull() }
+            left.zip(right).map { (x, y) -> x.compareTo(y) }
+                .firstOrNull { it != 0 }
+                ?: left.size.compareTo(right.size)
+        })
+        ?.name
+}
+
+// Same resolution order as build.sh: ANDROID_NDK_HOME, then the newest NDK the
+// SDK has installed. No revision is pinned, so any current NDK works.
 val ndkHome = System.getenv("ANDROID_NDK_HOME")
-    ?: File(sdkDir, "ndk/27.2.12479018").absolutePath
+    ?: newestInstalledNdk()?.let { File(sdkDir, "ndk/$it").absolutePath }
+    ?: error(
+        "no NDK found under ${File(sdkDir, "ndk").path}; " +
+            "install one with sdkmanager or set ANDROID_NDK_HOME"
+    )
 val rustJniDir = File(repoRoot, "target/android-jni")
 
 val buildRustJni = tasks.register<Exec>("buildRustJni") {
