@@ -165,6 +165,12 @@ class MainActivity : Activity(), Host {
     private var diagnosticsExporting = false
     private var configSaving = false
     private var autoStartPending = false
+
+    /** The launch-time resume runs once per Activity, not on every onResume. */
+    private var autoStartAttempted = false
+
+    /** The revoked-grant prompt is offered once per process. */
+    private var consentPrompted = false
     private var pendingVpnStart = false
     @Volatile private var staleProxyChecked = false
     private var tab = 0
@@ -329,14 +335,34 @@ class MainActivity : Activity(), Host {
     }
 
     private fun maybeAutoStart() {
-        if (!autoStartPending) return
-        autoStartPending = false
-        if (userCaTrusted) {
-            startAcceleration()
-        } else {
+        // An explicit "start" request always wins, even from a warm Activity.
+        if (autoStartPending) {
+            autoStartPending = false
+            autoStartAttempted = true
+            resumeDesired()
+            return
+        }
+        // desired_running is the user's own last choice, so every resume
+        // reconciles it against reality. A warm Activity outlives a service the
+        // system stopped from outside (another VPN took over, the process was
+        // frozen), and nothing else would notice the tunnel is gone.
+        if (!Prefs.desired(this)) return
+        // A refused consent dialog must not reopen on the next resume.
+        if (consentPrompted) return
+        // The CA sheet is pushed once; the home screen already explains the rest.
+        if (!userCaTrusted && autoStartAttempted) return
+        autoStartAttempted = true
+        resumeDesired()
+    }
+
+    /** Starts whatever [Prefs.desired] says should be running, CA permitting. */
+    private fun resumeDesired() {
+        if (!userCaTrusted) {
             startAfterCaInstall = true
             openCaSetup()
+            return
         }
+        startAcceleration()
     }
 
     // -- polling -------------------------------------------------------------
@@ -444,11 +470,22 @@ class MainActivity : Activity(), Host {
         val now = SystemClock.elapsedRealtime()
         if (now - lastAccelToggle < 800L) return
         lastAccelToggle = now
-        if (data.running || HakimiVpnService.active) stopAcceleration() else startAcceleration()
+        if (data.running || HakimiVpnService.active) stopAcceleration() else startAcceleration(true)
     }
 
-    private fun startAcceleration() {
-        if (data.running || starting || HakimiVpnService.active) return
+    /**
+     * @param userInitiated a tap on 开启, which may always reopen the consent
+     * dialog; an automatic resume defers to [consentPrompted] instead.
+     */
+    private fun startAcceleration(userInitiated: Boolean = false) {
+        // In VPN mode a running core is not the goal: the tunnel is. A core
+        // without a tunnel is exactly the broken state a start must repair.
+        val alreadyRunning = if (Prefs.mode(this) == Prefs.MODE_VPN) {
+            HakimiVpnService.active
+        } else {
+            data.running
+        }
+        if (alreadyRunning || starting) return
         if (!userCaTrusted) {
             startAfterCaInstall = true
             openCaSetup()
@@ -464,6 +501,13 @@ class MainActivity : Activity(), Host {
             }
             val consent = VpnService.prepare(this)
             if (consent != null) {
+                // An automatic resume must not reopen a dialog the user already
+                // refused; a deliberate tap always may.
+                if (consentPrompted && !userInitiated) {
+                    showSnack("VPN 授权已失效，请点「开启」重新授权", error = true)
+                    return
+                }
+                consentPrompted = true
                 pendingVpnStart = true
                 startActivityForResult(consent, REQUEST_VPN)
                 return
@@ -694,7 +738,7 @@ class MainActivity : Activity(), Host {
         waitForStop(0) {
             data = data.copy(running = false, listen = "")
             render()
-            startAcceleration()
+            startAcceleration(true)
         }
     }
 
@@ -724,7 +768,7 @@ class MainActivity : Activity(), Host {
             waitForStop(0) {
                 data = data.copy(running = false, listen = "")
                 render()
-                startAcceleration()
+                startAcceleration(true)
             }
         } else {
             render()
@@ -1416,7 +1460,7 @@ class MainActivity : Activity(), Host {
         if (startAfterCaInstall && userCaTrusted) {
             startAfterCaInstall = false
             showSnack("证书已安装，正在开启加速")
-            startAcceleration()
+            startAcceleration(true)
         } else if (installed) {
             showSnack("证书已安装，可以开始加速了")
         } else if (reopenCaSheet) {
@@ -1513,6 +1557,8 @@ class MainActivity : Activity(), Host {
             val pending = pendingVpnStart
             pendingVpnStart = false
             if (resultCode == RESULT_OK && pending) {
+                HakimiVpnService.needsConsent = false
+                consentPrompted = false
                 launchVpn()
             } else {
                 showSnack("未授权 VPN", error = true)

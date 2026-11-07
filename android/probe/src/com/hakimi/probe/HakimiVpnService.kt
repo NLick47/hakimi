@@ -52,6 +52,13 @@ class HakimiVpnService : VpnService() {
         @Volatile var alwaysOn = false
         @Volatile var lockdown = false
         @Volatile var lastError = ""
+
+        /**
+         * The system grant was revoked, so `establish()` cannot succeed until an
+         * Activity runs [prepare] again. Set here, cleared once a tunnel is up;
+         * the UI reads it on resume to re-arm the consent dialog.
+         */
+        @Volatile var needsConsent = false
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -72,7 +79,11 @@ class HakimiVpnService : VpnService() {
             if (!Prefs.desired(this@HakimiVpnService) && !alwaysOn) return
 
             if (!active) {
-                if (starting) {
+                // A revoked grant cannot be repaired from a Service; hold the
+                // retry loop until the UI re-arms the consent dialog.
+                if (needsConsent) {
+                    handler.postDelayed(this, 15_000L)
+                } else if (starting) {
                     handler.postDelayed(this, 2_000L)
                 } else {
                     startCoreAndVpn()
@@ -160,6 +171,17 @@ class HakimiVpnService : VpnService() {
 
     private fun startCoreAndVpn() {
         if (starting || stopping || active) return
+        // Checked before the core starts: a revoked grant (force-stop, another
+        // VPN, reinstall) makes every establish() fail, and only an Activity may
+        // show the consent dialog. Retrying here would leave a core with no
+        // tunnel behind it, so flag the loss and wait for the UI to re-arm it.
+        if (VpnService.prepare(this) != null) {
+            needsConsent = true
+            lastError = "VPN 授权已失效"
+            notice("hakimi VPN", "请在 hakimi 中重新授权 VPN")
+            scheduleHealth(15_000L)
+            return
+        }
         starting = true
         CoreController.start(this, ownerToken) { ok, error, trusted ->
             starting = false
@@ -272,6 +294,14 @@ class HakimiVpnService : VpnService() {
         if (stopping) return
         val next = builder.establish()
         if (next == null) {
+            // establish() reports null both for a revoked grant and for a
+            // rejected configuration; only the former can be fixed by consent.
+            if (VpnService.prepare(this) != null) {
+                needsConsent = true
+                lastError = "VPN 授权已失效"
+                notice("hakimi VPN", "请在 hakimi 中重新授权 VPN")
+                return
+            }
             lastError = "系统未建立 VPN 接口"
             notice("hakimi VPN", lastError)
             return
@@ -282,6 +312,7 @@ class HakimiVpnService : VpnService() {
         }
         tun = next
         active = true
+        needsConsent = false
         lastError = ""
         retryDelay = 3_000L
         Log.i(TAG, "VPN established apps=${if (scopeOnly) "only:${allowed.size}" else "all"} dns=${dnsServers.size} proxy=127.0.0.1:$port")
@@ -360,6 +391,7 @@ class HakimiVpnService : VpnService() {
     private fun stopInternal() {
         if (stopping) return
         stopping = true
+        needsConsent = false
         handler.removeCallbacks(health)
         starting = false
         active = false
