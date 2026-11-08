@@ -1160,6 +1160,11 @@ impl UpstreamPool {
         self.mark_rejected(host);
     }
 
+    pub(crate) fn note_body_failure(&self, host: &str, port: u16, tls: bool) {
+        self.mark_slow(host);
+        self.engine.forget_plan(host, port, tls);
+    }
+
     /// Dials a fresh HTTP/1.1-only connection through the route, never pooled.
     /// Segment connections use it: one connection each, bypassing h2 multiplexing.
     pub(crate) async fn dial_http1(&self, uri: Uri) -> Result<TokioIo<PooledIo>, String> {

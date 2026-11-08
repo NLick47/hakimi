@@ -75,6 +75,7 @@ enum ProxyBodyKind {
         body: UpstreamResponseBody,
         uri: http::Uri,
         status: StatusCode,
+        pool: Arc<UpstreamPool>,
     },
     Download(download::SegmentedBody),
     Full(Full<Bytes>),
@@ -94,9 +95,19 @@ impl ProxyBody {
         }
     }
 
-    pub(crate) fn upstream(body: UpstreamResponseBody, uri: http::Uri, status: StatusCode) -> Self {
+    pub(crate) fn upstream(
+        body: UpstreamResponseBody,
+        uri: http::Uri,
+        status: StatusCode,
+        pool: Arc<UpstreamPool>,
+    ) -> Self {
         Self {
-            kind: ProxyBodyKind::Upstream { body, uri, status },
+            kind: ProxyBodyKind::Upstream {
+                body,
+                uri,
+                status,
+                pool,
+            },
         }
     }
 
@@ -116,14 +127,25 @@ impl Body for ProxyBody {
         cx: &mut TaskContext<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match &mut self.get_mut().kind {
-            ProxyBodyKind::Upstream { body, uri, status } => match Pin::new(body).poll_frame(cx) {
+            ProxyBodyKind::Upstream {
+                body,
+                uri,
+                status,
+                pool,
+            } => match Pin::new(body).poll_frame(cx) {
                 Poll::Ready(Some(Err(error))) => {
+                    let host = uri.host().unwrap_or("");
                     tracing::warn!(
-                        host = uri.host().unwrap_or(""),
+                        host = host,
                         status = status.as_u16(),
                         error = %error,
                         "upstream response body failed"
                     );
+                    if !host.is_empty() {
+                        let tls = uri.scheme_str() != Some("http");
+                        let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+                        pool.note_body_failure(host, port, tls);
+                    }
                     Poll::Ready(Some(Err(Box::new(error))))
                 }
                 Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),

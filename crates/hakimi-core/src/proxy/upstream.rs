@@ -538,7 +538,7 @@ async fn forward_with_uri(
                 }
             });
         }
-        return Ok(into_proxy_response(response, response_uri));
+        return Ok(into_proxy_response(response, response_uri, ctx));
     }
 
     if super::download::segment_eligible(ctx, &rule_uri, is_get, has_range, &response) {
@@ -674,7 +674,7 @@ async fn forward_with_uri(
         .await);
     }
 
-    Ok(into_proxy_response(response, response_uri))
+    Ok(into_proxy_response(response, response_uri, ctx))
 }
 
 /// First-byte budget for one mirror. A hung mirror must not hold the download
@@ -769,12 +769,16 @@ async fn send_once(
 fn into_proxy_response(
     mut response: Response<UpstreamResponseBody>,
     uri: http::Uri,
+    ctx: &ProxyContext,
 ) -> Response<ProxyBody> {
     let status = response.status();
     let upgrade = status == StatusCode::SWITCHING_PROTOCOLS;
     sanitize_response_headers(response.headers_mut(), upgrade);
     let (parts, body) = response.into_parts();
-    Response::from_parts(parts, ProxyBody::upstream(body, uri, status))
+    Response::from_parts(
+        parts,
+        ProxyBody::upstream(body, uri, status, ctx.upstream.clone()),
+    )
 }
 
 /// `HeaderName::from_static` does not allocate, while removing a header by

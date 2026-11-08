@@ -1147,7 +1147,10 @@ pub(crate) async fn segment(
         );
         let (mut parts, body) = response.into_parts();
         super::upstream::sanitize_response_headers(&mut parts.headers, false);
-        return Response::from_parts(parts, ProxyBody::upstream(body, uri, StatusCode::OK));
+        return Response::from_parts(
+            parts,
+            ProxyBody::upstream(body, uri, StatusCode::OK, ctx.upstream.clone()),
+        );
     }
 
     let chunk_len = download.chunk_bytes.max(64 * 1024);
