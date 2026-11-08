@@ -164,21 +164,47 @@ fn trust_hint(path: &Path) {
 /// root's environment: the data directory has to be named explicitly or the
 /// command would act on `/root/.local/share/hakimi`.
 fn root_action<T>(runtime: &HakimiRuntime, action: &str, result: Result<T>) -> Result<T> {
-    match result {
+    let mapped = match result {
         Ok(value) => Ok(value),
         Err(error) => {
             if error.chain().any(|cause| cause.is::<NeedsRoot>()) {
                 // One message, error first and the fix below it: main prints
                 // the whole thing after its `hakimi:` prefix.
-                return Err(anyhow::anyhow!(
+                Err(anyhow::anyhow!(
                     "{error:#}\n提示：sudo 不会继承 HAKIMI_DATA_DIR，请显式指定数据目录：\n  {}",
                     privileged_command(runtime, action)
-                ));
+                ))
+            } else {
+                Err(error)
             }
-            Err(error)
         }
+    };
+    restore_ownership(runtime);
+    mapped
+}
+
+#[cfg(target_os = "linux")]
+fn restore_ownership(runtime: &HakimiRuntime) {
+    let (Ok(uid), Ok(gid)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) else {
+        return;
+    };
+    if uid.parse::<u32>().is_err() || gid.parse::<u32>().is_err() {
+        return;
+    }
+    let status = std::process::Command::new("chown")
+        .args(["-R", "--from=0"])
+        .arg(format!("{uid}:{gid}"))
+        .arg(runtime.paths().root())
+        .status();
+    match status {
+        Ok(result) if result.success() => {}
+        Ok(result) => eprintln!("hakimi: 归还数据目录属主失败: {result}"),
+        Err(error) => eprintln!("hakimi: 执行 chown 失败: {error}"),
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+fn restore_ownership(_runtime: &HakimiRuntime) {}
 
 /// The command that touches the trust store, with the data directory spelled
 /// out: `sudo` does not inherit `HAKIMI_DATA_DIR`, and on Linux the trust store
