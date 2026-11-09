@@ -221,6 +221,35 @@ pub struct AdvancedConfig {
     /// `cloudflared`. Off by default: when disabled the runtime binds no port
     /// and spawns no task.
     pub relay: RelayConfig,
+    /// Desktop launch behavior. The CLI ignores it and the Android build has
+    /// its own launcher.
+    pub startup: StartupConfig,
+}
+
+/// How the desktop app starts. The OS entry (Startup-folder shortcut,
+/// LaunchAgent or XDG autostart file) always carries `--autostart`, so a login
+/// launch is distinguishable from a double-click.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StartupConfig {
+    /// Register the app with the OS login items. The registration is
+    /// rewritten on every launch, so moving the executable fixes the entry.
+    pub auto_start: bool,
+    /// Launch with only the tray icon: no window until the user asks for it.
+    pub start_hidden: bool,
+    /// Turn acceleration on as part of the launch. Off by default: taking
+    /// over the system proxy stays an explicit choice unless opted in.
+    pub auto_connect: bool,
+}
+
+impl Default for StartupConfig {
+    fn default() -> Self {
+        Self {
+            auto_start: false,
+            start_hidden: false,
+            auto_connect: false,
+        }
+    }
 }
 
 /// Local raw-TCP relay settings.
@@ -326,6 +355,7 @@ impl Default for AdvancedConfig {
             upstream_header_timeout_secs: 60,
             download: DownloadConfig::default(),
             relay: RelayConfig::default(),
+            startup: StartupConfig::default(),
         }
     }
 }
@@ -2190,6 +2220,32 @@ mod tests {
         assert!(manager2.snapshot().group("eh").unwrap().enabled); // other holders are not auto-reloaded
         let manager3 = ConfigManager::load(paths.config_file()).unwrap();
         assert!(!manager3.snapshot().group("eh").unwrap().enabled);
+    }
+
+    /// The startup section is desktop-only and opt-in: an absent section
+    /// means every switch is off, and a non-default value survives a reload.
+    #[test]
+    fn startup_settings_are_opt_in_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        assert!(!manager.snapshot().advanced.startup.auto_start);
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(!text.contains("\"startup\""));
+
+        manager
+            .mutate(|config| {
+                config.advanced.startup.auto_start = true;
+                config.advanced.startup.start_hidden = true;
+                Ok(())
+            })
+            .unwrap();
+        let reloaded = ConfigManager::load(paths.config_file()).unwrap();
+        let startup = &reloaded.snapshot().advanced.startup;
+        assert!(startup.auto_start && startup.start_hidden);
+        assert!(!startup.auto_connect);
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(text.contains("\"autoStart\""), "{text}");
     }
 
     #[test]

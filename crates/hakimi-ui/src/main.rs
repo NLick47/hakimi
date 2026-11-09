@@ -25,6 +25,7 @@ use ui_state::SettlePhase;
 
 slint::include_modules!();
 
+mod autostart;
 mod model;
 mod ui_state;
 mod update;
@@ -378,16 +379,17 @@ fn apply_update(app: &AppWindow) {
 
 /// Runs one check off the UI thread. Duplicate requests (a click landing while
 /// the automatic check is in flight) are ignored instead of stacking up.
-fn start_update_check(app: &AppWindow, spawner: &tokio::runtime::Handle) {
+/// Returns true when this call started a check.
+fn start_update_check(spawner: &tokio::runtime::Handle) -> bool {
     if UPDATE.with(|slot| slot.borrow().checking) {
-        return;
+        return false;
     }
     UPDATE.with(|slot| {
         let mut state = slot.borrow_mut();
         state.checking = true;
         state.status = "正在检查更新…".to_string();
     });
-    apply_update(app);
+    tracing::info!("checking for updates");
 
     spawner.spawn(async move {
         let outcome = update::check().await;
@@ -416,25 +418,33 @@ fn start_update_check(app: &AppWindow, spawner: &tokio::runtime::Handle) {
             });
             // The window that started the check may have been closed while it
             // was in flight; apply the result to whichever window is live now.
-            WINDOW.with(|slot| {
-                if let Some(shell) = slot.borrow().as_ref() {
-                    apply_update(&shell.app);
-                }
-            });
+            apply_update_to_live_window();
         });
     });
+    true
 }
 
-/// Automatic checks run at most once a day while a window exists. A failed
+/// Automatic checks run at most once a day, whether or not a window exists:
+/// a silent autostart would otherwise never check for updates. A failed
 /// attempt also counts, so an offline machine is not retried every tick.
-fn maybe_auto_update(app: &AppWindow, spawner: &tokio::runtime::Handle) {
+/// Returns true when a check was started.
+fn maybe_auto_update(spawner: &tokio::runtime::Handle) -> bool {
     let due = UPDATE_LAST_ATTEMPT
         .with(|slot| slot.get().is_none_or(|at| at.elapsed() >= UPDATE_INTERVAL));
     if !due {
-        return;
+        return false;
     }
     UPDATE_LAST_ATTEMPT.with(|slot| slot.set(Some(Instant::now())));
-    start_update_check(app, spawner);
+    start_update_check(spawner)
+}
+
+/// Mirrors the update state into whichever window is live, if any.
+fn apply_update_to_live_window() {
+    WINDOW.with(|slot| {
+        if let Some(shell) = slot.borrow().as_ref() {
+            apply_update(&shell.app);
+        }
+    });
 }
 
 struct WindowShell {
@@ -736,11 +746,13 @@ fn wire_window(app: &AppWindow, ctx: &UiContext) {
         let spawner = spawner.clone();
         let weak = app.as_weak();
         app.on_check_update(move || {
-            if let Some(app) = weak.upgrade() {
-                // A manual check resets the daily timer: the next automatic
-                // one is a day after this click, not sooner.
-                UPDATE_LAST_ATTEMPT.with(|slot| slot.set(Some(Instant::now())));
-                start_update_check(&app, &spawner);
+            // A manual check resets the daily timer: the next automatic one
+            // is a day after this click, not sooner.
+            UPDATE_LAST_ATTEMPT.with(|slot| slot.set(Some(Instant::now())));
+            if start_update_check(&spawner) {
+                if let Some(app) = weak.upgrade() {
+                    apply_update(&app);
+                }
             }
         });
     }
@@ -926,8 +938,9 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
 
     MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
     refresh(&app, &ctx.runtime, &ctx.expanded.borrow(), &ctx.sweep);
+    // Start a due check first so its "checking" state is mirrored after.
+    maybe_auto_update(&ctx.spawner);
     apply_update(&app);
-    maybe_auto_update(&app, &ctx.spawner);
 
     let id = NEXT_WINDOW_ID.with(|next| {
         let id = next.get() + 1;
@@ -941,7 +954,6 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
         let runtime = ctx.runtime.clone();
         let expanded = ctx.expanded.clone();
         let sweep = ctx.sweep.clone();
-        let spawner = ctx.spawner.clone();
         let closing = closing.clone();
         timer.start(
             slint::TimerMode::Repeated,
@@ -983,7 +995,6 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
                     return;
                 }
                 refresh(&app, &runtime, &expanded.borrow(), &sweep);
-                maybe_auto_update(&app, &spawner);
             },
         );
     }
@@ -1049,6 +1060,42 @@ fn show_main_window(ctx: &UiContext) {
         }
         Err(error) => eprintln!("hakimi-ui: rebuilding the window failed: {error:#}"),
     }
+}
+
+fn set_tray_startup_flags(auto_start: bool, start_hidden: bool) {
+    TRAY.with(|slot| {
+        if let Some(tray) = slot.borrow().as_ref() {
+            tray.set_auto_start(auto_start);
+            tray.set_start_hidden(start_hidden);
+        }
+    });
+}
+
+/// Mirrors the startup switches into the tray menu, which mirrors them again
+/// when clicked without a window present.
+fn sync_tray_settings(runtime: &HakimiRuntime) {
+    let startup = &runtime.config().snapshot().advanced.startup;
+    set_tray_startup_flags(startup.auto_start, startup.start_hidden);
+}
+
+/// Shows a settings error in whichever window is live, if any. Used by the
+/// tray switches, which have no window of their own.
+fn report_setting_error(key: &str, error: Option<String>) {
+    WINDOW.with(|slot| {
+        if let Some(shell) = slot.borrow().as_ref() {
+            let app = &shell.app;
+            let current_key = app.get_cfg_error_key();
+            if error.is_some() || current_key.as_str() == key {
+                let failed = error.is_some();
+                app.set_cfg_error(SharedString::from(error.unwrap_or_default()));
+                app.set_cfg_error_key(SharedString::from(if failed {
+                    key.to_string()
+                } else {
+                    String::new()
+                }));
+            }
+        }
+    });
 }
 
 /// Sidebar counters for the desktop layout.
@@ -1181,6 +1228,21 @@ fn apply_ui_update(
         if changed(|s| &s.http1_hosts) {
             app.set_cfg_http1_hosts(SharedString::from(settings.http1_hosts.clone()));
         }
+        let auto_start_changed = old.is_none_or(|prev| prev.auto_start != settings.auto_start);
+        let start_hidden_changed =
+            old.is_none_or(|prev| prev.start_hidden != settings.start_hidden);
+        if auto_start_changed {
+            app.set_cfg_auto_start(settings.auto_start);
+        }
+        if start_hidden_changed {
+            app.set_cfg_start_hidden(settings.start_hidden);
+        }
+        if auto_start_changed || start_hidden_changed {
+            set_tray_startup_flags(settings.auto_start, settings.start_hidden);
+        }
+        if old.is_none_or(|prev| prev.auto_connect != settings.auto_connect) {
+            app.set_cfg_auto_connect(settings.auto_connect);
+        }
     }
 
     if prev.as_ref().map(|state| state.ca) != Some(ca) {
@@ -1290,6 +1352,9 @@ pub(crate) struct SettingsValues {
     /// commas for editing. This list belongs to the user: the defaults cover
     /// the built-in sites, and an edit applies without a restart.
     pub http1_hosts: String,
+    pub auto_start: bool,
+    pub start_hidden: bool,
+    pub auto_connect: bool,
 }
 
 pub(crate) fn settings_values(config: &Value) -> SettingsValues {
@@ -1312,6 +1377,17 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
         relay
             .map(|value| text(value, key))
             .unwrap_or_default()
+    };
+    // The persisted file omits `advanced` fields that still equal the
+    // defaults, so an absent `startup` section means "all off".
+    let startup = config
+        .get("advanced")
+        .and_then(|advanced| advanced.get("startup"));
+    let startup_flag = |key: &str| {
+        startup
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     };
     SettingsValues {
         proxy_port: field("proxy", "port"),
@@ -1339,6 +1415,9 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
                     .join(", ")
             })
             .unwrap_or_default(),
+        auto_start: startup_flag("autoStart"),
+        start_hidden: startup_flag("startHidden"),
+        auto_connect: startup_flag("autoConnect"),
     }
 }
 
@@ -1449,6 +1528,18 @@ fn apply_setting_bool(runtime: &HakimiRuntime, key: &str, value: bool) -> Option
                             Some("region1.v2.argotunnel.com:7844".to_string());
                     }
                 }
+            }
+            "advanced.startup.autoStart" => {
+                // The OS entry is the actual effect: registering first keeps
+                // the file and the switch honest when the write fails.
+                autostart::apply(value)?;
+                config.advanced.startup.auto_start = value;
+            }
+            "advanced.startup.startHidden" => {
+                config.advanced.startup.start_hidden = value;
+            }
+            "advanced.startup.autoConnect" => {
+                config.advanced.startup.auto_connect = value;
             }
             other => bail!("未知设置项 {other}"),
         }
@@ -1863,6 +1954,12 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     app.set_cfg_data_dir(SharedString::from("~/Library/Application Support/hakimi"));
     app.set_cfg_version(SharedString::from(env!("CARGO_PKG_VERSION")));
     app.set_cfg_core_version(SharedString::from(hakimi_core::VERSION));
+    if std::env::var("HAKIMI_UI_AUTOSTART_WARN").is_ok() {
+        app.set_cfg_auto_start(true);
+        app.set_auto_start_warning(SharedString::from(
+            "已被系统启动应用设置禁用，请在任务管理器 → 启动应用中重新启用",
+        ));
+    }
     if std::env::var("HAKIMI_UI_UPDATE").is_ok() {
         app.set_update_available(true);
         app.set_update_status(SharedString::from("发现新版本 v0.2.0"));
@@ -2119,8 +2216,23 @@ fn refresh(
         }
     };
 
+    let auto_start = settings.auto_start;
     let (sites, subtitle) = finish_snapshot(raw_sites, selected, running, starting, Some(phase));
     apply_ui_update(app, sites, subtitle, running, ca_state, settings);
+    // The switch describes the stored intent; Windows can disable the entry
+    // from its Startup apps page without touching the file, so surface that
+    // instead of letting the switch claim it will run.
+    let warning = if auto_start {
+        autostart::login_state().problem().unwrap_or_default()
+    } else {
+        ""
+    };
+    if app.get_auto_start_warning().as_str() != warning {
+        if !warning.is_empty() {
+            tracing::info!(warning, "startup entry warning");
+        }
+        app.set_auto_start_warning(SharedString::from(warning));
+    }
     // Environment state comes from the probe thread; the window already
     // mirrors the model, so there is nothing else to do here.
 }
@@ -2137,6 +2249,33 @@ fn cached_config(revision: u64, fetch: impl FnOnce() -> Value) -> Rc<Value> {
             }
         }
     })
+}
+
+/// How this process was launched. Parsed before anything else so a login
+/// launch can stay silent even when a window would otherwise be built.
+#[derive(Clone, Copy, Default)]
+struct LaunchOptions {
+    /// Started by the OS login entry: never pop a window unless `--show` is
+    /// also present.
+    autostart: bool,
+    /// `--hidden`: park in the tray for this launch only.
+    hidden: bool,
+    /// `--show`: force the window open despite the settings above.
+    show: bool,
+}
+
+fn launch_options(args: &[String]) -> LaunchOptions {
+    LaunchOptions {
+        autostart: args.iter().any(|arg| arg == autostart::AUTOSTART_ARG),
+        hidden: args.iter().any(|arg| arg == "--hidden"),
+        show: args.iter().any(|arg| arg == "--show"),
+    }
+}
+
+/// Whether this launch builds no window. A login launch is always silent
+/// unless the entry was customized with `--show`.
+fn starts_hidden(options: LaunchOptions, config_hidden: bool) -> bool {
+    (options.autostart || options.hidden || config_hidden) && !options.show
 }
 
 fn main() -> Result<()> {
@@ -2159,6 +2298,9 @@ fn main() -> Result<()> {
         }
     }
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let options = launch_options(&args);
+
     // Single instance: a second long-running app would fight over the proxy port.
     let instance_dir = match data_dir() {
         Some(dir) => dir,
@@ -2169,6 +2311,11 @@ fn main() -> Result<()> {
     let _instance_lock = match InstanceLock::acquire(&instance_dir) {
         Ok(lock) => lock,
         Err(InstanceLockError::AlreadyRunning { .. }) => {
+            // A login entry racing a process the user just opened (or one
+            // they closed to the tray) must not pop a window over their work.
+            if options.autostart {
+                return Ok(());
+            }
             // Visible feedback instead of a silently dead second launch.
             let notice = AlreadyRunningWindow::new()?;
             notice.show()?;
@@ -2203,13 +2350,26 @@ fn main() -> Result<()> {
     // dedicated tokio runtime in the background.
     let runtime = HakimiRuntime::new(data_dir())?;
     let sweep = std::sync::Arc::new(SweepState::default());
+    let startup = runtime.config().snapshot().advanced.startup.clone();
+
+    // Reconcile the OS login entry with the config on every launch: a moved
+    // executable rewrites its own path, and an entry left behind by a manual
+    // edit is cleaned up while the switch is off.
+    if let Err(error) = autostart::apply(startup.auto_start) {
+        tracing::warn!(
+            error = %format!("{error:#}"),
+            "could not update the login item"
+        );
+    }
 
     // The state machine decides the startup posture. This one synchronous
     // probe is the only environment check on the UI thread; after this, the
     // probe thread streams results in. The proxy effects map onto the start
     // mode because they need the PAC URL, which only exists post-bind.
-    let startup_effects =
-        MODEL.with(|m| m.borrow_mut().startup(ui_state::probe_env(&runtime, false)));
+    let startup_effects = MODEL.with(|m| {
+        m.borrow_mut()
+            .startup(ui_state::probe_env(&runtime, false), startup.auto_connect)
+    });
     let start_mode = ui_state::execute_startup(&startup_effects, &runtime);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2293,12 +2453,38 @@ fn main() -> Result<()> {
             });
         }
     });
+    tray.on_toggle_auto_start({
+        let runtime = runtime.clone();
+        move || {
+            let enabled = !runtime.config().snapshot().advanced.startup.auto_start;
+            let error = apply_setting_bool(&runtime, "advanced.startup.autoStart", enabled);
+            if let Some(message) = &error {
+                tracing::warn!(error = %message, "tray auto-start toggle failed");
+            }
+            // A window may be open; show the failure there when it is.
+            report_setting_error("advanced.startup.autoStart", error);
+            sync_tray_settings(&runtime);
+        }
+    });
+    tray.on_toggle_start_hidden({
+        let runtime = runtime.clone();
+        move || {
+            let enabled = !runtime.config().snapshot().advanced.startup.start_hidden;
+            let error = apply_setting_bool(&runtime, "advanced.startup.startHidden", enabled);
+            if let Some(message) = &error {
+                tracing::warn!(error = %message, "tray start-hidden toggle failed");
+            }
+            report_setting_error("advanced.startup.startHidden", error);
+            sync_tray_settings(&runtime);
+        }
+    });
     tray.on_quit(|| {
         // Quitting goes through the normal path below: run_event_loop returns,
         // the background thread stops the proxy and restores the system proxy.
         let _ = slint::quit_event_loop();
     });
     TRAY.with(|slot| *slot.borrow_mut() = Some(tray));
+    sync_tray_settings(&runtime);
 
     // The environment probe is an input stream: it runs off the UI thread and
     // posts results through the event loop. The state machine and the proxy
@@ -2307,6 +2493,7 @@ fn main() -> Result<()> {
     {
         let probe_stop = probe_stop.clone();
         let probe_runtime = runtime.clone();
+        let probe_spawner = spawner.clone();
         std::thread::spawn(move || {
             // One OS-proxy read-back every 3 s on every platform: a `scutil
             // --proxy` run on macOS (≈5 ms) and a registry read on Windows
@@ -2322,6 +2509,7 @@ fn main() -> Result<()> {
                 tick = tick.wrapping_add(1);
                 let env = ui_state::probe_env(&probe_runtime, tick % proxy_check_every == 0);
                 let runtime = probe_runtime.clone();
+                let spawner = probe_spawner.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     MODEL.with(|m| {
                         let mut model = m.borrow_mut();
@@ -2345,6 +2533,11 @@ fn main() -> Result<()> {
                             }
                         });
                     }
+                    // Independent of any window: a silent launch checks once
+                    // a day and shows the result when a window comes back.
+                    if maybe_auto_update(&spawner) {
+                        apply_update_to_live_window();
+                    }
                 });
             }
         });
@@ -2352,17 +2545,35 @@ fn main() -> Result<()> {
 
     // The initial window. `run_event_loop` keeps running while the tray icon
     // exists; closing the window drops the component without stopping it.
-    let shell = build_window(&ctx)?;
-    set_dock_visible(true);
-    shell.app.show()?;
-    WINDOW.with(|slot| *slot.borrow_mut() = Some(shell));
+    // A login or silent launch builds no window at all: the tray keeps the
+    // event loop alive and rebuilds the component on demand.
+    let start_hidden = starts_hidden(options, startup.start_hidden);
+    if start_hidden {
+        set_dock_visible(false);
+        tracing::info!("starting with only the tray icon");
+    } else {
+        let shell = build_window(&ctx)?;
+        set_dock_visible(true);
+        shell.app.show()?;
+        WINDOW.with(|slot| *slot.borrow_mut() = Some(shell));
+    }
 
-    // The backend has created its event loop (and winit's delegate) by now.
+    // A visible launch has created the backend event loop (and winit's
+    // NSApplication delegate) by now. A hidden launch has no window yet, so
+    // the delegate may not exist and `install` returns early; retry once the
+    // event loop is running. Both calls are idempotent.
     #[cfg(target_os = "macos")]
-    macos_reopen::install({
+    {
+        macos_reopen::install({
+            let ctx = ctx.clone();
+            move || show_main_window(&ctx)
+        });
         let ctx = ctx.clone();
-        move || show_main_window(&ctx)
-    });
+        slint::Timer::single_shot(Duration::from_millis(50), move || {
+            let ctx = ctx.clone();
+            macos_reopen::install(move || show_main_window(&ctx));
+        });
+    }
 
     slint::run_event_loop()?;
 

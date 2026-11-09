@@ -657,3 +657,57 @@ fn an_empty_http1_host_list_is_accepted() {
     assert_eq!(crate::settings_values(&json).http1_hosts, "");
     assert!(config.validate().is_ok(), "an empty list must validate");
 }
+
+/// A login launch is silent, `--show` overrides every hidden source, and a
+/// saved "start hidden" preference only applies to launches without `--show`.
+#[test]
+fn the_initial_window_follows_the_launch_flags() {
+    let hidden = |autostart, hide, show, config_hidden| {
+        crate::starts_hidden(
+            crate::LaunchOptions {
+                autostart,
+                hidden: hide,
+                show,
+            },
+            config_hidden,
+        )
+    };
+    assert!(
+        hidden(true, false, false, false),
+        "a login launch is silent"
+    );
+    assert!(hidden(false, true, false, false), "--hidden is one-shot");
+    assert!(hidden(false, false, false, true), "the saved preference");
+    assert!(!hidden(false, false, false, false));
+    assert!(!hidden(true, false, true, true), "--show wins");
+    assert!(!hidden(false, true, true, true), "--show wins");
+}
+
+#[test]
+fn launch_flags_are_parsed_from_the_command_line() {
+    let args: Vec<String> = ["--autostart", "--hidden", "--show"]
+        .iter()
+        .map(|value| value.to_string())
+        .collect();
+    let options = crate::launch_options(&args);
+    assert!(options.autostart && options.hidden && options.show);
+    let empty = crate::launch_options(&[]);
+    assert!(!empty.autostart && !empty.hidden && !empty.show);
+}
+
+/// The startup switches read from the nested `advanced.startup` section; a
+/// config written before the section existed must read as all-off instead of
+/// failing to load.
+#[test]
+fn startup_switches_default_to_off_and_follow_the_config() {
+    let values = crate::settings_values(&serde_json::json!({ "advanced": {} }));
+    assert!(!values.auto_start && !values.start_hidden && !values.auto_connect);
+
+    let mut config = AppConfig::default();
+    config.advanced.startup.auto_start = true;
+    config.advanced.startup.start_hidden = true;
+    config.advanced.startup.auto_connect = true;
+    let json = serde_json::to_value(&config).unwrap();
+    let values = crate::settings_values(&json);
+    assert!(values.auto_start && values.start_hidden && values.auto_connect);
+}
