@@ -1299,7 +1299,7 @@ fn release_ui_caches(app: &AppWindow) {
 /// Site logos are embedded in the executable. `CARGO_MANIFEST_DIR` is an
 /// absolute path on the build machine, so loading them from disk would fail
 /// once the binary is copied to another machine.
-const ICON_ASSETS: [(&str, &[u8]); 12] = [
+const ICON_ASSETS: [(&str, &[u8]); 13] = [
     ("pixiv", include_bytes!("../assets/pixiv.png")),
     ("hitomi", include_bytes!("../assets/hitomi.png")),
     ("poipiku", include_bytes!("../assets/poipiku.png")),
@@ -1314,6 +1314,7 @@ const ICON_ASSETS: [(&str, &[u8]); 12] = [
     // the `huggingface-co` slug instead, so both spellings share one image.
     ("hf", HF_LOGO),
     ("huggingface", HF_LOGO),
+    ("x", include_bytes!("../assets/x.png")),
 ];
 
 const HF_LOGO: &[u8] = include_bytes!("../assets/hf.png");

@@ -278,6 +278,7 @@ private val SITE_ICONS = mapOf(
     // `huggingface-co` slug. Both spellings share one drawable.
     "hf" to R.drawable.site_hf,
     "huggingface" to R.drawable.site_hf,
+    "x" to R.drawable.site_x,
 )
 
 fun siteIconRes(id: String): Int {
