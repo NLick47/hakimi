@@ -871,6 +871,21 @@ pub fn default_groups() -> Vec<GroupConfig> {
             true,
             "https://huggingface.co/",
         ),
+        group(
+            "x-com",
+            "X-beta",
+            vec![
+                plain("x.com"),
+                plain("*.x.com"),
+                plain("t.co"),
+                // The web app's entry bundle, styles and fonts live on
+                // abs.twimg.com; without these the page never boots.
+                plain("*.twimg.com"),
+            ],
+            RoutePolicy::auto(),
+            true,
+            "https://x.com/",
+        ),
     ]
 }
 
@@ -1616,7 +1631,10 @@ mod tests {
     fn defaults_validate_and_match_document() {
         let config = AppConfig::default();
         config.validate().unwrap();
-        assert_eq!(config.groups.len(), 9);
+        assert_eq!(config.groups.len(), 10);
+        let x = config.group("x-com").unwrap();
+        assert!(x.enabled);
+        assert!(x.domains.iter().any(|rule| rule.pattern == "*.twimg.com"));
         let eh = config.group("eh").unwrap();
         assert!(eh.enabled);
         assert!(config.groups.iter().all(|group| group.enabled));
