@@ -4,8 +4,8 @@
 //! [`apply`] reconciles the two and runs once at launch (a moved executable
 //! rewrites its own path) and again whenever the settings switch flips.
 //!
-//! Every platform write is idempotent: enabling an already-enabled entry just
-//! rewrites it, and disabling an absent one is a success, because "not
+//! Every platform write is idempotent: enabling an already-enabled entry leaves
+//! it alone, and disabling an absent one is a success, because "not
 //! registered" is the state being asked for.
 
 use anyhow::Result;
@@ -28,6 +28,7 @@ pub enum LoginState {
     Present,
     Missing,
     /// The file exists, but the OS startup list has it disabled.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Disabled,
 }
 
@@ -287,11 +288,18 @@ mod windows_impl {
     }
 }
 
+/// The login item is a LaunchAgent: `~/Library/LaunchAgents` is read at login,
+/// so the file itself is the registration.
+///
+/// The "user disabled it in System Settings" state lives in
+/// BackgroundTaskManagement, which has no public query before `SMAppService`
+/// (13+), so [`super::LoginState`] cannot report it here.
 #[cfg(target_os = "macos")]
 mod macos_impl {
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
-    use anyhow::{Context, Result};
+    use anyhow::{bail, Context, Result};
 
     const LABEL: &str = "com.hakimi.app";
 
@@ -304,7 +312,11 @@ mod macos_impl {
 
     /// A packaged app must be started through LaunchServices (that is what
     /// gives it its bundle identity); a bare binary is executed directly.
-    fn program_arguments(exe: &Path) -> Vec<String> {
+    ///
+    /// `-n` is deliberate: without it `open` treats an already-running copy as
+    /// the target, drops `--args`, and delivers a reopen event instead, which
+    /// pops the window the login launch was supposed to keep closed.
+    pub(super) fn program_arguments(exe: &Path) -> Vec<String> {
         let macos_dir = exe.parent();
         let contents = macos_dir.and_then(Path::parent);
         let bundle = contents.and_then(Path::parent);
@@ -314,6 +326,7 @@ mod macos_impl {
         match bundle {
             Some(bundle) if in_bundle => vec![
                 "/usr/bin/open".to_string(),
+                "-n".to_string(),
                 "-a".to_string(),
                 bundle.display().to_string(),
                 "--args".to_string(),
@@ -323,6 +336,11 @@ mod macos_impl {
         }
     }
 
+    fn is_temporary(exe: &Path) -> bool {
+        let path = exe.to_string_lossy();
+        path.contains("/AppTranslocation/") || path.starts_with("/Volumes/")
+    }
+
     fn xml_escape(value: &str) -> String {
         value
             .replace('&', "&amp;")
@@ -330,7 +348,7 @@ mod macos_impl {
             .replace('>', "&gt;")
     }
 
-    fn plist(program: &[String]) -> String {
+    pub(super) fn plist(program: &[String]) -> String {
         let mut args = String::new();
         for arg in program {
             args.push_str(&format!("        <string>{}</string>\n", xml_escape(arg)));
@@ -355,38 +373,46 @@ mod macos_impl {
         )
     }
 
-    /// Writing the file is the whole registration: launchd reads the folder
-    /// at login, which is exactly when the entry should fire. Loading it into
-    /// the current session with `launchctl` is unnecessary.
     pub(super) fn apply(enabled: bool) -> Result<()> {
         let path = plist_path()?;
-        if enabled {
-            let exe = std::env::current_exe().context("无法定位当前可执行文件")?;
-            let content = plist(&program_arguments(&exe));
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("无法创建 {}", parent.display()))?;
-            }
-            std::fs::write(&path, content)
-                .with_context(|| format!("无法写入 {}", path.display()))?;
-            return Ok(());
-        }
-        // Only remove the plist this executable would have written. Another
-        // copy of the app (or a hand-edited launch agent) is left alone.
-        let Ok(exe) = std::env::current_exe() else {
-            return Ok(());
-        };
-        let expected = plist(&program_arguments(&exe));
-        match std::fs::read_to_string(&path) {
-            Ok(content) if content == expected => match std::fs::remove_file(&path) {
+        let exe = std::env::current_exe().context("无法定位当前可执行文件")?;
+        apply_entry(&path, &exe, enabled)
+    }
+
+    pub(super) fn apply_entry(path: &Path, exe: &Path, enabled: bool) -> Result<()> {
+        if !enabled {
+            // The path is ours whatever executable the file names: a second
+            // copy of the app shares it, and a stale entry left behind keeps
+            // launching the old path after the switch was turned off.
+            return match std::fs::remove_file(path) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error).with_context(|| format!("无法删除 {}", path.display())),
-            },
-            Ok(_) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).with_context(|| format!("无法读取 {}", path.display())),
+            };
         }
+        // A quarantined app runs from a read-only AppTranslocation mount, and
+        // one started from a mounted image lives under /Volumes; both paths are
+        // gone after a reboot, so an entry written there is dead on arrival.
+        if is_temporary(exe) {
+            bail!("应用没有安装在固定位置，请先拖到「应用程序」再开启开机自启");
+        }
+        let content = plist(&program_arguments(exe));
+        let up_to_date = std::fs::read_to_string(path).is_ok_and(|current| current == content)
+            && std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o022 == 0);
+        if up_to_date {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("无法创建 {}", parent.display()))?;
+        }
+        // Written aside and renamed so a crash cannot leave launchd a partial
+        // plist; 0644 because launchd ignores a group-writable agent.
+        let temp = path.with_extension("plist.tmp");
+        std::fs::write(&temp, content).with_context(|| format!("无法写入 {}", temp.display()))?;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o644))
+            .with_context(|| format!("无法设置 {}", temp.display()))?;
+        std::fs::rename(&temp, path).with_context(|| format!("无法替换 {}", path.display()))
     }
 
     pub(super) fn state() -> super::LoginState {
@@ -537,5 +563,138 @@ mod tests {
         assert!(!super::windows_impl::entry_belongs(
             &target, "--other", &exe
         ));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_entry() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "hakimi-autostart-{}-{}.plist",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// A packaged app has to go through LaunchServices; `-n` keeps a running
+    /// copy from swallowing `--args` and turning the login launch into a
+    /// reopen that shows the window.
+    #[test]
+    fn a_bundle_is_opened_through_launch_services() {
+        let exe = Path::new("/Applications/hakimi.app/Contents/MacOS/hakimi");
+        assert_eq!(
+            super::macos_impl::program_arguments(exe),
+            vec![
+                "/usr/bin/open",
+                "-n",
+                "-a",
+                "/Applications/hakimi.app",
+                "--args",
+                super::AUTOSTART_ARG,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bare_binary_is_executed_directly() {
+        let exe = Path::new("/usr/local/bin/hakimi-ui");
+        assert_eq!(
+            super::macos_impl::program_arguments(exe),
+            vec!["/usr/local/bin/hakimi-ui", super::AUTOSTART_ARG]
+        );
+    }
+
+    /// Only `Foo.app/Contents/MacOS/<exe>` is a bundle; a directory that
+    /// happens to be named MacOS must not be opened as one.
+    #[test]
+    fn a_lookalike_directory_is_not_a_bundle() {
+        let exe = Path::new("/tmp/foo/MacOS/hakimi");
+        assert_eq!(
+            super::macos_impl::program_arguments(exe),
+            vec!["/tmp/foo/MacOS/hakimi", super::AUTOSTART_ARG]
+        );
+    }
+
+    /// launchd only runs an agent in the GUI session, and the arguments have
+    /// to survive XML escaping.
+    #[test]
+    fn the_agent_runs_at_login_in_the_gui_session() {
+        let plist = super::macos_impl::plist(&["/tmp/a&b.app".to_string()]);
+        assert!(plist.contains("<key>RunAtLoad</key>\n    <true/>"));
+        assert!(plist.contains("<key>LimitLoadToSessionType</key>\n    <string>Aqua</string>"));
+        assert!(plist.contains("<string>com.hakimi.app</string>"));
+        assert!(plist.contains("<string>/tmp/a&amp;b.app</string>"));
+    }
+
+    /// The entry is ours by path: turning the switch off after the app moved
+    /// has to delete it, otherwise the old path keeps starting at login while
+    /// the switch claims it is off.
+    #[test]
+    fn disabling_removes_an_entry_written_for_another_path() {
+        let path = temp_entry();
+        let old = Path::new("/Applications/old/hakimi.app/Contents/MacOS/hakimi");
+        let new = Path::new("/Applications/hakimi.app/Contents/MacOS/hakimi");
+
+        super::macos_impl::apply_entry(&path, old, true).unwrap();
+        assert!(path.exists());
+        super::macos_impl::apply_entry(&path, new, false).unwrap();
+        assert!(!path.exists());
+    }
+
+    /// Enabling again after a move rewrites the path instead of stacking a
+    /// second entry, and leaves a file launchd accepts.
+    #[test]
+    fn enabling_rewrites_the_path_when_the_app_moved() {
+        let path = temp_entry();
+        let old = Path::new("/Applications/old/hakimi.app/Contents/MacOS/hakimi");
+        let new = Path::new("/Applications/hakimi.app/Contents/MacOS/hakimi");
+
+        super::macos_impl::apply_entry(&path, old, true).unwrap();
+        super::macos_impl::apply_entry(&path, new, true).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&path);
+        assert!(content.contains("<string>/Applications/hakimi.app</string>"));
+        assert!(!content.contains("/Applications/old/"));
+        assert_eq!(mode, 0o644, "launchd ignores a group-writable agent");
+    }
+
+    /// launchd ignores a group-writable agent, so an entry whose permissions
+    /// drifted has to be rewritten even when the content is already right.
+    #[test]
+    fn a_world_writable_entry_is_repaired() {
+        let path = temp_entry();
+        let exe = Path::new("/Applications/hakimi.app/Contents/MacOS/hakimi");
+        super::macos_impl::apply_entry(&path, exe, true).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        super::macos_impl::apply_entry(&path, exe, true).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode, 0o644);
+    }
+
+    /// A quarantined app runs from a random AppTranslocation path and one
+    /// started from a mounted image lives under /Volumes; either way the entry
+    /// is dead after a reboot, so enabling has to fail loudly.
+    #[test]
+    fn a_temporary_location_is_refused() {
+        let path = temp_entry();
+        for exe in [
+            "/private/var/folders/x/AppTranslocation/1D3F/d/hakimi.app/Contents/MacOS/hakimi",
+            "/Volumes/hakimi 2.5.0/hakimi.app/Contents/MacOS/hakimi",
+        ] {
+            assert!(
+                super::macos_impl::apply_entry(&path, Path::new(exe), true).is_err(),
+                "{exe} must not become a login entry"
+            );
+            assert!(!path.exists());
+        }
     }
 }
