@@ -66,6 +66,10 @@ pub struct CatalogMeta {
     pub catalog_version: u64,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// The binary version that wrote this cache. A mismatch forces one full
+    /// refresh after an upgrade, bypassing the conditional request.
+    #[serde(default)]
+    pub app_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -325,6 +329,14 @@ impl CatalogManager {
         }
     }
 
+    /// True when a cached catalog was written by another binary version.
+    /// The startup refresh then bypasses the conditional request once, so an
+    /// upgrade always sees the catalog published for its defaults.
+    pub fn app_version_changed(&self) -> bool {
+        meta_from_other_app_version(self.ip_meta.read().as_ref())
+            || meta_from_other_app_version(self.doh_meta.read().as_ref())
+    }
+
     pub async fn refresh_ip(&self, force: bool) -> Result<RefreshReport> {
         let _guard = self.refresh_lock.lock().await;
         let config = self.config.snapshot();
@@ -365,6 +377,7 @@ impl CatalogManager {
                     if self.ip_catalog.read().is_some() {
                         if let Some(meta) = self.ip_meta.write().as_mut() {
                             meta.fetched_at = now();
+                            meta.app_version = Some(crate::VERSION.to_string());
                         }
                         self.persist_ip_meta();
                         let version = self
@@ -403,6 +416,7 @@ impl CatalogManager {
                             meta.etag = etag.or_else(|| meta.etag.clone());
                             meta.last_modified =
                                 last_modified.or_else(|| meta.last_modified.clone());
+                            meta.app_version = Some(crate::VERSION.to_string());
                         }
                         self.persist_ip_meta();
                         let version = self
@@ -444,6 +458,7 @@ impl CatalogManager {
                         sha256: hash,
                         catalog_version: version,
                         warnings: warnings.clone(),
+                        app_version: Some(crate::VERSION.to_string()),
                     };
                     // the write includes fsync and the body can reach 2MB, so it
                     // goes to a blocking thread and the worker plus every other
@@ -530,6 +545,7 @@ impl CatalogManager {
                     if self.doh_catalog.read().is_some() {
                         if let Some(meta) = self.doh_meta.write().as_mut() {
                             meta.fetched_at = now();
+                            meta.app_version = Some(crate::VERSION.to_string());
                         }
                         self.persist_doh_meta();
                         let version = self
@@ -568,6 +584,7 @@ impl CatalogManager {
                             meta.etag = etag.or_else(|| meta.etag.clone());
                             meta.last_modified =
                                 last_modified.or_else(|| meta.last_modified.clone());
+                            meta.app_version = Some(crate::VERSION.to_string());
                         }
                         self.persist_doh_meta();
                         let version = self
@@ -603,6 +620,7 @@ impl CatalogManager {
                         sha256: hash,
                         catalog_version: version,
                         warnings: Vec::new(),
+                        app_version: Some(crate::VERSION.to_string()),
                     };
                     // same as refresh_ip: the write includes fsync, move it off
                     let doh_file = self.paths.catalog_doh_file();
@@ -747,6 +765,11 @@ enum FetchOutcome {
     },
 }
 
+/// Whether a cached catalog was written by a different binary version.
+fn meta_from_other_app_version(meta: Option<&CatalogMeta>) -> bool {
+    meta.is_some_and(|meta| meta.app_version.as_deref() != Some(crate::VERSION))
+}
+
 fn catalog_sources(primary: &str, mirrors: &[String]) -> Vec<String> {
     let mut sources = Vec::new();
     if !primary.trim().is_empty() {
@@ -801,5 +824,21 @@ mod tests {
             default_signature_url("https://example.com/catalog/ips.json"),
             "https://example.com/catalog/ips.json.sig"
         );
+    }
+
+    #[test]
+    fn a_cache_from_another_version_forces_one_refresh() {
+        let base = serde_json::json!({
+            "source": "https://example.com/ips.json",
+            "fetchedAt": "2026-01-01T00:00:00Z",
+            "sha256": "00",
+            "catalogVersion": 1,
+        });
+        let old: CatalogMeta = serde_json::from_value(base.clone()).unwrap();
+        assert!(meta_from_other_app_version(Some(&old)));
+        let mut current: CatalogMeta = serde_json::from_value(base).unwrap();
+        current.app_version = Some(crate::VERSION.to_string());
+        assert!(!meta_from_other_app_version(Some(&current)));
+        assert!(!meta_from_other_app_version(None));
     }
 }

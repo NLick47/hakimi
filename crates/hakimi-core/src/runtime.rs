@@ -1244,9 +1244,19 @@ impl HakimiRuntime {
                 _ = receiver.changed() => return,
                 _ = tokio::time::sleep(Duration::from_millis(300)) => {}
             }
+            // An upgrade re-reads the catalog once even when the server would
+            // answer 304: the new binary's built-in groups and defaults expect
+            // a catalog published for that version.
+            let force = runtime.catalogs.app_version_changed();
+            if force {
+                tracing::info!(
+                    app_version = crate::VERSION,
+                    "catalog cache is from another app version; forcing a full refresh"
+                );
+            }
             let results = tokio::select! {
                 _ = receiver.changed() => return,
-                results = runtime.refresh_catalogs(false) => results,
+                results = runtime.refresh_catalogs(force) => results,
             };
             for result in results {
                 match result {
