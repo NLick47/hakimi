@@ -460,10 +460,13 @@ component CheckSquare inherits Rectangle {
 component ToggleRow inherits Rectangle {
     in property <string> label;
     in property <string> hint: "";
+    // A problem the host wants shown in place (e.g. the OS disabled the
+    // startup entry), or the save error for this specific switch.
+    in property <string> error: "";
     in-out property <bool> checked;
     callback toggled(bool);
 
-    height: root.hint == "" ? 52px : 58px;
+    height: 52px + (root.hint == "" ? 0px : 6px) + (root.error == "" ? 0px : 16px);
 
     HorizontalLayout {
         padding-left: 16px;
@@ -484,6 +487,12 @@ component ToggleRow inherits Rectangle {
                 text: root.hint;
                 font-size: 11px;
                 color: #8A95A2;
+                overflow: elide;
+            }
+            if root.error != "": Text {
+                text: root.error;
+                font-size: 11px;
+                color: #C0392B;
                 overflow: elide;
             }
         }
@@ -789,6 +798,13 @@ export component AppWindow inherits Window {
     in-out property <string> cfg-relay-target;
     // Hosts that get independent HTTP/1.1 connections, comma separated.
     in-out property <string> cfg-http1-hosts;
+    // Desktop launch behavior; applied through the OS login entry.
+    in-out property <bool> cfg-auto-start;
+    in-out property <bool> cfg-start-hidden;
+    in-out property <bool> cfg-auto-connect;
+    // Set when the login entry exists but the OS disabled it (Windows startup
+    // apps), or when it went missing while the app was running.
+    in property <string> auto-start-warning;
     in property <string> cfg-data-dir;
     in property <string> cfg-version;
     in property <string> cfg-core-version;
@@ -1963,6 +1979,53 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    // ---- 启动 ----
+                    Text {
+                        text: "启动";
+                        font-size: 12.5px;
+                        color: #5C6670;
+                    }
+                    Rectangle {
+                        border-radius: 8px;
+                        background: #FFFFFF;
+                        border-width: 1px;
+                        border-color: #E1E4E8;
+
+                        VerticalLayout {
+                            spacing: 0px;
+
+                            ToggleRow {
+                                label: "开机自启";
+                                hint: "登录系统后自动在托盘运行，不显示窗口";
+                                error: root.cfg-error-key == "advanced.startup.autoStart"
+                                    ? root.cfg-error
+                                    : root.auto-start-warning;
+                                checked: root.cfg-auto-start;
+                                toggled(value) => {
+                                    root.save-bool("advanced.startup.autoStart", value);
+                                }
+                            }
+                            RowLine { }
+                            ToggleRow {
+                                label: "静默启动";
+                                hint: "启动时不显示窗口，只保留托盘图标";
+                                checked: root.cfg-start-hidden;
+                                toggled(value) => {
+                                    root.save-bool("advanced.startup.startHidden", value);
+                                }
+                            }
+                            RowLine { }
+                            ToggleRow {
+                                label: "启动后自动加速";
+                                hint: "启动时自动开启加速并接管系统代理";
+                                checked: root.cfg-auto-connect;
+                                toggled(value) => {
+                                    root.save-bool("advanced.startup.autoConnect", value);
+                                }
+                            }
+                        }
+                    }
+
                     // ---- 数据 ----
                     Text {
                         text: "数据";
@@ -2367,8 +2430,12 @@ export component TrayRoot inherits SystemTrayIcon {
     icon: @image-url("../assets/tray.png");
     tooltip: "hakimi";
     in property <bool> running: false;
+    in property <bool> auto-start: false;
+    in property <bool> start-hidden: false;
     callback show-main();
     callback toggle-master();
+    callback toggle-auto-start();
+    callback toggle-start-hidden();
     callback quit();
     clicked => { root.show-main(); }
     Menu {
@@ -2380,6 +2447,17 @@ export component TrayRoot inherits SystemTrayIcon {
         MenuItem {
             title: root.running ? "停止加速" : "开启加速";
             activated => { root.toggle-master(); }
+        }
+        MenuSeparator {}
+        // Titles carry the state instead of check marks: the settings page is
+        // the canonical editor, and these are one-click shortcuts for it.
+        MenuItem {
+            title: root.auto-start ? "开机自启：开" : "开机自启：关";
+            activated => { root.toggle-auto-start(); }
+        }
+        MenuItem {
+            title: root.start-hidden ? "静默启动：开" : "静默启动：关";
+            activated => { root.toggle-start-hidden(); }
         }
         MenuSeparator {}
         MenuItem {

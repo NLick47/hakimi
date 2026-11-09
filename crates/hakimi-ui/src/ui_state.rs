@@ -142,15 +142,23 @@ impl Default for AppModel {
 }
 
 impl AppModel {
-    /// App launch. Acceleration always starts paused; taking over the system
-    /// proxy is an explicit user action. A stale takeover from a previous run
-    /// is still rolled back, so browsing keeps working directly in the
-    /// meantime.
-    pub fn startup(&mut self, env: EnvState) -> Effects {
+    /// App launch. Acceleration starts paused unless the user opted into
+    /// auto-connect; taking over the system proxy otherwise stays an explicit
+    /// action. A stale takeover from a previous run is still rolled back, so
+    /// browsing keeps working directly in the meantime.
+    ///
+    /// Auto-connect goes through [`Self::toggle`], so a broken environment
+    /// parks in [`AccelState::AwaitingEnvironment`] and starts by itself once
+    /// the CA is trusted instead of silently doing nothing.
+    pub fn startup(&mut self, env: EnvState, auto_connect: bool) -> Effects {
         self.env = env;
         self.accel = AccelState::Stopped;
         self.running_since = None;
         self.interrupt_dismissed = false;
+        if auto_connect {
+            let env = self.env.clone();
+            return self.toggle(env);
+        }
         Effects::awaiting()
     }
 
@@ -496,7 +504,7 @@ mod tests {
     /// The state right after the user flips acceleration on at launch.
     fn running_model() -> AppModel {
         let mut model = AppModel::default();
-        model.startup(env(true));
+        model.startup(env(true), false);
         model.toggle(env(true));
         // Tests cannot wait out the grace window; the suppression test below
         // uses the real window instead.
@@ -505,10 +513,10 @@ mod tests {
     }
 
     #[test]
-    fn startup_always_starts_paused() {
+    fn startup_starts_paused_without_auto_connect() {
         for healthy in [true, false] {
             let mut model = AppModel::default();
-            let effects = model.startup(env(healthy));
+            let effects = model.startup(env(healthy), false);
             assert_eq!(model.accel(), AccelState::Stopped);
             assert!(
                 !model.fix_page(),
@@ -517,6 +525,32 @@ mod tests {
             assert!(effects.pause && effects.release_proxy && !effects.resume);
             assert_eq!(start_mode(&effects), StartMode::Deferred);
         }
+    }
+
+    #[test]
+    fn auto_connect_takes_over_at_launch() {
+        let mut model = AppModel::default();
+        let effects = model.startup(env(true), true);
+        assert_eq!(model.accel(), AccelState::Running);
+        assert!(effects.resume && effects.apply_proxy);
+        assert_eq!(start_mode(&effects), StartMode::Takeover);
+    }
+
+    /// A login on a machine whose CA was since removed must not pretend to
+    /// accelerate, but it also must start once the user fixes the CA.
+    #[test]
+    fn auto_connect_waits_for_a_broken_environment() {
+        let mut model = AppModel::default();
+        let effects = model.startup(env(false), true);
+        assert_eq!(model.accel(), AccelState::AwaitingEnvironment);
+        assert_eq!(start_mode(&effects), StartMode::Deferred);
+        // The user asked for acceleration, so the fix page explains what is
+        // missing instead of leaving the switch silently off.
+        assert!(model.fix_page() && model.fix_blocked());
+
+        let effects = model.env_changed(env(true));
+        assert_eq!(model.accel(), AccelState::Running);
+        assert!(effects.resume && effects.apply_proxy);
     }
 
     #[test]
@@ -612,7 +646,7 @@ mod tests {
         // a moment to publish the PAC, so an immediate read-back that does not
         // see it yet is our own lag, not another program.
         let mut model = AppModel::default();
-        model.startup(env(true));
+        model.startup(env(true), false);
         model.toggle(env(true));
 
         let effects = model.env_changed(env_lost());
