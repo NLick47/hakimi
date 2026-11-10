@@ -49,7 +49,7 @@ component InlineField inherits Rectangle {
     border-radius: 6px;
     background: #FFFFFF;
     border-width: 1px;
-    border-color: input.has-focus ? #0067C0 : (root.invalid ? #C05B5B : #D8DDE3);
+    border-color: input.has-focus ? #385D78 : (root.invalid ? #C05B5B : #D8DDE3);
     animate border-color { duration: 120ms; }
 
     // Clicks on the inner padding should focus the editor too.
@@ -106,10 +106,10 @@ component FormInput inherits Rectangle {
     callback edited(string);
 
     height: 40px;
-    border-radius: 8px;
+    border-radius: 6px;
     background: #FFFFFF;
     border-width: 1px;
-    border-color: input.has-focus ? #0067C0 : (root.invalid ? #C05B5B : #D8DDE3);
+    border-color: input.has-focus ? #385D78 : (root.invalid ? #C05B5B : #D8DDE3);
     animate border-color { duration: 120ms; }
 
     if root.text == "": Text {
@@ -146,9 +146,9 @@ component RouteSelect inherits Rectangle {
 
     width: 126px;
     height: 40px;
-    border-radius: 8px;
+    border-radius: 6px;
     border-width: 1px;
-    border-color: popup.is-open ? #0067C0 : (touch.has-hover ? #BFC7CF : #D6DBE0);
+    border-color: popup.is-open ? #385D78 : (touch.has-hover ? #BFC7CF : #D6DBE0);
     background: popup.is-open ? #F2F7FC : (touch.has-hover ? #F2F4F6 : #FFFFFF);
     animate background { duration: 100ms; }
 
@@ -197,7 +197,7 @@ component RouteSelect inherits Rectangle {
         close-policy: close-on-click-outside;
 
         Rectangle {
-            border-radius: 8px;
+            border-radius: 6px;
             background: #FFFFFF;
             border-width: 1px;
             border-color: #D6DBE0;
@@ -220,7 +220,7 @@ component RouteSelect inherits Rectangle {
                         width: parent.width - 36px;
                         text: option;
                         font-size: 12.5px;
-                        color: k == root.current ? #0067C0 : #1B1F24;
+                        color: k == root.current ? #385D78 : #1B1F24;
                         vertical-alignment: center;
                         overflow: elide;
                     }
@@ -231,7 +231,7 @@ component RouteSelect inherits Rectangle {
                         x: parent.width - 22px;
                         y: (parent.height - self.height) / 2;
                         commands: "M 1.5 5.2 L 4 7.6 L 8.6 2.4";
-                        stroke: #0067C0;
+                        stroke: #385D78;
                         stroke-width: 1.6px;
                         stroke-line-cap: round;
                         stroke-line-join: round;
@@ -334,7 +334,7 @@ export component AlreadyRunningWindow inherits Window {
         Text {
             text: "hakimi 已经在运行";
             font-size: 14px;
-            font-weight: 600;
+            font-weight: 500;
             color: #1B1F24;
             horizontal-alignment: center;
         }
@@ -354,13 +354,13 @@ component ActionButton inherits Rectangle {
     in property <bool> emphasis: true;
     callback clicked();
 
-    height: 32px;
+                    height: 34px;
     min-width: 92px;
-    border-radius: 6px;
+    border-radius: 5px;
     border-width: emphasis ? 0px : 1px;
     border-color: emphasis ? transparent : #D6DBE0;
     background: emphasis
-        ? (touch.pressed ? #005BA6 : touch.has-hover ? #0B72BE : #0067C0)
+        ? (touch.pressed ? #294A62 : touch.has-hover ? #466E8A : #385D78)
         : (touch.pressed ? #ECEEF0 : touch.has-hover ? #F2F4F6 : #FFFFFF);
     animate background { duration: 100ms; }
 
@@ -375,26 +375,6 @@ component ActionButton inherits Rectangle {
 
     touch := TouchArea {
         clicked => { root.clicked(); }
-    }
-}
-
-component PowerBadge inherits Rectangle {
-    in property <bool> active;
-
-    width: 36px;
-    height: 36px;
-    border-radius: 18px;
-    background: active ? #0067C0 : #E9ECEF;
-
-    Path {
-        width: 17px;
-        height: 17px;
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-        commands: "M 13.2 4.8 A 6.2 6.2 0 1 1 4.8 4.8 M 9 1.5 L 9 8.8";
-        stroke: active ? #FFFFFF : #6B7680;
-        stroke-width: 1.7px;
-        stroke-line-cap: round;
     }
 }
 
@@ -432,8 +412,8 @@ component CheckSquare inherits Rectangle {
     height: 16px;
     border-radius: 4px;
     border-width: 1px;
-    border-color: checked || touch.has-hover ? #0067C0 : #9AA3AC;
-    background: checked ? #0067C0 : #FFFFFF;
+    border-color: checked || touch.has-hover ? #385D78 : #9AA3AC;
+    background: checked ? #385D78 : #FFFFFF;
     animate background { duration: 100ms; }
     animate border-color { duration: 100ms; }
 
@@ -456,7 +436,34 @@ component CheckSquare inherits Rectangle {
     }
 }
 
-// Settings row for a boolean: label column on the left, checkbox on the right.
+component SwitchControl inherits Rectangle {
+    in property <bool> checked;
+    callback toggled();
+
+    width: 36px;
+    height: 22px;
+    border-radius: 11px;
+    background: root.checked ? #385D78 : #B4BCC4;
+    animate background { duration: 120ms; }
+    accessible-role: switch;
+    accessible-checked: root.checked;
+    accessible-action-default => { root.toggled(); }
+
+    Rectangle {
+        x: root.checked ? 16px : 3px;
+        y: 3px;
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        background: #FFFFFF;
+        animate x { duration: 120ms; easing: ease-out; }
+    }
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.toggled(); }
+    }
+}
+
 component ToggleRow inherits Rectangle {
     in property <string> label;
     in property <string> hint: "";
@@ -500,8 +507,9 @@ component ToggleRow inherits Rectangle {
         VerticalLayout {
             alignment: center;
 
-            CheckSquare {
+            SwitchControl {
                 checked: root.checked;
+                accessible-label: root.label;
                 toggled => { root.toggled(!root.checked); }
             }
         }
@@ -660,7 +668,7 @@ component TextButton inherits Rectangle {
     Text {
         text: root.label;
         font-size: 12.5px;
-        color: root.accent || touch.has-hover ? #0067C0 : #5C6670;
+        color: root.accent || touch.has-hover ? #385D78 : #5C6670;
         animate color { duration: 100ms; }
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -690,7 +698,7 @@ component PillButton inherits Rectangle {
     Text {
         text: root.label;
         font-size: 12px;
-        color: root.tone == 1 ? #C0392B : #0067C0;
+        color: root.tone == 1 ? #C0392B : #385D78;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
@@ -711,8 +719,8 @@ component ChoicePill inherits Rectangle {
     min-width: 58px;
     border-radius: 5px;
     border-width: 1px;
-    border-color: active ? #0067C0 : (touch.has-hover ? #BFC7CF : #D6DBE0);
-    background: active ? #0067C0 : (touch.has-hover ? #F2F4F6 : #FFFFFF);
+    border-color: active ? #385D78 : (touch.has-hover ? #BFC7CF : #D6DBE0);
+    background: active ? #385D78 : (touch.has-hover ? #F2F4F6 : #FFFFFF);
     animate background { duration: 100ms; }
     animate border-color { duration: 100ms; }
 
@@ -733,7 +741,7 @@ component ChoicePill inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "hakimi";
-    width: 800px;
+    width: 760px;
     height: 600px;
     background: #F3F4F5;
     icon: @image-url("../assets/app-icon.png");
@@ -741,9 +749,7 @@ export component AppWindow inherits Window {
     in property <[SiteEntry]> sites;
     in property <string> status-subtitle: "正在启动";
     in property <bool> running: false;
-    // Settings column width, capped so the page stays readable when maximized.
-    // URL fields bind to it instead of asking the layout, which would loop.
-    property <length> settings-column: min(root.width - 40px, 660px);
+    property <length> settings-column: root.width - 208px;
     // The row is: 16 padding + label + 12 spacing + spacer + 12 spacing +
     // field + 16 padding. The spacer is the stretch rectangle between the two
     // columns, so its two gaps are part of the budget — leaving them out made
@@ -830,6 +836,7 @@ export component AppWindow inherits Window {
     in property <string> editor-error;
     in property <string> sites-summary;
     in-out property <bool> sites-expanded: false;
+    in-out property <int> settings-section: 0;
     in property <bool> editor-is-new: true;
     in property <bool> editor-deletable: false;
 
@@ -866,8 +873,8 @@ export component AppWindow inherits Window {
 
         // ---- toolbar ----
         if !root.show-onboarding: Rectangle {
-            height: 42px;
-            background: #F3F4F5;
+            height: 44px;
+            background: #FAFBFC;
 
             Rectangle {
                 width: parent.width;
@@ -896,9 +903,10 @@ export component AppWindow inherits Window {
                     alignment: center;
                     horizontal-stretch: 1;
 
-                    if root.page == 1: Text {
-                        text: "设置";
-                        font-size: 13.5px;
+                    Text {
+                        text: root.page == 1 ? "设置" : "hakimi";
+                        font-size: 14px;
+                        font-weight: 500;
                         color: #1B1F24;
                     }
                 }
@@ -921,7 +929,7 @@ export component AppWindow inherits Window {
                         x: parent.width - 10px;
                         y: 8px;
                         border-radius: 3.5px;
-                        background: #0067C0;
+                        background: #385D78;
                         border-width: 1px;
                         border-color: #F3F4F5;
                     }
@@ -932,9 +940,8 @@ export component AppWindow inherits Window {
         if !root.show-onboarding && root.page == 0: HorizontalLayout {
             spacing: 0px;
 
-            // ---- left rail: state, environment, counters ----
             Rectangle {
-                width: 250px;
+                width: 220px;
                 background: #FAFBFC;
 
                 Rectangle {
@@ -945,50 +952,25 @@ export component AppWindow inherits Window {
                 }
 
                 VerticalLayout {
-                    padding-left: 14px;
-                    padding-right: 14px;
-                    padding-top: 14px;
-                    padding-bottom: 12px;
-                    spacing: 10px;
+                    padding: 16px;
+                    spacing: 14px;
 
                     Rectangle {
                         background: #FFFFFF;
-                        border-radius: 10px;
+                        border-radius: 6px;
                         border-width: 1px;
                         border-color: #E1E4E8;
 
                         VerticalLayout {
-                            padding: 14px;
-                            spacing: 12px;
+                            padding: 16px;
+                            spacing: 14px;
 
-                            HorizontalLayout {
-                                spacing: 10px;
-
-                                VerticalLayout {
-                                    alignment: center;
-                                    PowerBadge {
-                                        active: root.running;
-                                    }
-                                }
-
-                                VerticalLayout {
-                                    horizontal-stretch: 1;
-                                    alignment: center;
-                                    spacing: 2px;
-
-                                    Text {
-                                        text: root.running ? "加速已开启" : "加速已暂停";
-                                        font-size: 14px;
-                                        font-weight: 600;
-                                        color: #1B1F24;
-                                    }
-                                    Text {
-                                        text: root.status-subtitle;
-                                        font-size: 11.5px;
-                                        color: #6B7480;
-                                        overflow: elide;
-                                    }
-                                }
+                            Text {
+                                text: root.running ? "加速已开启" : "加速已暂停";
+                                font-size: 14px;
+                                font-weight: 500;
+                                color: #1B1F24;
+                                horizontal-alignment: left;
                             }
 
                             ActionButton {
@@ -1001,7 +983,7 @@ export component AppWindow inherits Window {
 
                     if (!root.ca-installed || !root.proxy-ok): Rectangle {
                         background: #FFF6E5;
-                        border-radius: 8px;
+                        border-radius: 6px;
                         border-width: 1px;
                         border-color: #F0DFC0;
 
@@ -1027,7 +1009,7 @@ export component AppWindow inherits Window {
 
                     if root.proxy-interrupted: Rectangle {
                         background: #FDECEA;
-                        border-radius: 8px;
+                        border-radius: 6px;
                         border-width: 1px;
                         border-color: #F2C8C2;
 
@@ -1038,7 +1020,7 @@ export component AppWindow inherits Window {
                             Text {
                                 text: "加速已中断";
                                 font-size: 11.5px;
-                                font-weight: 600;
+                                font-weight: 500;
                                 color: #A32D2D;
                             }
                             Text {
@@ -1064,21 +1046,19 @@ export component AppWindow inherits Window {
 
                     Rectangle {
                         background: #FFFFFF;
-                        border-radius: 10px;
+                        border-radius: 6px;
                         border-width: 1px;
                         border-color: #E1E4E8;
 
                         VerticalLayout {
-                            padding-left: 14px;
-                            padding-right: 14px;
-                            padding-top: 12px;
-                            padding-bottom: 12px;
-                            spacing: 7px;
+                            padding: 16px;
+                            spacing: 10px;
 
                             Text {
                                 text: "概览";
-                                font-size: 11px;
-                                color: #8A95A2;
+                                font-size: 13px;
+                                font-weight: 500;
+                                color: #4F5963;
                             }
                             StatRow { label: "站点"; value: root.stat-sites; }
                             StatRow { label: "已启用"; value: root.stat-enabled; }
@@ -1100,28 +1080,41 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // ---- main column: the site table ----
             VerticalLayout {
-                padding-left: 18px;
-                padding-right: 18px;
-                padding-top: 12px;
-                padding-bottom: 14px;
-                spacing: 6px;
+                padding: 18px;
+                spacing: 12px;
 
                 HorizontalLayout {
-                    height: 28px;
+                    height: 34px;
                     padding-left: 2px;
+                    spacing: 8px;
 
                     Text {
-                        text: "站点";
-                        font-size: 12.5px;
-                        color: #5C6670;
+                        text: "加速站点";
+                        font-size: 15px;
+                        font-weight: 500;
+                        color: #1B1F24;
                         vertical-alignment: center;
                     }
                     Rectangle { horizontal-stretch: 1; }
-                    TextButton { label: "检测选中"; min-width: 60px; clicked => { root.probe-selected(); } }
-                    TextButton { label: "全选"; min-width: 44px; clicked => { root.select-all(true); } }
-                    TextButton { label: "取消全选"; min-width: 64px; clicked => { root.select-all(false); } }
+                    PillButton {
+                        min-width: 60px;
+                        height: 30px;
+                        label: "检测选中";
+                        clicked => { root.probe-selected(); }
+                    }
+                    TextButton {
+                        height: 30px;
+                        label: root.stat-enabled == root.stat-sites && root.stat-sites != "0" ? "取消全选" : "全选";
+                        min-width: root.stat-enabled == root.stat-sites && root.stat-sites != "0" ? 64px : 44px;
+                        clicked => { root.select-all(!(root.stat-enabled == root.stat-sites && root.stat-sites != "0")); }
+                    }
+                    PillButton {
+                        width: 88px;
+                        height: 30px;
+                        label: "添加站点";
+                        clicked => { root.open-editor(""); }
+                    }
                 }
 
                 ScrollView {
@@ -1133,7 +1126,7 @@ export component AppWindow inherits Window {
                         alignment: start;
 
                         Rectangle {
-                            border-radius: 10px;
+                            border-radius: 6px;
                             background: #FFFFFF;
                             border-width: 1px;
                             border-color: #E1E4E8;
@@ -1227,6 +1220,7 @@ export component AppWindow inherits Window {
                                                     Text {
                                                         text: site.name;
                                                         font-size: 13px;
+                                                        font-weight: 500;
                                                         color: site.enabled ? #1B1F24 : #6B7480;
                                                     }
                                                     Text {
@@ -1335,7 +1329,7 @@ export component AppWindow inherits Window {
 
             Rectangle {
                 background: #FFFFFF;
-                border-radius: 8px;
+                border-radius: 6px;
                 border-width: 1px;
                 border-color: #E1E4E8;
 
@@ -1348,7 +1342,7 @@ export component AppWindow inherits Window {
                             ? "无法开启加速：环境检查未通过"
                             : (root.ca-installed && root.proxy-ok ? "环境检查通过" : "环境检查未通过");
                         font-size: 17px;
-                        font-weight: 600;
+                        font-weight: 500;
                         color: #1B1F24;
                         horizontal-alignment: center;
                     }
@@ -1374,8 +1368,8 @@ export component AppWindow inherits Window {
                             Text {
                                 text: root.ca-installed ? "✓" : "!";
                                 font-size: 14px;
-                                font-weight: 600;
-                                color: root.ca-installed ? #1B7F4D : #0067C0;
+                                font-weight: 500;
+                                color: root.ca-installed ? #1B7F4D : #385D78;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
@@ -1434,8 +1428,8 @@ export component AppWindow inherits Window {
                             Text {
                                 text: root.proxy-ok ? "✓" : "!";
                                 font-size: 14px;
-                                font-weight: 600;
-                                color: root.proxy-ok ? #1B7F4D : #0067C0;
+                                font-weight: 500;
+                                color: root.proxy-ok ? #1B7F4D : #385D78;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
@@ -1496,101 +1490,167 @@ export component AppWindow inherits Window {
             }
         }
 
-        if !root.show-onboarding && root.page == 1: VerticalLayout {
-            // Keep the settings column readable on a wide desktop window.
-            padding-left: max(20px, (root.width - 660px) / 2);
-            padding-right: max(20px, (root.width - 660px) / 2);
-            padding-bottom: 16px;
+        if !root.show-onboarding && root.page == 1: HorizontalLayout {
+            padding-left: 18px;
+            padding-right: 18px;
             padding-top: 14px;
+            padding-bottom: 14px;
+            spacing: 18px;
+
+            VerticalLayout {
+                width: 154px;
+                spacing: 4px;
+
+                Text {
+                    text: "偏好设置";
+                    font-size: 11px;
+                    color: #7B858F;
+                }
+                Rectangle { height: 4px; }
+                for section[i] in ["常规", "网络", "下载与目录", "数据与更新"]: Rectangle {
+                    height: 34px;
+                    border-radius: 5px;
+                    background: root.settings-section == i ? #E8EEF4 : (section-touch.has-hover ? #EAEDF0 : transparent);
+                    animate background { duration: 100ms; }
+
+                    Text {
+                        x: 10px;
+                        width: i == 3 && root.update-available ? parent.width - 70px : parent.width - 20px;
+                        text: section;
+                        font-size: 12.5px;
+                        font-weight: root.settings-section == i ? 500 : 400;
+                        color: root.settings-section == i ? #263746 : #4F5963;
+                        vertical-alignment: center;
+                    }
+                    if i == 3 && root.update-available: Rectangle {
+                        width: 42px;
+                        height: 18px;
+                        x: parent.width - 50px;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: 4px;
+                        background: #E8EEF4;
+                        Text {
+                            text: "有新版";
+                            font-size: 10px;
+                            color: #385D78;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    accessible-role: button;
+                    accessible-label: section;
+                    accessible-action-default => { root.settings-section = i; }
+                    border-width: section-focus.has-focus ? 1px : 0px;
+                    border-color: #385D78;
+                    section-focus := FocusScope {
+                        key-pressed(event) => {
+                            if event.text == " " || event.text == "\n" || event.text == Key.Return {
+                                root.settings-section = i;
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+                    section-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            section-focus.focus();
+                            root.settings-section = i;
+                        }
+                    }
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
 
             settings-scroll := ScrollView {
+                horizontal-stretch: 1;
                 vertical-stretch: 1;
                 vertical-scrollbar-policy: ScrollBarPolicy.always-off;
 
-                // Pin the content to the viewport: letting it size from its
-                // children made every `parent.width` inside the cards fall back
-                // to the preferred width (409px), which clipped the dividers.
                 VerticalLayout {
                     width: settings-scroll.content-width;
                     spacing: 12px;
                     alignment: start;
 
-                    // ---- 站点 ----
-                    Rectangle {
-                        border-radius: 8px;
-                        background: #FFFFFF;
-                        border-width: 1px;
-                        border-color: #E1E4E8;
-                        clip: true;
+                    VerticalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: ["常规", "网络", "下载与目录", "数据与更新"][root.settings-section];
+                            font-size: 18px;
+                            font-weight: 500;
+                            color: #1B1F24;
+                        }
+                        Text {
+                            text: ["管理站点、证书和启动行为", "设置监听端口、加密 DNS 与中继", "配置下载镜像和远程目录来源", "打开数据目录与检查更新"][root.settings-section];
+                            font-size: 12px;
+                            color: #6B7480;
+                        }
+                    }
+                    Rectangle { height: 4px; }
 
-                        VerticalLayout {
-                            spacing: 0px;
+                    if root.settings-section == 0: VerticalLayout {
+                        spacing: 8px;
 
-                            Rectangle {
-                                height: 52px;
-                                background: sites-head-touch.has-hover ? #F7F8F9 : #FFFFFF;
-                                animate background { duration: 100ms; }
+                        Rectangle {
+                            border-radius: 6px;
+                            background: #FFFFFF;
+                            border-width: 1px;
+                            border-color: #E1E4E8;
+                            clip: true;
 
-                                sites-head-touch := TouchArea {
-                                    clicked => { root.sites-expanded = !root.sites-expanded; }
-                                }
-
-                                HorizontalLayout {
-                                    padding-left: 16px;
-                                    padding-right: 14px;
-                                    spacing: 8px;
-
-                                    VerticalLayout {
-                                        alignment: center;
-                                        Text {
-                                            text: "站点管理";
-                                            font-size: 13.5px;
-                                            color: #3B434C;
-                                        }
-                                    }
-                                    VerticalLayout {
-                                        alignment: center;
-                                        Text {
-                                            text: root.sites-summary;
-                                            font-size: 12px;
-                                            color: #6B7480;
-                                        }
-                                    }
-                                    Rectangle { horizontal-stretch: 1; }
-                                    VerticalLayout {
-                                        alignment: center;
-                                        PillButton {
-                                            label: "+ 添加站点";
-                                            min-width: 86px;
-                                            clicked => { root.open-editor(""); }
-                                        }
-                                    }
-                                    VerticalLayout {
-                                        alignment: center;
-                                        Chevron { open: root.sites-expanded; }
-                                    }
-                                }
-                            }
-
-                            if root.sites-expanded: VerticalLayout {
+                            VerticalLayout {
                                 spacing: 0px;
 
                                 Rectangle {
-                                    height: 1px;
-                                    background: transparent;
+                                    height: 52px;
+                                    background: sites-head-touch.has-hover ? #F7F8F9 : #FFFFFF;
+                                    animate background { duration: 100ms; }
 
-                                    Rectangle {
-                                        x: 16px;
-                                        width: parent.width - 32px;
-                                        height: 1px;
-                                        background: #ECEEF0;
+                                    sites-head-touch := TouchArea {
+                                        clicked => { root.sites-expanded = !root.sites-expanded; }
+                                    }
+
+                                    HorizontalLayout {
+                                        padding-left: 16px;
+                                        padding-right: 14px;
+                                        spacing: 8px;
+
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Text {
+                                                text: "站点管理";
+                                                font-size: 13.5px;
+                                                color: #3B434C;
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Text {
+                                                text: root.sites-summary;
+                                                font-size: 12px;
+                                                color: #6B7480;
+                                            }
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        VerticalLayout {
+                                            alignment: center;
+                                            PillButton {
+                                                label: "+ 添加站点";
+                                                min-width: 86px;
+                                                clicked => { root.open-editor(""); }
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Chevron { open: root.sites-expanded; }
+                                        }
                                     }
                                 }
 
-                                for site in root.sites: VerticalLayout {
+                                if root.sites-expanded: VerticalLayout {
                                     spacing: 0px;
 
-                                    if !site.first: Rectangle {
+                                    Rectangle {
                                         height: 1px;
                                         background: transparent;
 
@@ -1602,449 +1662,87 @@ export component AppWindow inherits Window {
                                         }
                                     }
 
-                                    Rectangle {
-                                        height: 48px;
-                                        background: site-touch.has-hover ? #F7F8F9 : transparent;
-                                        animate background { duration: 100ms; }
+                                    for site in root.sites: VerticalLayout {
+                                        spacing: 0px;
 
-                                        site-touch := TouchArea {
-                                            clicked => { root.open-editor(site.id); }
-                                        }
+                                        if !site.first: Rectangle {
+                                            height: 1px;
+                                            background: transparent;
 
-                                        HorizontalLayout {
-                                            padding-left: 16px;
-                                            padding-right: 14px;
-                                            spacing: 10px;
-
-                                            VerticalLayout {
-                                                alignment: center;
-                                                SiteBadge {
-                                                    badge: 24px;
-                                                    icon: site.icon;
-                                                    initial: site.initial;
-                                                    tile-color: site.tile-color;
-                                                }
-                                            }
-                                            VerticalLayout {
-                                                horizontal-stretch: 1;
-                                                alignment: center;
-                                                spacing: 1px;
-
-                                                Text {
-                                                    text: site.name;
-                                                    font-size: 13.5px;
-                                                    font-weight: 500;
-                                                    color: site.enabled ? #1B1F24 : #6B7480;
-                                                }
-                                                Text {
-                                                    text: site.summary;
-                                                    font-size: 11.5px;
-                                                    color: site.summary-color;
-                                                    overflow: elide;
-                                                }
-                                            }
-                                            VerticalLayout {
-                                                alignment: center;
-                                                Chevron { open: false; }
+                                            Rectangle {
+                                                x: 16px;
+                                                width: parent.width - 32px;
+                                                height: 1px;
+                                                background: #ECEEF0;
                                             }
                                         }
+
+                                        Rectangle {
+                                            height: 48px;
+                                            background: site-touch.has-hover ? #F7F8F9 : transparent;
+                                            animate background { duration: 100ms; }
+
+                                            site-touch := TouchArea {
+                                                clicked => { root.open-editor(site.id); }
+                                            }
+
+                                            HorizontalLayout {
+                                                padding-left: 16px;
+                                                padding-right: 14px;
+                                                spacing: 10px;
+
+                                                VerticalLayout {
+                                                    alignment: center;
+                                                    SiteBadge {
+                                                        badge: 24px;
+                                                        icon: site.icon;
+                                                        initial: site.initial;
+                                                        tile-color: site.tile-color;
+                                                    }
+                                                }
+                                                VerticalLayout {
+                                                    horizontal-stretch: 1;
+                                                    alignment: center;
+                                                    spacing: 1px;
+
+                                                    Text {
+                                                        text: site.name;
+                                                        font-size: 13.5px;
+                                                        font-weight: 500;
+                                                        color: site.enabled ? #1B1F24 : #6B7480;
+                                                    }
+                                                    Text {
+                                                        text: site.summary;
+                                                        font-size: 11.5px;
+                                                        color: site.summary-color;
+                                                        overflow: elide;
+                                                    }
+                                                }
+                                                VerticalLayout {
+                                                    alignment: center;
+                                                    Chevron { open: false; }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
+
                     }
-
-                    // ---- 证书 ----
-                    Text {
-                        text: "证书";
-                        font-size: 12.5px;
-                        color: #5C6670;
-                    }
-                    Rectangle {
-                        border-radius: 8px;
-                        background: #FFFFFF;
-                        border-width: 1px;
-                        border-color: #E1E4E8;
-
-                        VerticalLayout {
-                            spacing: 0px;
-
-                        HorizontalLayout {
-                            height: 58px;
-                            padding-left: 16px;
-                            padding-right: 14px;
-                            spacing: 12px;
+                    if root.settings-section == 0: VerticalLayout {
+                        spacing: 12px;
+                        Rectangle {
+                            border-radius: 6px;
+                            background: #FFFFFF;
+                            border-width: 1px;
+                            border-color: #E1E4E8;
 
                             VerticalLayout {
-                                width: 112px;
-                                alignment: center;
-                                Text {
-                                    text: "本地 CA";
-                                    font-size: 13px;
-                                    color: #1B1F24;
-                                }
-                            }
-
-                            VerticalLayout {
-                                horizontal-stretch: 1;
-                                alignment: center;
-                                spacing: 2px;
-
-                                Text {
-                                    text: root.ca-busy ? "处理中…" : (root.ca-installed ? "已安装并受信任" : "未受信任");
-                                    font-size: 12px;
-                                    color: root.ca-busy ? #5C6670 : (root.ca-installed ? #1B7F4D : #C0392B);
-                                }
-                                Text {
-                                    text: root.ca-busy
-                                        ? "等待系统授权，完成前不会改判状态"
-                                        : (root.ca-installed ? "ECH / SNI 修改可用" : (root.ca-error != "" ? root.ca-error : "ECH / SNI 修改会失败"));
-                                    font-size: 11px;
-                                    color: #8A95A2;
-                                    overflow: elide;
-                                }
-                            }
-
-                            Rectangle {
-                                width: 152px;
-                                height: parent.height;
+                                spacing: 0px;
 
                                 HorizontalLayout {
-                                    y: (parent.height - self.height) / 2;
-                                    height: 28px;
-                                    spacing: 8px;
-                                    alignment: end;
-
-                                    if root.ca-installed: PillButton {
-                                        label: "移除";
-                                        tone: 1;
-                                        clicked => { root.settings-action(2); }
-                                    }
-                                    PillButton {
-                                        label: root.ca-busy ? "处理中…" : (root.ca-installed ? "修复" : "安装");
-                                        clicked => { root.settings-action(root.ca-installed ? 3 : 1); }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Result of the last attempt: a wrong keychain password or a
-                        // cancelled dialog lands here instead of vanishing.
-                        if root.ca-action-error != "": Rectangle {
-                            height: 1px;
-                            background: transparent;
-
-                            Rectangle {
-                                x: 16px;
-                                width: parent.width - 32px;
-                                height: 1px;
-                                background: #ECEEF0;
-                            }
-                        }
-                        if root.ca-action-error != "": Rectangle {
-                            min-height: 32px;
-
-                            HorizontalLayout {
-                                padding-left: 16px;
-                                padding-right: 14px;
-                                padding-top: 8px;
-                                padding-bottom: 8px;
-
-                                Text {
-                                    text: root.ca-action-error;
-                                    font-size: 11.5px;
-                                    color: #B88325;
-                                    wrap: word-wrap;
-                                }
-                            }
-                        }
-                        }
-                    }
-
-                    // ---- 网络 ----
-                    Text {
-                        text: "网络";
-                        font-size: 12.5px;
-                        color: #5C6670;
-                    }
-                    Rectangle {
-                        border-radius: 8px;
-                        background: #FFFFFF;
-                        border-width: 1px;
-                        border-color: #E1E4E8;
-
-                        VerticalLayout {
-                            spacing: 0px;
-
-                            FieldRow {
-                                label: "监听端口";
-                                hint: "重启后生效";
-                                setting-key: "proxy.port";
-                                error-key: root.cfg-error-key;
-                                placeholder: "8443";
-                                label-width: root.settings-label;
-                                text <=> root.cfg-proxy-port;
-                                commit(value) => { root.save-string("proxy.port", value); }
-                            }
-                            RowLine { }
-                            FieldRow {
-                                label: "主加密 DNS";
-                                hint: "HTTPS DoH 端点";
-                                setting-key: "doh.primary";
-                                error-key: root.cfg-error-key;
-                                placeholder: "https://…";
-                                field-width: root.settings-field;
-                                label-width: root.settings-label;
-                                text <=> root.cfg-doh-primary;
-                                commit(value) => { root.save-string("doh.primary", value); }
-                            }
-                            RowLine { }
-                            FieldRow {
-                                label: "备用 DNS";
-                                hint: "主端点不可用时回退";
-                                setting-key: "doh.fallback";
-                                error-key: root.cfg-error-key;
-                                placeholder: "https://…";
-                                field-width: root.settings-field;
-                                label-width: root.settings-label;
-                                text <=> root.cfg-doh-fallback;
-                                commit(value) => { root.save-string("doh.fallback", value); }
-                            }
-                        }
-                    }
-
-                    // ---- 下载 ----
-                    Text {
-                        text: "下载";
-                        font-size: 12.5px;
-                        color: #5C6670;
-                    }
-                    Rectangle {
-                        border-radius: 8px;
-                        background: #FFFFFF;
-                        border-width: 1px;
-                        border-color: #E1E4E8;
-
-                        VerticalLayout {
-                            spacing: 0px;
-
-                            ToggleRow {
-                                label: "GitHub 镜像加速";
-                                hint: "release 资产与源码包改走第三方镜像（仅公开仓库）";
-                                checked: root.cfg-download-mirror;
-                                toggled(value) => {
-                                    root.save-bool("advanced.download.mirrorSource", value);
-                                }
-                            }
-                            RowLine { }
-                            FieldRow {
-                                label: "镜像列表";
-                                hint: "留空则停用";
-                                setting-key: "advanced.download.mirrorSource";
-                                error-key: root.cfg-error-key;
-                                placeholder: "https://…";
-                                field-width: root.settings-field;
-                                label-width: root.settings-label;
-                                text <=> root.cfg-mirror-source;
-                                commit(value) => {
-                                    root.save-string("advanced.download.mirrorSource", value);
-                                }
-                            }
-                        }
-                    }
-
-                    // ---- 并发连接 ----
-                    Text {
-                        text: "并发连接";
-                        font-size: 12.5px;
-                        color: #5C6670;
-                    }
-                    Rectangle {
-                        border-radius: 8px;
-                        background: #FFFFFF;
-                        border-width: 1px;
-                        border-color: #E1E4E8;
-
-                        VerticalLayout {
-                            spacing: 0px;
-
-                            FieldRow {
-                                label: "独立连接的站点";
-                                hint: "逗号分隔，留空则关闭";
-                                setting-key: "advanced.http1Hosts";
-                                error-key: root.cfg-error-key;
-                                placeholder: "i.pximg.net, s.pximg.net";
-                                field-width: root.settings-field;
-                                label-width: root.settings-label;
-                                text <=> root.cfg-http1-hosts;
-                                commit(value) => {
-                                    root.save-string("advanced.http1Hosts", value);
-                                }
-                            }
-                        }
-                    }
-
-                    // ---- 隧道中继 ----
-                    Text {
-                        text: "隧道中继";
-                        font-size: 12.5px;
-                        color: #5C6670;
-                    }
-                    Rectangle {
-                        border-radius: 8px;
-                        background: #FFFFFF;
-                        border-width: 1px;
-                        border-color: #E1E4E8;
-
-                        VerticalLayout {
-                            spacing: 0px;
-
-                            ToggleRow {
-                                label: "本地 TCP 中继";
-                                hint: "给 cloudflared 这类不走 HTTP 代理的客户端用；只转发字节，不终止 TLS";
-                                checked: root.cfg-relay-enabled;
-                                toggled(value) => {
-                                    root.save-bool("advanced.relay.enabled", value);
-                                }
-                            }
-                            RowLine { }
-                            FieldRow {
-                                label: "监听地址";
-                                hint: "如 127.0.0.1:17844";
-                                setting-key: "advanced.relay.listen";
-                                error-key: root.cfg-error-key;
-                                placeholder: "127.0.0.1:17844";
-                                field-width: root.settings-field;
-                                label-width: root.settings-label;
-                                text <=> root.cfg-relay-listen;
-                                commit(value) => {
-                                    root.save-string("advanced.relay.listen", value);
-                                }
-                            }
-                            RowLine { }
-                            FieldRow {
-                                label: "上游目标";
-                                hint: "端口默认 7844";
-                                setting-key: "advanced.relay.target";
-                                error-key: root.cfg-error-key;
-                                placeholder: "region1.v2.argotunnel.com:7844";
-                                field-width: root.settings-field;
-                                label-width: root.settings-label;
-                                text <=> root.cfg-relay-target;
-                                commit(value) => {
-                                    root.save-string("advanced.relay.target", value);
-                                }
-                            }
-                        }
-                    }
-
-                    // ---- 目录 ----
-                    Text {
-                        text: "目录";
-                        font-size: 12.5px;
-                        color: #5C6670;
-                    }
-                    Rectangle {
-                        border-radius: 8px;
-                        background: #FFFFFF;
-                        border-width: 1px;
-                        border-color: #E1E4E8;
-
-                        VerticalLayout {
-                            spacing: 0px;
-
-                            FieldRow {
-                                label: "IP 目录";
-                                hint: "留空则停用远程 IP";
-                                setting-key: "catalogs.ip";
-                                error-key: root.cfg-error-key;
-                                placeholder: "https://…";
-                                field-width: root.settings-field;
-                                label-width: root.settings-label;
-                                text <=> root.cfg-catalog-ip;
-                                commit(value) => { root.save-string("catalogs.ip", value); }
-                            }
-                            RowLine { }
-                            FieldRow {
-                                label: "DoH 目录";
-                                hint: "留空则停用远程 DoH 列表";
-                                setting-key: "catalogs.doh";
-                                error-key: root.cfg-error-key;
-                                placeholder: "https://…";
-                                field-width: root.settings-field;
-                                label-width: root.settings-label;
-                                text <=> root.cfg-catalog-doh;
-                                commit(value) => { root.save-string("catalogs.doh", value); }
-                            }
-                        }
-                    }
-
-                    // ---- 启动 ----
-                    Text {
-                        text: "启动";
-                        font-size: 12.5px;
-                        color: #5C6670;
-                    }
-                    Rectangle {
-                        border-radius: 8px;
-                        background: #FFFFFF;
-                        border-width: 1px;
-                        border-color: #E1E4E8;
-
-                        VerticalLayout {
-                            spacing: 0px;
-
-                            ToggleRow {
-                                label: "开机自启";
-                                hint: "登录系统后自动在托盘运行，不显示窗口";
-                                error: root.cfg-error-key == "advanced.startup.autoStart"
-                                    ? root.cfg-error
-                                    : root.auto-start-warning;
-                                checked: root.cfg-auto-start;
-                                toggled(value) => {
-                                    root.save-bool("advanced.startup.autoStart", value);
-                                }
-                            }
-                            RowLine { }
-                            ToggleRow {
-                                label: "静默启动";
-                                hint: "启动时不显示窗口，只保留托盘图标";
-                                checked: root.cfg-start-hidden;
-                                toggled(value) => {
-                                    root.save-bool("advanced.startup.startHidden", value);
-                                }
-                            }
-                            RowLine { }
-                            ToggleRow {
-                                label: "启动后自动加速";
-                                hint: "启动时自动开启加速并接管系统代理";
-                                checked: root.cfg-auto-connect;
-                                toggled(value) => {
-                                    root.save-bool("advanced.startup.autoConnect", value);
-                                }
-                            }
-                        }
-                    }
-
-                    // ---- 数据 ----
-                    Text {
-                        text: "数据";
-                        font-size: 12.5px;
-                        color: #5C6670;
-                    }
-                    Rectangle {
-                        border-radius: 8px;
-                        background: #FFFFFF;
-                        border-width: 1px;
-                        border-color: #E1E4E8;
-
-                        VerticalLayout {
-                            spacing: 0px;
-
-                            Rectangle {
-                                height: 52px;
-
-                                HorizontalLayout {
+                                    height: 58px;
                                     padding-left: 16px;
                                     padding-right: 14px;
                                     spacing: 12px;
@@ -2053,50 +1751,7 @@ export component AppWindow inherits Window {
                                         width: 112px;
                                         alignment: center;
                                         Text {
-                                            text: "数据目录";
-                                            font-size: 13px;
-                                            color: #1B1F24;
-                                        }
-                                    }
-
-                                    Text {
-                                        horizontal-stretch: 1;
-                                        text: root.cfg-data-dir;
-                                        font-size: 11.5px;
-                                        font-family: "Menlo";
-                                        color: #6B7480;
-                                        overflow: elide;
-                                        vertical-alignment: center;
-                                    }
-
-                                    Rectangle {
-                                        width: 64px;
-                                        height: parent.height;
-                                        PillButton {
-                                            width: parent.width;
-                                            y: (parent.height - self.height) / 2;
-                                            label: "打开";
-                                            clicked => { root.open-data-dir(); }
-                                        }
-                                    }
-                                }
-                            }
-
-                            RowLine { }
-
-                            Rectangle {
-                                height: 52px;
-
-                                HorizontalLayout {
-                                    padding-left: 16px;
-                                    padding-right: 14px;
-                                    spacing: 12px;
-
-                                    VerticalLayout {
-                                        width: 112px;
-                                        alignment: center;
-                                        Text {
-                                            text: "检查更新";
+                                            text: "本地 CA";
                                             font-size: 13px;
                                             color: #1B1F24;
                                         }
@@ -2108,36 +1763,439 @@ export component AppWindow inherits Window {
                                         spacing: 2px;
 
                                         Text {
-                                            text: root.update-status;
+                                            text: root.ca-busy ? "处理中…" : (root.ca-installed ? "已安装并受信任" : "未受信任");
                                             font-size: 12px;
-                                            color: root.update-available ? #0067C0 : #6B7480;
-                                            overflow: elide;
+                                            color: root.ca-busy ? #5C6670 : (root.ca-installed ? #1B7F4D : #C0392B);
                                         }
-
                                         Text {
-                                            text: "客户端版本 " + root.cfg-version
-                                                + " · Rust Core " + root.cfg-core-version;
-                                            font-size: 10.5px;
-                                            color: #6B7480;
+                                            text: root.ca-busy
+                                            ? "等待系统授权，完成前不会改判状态"
+                                            : (root.ca-installed ? "ECH / SNI 修改可用" : (root.ca-error != "" ? root.ca-error : "ECH / SNI 修改会失败"));
+                                            font-size: 11px;
+                                            color: #8A95A2;
                                             overflow: elide;
                                         }
                                     }
 
                                     Rectangle {
-                                        width: 72px;
+                                        width: 152px;
                                         height: parent.height;
 
-                                        PillButton {
-                                            width: parent.width;
+                                        HorizontalLayout {
                                             y: (parent.height - self.height) / 2;
-                                            label: root.update-available
+                                            height: 28px;
+                                            spacing: 8px;
+                                            alignment: end;
+
+                                            if root.ca-installed: PillButton {
+                                                label: "移除";
+                                                tone: 1;
+                                                clicked => { root.settings-action(2); }
+                                            }
+                                            PillButton {
+                                                label: root.ca-busy ? "处理中…" : (root.ca-installed ? "修复" : "安装");
+                                                clicked => { root.settings-action(root.ca-installed ? 3 : 1); }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Result of the last attempt: a wrong keychain password or a
+                                // cancelled dialog lands here instead of vanishing.
+                                if root.ca-action-error != "": Rectangle {
+                                    height: 1px;
+                                    background: transparent;
+
+                                    Rectangle {
+                                        x: 16px;
+                                        width: parent.width - 32px;
+                                        height: 1px;
+                                        background: #ECEEF0;
+                                    }
+                                }
+                                if root.ca-action-error != "": Rectangle {
+                                    min-height: 32px;
+
+                                    HorizontalLayout {
+                                        padding-left: 16px;
+                                        padding-right: 14px;
+                                        padding-top: 8px;
+                                        padding-bottom: 8px;
+
+                                        Text {
+                                            text: root.ca-action-error;
+                                            font-size: 11.5px;
+                                            color: #B88325;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            border-radius: 6px;
+                            background: #FFFFFF;
+                            border-width: 1px;
+                            border-color: #E1E4E8;
+
+                            VerticalLayout {
+                                spacing: 0px;
+
+                                ToggleRow {
+                                    label: "开机自启";
+                                    hint: "登录系统后自动在托盘运行，不显示窗口";
+                                    error: root.cfg-error-key == "advanced.startup.autoStart"
+                                    ? root.cfg-error
+                                    : root.auto-start-warning;
+                                    checked: root.cfg-auto-start;
+                                    toggled(value) => {
+                                        root.save-bool("advanced.startup.autoStart", value);
+                                    }
+                                }
+                                RowLine { }
+                                ToggleRow {
+                                    label: "静默启动";
+                                    hint: "启动时不显示窗口，只保留托盘图标";
+                                    checked: root.cfg-start-hidden;
+                                    toggled(value) => {
+                                        root.save-bool("advanced.startup.startHidden", value);
+                                    }
+                                }
+                                RowLine { }
+                                ToggleRow {
+                                    label: "启动后自动加速";
+                                    hint: "启动时自动开启加速并接管系统代理";
+                                    checked: root.cfg-auto-connect;
+                                    toggled(value) => {
+                                        root.save-bool("advanced.startup.autoConnect", value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if root.settings-section == 1: VerticalLayout {
+                        spacing: 12px;
+
+                        Text {
+                            text: "加密连接";
+                            font-size: 13px;
+                            font-weight: 500;
+                            color: #4F5963;
+                        }
+                        Rectangle {
+                            border-radius: 6px;
+                            background: #FFFFFF;
+                            border-width: 1px;
+                            border-color: #E1E4E8;
+
+                            VerticalLayout {
+                                spacing: 0px;
+
+                                FieldRow {
+                                    label: "监听端口";
+                                    hint: "重启后生效";
+                                    setting-key: "proxy.port";
+                                    error-key: root.cfg-error-key;
+                                    placeholder: "8443";
+                                    label-width: root.settings-label;
+                                    text <=> root.cfg-proxy-port;
+                                    commit(value) => { root.save-string("proxy.port", value); }
+                                }
+                                RowLine { }
+                                FieldRow {
+                                    label: "主加密 DNS";
+                                    hint: "HTTPS DoH 端点";
+                                    setting-key: "doh.primary";
+                                    error-key: root.cfg-error-key;
+                                    placeholder: "https://…";
+                                    field-width: root.settings-field;
+                                    label-width: root.settings-label;
+                                    text <=> root.cfg-doh-primary;
+                                    commit(value) => { root.save-string("doh.primary", value); }
+                                }
+                                RowLine { }
+                                FieldRow {
+                                    label: "备用 DNS";
+                                    hint: "主端点不可用时回退";
+                                    setting-key: "doh.fallback";
+                                    error-key: root.cfg-error-key;
+                                    placeholder: "https://…";
+                                    field-width: root.settings-field;
+                                    label-width: root.settings-label;
+                                    text <=> root.cfg-doh-fallback;
+                                    commit(value) => { root.save-string("doh.fallback", value); }
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "连接复用";
+                            font-size: 13px;
+                            font-weight: 500;
+                            color: #4F5963;
+                        }
+                        Rectangle {
+                            border-radius: 6px;
+                            background: #FFFFFF;
+                            border-width: 1px;
+                            border-color: #E1E4E8;
+
+                            VerticalLayout {
+                                spacing: 0px;
+                                FieldRow {
+                                    label: "独立连接的站点";
+                                    hint: "逗号分隔，留空则关闭";
+                                    setting-key: "advanced.http1Hosts";
+                                    error-key: root.cfg-error-key;
+                                    placeholder: "i.pximg.net, s.pximg.net";
+                                    field-width: root.settings-field;
+                                    label-width: root.settings-label;
+                                    text <=> root.cfg-http1-hosts;
+                                    commit(value) => {
+                                        root.save-string("advanced.http1Hosts", value);
+                                    }
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "隧道中继";
+                            font-size: 13px;
+                            font-weight: 500;
+                            color: #4F5963;
+                        }
+                        Rectangle {
+                            border-radius: 6px;
+                            background: #FFFFFF;
+                            border-width: 1px;
+                            border-color: #E1E4E8;
+
+                            VerticalLayout {
+                                spacing: 0px;
+                                ToggleRow {
+                                    label: "本地 TCP 中继";
+                                    hint: "给 cloudflared 这类不走 HTTP 代理的客户端用；只转发字节，不终止 TLS";
+                                    checked: root.cfg-relay-enabled;
+                                    toggled(value) => {
+                                        root.save-bool("advanced.relay.enabled", value);
+                                    }
+                                }
+                                RowLine { }
+                                FieldRow {
+                                    label: "监听地址";
+                                    hint: "如 127.0.0.1:17844";
+                                    setting-key: "advanced.relay.listen";
+                                    error-key: root.cfg-error-key;
+                                    placeholder: "127.0.0.1:17844";
+                                    field-width: root.settings-field;
+                                    label-width: root.settings-label;
+                                    text <=> root.cfg-relay-listen;
+                                    commit(value) => {
+                                        root.save-string("advanced.relay.listen", value);
+                                    }
+                                }
+                                RowLine { }
+                                FieldRow {
+                                    label: "上游目标";
+                                    hint: "端口默认 7844";
+                                    setting-key: "advanced.relay.target";
+                                    error-key: root.cfg-error-key;
+                                    placeholder: "region1.v2.argotunnel.com:7844";
+                                    field-width: root.settings-field;
+                                    label-width: root.settings-label;
+                                    text <=> root.cfg-relay-target;
+                                    commit(value) => {
+                                        root.save-string("advanced.relay.target", value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if root.settings-section == 2: VerticalLayout {
+                        spacing: 12px;
+                        Rectangle {
+                            border-radius: 6px;
+                            background: #FFFFFF;
+                            border-width: 1px;
+                            border-color: #E1E4E8;
+
+                            VerticalLayout {
+                                spacing: 0px;
+
+                                ToggleRow {
+                                    label: "GitHub 镜像加速";
+                                    hint: "release 资产与源码包改走第三方镜像（仅公开仓库）";
+                                    checked: root.cfg-download-mirror;
+                                    toggled(value) => {
+                                        root.save-bool("advanced.download.mirrorSource", value);
+                                    }
+                                }
+                                RowLine { }
+                                FieldRow {
+                                    label: "镜像列表";
+                                    hint: "留空则停用";
+                                    setting-key: "advanced.download.mirrorSource";
+                                    error-key: root.cfg-error-key;
+                                    placeholder: "https://…";
+                                    field-width: root.settings-field;
+                                    label-width: root.settings-label;
+                                    text <=> root.cfg-mirror-source;
+                                    commit(value) => {
+                                        root.save-string("advanced.download.mirrorSource", value);
+                                    }
+                                }
+                            }
+                        }
+
+                    }
+                    if root.settings-section == 2: VerticalLayout {
+                        spacing: 12px;
+                        Rectangle {
+                            border-radius: 6px;
+                            background: #FFFFFF;
+                            border-width: 1px;
+                            border-color: #E1E4E8;
+
+                            VerticalLayout {
+                                spacing: 0px;
+
+                                FieldRow {
+                                    label: "IP 目录";
+                                    hint: "留空则停用远程 IP";
+                                    setting-key: "catalogs.ip";
+                                    error-key: root.cfg-error-key;
+                                    placeholder: "https://…";
+                                    field-width: root.settings-field;
+                                    label-width: root.settings-label;
+                                    text <=> root.cfg-catalog-ip;
+                                    commit(value) => { root.save-string("catalogs.ip", value); }
+                                }
+                                RowLine { }
+                                FieldRow {
+                                    label: "DoH 目录";
+                                    hint: "留空则停用远程 DoH 列表";
+                                    setting-key: "catalogs.doh";
+                                    error-key: root.cfg-error-key;
+                                    placeholder: "https://…";
+                                    field-width: root.settings-field;
+                                    label-width: root.settings-label;
+                                    text <=> root.cfg-catalog-doh;
+                                    commit(value) => { root.save-string("catalogs.doh", value); }
+                                }
+                            }
+                        }
+
+                    }
+                    if root.settings-section == 3: VerticalLayout {
+                        spacing: 12px;
+                        Rectangle {
+                            border-radius: 6px;
+                            background: #FFFFFF;
+                            border-width: 1px;
+                            border-color: #E1E4E8;
+
+                            VerticalLayout {
+                                spacing: 0px;
+
+                                Rectangle {
+                                    height: 52px;
+
+                                    HorizontalLayout {
+                                        padding-left: 16px;
+                                        padding-right: 14px;
+                                        spacing: 12px;
+
+                                        VerticalLayout {
+                                            width: 112px;
+                                            alignment: center;
+                                            Text {
+                                                text: "数据目录";
+                                                font-size: 13px;
+                                                color: #1B1F24;
+                                            }
+                                        }
+
+                                        Text {
+                                            horizontal-stretch: 1;
+                                            text: root.cfg-data-dir;
+                                            font-size: 11.5px;
+                                            font-family: "Menlo";
+                                            color: #6B7480;
+                                            overflow: elide;
+                                            vertical-alignment: center;
+                                        }
+
+                                        Rectangle {
+                                            width: 64px;
+                                            height: parent.height;
+                                            PillButton {
+                                                width: parent.width;
+                                                y: (parent.height - self.height) / 2;
+                                                label: "打开";
+                                                clicked => { root.open-data-dir(); }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                RowLine { }
+
+                                Rectangle {
+                                    height: 52px;
+
+                                    HorizontalLayout {
+                                        padding-left: 16px;
+                                        padding-right: 14px;
+                                        spacing: 12px;
+
+                                        VerticalLayout {
+                                            width: 112px;
+                                            alignment: center;
+                                            Text {
+                                                text: "检查更新";
+                                                font-size: 13px;
+                                                color: #1B1F24;
+                                            }
+                                        }
+
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            alignment: center;
+                                            spacing: 2px;
+
+                                            Text {
+                                                text: root.update-status;
+                                                font-size: 12px;
+                                                color: root.update-available ? #385D78 : #6B7480;
+                                                overflow: elide;
+                                            }
+
+                                            Text {
+                                                text: "客户端版本 " + root.cfg-version
+                                                + " · Rust Core " + root.cfg-core-version;
+                                                font-size: 10.5px;
+                                                color: #6B7480;
+                                                overflow: elide;
+                                            }
+                                        }
+
+                                        Rectangle {
+                                            width: 72px;
+                                            height: parent.height;
+
+                                            PillButton {
+                                                width: parent.width;
+                                                y: (parent.height - self.height) / 2;
+                                                label: root.update-available
                                                 ? "下载"
                                                 : (root.update-checking ? "检查中…" : "检查");
-                                            clicked => {
-                                                if root.update-available {
-                                                    root.open-update();
-                                                } else if !root.update-checking {
-                                                    root.check-update();
+                                                clicked => {
+                                                    if root.update-available {
+                                                        root.open-update();
+                                                        } else if !root.update-checking {
+                                                        root.check-update();
+                                                    }
                                                 }
                                             }
                                         }
@@ -2145,6 +2203,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+
                     }
 
                     if root.cfg-error != "": Rectangle {
@@ -2185,7 +2244,7 @@ export component AppWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             background: #FFFFFF;
-            border-radius: 12px;
+            border-radius: 6px;
             border-width: 1px;
             border-color: #DDE2E7;
             drop-shadow-blur: 28px;
@@ -2202,14 +2261,14 @@ export component AppWindow inherits Window {
                         Text {
                             text: root.editor-is-new ? "添加站点" : "编辑站点";
                             font-size: 19px;
-                            font-weight: 600;
+                            font-weight: 500;
                             color: #1B1F24;
                         }
 
                 Text {
                     text: "名称与访问地址";
                     font-size: 12.5px;
-                    font-weight: 600;
+                    font-weight: 500;
                     color: #4B5563;
                 }
 
@@ -2242,7 +2301,7 @@ export component AppWindow inherits Window {
                 Text {
                     text: "域名与线路";
                     font-size: 12.5px;
-                    font-weight: 600;
+                    font-weight: 500;
                     color: #4B5563;
                 }
                 Text {
@@ -2324,7 +2383,7 @@ export component AppWindow inherits Window {
                 Text {
                     text: "站点默认线路";
                     font-size: 12.5px;
-                    font-weight: 600;
+                    font-weight: 500;
                     color: #4B5563;
                 }
                 Text {
@@ -2401,12 +2460,14 @@ export component AppWindow inherits Window {
                         spacing: 8px;
 
                         if root.editor-deletable: PillButton {
+                            height: 34px;
                             label: "删除站点";
                             tone: 1;
                             clicked => { root.delete-site(root.editor-id); }
                         }
                         Rectangle { horizontal-stretch: 1; }
                         TextButton {
+                            height: 34px;
                             label: "取消";
                             min-width: 52px;
                             clicked => { root.close-editor(); }

@@ -1968,6 +1968,9 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     app.set_status_subtitle(SharedString::from(subtitle));
     app.set_running(running);
     app.set_page(page);
+    if let Ok(section) = std::env::var("HAKIMI_UI_SECTION") {
+        app.set_settings_section(section.parse::<i32>()?.clamp(0, 3));
+    }
     // Offscreen states for reviewing the environment-check UI.
     let broken = std::env::var("HAKIMI_UI_BROKEN").is_ok();
     let fix_page = std::env::var("HAKIMI_UI_FIXPAGE").is_ok();
