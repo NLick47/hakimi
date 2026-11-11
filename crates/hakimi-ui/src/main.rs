@@ -1228,6 +1228,26 @@ fn apply_ui_update(
         if changed(|s| &s.http1_hosts) {
             app.set_cfg_http1_hosts(SharedString::from(settings.http1_hosts.clone()));
         }
+        if old.is_none_or(|prev| prev.image_relay_enabled != settings.image_relay_enabled) {
+            app.set_cfg_image_relay_enabled(settings.image_relay_enabled);
+        }
+        if changed(|s| &s.image_relay_base) {
+            app.set_cfg_image_relay_base(SharedString::from(settings.image_relay_base.clone()));
+        }
+        if changed(|s| &s.image_relay_hosts) {
+            app.set_cfg_image_relay_hosts(SharedString::from(settings.image_relay_hosts.clone()));
+        }
+        if changed(|s| &s.image_relay_user_agent) {
+            app.set_cfg_image_relay_ua(SharedString::from(
+                settings.image_relay_user_agent.clone(),
+            ));
+        }
+        if changed(|s| &s.image_relay_paths) {
+            app.set_cfg_image_relay_paths(SharedString::from(settings.image_relay_paths.clone()));
+        }
+        if old.is_none_or(|prev| prev.image_relay_fallback != settings.image_relay_fallback) {
+            app.set_cfg_image_relay_fallback(settings.image_relay_fallback);
+        }
         let auto_start_changed = old.is_none_or(|prev| prev.auto_start != settings.auto_start);
         let start_hidden_changed =
             old.is_none_or(|prev| prev.start_hidden != settings.start_hidden);
@@ -1353,6 +1373,14 @@ pub(crate) struct SettingsValues {
     /// commas for editing. This list belongs to the user: the defaults cover
     /// the built-in sites, and an edit applies without a restart.
     pub http1_hosts: String,
+    /// The `pixiv` image relay rule. Only this rule is edited here; hand-written
+    /// rules with other ids are left alone.
+    pub image_relay_enabled: bool,
+    pub image_relay_base: String,
+    pub image_relay_hosts: String,
+    pub image_relay_paths: String,
+    pub image_relay_user_agent: String,
+    pub image_relay_fallback: bool,
     pub auto_start: bool,
     pub start_hidden: bool,
     pub auto_connect: bool,
@@ -1390,6 +1418,18 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
             .and_then(Value::as_bool)
             .unwrap_or(false)
     };
+    // The card edits the `pixiv` rule only; a missing rule means "not set up".
+    let relay_rule = config
+        .get("advanced")
+        .and_then(|advanced| advanced.get("imageRelays"))
+        .and_then(Value::as_array)
+        .and_then(|rules| rules.iter().find(|rule| text(rule, "id") == "pixiv"));
+    let relay_rule_flag = |key: &str, fallback: bool| {
+        relay_rule
+            .and_then(|rule| rule.get(key))
+            .and_then(Value::as_bool)
+            .unwrap_or(fallback)
+    };
     SettingsValues {
         proxy_port: field("proxy", "port"),
         doh_primary: field("doh", "primary"),
@@ -1416,6 +1456,36 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
                     .join(", ")
             })
             .unwrap_or_default(),
+        image_relay_enabled: relay_rule_flag("enabled", false),
+        image_relay_base: relay_rule
+            .map(|rule| text(rule, "base"))
+            .unwrap_or_default(),
+        image_relay_hosts: relay_rule
+            .and_then(|rule| rule.get("hosts"))
+            .and_then(Value::as_array)
+            .map(|hosts| {
+                hosts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
+        image_relay_user_agent: relay_rule
+            .map(|rule| text(rule, "userAgent"))
+            .unwrap_or_default(),
+        image_relay_paths: relay_rule
+            .and_then(|rule| rule.get("paths"))
+            .and_then(Value::as_array)
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
+        image_relay_fallback: relay_rule_flag("fallbackDirect", true),
         auto_start: startup_flag("autoStart"),
         start_hidden: startup_flag("startHidden"),
         auto_connect: startup_flag("autoConnect"),
@@ -1426,6 +1496,33 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
 
 /// Commit one text setting. Returns `Some(error)` when the value was rejected;
 /// the refresh tick then restores the field to the stored value.
+/// The image relay the settings card owns. Creating it lazily keeps a fresh
+/// install free of a rule the user never asked for.
+fn pixiv_image_relay(config: &mut hakimi_core::config::AppConfig) -> &mut hakimi_core::config::ImageRelayRule {
+    let index = config
+        .advanced
+        .image_relays
+        .iter()
+        .position(|rule| rule.id == "pixiv");
+    let index = match index {
+        Some(index) => index,
+        None => {
+            config
+                .advanced
+                .image_relays
+                .push(hakimi_core::config::ImageRelayRule {
+                    // The shipped values, but off: the rule only exists here
+                    // because the user emptied the list, so re-enabling it is
+                    // their call.
+                    enabled: false,
+                    ..hakimi_core::config::ImageRelayRule::pixiv_default()
+                });
+            config.advanced.image_relays.len() - 1
+        }
+    };
+    &mut config.advanced.image_relays[index]
+}
+
 fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Option<String> {
     let result = runtime.config().mutate(|config| {
         match key {
@@ -1469,12 +1566,21 @@ fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Opti
                 // Comma-separated, the same shape the fake-SNI field uses.
                 // Empty is allowed and means "no host gets its own connections",
                 // which is a legitimate choice rather than an error.
-                config.advanced.http1_hosts = value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|entry| !entry.is_empty())
-                    .map(str::to_string)
-                    .collect();
+                config.advanced.http1_hosts = split_entries(value);
+            }
+            "advanced.imageRelays.pixiv.base" => {
+                pixiv_image_relay(config).base = value.to_string()
+            }
+            "advanced.imageRelays.pixiv.hosts" => {
+                pixiv_image_relay(config).hosts = split_entries(value);
+            }
+            "advanced.imageRelays.pixiv.paths" => {
+                pixiv_image_relay(config).paths = split_entries(value);
+            }
+            "advanced.imageRelays.pixiv.userAgent" => {
+                // Empty means "keep the browser's UA", not "send an empty one".
+                pixiv_image_relay(config).user_agent =
+                    (!value.is_empty()).then(|| value.to_string());
             }
             other => bail!("未知设置项 {other}"),
         }
@@ -1529,6 +1635,12 @@ fn apply_setting_bool(runtime: &HakimiRuntime, key: &str, value: bool) -> Option
                             Some("region1.v2.argotunnel.com:7844".to_string());
                     }
                 }
+            }
+            "advanced.imageRelays.pixiv.enabled" => {
+                pixiv_image_relay(config).enabled = value;
+            }
+            "advanced.imageRelays.pixiv.fallbackDirect" => {
+                pixiv_image_relay(config).fallback_direct = value;
             }
             "advanced.startup.autoStart" => {
                 // The OS entry is the actual effect: registering first keeps
@@ -1696,12 +1808,23 @@ fn editor_rows_snapshot() -> Vec<DomainDraft> {
     })
 }
 
-fn parse_sni_hosts(raw: &str) -> Result<Vec<String>> {
-    raw.split(',')
+/// Splits a comma separated settings field.
+///
+/// A Chinese input method emits `，`, which used to stay inside the entry: a
+/// host list failed validation, a path list silently matched nothing.
+fn split_entries(raw: &str) -> Vec<String> {
+    raw.split(|c| c == ',' || c == '，')
         .map(str::trim)
-        .filter(|host| !host.is_empty())
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_sni_hosts(raw: &str) -> Result<Vec<String>> {
+    split_entries(raw)
+        .into_iter()
         .map(|host| {
-            hakimi_core::domain::normalize_hostname(host)
+            hakimi_core::domain::normalize_hostname(&host)
                 .map(|host| host.to_ascii_lowercase())
                 .with_context(|| format!("SNI 主机 {host} 格式不正确"))
         })
@@ -1952,6 +2075,14 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     app.set_cfg_relay_listen(SharedString::from(settings.relay_listen.clone()));
     app.set_cfg_relay_target(SharedString::from(settings.relay_target.clone()));
     app.set_cfg_http1_hosts(SharedString::from(settings.http1_hosts.clone()));
+    app.set_cfg_image_relay_enabled(settings.image_relay_enabled);
+    app.set_cfg_image_relay_base(SharedString::from(settings.image_relay_base.clone()));
+    app.set_cfg_image_relay_hosts(SharedString::from(settings.image_relay_hosts.clone()));
+    app.set_cfg_image_relay_paths(SharedString::from(settings.image_relay_paths.clone()));
+    app.set_cfg_image_relay_ua(SharedString::from(
+        settings.image_relay_user_agent.clone(),
+    ));
+    app.set_cfg_image_relay_fallback(settings.image_relay_fallback);
     app.set_cfg_data_dir(SharedString::from("~/Library/Application Support/hakimi"));
     app.set_cfg_version(SharedString::from(env!("CARGO_PKG_VERSION")));
     app.set_cfg_core_version(SharedString::from(hakimi_core::VERSION));

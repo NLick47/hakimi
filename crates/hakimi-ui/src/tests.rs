@@ -638,13 +638,10 @@ fn the_http1_host_list_round_trips_through_the_settings_field() {
 
     // The editor parses the same shape back: commas, arbitrary spaces, and an
     // empty entry from a trailing comma all collapse to the list.
-    let parsed: Vec<String> = " i.pximg.net ,, s.pximg.net , "
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(str::to_string)
-        .collect();
-    assert_eq!(parsed, vec!["i.pximg.net", "s.pximg.net"]);
+    assert_eq!(
+        split_entries(" i.pximg.net ,, s.pximg.net , "),
+        vec!["i.pximg.net", "s.pximg.net"]
+    );
 }
 
 /// An empty list is a legitimate choice, not an error: it turns the feature off
@@ -710,4 +707,33 @@ fn startup_switches_default_to_off_and_follow_the_config() {
     let json = serde_json::to_value(&config).unwrap();
     let values = crate::settings_values(&json);
     assert!(values.auto_start && values.start_hidden && values.auto_connect);
+}
+
+/// The card must render the shipped relay without the user typing anything:
+/// the values come from the config snapshot, which carries the defaults.
+#[test]
+fn the_settings_card_shows_the_shipped_image_relay() {
+    let config = serde_json::to_value(hakimi_core::config::AppConfig::default()).unwrap();
+    let settings = settings_values(&config);
+    assert!(settings.image_relay_enabled);
+    assert_eq!(settings.image_relay_base, "https://pic-relay.cyou/pximg");
+    assert_eq!(settings.image_relay_hosts, "i.pximg.net");
+    assert_eq!(settings.image_relay_paths, "/img-original/, /img-master/");
+    assert_eq!(settings.image_relay_user_agent, "Piku/3.7.0");
+    assert!(settings.image_relay_fallback);
+}
+
+/// The hosts and paths fields are comma separated. A Chinese input method
+/// emits `，`, and an unsplit entry made the host list invalid and the path
+/// list match nothing at all.
+#[test]
+fn comma_separated_fields_split_on_both_commas() {
+    assert_eq!(split_entries("/img-original/, /img-master/"), ["/img-original/", "/img-master/"]);
+    assert_eq!(split_entries("/img-original/，/img-master/"), ["/img-original/", "/img-master/"]);
+    assert_eq!(split_entries(" i.pximg.net ， s.pximg.net ,,"), ["i.pximg.net", "s.pximg.net"]);
+    assert!(split_entries("   ").is_empty());
+    assert_eq!(
+        parse_sni_hosts("a.example.com，B.Example.com ").unwrap(),
+        ["a.example.com", "b.example.com"]
+    );
 }

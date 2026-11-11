@@ -804,6 +804,13 @@ export component AppWindow inherits Window {
     in-out property <string> cfg-relay-target;
     // Hosts that get independent HTTP/1.1 connections, comma separated.
     in-out property <string> cfg-http1-hosts;
+    // Image relay: requests for `cfg-image-relay-hosts` go to this prefix.
+    in-out property <bool> cfg-image-relay-enabled;
+    in-out property <string> cfg-image-relay-base;
+    in-out property <string> cfg-image-relay-hosts;
+    in-out property <string> cfg-image-relay-paths;
+    in-out property <string> cfg-image-relay-ua;
+    in-out property <bool> cfg-image-relay-fallback;
     // Desktop launch behavior; applied through the OS login entry.
     in-out property <bool> cfg-auto-start;
     in-out property <bool> cfg-start-hidden;
@@ -1954,6 +1961,95 @@ export component AppWindow inherits Window {
                                     text <=> root.cfg-http1-hosts;
                                     commit(value) => {
                                         root.save-string("advanced.http1Hosts", value);
+                                    }
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "图片中转";
+                            font-size: 13px;
+                            font-weight: 500;
+                            color: #4F5963;
+                        }
+                        Rectangle {
+                            border-radius: 6px;
+                            background: #FFFFFF;
+                            border-width: 1px;
+                            border-color: #E1E4E8;
+
+                            VerticalLayout {
+                                spacing: 0px;
+                                ToggleRow {
+                                    label: "启用中转";
+                                    hint: "图片改走 Cloudflare 中转，网页与 API 不受影响";
+                                    checked: root.cfg-image-relay-enabled;
+                                    toggled(value) => {
+                                        root.save-bool("advanced.imageRelays.pixiv.enabled", value);
+                                    }
+                                }
+                                RowLine { }
+                                FieldRow {
+                                    label: "中转地址";
+                                    hint: "路径拼在该前缀后";
+                                    setting-key: "advanced.imageRelays.pixiv.base";
+                                    error-key: root.cfg-error-key;
+                                    field-width: root.settings-field;
+                                    label-width: root.settings-label;
+                                    text <=> root.cfg-image-relay-base;
+                                    commit(value) => {
+                                        root.save-string("advanced.imageRelays.pixiv.base", value);
+                                    }
+                                }
+                                RowLine { }
+                                FieldRow {
+                                    label: "适用域名";
+                                    hint: "逗号分隔";
+                                    setting-key: "advanced.imageRelays.pixiv.hosts";
+                                    error-key: root.cfg-error-key;
+                                    placeholder: "i.pximg.net";
+                                    field-width: root.settings-field;
+                                    label-width: root.settings-label;
+                                    text <=> root.cfg-image-relay-hosts;
+                                    commit(value) => {
+                                        root.save-string("advanced.imageRelays.pixiv.hosts", value);
+                                    }
+                                }
+                                RowLine { }
+                                FieldRow {
+                                    label: "只匹配路径";
+                                    hint: "逗号分隔；留空=整站";
+                                    setting-key: "advanced.imageRelays.pixiv.paths";
+                                    error-key: root.cfg-error-key;
+                                    placeholder: "/img-original/";
+                                    field-width: root.settings-field;
+                                    label-width: root.settings-label;
+                                    text <=> root.cfg-image-relay-paths;
+                                    commit(value) => {
+                                        root.save-string("advanced.imageRelays.pixiv.paths", value);
+                                    }
+                                }
+                                RowLine { }
+                                FieldRow {
+                                    label: "请求 UA";
+                                    hint: "留空则不覆盖";
+                                    setting-key: "advanced.imageRelays.pixiv.userAgent";
+                                    error-key: root.cfg-error-key;
+                                    placeholder: "留空不覆盖";
+                                    field-width: root.settings-field;
+                                    label-width: root.settings-label;
+                                    text <=> root.cfg-image-relay-ua;
+                                    commit(value) => {
+                                        root.save-string("advanced.imageRelays.pixiv.userAgent", value);
+                                    }
+                                }
+                                RowLine { }
+                                ToggleRow {
+                                    label: "失败回落直连";
+                                    hint: "被拦截或超时后自动改走源站，代价是慢";
+                                    checked: root.cfg-image-relay-fallback;
+                                    toggled(value) => {
+                                        root.save-bool("advanced.imageRelays.pixiv.fallbackDirect", value);
                                     }
                                 }
                             }
