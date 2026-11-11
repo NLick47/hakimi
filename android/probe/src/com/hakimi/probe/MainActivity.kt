@@ -997,9 +997,17 @@ class MainActivity : Activity(), Host {
             title,
             subtitle,
             value,
-            if (key == "proxy.port") "8443" else "https://…",
+            when (key) {
+                "proxy.port" -> "8443"
+                "advanced.imageRelays.pixiv.hosts" -> "i.pximg.net"
+                "advanced.imageRelays.pixiv.paths" -> "/img-original/"
+                "advanced.imageRelays.pixiv.userAgent" -> "留空则不覆盖"
+                else -> "https://…"
+            },
             numeric = key == "proxy.port",
-            allowEmpty = key == "advanced.download.mirrorSource"
+            allowEmpty = key == "advanced.download.mirrorSource" ||
+                key == "advanced.imageRelays.pixiv.paths" ||
+                key == "advanced.imageRelays.pixiv.userAgent"
         ) { raw ->
             val next = runCatching { JSONObject(data.configJson.toString()) }.getOrNull()
             if (next == null) {
@@ -1092,6 +1100,11 @@ class MainActivity : Activity(), Host {
                     advanced.put("http1Hosts", JSONArray(hosts))
                     true
                 }
+                "advanced.imageRelays.pixiv.base",
+                "advanced.imageRelays.pixiv.hosts",
+                "advanced.imageRelays.pixiv.paths",
+                "advanced.imageRelays.pixiv.userAgent" ->
+                    editImageRelay(next, key.substringAfterLast('.'), raw)
                 else -> false
             }
             if (changed) {
@@ -1103,6 +1116,87 @@ class MainActivity : Activity(), Host {
                 }
             }
         }
+    }
+
+    override fun setImageRelayFlag(field: String, value: Boolean) {
+        if (configSaving) {
+            showSnack("正在保存设置，请稍候")
+            return
+        }
+        val next = runCatching { JSONObject(data.configJson.toString()) }.getOrNull()
+        if (next == null) {
+            showSnack("配置尚未就绪", error = true)
+            return
+        }
+        val rule = imageRelayForWrite(next) ?: return
+        rule.put(field, value)
+        applyConfig(next) { ok, error ->
+            showSnack(if (ok) "设置已保存" else (error ?: "保存失败"), error = !ok)
+        }
+    }
+
+    /** The settings card owns the `pixiv` rule; hand-written rules stay untouched. */
+    private fun imageRelayForWrite(next: JSONObject): JSONObject? {
+        val advanced = next.optJSONObject("advanced")
+        if (advanced == null) {
+            showSnack("配置尚未就绪", error = true)
+            return null
+        }
+        val relays = advanced.optJSONArray("imageRelays")
+            ?: JSONArray().also { advanced.put("imageRelays", it) }
+        for (index in 0 until relays.length()) {
+            val rule = relays.optJSONObject(index) ?: continue
+            if (rule.optString("id") == "pixiv") return rule
+        }
+        val shipped = runCatching { JSONObject(Native.defaultImageRelay()) }.getOrNull()
+        if (shipped == null) {
+            showSnack("无法读取默认中转规则", error = true)
+            return null
+        }
+        shipped.put("enabled", false)
+        relays.put(shipped)
+        return shipped
+    }
+
+    private fun editImageRelay(next: JSONObject, field: String, raw: String): Boolean {
+        val values = raw.split(',', '，')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        val rule = imageRelayForWrite(next) ?: return false
+        when (field) {
+            "base" -> {
+                val value = raw.trim()
+                if (!value.startsWith("https://")) {
+                    showSnack("中转地址必须以 https:// 开头", error = true)
+                    return false
+                }
+                rule.put("base", value)
+            }
+            "hosts" -> {
+                if (values.isEmpty()) {
+                    showSnack("适用域名不能为空", error = true)
+                    return false
+                }
+                if (values.size > 16) {
+                    showSnack("最多 16 个域名", error = true)
+                    return false
+                }
+                rule.put("hosts", JSONArray(values))
+            }
+            "paths" -> {
+                if (values.size > 8) {
+                    showSnack("最多 8 条路径", error = true)
+                    return false
+                }
+                rule.put("paths", JSONArray(values))
+            }
+            "userAgent" -> rule.put(
+                "userAgent",
+                if (raw.isBlank()) JSONObject.NULL else raw.trim()
+            )
+            else -> return false
+        }
+        return true
     }
 
     override fun resetCatalogs() {

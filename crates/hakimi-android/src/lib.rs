@@ -152,6 +152,12 @@ fn default_catalog_urls() -> String {
     .to_string()
 }
 
+/// The shipped rule, so the UI can rebuild it without copying the defaults.
+fn default_image_relay() -> String {
+    serde_json::to_string(&hakimi_core::config::ImageRelayRule::pixiv_default())
+        .unwrap_or_default()
+}
+
 fn apply_config(raw: &str) -> Result<()> {
     let host = host()?;
     let config: AppConfig = serde_json::from_str(raw).context("parsing config JSON")?;
@@ -399,6 +405,15 @@ pub extern "system" fn Java_com_hakimi_probe_Native_defaultCatalogUrls(
 ) -> jstring {
     let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(default_catalog_urls))
         .unwrap_or_else(|_| "{}".to_string());
+    new_string(&mut env, value)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_hakimi_probe_Native_defaultImageRelay(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let value = std::panic::catch_unwind(default_image_relay).unwrap_or_default();
     new_string(&mut env, value)
 }
 

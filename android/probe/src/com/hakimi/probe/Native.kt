@@ -30,6 +30,9 @@ object Native {
 
     @JvmStatic external fun defaultCatalogUrls(): String
 
+    /** The shipped `pixiv` image relay rule as JSON. */
+    @JvmStatic external fun defaultImageRelay(): String
+
     @JvmStatic external fun applyConfig(json: String): Boolean
 
     @JvmStatic external fun setGroupEnabled(id: String, enabled: Boolean): Boolean
