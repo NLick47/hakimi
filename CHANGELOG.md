@@ -1,16 +1,10 @@
 # 更新日志
 
-## 2026-11-10
+## 2026-11-11
 
-优化代理层核心
-桌面端加入开机自启设置
-加入内置X分组 （能不能连上看运营商）
-修复android vpn中断后下次启动行为
-
-
-首次安装提示：
-
-- 安卓下载android.apk就行了，armv7.apk是留给老旧设备兼容的
-- macOS：先把 hakimi.app 拖进「应用程序」，再在终端执行  
-  `xattr -dr com.apple.quarantine /Applications/hakimi.app`
-
+优化了桌面端ui
+新增图片中转，Pixiv原图片默认走中转，加速图片加载
+桌面和安卓设置页都能改中转地址、适用域名、只匹配路径
+支持自建 Cloudflare Worker，仓库里带了一键部署脚本
+补了配置说明和自建文档
+具体使用或者自建去看文档，已默认开启中转地址用的是我 [Piku](https://github.com/NLick47/Piku) 项目的
