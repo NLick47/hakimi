@@ -2,7 +2,9 @@ mod connect;
 mod download;
 mod gate;
 mod pool;
+pub(crate) mod relay;
 mod response;
+mod third_party;
 mod upstream;
 
 // Image slicing is parked. The design and the measurements behind it live in
@@ -76,6 +78,8 @@ enum ProxyBodyKind {
         uri: http::Uri,
         status: StatusCode,
         pool: Arc<UpstreamPool>,
+        /// Present only when a relay carried this response.
+        relay: Option<relay::BodyTrace>,
     },
     Download(download::SegmentedBody),
     Full(Full<Bytes>),
@@ -100,6 +104,7 @@ impl ProxyBody {
         uri: http::Uri,
         status: StatusCode,
         pool: Arc<UpstreamPool>,
+        relay: Option<relay::BodyTrace>,
     ) -> Self {
         Self {
             kind: ProxyBodyKind::Upstream {
@@ -107,6 +112,7 @@ impl ProxyBody {
                 uri,
                 status,
                 pool,
+                relay,
             },
         }
     }
@@ -132,26 +138,50 @@ impl Body for ProxyBody {
                 uri,
                 status,
                 pool,
-            } => match Pin::new(body).poll_frame(cx) {
-                Poll::Ready(Some(Err(error))) => {
-                    let host = uri.host().unwrap_or("");
-                    tracing::warn!(
-                        host = host,
-                        status = status.as_u16(),
-                        error = %error,
-                        "upstream response body failed"
-                    );
-                    if !host.is_empty() {
-                        let tls = uri.scheme_str() != Some("http");
-                        let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
-                        pool.note_body_failure(host, port, tls);
+                relay,
+            } => {
+                let polled = Pin::new(&mut *body).poll_frame(cx);
+                match polled {
+                    Poll::Ready(Some(Err(error))) => {
+                        let host = uri.host().unwrap_or("");
+                        tracing::warn!(
+                            host = host,
+                            status = status.as_u16(),
+                            error = %error,
+                            "upstream response body failed"
+                        );
+                        if !host.is_empty() {
+                            let tls = uri.scheme_str() != Some("http");
+                            let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+                            pool.note_body_failure(host, port, tls);
+                        }
+                        Poll::Ready(Some(Err(Box::new(error))))
                     }
-                    Poll::Ready(Some(Err(Box::new(error))))
+                    Poll::Ready(Some(Ok(frame))) => {
+                        if let Some(trace) = relay.as_mut() {
+                            if let Some(data) = frame.data_ref() {
+                                trace.note(data.len());
+                            }
+                        }
+                        // A body that knows its length never polls to `None`:
+                        // hyper stops calling once `is_end_stream` flips, so
+                        // the last frame is the only place to close the trace.
+                        if relay.is_some() && Pin::new(&mut *body).is_end_stream() {
+                            if let Some(trace) = relay.take() {
+                                log_relay_finish(trace, uri, *status);
+                            }
+                        }
+                        Poll::Ready(Some(Ok(frame)))
+                    }
+                    Poll::Ready(None) => {
+                        if let Some(trace) = relay.take() {
+                            log_relay_finish(trace, uri, *status);
+                        }
+                        Poll::Ready(None)
+                    }
+                    Poll::Pending => Poll::Pending,
                 }
-                Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
-                Poll::Ready(None) => Poll::Ready(None),
-                Poll::Pending => Poll::Pending,
-            },
+            }
             ProxyBodyKind::Download(body) => match Pin::new(body).poll_frame(cx) {
                 Poll::Ready(Some(result)) => {
                     Poll::Ready(Some(result.map_err(|error| Box::from(error) as BoxError)))
@@ -188,6 +218,20 @@ impl Body for ProxyBody {
     }
 }
 
+/// Closes a relayed body with what it actually delivered.
+fn log_relay_finish(trace: relay::BodyTrace, uri: &http::Uri, status: StatusCode) {
+    let (bytes, ms, kbps) = trace.finish();
+    tracing::debug!(
+        relay = %trace.id,
+        host = uri.host().unwrap_or(""),
+        status = status.as_u16(),
+        bytes,
+        elapsed_ms = ms as u64,
+        kbps,
+        "image relay body finished"
+    );
+}
+
 /// Per-direction buffer for upgraded/TCP tunnels. 64 KiB moves large responses
 /// with far fewer read/write syscalls than tokio's 8 KiB default while keeping
 /// per-connection memory reasonable.
@@ -206,6 +250,9 @@ pub struct ProxyContext {
     pub tls: Arc<TlsContext>,
     pub upstream: Arc<UpstreamPool>,
     pub download: Arc<download::DownloadManager>,
+    /// Consecutive-failure memory for image relays, so a relay that is down
+    /// costs one attempt per minute instead of one per image.
+    pub(crate) relay_health: Arc<relay::Health>,
     /// The status snapshot. The flag asks for every known domain instead of
     /// the ones the groups show; the polled view is the small one.
     pub status_json: Arc<dyn Fn(bool) -> serde_json::Value + Send + Sync>,
@@ -244,6 +291,7 @@ impl ProxyContext {
             tls,
             upstream,
             download,
+            relay_health: Arc::new(relay::Health::default()),
             status_json,
             on_stop,
             proxy_addr: OnceLock::new(),

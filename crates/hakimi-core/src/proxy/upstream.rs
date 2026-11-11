@@ -413,32 +413,55 @@ async fn forward_with_uri(
     let is_get = req.method() == Method::GET;
     let has_range = req.headers().contains_key(header::RANGE);
     let rule_uri = upstream_uri;
-    // cheap pre-filter first: only download URLs pay for the config snapshot
+    let (mut parts, body) = req.into_parts();
+    sanitize_request_headers(&mut parts.headers, upgrade_requested);
+    // One lazy snapshot, shared by both lookups; other requests never take it.
+    let mut config = None;
     let plan = if super::download::mirror_candidate(&rule_uri) {
+        let config = config.get_or_insert_with(|| ctx.config.snapshot());
         super::download::mirror_origins(
-            &ctx.config.snapshot().advanced.download,
+            &config.advanced.download,
             &ctx.download.mirrors,
-            req.method(),
+            &parts.method,
             &rule_uri,
         )
     } else {
         None
     };
     let mirrored = plan.is_some();
-    let (mut parts, body) = req.into_parts();
-    sanitize_request_headers(&mut parts.headers, upgrade_requested);
+    // Image relays replace the whole request, so they are resolved after the
+    // browser headers are cleaned up and before anything is built for the
+    // origin.
+    let relay = if parts.method == Method::GET || parts.method == Method::HEAD {
+        let config = config.get_or_insert_with(|| ctx.config.snapshot());
+        if config.advanced.image_relays.iter().any(|rule| rule.enabled) {
+            super::relay::plan(
+                config,
+                &parts.method,
+                &parts.headers,
+                &rule_uri,
+                &ctx.relay_health,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let relayed = relay.is_some();
     // Keep the browser's headers for the direct retry and for the range
     // requests of a direct download: a private codeload archive needs its
     // cookies on every chunk. A mirror never sees them.
     let (direct_headers, mirror_headers) = if mirrored {
         let direct_headers = parts.headers.clone();
-        // A third-party mirror neither needs nor deserves the user's GitHub
-        // session.
-        parts.headers.remove(header::COOKIE);
-        parts.headers.remove(header::AUTHORIZATION);
+        super::third_party::strip_request_credentials(&mut parts.headers);
         // The mirrored path never reads `parts.headers` again, so the mirror
         // copy moves instead of cloning the whole map a second time.
         (direct_headers, std::mem::take(&mut parts.headers))
+    } else if relayed {
+        // The relay keeps its own copy of the headers; the direct fallback
+        // replays the browser's request unchanged.
+        (parts.headers.clone(), HeaderMap::new())
     } else {
         // No mirror runs on this request, and the direct retry below is only
         // reachable from the mirrored branch. The segment base needs just the
@@ -453,6 +476,8 @@ async fn forward_with_uri(
     let response_uri;
     let mut response;
     let mut served_by_mirror = false;
+    let mut served_by_third_party = false;
+    let mut relay_trace: Option<super::relay::BodyTrace> = None;
     let mut mirror_prefix: Option<String> = None;
     let method = parts.method.clone();
     // Kept for the range-probe failover: the next candidate needs a rewrite.
@@ -468,20 +493,96 @@ async fn forward_with_uri(
         )
         .await
         {
-            Some((mut mirrored_response, uri, prefix)) => {
+            Some((mirrored_response, uri, prefix)) => {
                 tracing::debug!(mirror = %prefix, path = %rule_uri.path(), "served through a mirror");
-                // The browser sees this response as github.com, so a mirror
-                // must not be able to plant cookies on that origin.
-                strip_mirror_cookies(mirrored_response.headers_mut());
                 response = mirrored_response;
                 response_uri = uri;
                 served_by_mirror = true;
+                served_by_third_party = true;
                 mirror_prefix = Some(prefix);
             }
             None => {
                 tracing::info!(
                     path = %rule_uri.path(),
                     "every mirror failed, serving direct"
+                );
+                response =
+                    send_once(ctx, &method, &direct_headers, &rule_uri, upgrade_requested).await?;
+                response_uri = rule_uri.clone();
+            }
+        }
+    } else if let Some(relay) = relay {
+        if relay.parked {
+            return Err(format!("image relay `{}` is cooling down", relay.id));
+        }
+        let method = parts.method.clone();
+        // The budget covers the header wait only: once the relay starts
+        // streaming, the body belongs to the browser and is never cut off.
+        let attempt = tokio::time::timeout(
+            relay.timeout,
+            send_once(ctx, &method, &relay.headers, &relay.uri, upgrade_requested),
+        )
+        .await;
+        match attempt {
+            Ok(Ok(served)) => {
+                let failed = super::relay::should_fallback(served.status());
+                if failed {
+                    ctx.relay_health.note_failure(&relay.id);
+                } else {
+                    ctx.relay_health.note_success(&relay.id);
+                }
+                if failed && relay.fallback_direct {
+                    tracing::info!(
+                        relay = %relay.id,
+                        status = %served.status(),
+                        "image relay refused the request; serving the origin"
+                    );
+                    response =
+                        send_once(ctx, &method, &direct_headers, &rule_uri, upgrade_requested)
+                            .await?;
+                    response_uri = rule_uri.clone();
+                } else {
+                    // A cache HIT and a cache MISS read the same in the pool
+                    // log once the headers are in, which makes "the relay is
+                    // slow" impossible to rule out from logs alone.
+                    tracing::debug!(
+                        relay = %relay.id,
+                        status = %served.status(),
+                        cache = header_text(served.headers(), "cf-cache-status"),
+                        age = header_text(served.headers(), "age"),
+                        length = header_text(served.headers(), header::CONTENT_LENGTH.as_str()),
+                        "image relay answered"
+                    );
+                    response_uri = relay.uri;
+                    response = served;
+                    served_by_third_party = true;
+                    relay_trace = Some(super::relay::BodyTrace::new(&relay.id));
+                }
+            }
+            Ok(Err(error)) => {
+                ctx.relay_health.note_failure(&relay.id);
+                if !relay.fallback_direct {
+                    return Err(format!("image relay `{}` failed: {error}", relay.id));
+                }
+                tracing::info!(relay = %relay.id, error = %error, "image relay failed; serving the origin");
+                response =
+                    send_once(ctx, &method, &direct_headers, &rule_uri, upgrade_requested).await?;
+                response_uri = rule_uri.clone();
+            }
+            Err(_) => {
+                // A parked relay must never make the page slower than the
+                // origin would have been.
+                ctx.relay_health.note_failure(&relay.id);
+                if !relay.fallback_direct {
+                    return Err(format!(
+                        "image relay `{}` did not answer within {:?}",
+                        relay.id, relay.timeout
+                    ));
+                }
+                tracing::info!(
+                    relay = %relay.id,
+                    budget_ms = relay.timeout.as_millis() as u64,
+                    "image relay did not answer in time; serving the origin"
                 );
                 response =
                     send_once(ctx, &method, &direct_headers, &rule_uri, upgrade_requested).await?;
@@ -501,6 +602,10 @@ async fn forward_with_uri(
             .send_with_uri(upstream_request, upgrade_requested, &response_uri)
             .await
             .map_err(|error| format!("upstream request to {host}:{port} failed: {error}"))?;
+    }
+
+    if served_by_third_party {
+        super::third_party::strip_response_cookies(response.headers_mut());
     }
 
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
@@ -538,10 +643,12 @@ async fn forward_with_uri(
                 }
             });
         }
-        return Ok(into_proxy_response(response, response_uri, ctx));
+        return Ok(into_proxy_response(response, response_uri, ctx, relay_trace));
     }
 
-    if super::download::segment_eligible(ctx, &rule_uri, is_get, has_range, &response) {
+    // Segmentation dials the origin URI directly, so it would quietly bypass a
+    // relay that is already carrying the bytes.
+    if !relayed && super::download::segment_eligible(ctx, &rule_uri, is_get, has_range, &response) {
         let base_headers = if served_by_mirror {
             &mirror_headers
         } else {
@@ -646,6 +753,8 @@ async fn forward_with_uri(
                     .await
                     {
                         tracing::info!(mirror = %prefix, "mirror takes over the segmented download");
+                        let mut response = response;
+                        super::third_party::strip_response_cookies(response.headers_mut());
                         return Ok(super::download::segment(
                             ctx,
                             uri,
@@ -674,7 +783,7 @@ async fn forward_with_uri(
         .await);
     }
 
-    Ok(into_proxy_response(response, response_uri, ctx))
+    Ok(into_proxy_response(response, response_uri, ctx, relay_trace))
 }
 
 /// First-byte budget for one mirror. A hung mirror must not hold the download
@@ -770,6 +879,7 @@ fn into_proxy_response(
     mut response: Response<UpstreamResponseBody>,
     uri: http::Uri,
     ctx: &ProxyContext,
+    relay: Option<super::relay::BodyTrace>,
 ) -> Response<ProxyBody> {
     let status = response.status();
     let upgrade = status == StatusCode::SWITCHING_PROTOCOLS;
@@ -777,15 +887,22 @@ fn into_proxy_response(
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
-        ProxyBody::upstream(body, uri, status, ctx.upstream.clone()),
+        ProxyBody::upstream(body, uri, status, ctx.upstream.clone(), relay),
     )
+}
+
+/// Header value for a log field; `-` when absent or not UTF-8.
+fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
 }
 
 /// `HeaderName::from_static` does not allocate, while removing a header by
 /// `&str` builds a new name on every call.
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
-const SET_COOKIE2: HeaderName = HeaderName::from_static("set-cookie2");
 
 const HOP_CONNECTION: u16 = 1 << 0;
 const HOP_PROXY_AUTHENTICATE: u16 = 1 << 1;
@@ -902,18 +1019,6 @@ fn sanitize_request_headers(headers: &mut HeaderMap, upgrade: bool) {
 
 pub(super) fn sanitize_response_headers(headers: &mut HeaderMap, upgrade: bool) {
     sanitize_hop_by_hop(headers, upgrade, false);
-}
-
-/// Strip set-cookie headers from a response served through a third-party
-/// mirror. The browser sees this response as the original origin (e.g.
-/// github.com), so a mirror must not be able to plant cookies on it. This is
-/// applied at the single point a mirror response is turned into a proxy
-/// response, so every path — the primary `try_mirrors` result, a failover
-/// candidate that takes over a segmented download, and the single-stream
-/// fallback — is covered.
-pub(crate) fn strip_mirror_cookies(headers: &mut HeaderMap) {
-    headers.remove(header::SET_COOKIE);
-    headers.remove(&SET_COOKIE2);
 }
 
 fn authority(host: &str, port: u16, https: bool) -> Cow<'_, str> {
@@ -1072,8 +1177,7 @@ fn attempt_row(attempt: &AttemptRecord) -> String {
 mod tests {
     use super::{
         authority, build_mitm_uri, build_upstream_uri, host_header_name, is_upgrade, same_host,
-        sanitize_request_headers, sanitize_response_headers, strip_mirror_cookies, target_host,
-        target_of, MitmTarget, Target,
+        sanitize_request_headers, sanitize_response_headers, target_host, target_of, MitmTarget, Target,
     };
     use http::uri::{PathAndQuery, Scheme};
     use http::{header, HeaderMap, Request, Uri};
@@ -1083,24 +1187,6 @@ mod tests {
             target.normalized_host.as_deref(),
             target.upstream_uri.as_ref(),
         )
-    }
-
-    #[test]
-    fn mirror_cookies_are_stripped_but_other_headers_survive() {
-        let mut headers = HeaderMap::new();
-        headers.append(header::SET_COOKIE, "session=mirror".parse().unwrap());
-        headers.append(header::SET_COOKIE, "pref=mirror2".parse().unwrap());
-        headers.insert("set-cookie2", "legacy=mirror".parse().unwrap());
-        headers.insert(header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
-        headers.insert(header::CONTENT_LENGTH, "42".parse().unwrap());
-
-        strip_mirror_cookies(&mut headers);
-
-        assert!(!headers.contains_key(header::SET_COOKIE));
-        assert!(!headers.contains_key("set-cookie2"));
-        // End-to-end headers the browser needs must be left intact.
-        assert_eq!(headers[header::CONTENT_TYPE], "application/octet-stream");
-        assert_eq!(headers[header::CONTENT_LENGTH], "42");
     }
 
     #[test]

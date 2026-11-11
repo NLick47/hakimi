@@ -21,7 +21,6 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 use super::pool::UpstreamResponse;
-use super::upstream::strip_mirror_cookies;
 use super::ProxyBody;
 use crate::config::AppConfig;
 use http_body_util::BodyExt;
@@ -1084,7 +1083,7 @@ pub(crate) fn probe_headers(base: &HeaderMap, response: &UpstreamResponse) -> He
 pub(crate) async fn segment(
     ctx: &super::ProxyContext,
     uri: Uri,
-    mut response: UpstreamResponse,
+    response: UpstreamResponse,
     mirrored: bool,
     base_headers: &HeaderMap,
     mirror_prefix: Option<&str>,
@@ -1098,14 +1097,6 @@ pub(crate) async fn segment(
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let range_headers = range_request_headers(base_headers, response.headers());
-
-    if mirrored {
-        // A mirror response must never plant cookies on the origin the browser
-        // thinks it is talking to. Both the single-stream fallback below and
-        // the segmented path go through here; the failover path in upstream.rs
-        // hands us a raw mirror response that was never stripped.
-        strip_mirror_cookies(response.headers_mut());
-    }
 
     // The sliced path needs a body it can actually cut into byte ranges.
     // Without a known, non-zero length the chunk math collapses (one empty
@@ -1149,7 +1140,7 @@ pub(crate) async fn segment(
         super::upstream::sanitize_response_headers(&mut parts.headers, false);
         return Response::from_parts(
             parts,
-            ProxyBody::upstream(body, uri, StatusCode::OK, ctx.upstream.clone()),
+            ProxyBody::upstream(body, uri, StatusCode::OK, ctx.upstream.clone(), None),
         );
     }
 

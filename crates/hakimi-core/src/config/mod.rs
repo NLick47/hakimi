@@ -224,6 +224,80 @@ pub struct AdvancedConfig {
     /// Desktop launch behavior. The CLI ignores it and the Android build has
     /// its own launcher.
     pub startup: StartupConfig,
+    /// Image requests rewritten onto another host (`base + path`). The first
+    /// enabled rule whose hosts and path prefixes both match wins.
+    pub image_relays: Vec<ImageRelayRule>,
+}
+
+/// One rewrite rule: requests for `hosts` go to `base` with the same path.
+///
+/// The mapped endpoint is expected to be a prefix-style relay (a Cloudflare
+/// worker, a self-hosted gateway). Rules that need the path re-arranged are
+/// deliberately out of scope: a template language would cost more than it
+/// buys, and every relay that can be deployed today is prefix-style.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ImageRelayRule {
+    /// Stable anchor the UI edits by; must be unique across rules.
+    pub id: String,
+    pub enabled: bool,
+    /// Host patterns (`example.com`, `*.example.com`).
+    pub hosts: Vec<String>,
+    /// Path prefixes this rule applies to; empty means every path. Thumbnails
+    /// and rendered sizes share the host with the original, so a relay that is
+    /// only worth it for full-size art filters here.
+    pub paths: Vec<String>,
+    /// Prefix the path is appended to, e.g. `https://relay.example/pximg`.
+    pub base: String,
+    /// Sent as `Referer` when set; image CDNs check it.
+    pub referer: Option<String>,
+    /// Overrides the browser's `User-Agent` when set. Some relays gate on it.
+    pub user_agent: Option<String>,
+    /// Serve the origin URL when the relay errors or refuses.
+    pub fallback_direct: bool,
+    /// How long the relay may take to answer with headers before the request
+    /// falls back. A body already streaming is never cut off.
+    pub timeout_ms: u64,
+}
+
+impl ImageRelayRule {
+    /// The relay the app ships with: full-size pixiv art and the previews the
+    /// artwork page renders go through the project's Cloudflare worker;
+    /// thumbnails stay on the origin, where their size does not justify the
+    /// extra hop.
+    ///
+    /// It is a default, not a fixture: the toggle turns it off, editing any
+    /// field writes a private copy to the config file, and a relay that stops
+    /// answering falls back to the origin by itself.
+    pub fn pixiv_default() -> Self {
+        Self {
+            id: "pixiv".to_string(),
+            enabled: true,
+            hosts: vec!["i.pximg.net".to_string()],
+            paths: vec!["/img-original/".to_string(), "/img-master/".to_string()],
+            base: "https://pic-relay.cyou/pximg".to_string(),
+            referer: Some("https://www.pixiv.net/".to_string()),
+            user_agent: Some("Piku/3.7.0".to_string()),
+            fallback_direct: true,
+            timeout_ms: 5_000,
+        }
+    }
+}
+
+impl Default for ImageRelayRule {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            enabled: true,
+            hosts: Vec::new(),
+            paths: Vec::new(),
+            base: String::new(),
+            referer: None,
+            user_agent: None,
+            fallback_direct: true,
+            timeout_ms: 5_000,
+        }
+    }
 }
 
 /// How the desktop app starts. The OS entry (Startup-folder shortcut,
@@ -356,6 +430,7 @@ impl Default for AdvancedConfig {
             download: DownloadConfig::default(),
             relay: RelayConfig::default(),
             startup: StartupConfig::default(),
+            image_relays: vec![ImageRelayRule::pixiv_default()],
         }
     }
 }
@@ -912,6 +987,99 @@ impl AppConfig {
                 }
             }
         }
+        for rule in &mut self.advanced.image_relays {
+            // A trailing slash would turn the prefix into `//path`.
+            rule.base = rule.base.trim().trim_end_matches('/').to_string();
+            for host in &mut rule.hosts {
+                if is_canonical_pattern(host) {
+                    continue;
+                }
+                if let Ok(pattern) = DomainPattern::parse(host) {
+                    *host = pattern.as_str().to_owned();
+                }
+            }
+            for path in &mut rule.paths {
+                let trimmed = path.trim();
+                *path = if trimmed.starts_with('/') {
+                    trimmed.to_string()
+                } else {
+                    format!("/{trimmed}")
+                };
+            }
+        }
+    }
+
+    /// Image relays are hand-editable, so every rule is checked here instead of
+    /// failing later as a request that silently goes nowhere.
+    fn validate_image_relays(&self) -> Result<()> {
+        if self.advanced.image_relays.len() > 8 {
+            bail!("advanced.imageRelays supports at most 8 rules");
+        }
+        let mut mapped: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for rule in &self.advanced.image_relays {
+            let id = rule.id.trim();
+            if id.is_empty() {
+                bail!("advanced.imageRelays entries need a non-empty id");
+            }
+            if !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                bail!("advanced.imageRelays id `{id}` may only use letters, digits, `-` and `_`");
+            }
+            if !ids.insert(id.to_owned()) {
+                bail!("advanced.imageRelays id `{id}` is used twice");
+            }
+            if rule.hosts.is_empty() {
+                bail!("advanced.imageRelays.{id}.hosts must not be empty");
+            }
+            if rule.hosts.len() > 16 {
+                bail!("advanced.imageRelays.{id}.hosts supports at most 16 entries");
+            }
+            for host in &rule.hosts {
+                let pattern = DomainPattern::parse(host).with_context(|| {
+                    format!("invalid advanced.imageRelays.{id}.hosts entry `{host}`")
+                })?;
+                if let Some(previous) =
+                    mapped.insert(pattern.as_str().to_owned(), id.to_owned())
+                {
+                    bail!("host `{host}` is mapped by both `{previous}` and `{id}`");
+                }
+            }
+            if !rule.enabled {
+                // A rule that is off may be half-filled while the user edits it.
+                continue;
+            }
+            if rule.paths.len() > 8 {
+                bail!("advanced.imageRelays.{id}.paths supports at most 8 entries");
+            }
+            if !(500..=30_000).contains(&rule.timeout_ms) {
+                bail!("advanced.imageRelays.{id}.timeoutMs must be between 500 and 30000");
+            }
+            let base = rule.base.trim().trim_end_matches('/');
+            if base.is_empty() {
+                bail!("advanced.imageRelays.{id}.base must not be empty");
+            }
+            let uri: http::Uri = base
+                .parse()
+                .with_context(|| format!("advanced.imageRelays.{id}.base is not a valid URL"))?;
+            if uri.scheme_str() != Some("https") {
+                bail!("advanced.imageRelays.{id}.base must use https");
+            }
+            if uri.query().is_some() {
+                bail!("advanced.imageRelays.{id}.base must not carry a query");
+            }
+            let Some(target) = uri.host() else {
+                bail!("advanced.imageRelays.{id}.base has no host");
+            };
+            for host in &rule.hosts {
+                if crate::proxy::relay::matches_host(host, target) {
+                    bail!("advanced.imageRelays.{id}.base points at a host the rule rewrites");
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -958,6 +1126,7 @@ impl AppConfig {
         if !(1..=32).contains(&self.advanced.http1_max_concurrent) {
             bail!("advanced.http1MaxConcurrent must be between 1 and 32");
         }
+        self.validate_image_relays()?;
         if !(5..=600).contains(&self.advanced.upstream_header_timeout_secs) {
             bail!("advanced.upstreamHeaderTimeoutSecs must be between 5 and 600");
         }
@@ -2014,6 +2183,112 @@ mod tests {
         config.proxy.port = 8443;
         config.advanced.relay.target = Some("   ".to_string());
         assert!(config.validate().is_err());
+    }
+
+    fn image_relay(base: &str) -> ImageRelayRule {
+        ImageRelayRule {
+            id: "pixiv".into(),
+            hosts: vec!["i.pximg.net".into()],
+            base: base.into(),
+            referer: Some("https://www.pixiv.net/".into()),
+            ..ImageRelayRule::default()
+        }
+    }
+
+    #[test]
+    fn a_fresh_install_ships_the_pixiv_relay_without_persisting_it() {
+        let config = AppConfig::default();
+        assert!(config.validate().is_ok());
+        let rule = config
+            .advanced
+            .image_relays
+            .first()
+            .expect("the shipping default");
+        assert!(rule.enabled, "it is prefilled so it works without setup");
+        assert_eq!(rule.hosts, vec!["i.pximg.net".to_string()]);
+        assert_eq!(
+            rule.paths,
+            vec!["/img-original/".to_string(), "/img-master/".to_string()],
+            "originals and the page previews are relayed, thumbnails are not"
+        );
+        assert_eq!(rule.base, ImageRelayRule::pixiv_default().base);
+        assert!(rule.fallback_direct, "a dead relay must not blank the image");
+
+        // Defaults are re-applied on load, so they never reach the file: an
+        // install that never touches this card keeps a config without it.
+        let persisted = sanitized_persisted_value(&config);
+        assert!(
+            persisted
+                .get("advanced")
+                .and_then(|advanced| advanced.get("imageRelays"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_image_relay_is_validated_before_it_ships() {
+        let mut config = AppConfig::default();
+        config.advanced.image_relays = vec![image_relay("https://relay.example/pximg")];
+        assert!(config.validate().is_ok());
+
+        // Plain http would put the relay's bytes (and the Referer) on the wire.
+        config.advanced.image_relays = vec![image_relay("http://relay.example/pximg")];
+        assert!(config.validate().is_err());
+
+        config.advanced.image_relays = vec![image_relay("https://relay.example/pximg?x=1")];
+        assert!(config.validate().is_err());
+
+        // A rule that rewrites onto its own host would loop the prefix back.
+        config.advanced.image_relays = vec![image_relay("https://i.pximg.net/pximg")];
+        assert!(config.validate().is_err());
+
+        // Off may stay half-filled while the user edits it.
+        let mut disabled = image_relay("");
+        disabled.enabled = false;
+        config.advanced.image_relays = vec![disabled];
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn two_rules_cannot_claim_the_same_host() {
+        let mut config = AppConfig::default();
+        let mut second = image_relay("https://other.example/pximg");
+        second.id = "pixiv-2".into();
+        config.advanced.image_relays = vec![
+            image_relay("https://relay.example/pximg"),
+            second,
+        ];
+        assert!(config.validate().is_err());
+
+        let mut duplicate_id = image_relay("https://other.example/pximg");
+        duplicate_id.hosts = vec!["s.pximg.net".into()];
+        config.advanced.image_relays = vec![
+            image_relay("https://relay.example/pximg"),
+            duplicate_id,
+        ];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn a_hand_written_image_relay_gets_the_documented_defaults() {
+        let advanced: AdvancedConfig = serde_json::from_str(
+            r#"{"imageRelays":[{"id":"pixiv","hosts":["i.pximg.net"],
+                "base":"https://relay.example/pximg/"}]}"#,
+        )
+        .expect("hand-written rules must parse");
+        let rule = &advanced.image_relays[0];
+        assert!(rule.enabled, "a rule that exists is on unless it says otherwise");
+        assert!(rule.fallback_direct, "falling back is what keeps images loading");
+        assert!(rule.referer.is_none());
+
+        let mut config = AppConfig::default();
+        config.advanced.image_relays = vec![rule.clone()];
+        config.canonicalize();
+        assert_eq!(
+            config.advanced.image_relays[0].base,
+            "https://relay.example/pximg",
+            "a trailing slash would produce `//path`"
+        );
     }
 
     /// One rung per filter class, and no duplicates. The ladder is also what
