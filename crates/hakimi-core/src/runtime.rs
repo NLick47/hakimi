@@ -159,6 +159,38 @@ enum StartPolicy {
     Skip,
 }
 
+#[derive(Default)]
+struct PacWatch {
+    revision: u64,
+    paused: Option<bool>,
+    script: Option<String>,
+}
+
+impl PacWatch {
+    /// True means the script changed while the PAC takeover is ours
+    /// The first poll only records a baseline
+    fn poll(
+        &mut self,
+        revision: u64,
+        paused: bool,
+        script: impl FnOnce() -> String,
+        eligible: impl FnOnce() -> bool,
+    ) -> bool {
+        if self.paused == Some(paused) && self.revision == revision {
+            return false;
+        }
+        self.paused = Some(paused);
+        self.revision = revision;
+        let current = script();
+        let changed = self
+            .script
+            .as_deref()
+            .is_some_and(|previous| previous != current.as_str());
+        self.script = Some(current);
+        changed && eligible()
+    }
+}
+
 /// Top-level core runtime. The desktop shell (C ABI) and CLI share this object.
 pub struct HakimiRuntime {
     paths: Paths,
@@ -430,6 +462,14 @@ impl HakimiRuntime {
         let addr = (*self.proxy_listen.read())
             .unwrap_or_else(|| SocketAddr::new(config.proxy.bind, config.proxy.port));
         crate::pac::generate(&config, addr, self.status.paused())
+    }
+
+    fn pac_refresh_eligible(&self) -> bool {
+        let config = self.config.snapshot();
+        config.proxy.mode == ProxyMode::Pac
+            && config.proxy.takeover
+            && *self.proxy_applied.read() == Some(true)
+            && self.is_started()
     }
 
     pub fn started_at(&self) -> DateTime<Utc> {
@@ -1396,6 +1436,28 @@ impl HakimiRuntime {
                 }
             }
         });
+
+        // WinINet keeps serving a cached PAC until told the settings changed
+        let runtime = self.clone();
+        let mut receiver = shutdown.subscribe();
+        self.spawn(async move {
+            let mut watch = PacWatch::default();
+            let mut ticker = tokio::time::interval(Duration::from_millis(200));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = receiver.changed() => break,
+                    _ = ticker.tick() => {}
+                }
+                let revision = runtime.config.revision();
+                let paused = runtime.status.paused();
+                let script = || runtime.pac_script();
+                let eligible = || runtime.pac_refresh_eligible();
+                if watch.poll(revision, paused, script, eligible) {
+                    runtime.system_proxy.refresh_pac_cache();
+                }
+            }
+        });
     }
 
     fn spawn<F>(self: &Arc<Self>, future: F)
@@ -2135,6 +2197,70 @@ mod status_snapshot_tests {
         assert!(
             std::net::TcpListener::bind(("127.0.0.1", listen_port)).is_ok(),
             "stop must release the relay port"
+        );
+    }
+
+    #[test]
+    fn pac_watch_only_nudges_when_the_script_changes() {
+        let addr: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        let mut config = AppConfig::default();
+        config.groups.clear();
+        let baseline = crate::pac::generate(&config, addr, false);
+        config.groups.push(GroupConfig {
+            id: "custom".into(),
+            name: "Custom".into(),
+            domains: vec![DomainRule::new("custom.example")],
+            enabled: true,
+            homepage: None,
+            default_route: RoutePolicy::auto(),
+        });
+        let with_site = crate::pac::generate(&config, addr, false);
+        let paused = crate::pac::generate(&config, addr, true);
+        assert_ne!(baseline, with_site);
+        assert_ne!(with_site, paused);
+
+        let mut watch = PacWatch::default();
+        assert!(
+            !watch.poll(1, false, || baseline.clone(), || true),
+            "the first poll only seeds the baseline"
+        );
+        assert!(
+            !watch.poll(2, false, || baseline.clone(), || {
+                panic!("an unchanged script must not check eligibility")
+            }),
+            "an edit that leaves the PAC alone must not nudge"
+        );
+        assert!(
+            !watch.poll(2, false, || panic!("an idle tick must not rebuild the PAC"), || {
+                panic!("an idle tick must not check eligibility")
+            }),
+            "an idle tick must not nudge"
+        );
+        assert!(
+            watch.poll(3, false, || with_site.clone(), || true),
+            "adding a site must nudge"
+        );
+        assert!(
+            !watch.poll(3, false, || with_site.clone(), || true),
+            "the same script must not nudge twice"
+        );
+        assert!(
+            !watch.poll(3, true, || paused.clone(), || false),
+            "a pause without takeover must not nudge"
+        );
+        assert!(
+            !watch.poll(3, false, || with_site.clone(), || false),
+            "a resume without takeover must not nudge"
+        );
+        assert!(
+            !watch.poll(4, false, || with_site.clone(), || {
+                panic!("an unchanged script must not check eligibility")
+            }),
+            "a revision bump with an unchanged script must not nudge"
+        );
+        assert!(
+            watch.poll(5, false, || baseline.clone(), || true),
+            "removing a site must nudge"
         );
     }
 }

@@ -115,6 +115,15 @@ impl SystemProxyManager {
         Ok(status)
     }
 
+    /// Invalidate the cached PAC script without rewriting the proxy settings.
+    pub fn refresh_pac_cache(&self) {
+        #[cfg(windows)]
+        {
+            notify_proxy_changed();
+            tracing::debug!("PAC cache invalidated after a rule change");
+        }
+    }
+
     pub fn restore(&self) -> Result<bool> {
         if !self.state_path.exists() {
             return Ok(false);
