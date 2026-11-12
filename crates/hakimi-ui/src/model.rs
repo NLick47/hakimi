@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{bail, Context, Result};
 use hakimi_core::config::{DomainRule, EchSource, RouteAttempt, RoutePolicy};
 use hakimi_core::domain::{host_from_url, normalize_hostname, DomainPattern};
+use hakimi_core::mirror::MirrorStatus;
+use hakimi_core::resolver::EffectiveEndpoint;
 use serde_json::Value;
 
 use crate::ui_state::{apply_settle, SettlePhase, BAD_COLOR, IDLE_COLOR, OK_COLOR, SLOW_COLOR};
@@ -218,6 +220,187 @@ pub(crate) fn domain_status(
             None => ("正常".into(), OK_COLOR, "—".into()),
         },
         _ => ("—".into(), IDLE_COLOR, "—".into()),
+    }
+}
+
+/// Status tones for the sidebar status card. The host counts, the window
+/// colours: one place to keep the four values in sync with the Slint side.
+pub(crate) const TONE_NEUTRAL: i32 = 0;
+pub(crate) const TONE_OK: i32 = 1;
+pub(crate) const TONE_DEGRADED: i32 = 2;
+pub(crate) const TONE_BROKEN: i32 = 3;
+
+/// One address row in the expanded status card: a short name, a detail line
+/// (host or the last error) and the tone-coloured verdict.
+#[derive(Clone, PartialEq)]
+pub(crate) struct NetEntry {
+    pub(crate) label: String,
+    pub(crate) detail: String,
+    pub(crate) value: String,
+    pub(crate) tone: i32,
+}
+
+/// The two rows of the sidebar status card plus their address details.
+#[derive(Clone, PartialEq)]
+pub(crate) struct NetStatus {
+    pub(crate) doh: String,
+    pub(crate) doh_tone: i32,
+    pub(crate) mirror: String,
+    pub(crate) mirror_tone: i32,
+    pub(crate) doh_entries: Vec<NetEntry>,
+    pub(crate) mirror_entries: Vec<NetEntry>,
+}
+
+fn short(text: String) -> String {
+    text.chars().take(72).collect()
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct DohObservation {
+    pub(crate) url: String,
+    pub(crate) healthy: bool,
+    pub(crate) latency_ms: Option<u64>,
+    pub(crate) last_error: Option<String>,
+}
+
+/// An endpoint with no health record has not been queried yet: that is
+/// "检测中", not a failure. A failed one shows the error instead of its URL.
+pub(crate) fn doh_entries(
+    endpoints: &[EffectiveEndpoint],
+    health: &[DohObservation],
+) -> Vec<NetEntry> {
+    if endpoints.is_empty() {
+        return vec![NetEntry {
+            label: "未配置 DoH".into(),
+            detail: "在设置中填写加密 DNS 地址".into(),
+            value: "—".into(),
+            tone: TONE_BROKEN,
+        }];
+    }
+    endpoints
+        .iter()
+        .map(|endpoint| {
+            let label = if endpoint.name.trim().is_empty() {
+                endpoint.source.as_str().to_string()
+            } else {
+                endpoint.name.clone()
+            };
+            let host = host_from_url(&endpoint.url)
+                .unwrap_or(&endpoint.url)
+                .to_string();
+            let (detail, value, tone) = match health.iter().find(|row| row.url == endpoint.url) {
+                None => (host.clone(), "检测中".to_string(), TONE_NEUTRAL),
+                Some(row) if row.healthy => (
+                    host.clone(),
+                    row.latency_ms
+                        .map_or_else(|| "正常".to_string(), |ms| format!("{ms} ms")),
+                    TONE_OK,
+                ),
+                Some(row) => (
+                    row.last_error.clone().unwrap_or(host),
+                    "失败".to_string(),
+                    TONE_BROKEN,
+                ),
+            };
+            NetEntry {
+                label,
+                detail: short(detail),
+                value,
+                tone,
+            }
+        })
+        .collect()
+}
+
+/// The empty source is a switch, not a broken mirror list.
+pub(crate) fn mirror_entries(enabled: bool, status: &[MirrorStatus]) -> Vec<NetEntry> {
+    if !enabled {
+        return vec![NetEntry {
+            label: "镜像未开启".into(),
+            detail: "在设置中填写目录来源后启用".into(),
+            value: "已关闭".into(),
+            tone: TONE_NEUTRAL,
+        }];
+    }
+    if status.is_empty() {
+        return vec![NetEntry {
+            label: "镜像列表".into(),
+            detail: "正在获取远程目录".into(),
+            value: "更新中".into(),
+            tone: TONE_NEUTRAL,
+        }];
+    }
+    status
+        .iter()
+        .map(|row| {
+            let (value, tone) = if row.cooldown_secs == 0 {
+                ("可用".to_string(), TONE_OK)
+            } else {
+                (
+                    format!(
+                        "冷却 {}:{:02}",
+                        row.cooldown_secs / 60,
+                        row.cooldown_secs % 60
+                    ),
+                    if row.failures >= 3 {
+                        TONE_BROKEN
+                    } else {
+                        TONE_DEGRADED
+                    },
+                )
+            };
+            NetEntry {
+                label: host_from_url(&row.prefix)
+                    .unwrap_or(&row.prefix)
+                    .to_string(),
+                detail: short(row.prefix.clone()),
+                value,
+                tone,
+            }
+        })
+        .collect()
+}
+
+/// DoH endpoints as `healthy/total 可用`. An endpoint nobody has queried yet
+/// is neither a pass nor a failure, so a partially probed resolver stays
+/// neutral instead of flashing red the moment the window opens.
+pub(crate) fn doh_summary(total: usize, probed: usize, healthy: usize) -> (String, i32) {
+    if total == 0 {
+        return ("未配置".into(), TONE_BROKEN);
+    }
+    if probed == 0 {
+        return ("检测中".into(), TONE_NEUTRAL);
+    }
+    let value = format!("{healthy}/{total} 可用");
+    if probed < total {
+        // The rest are still in flight: a partial count is not a verdict.
+        return (value, TONE_NEUTRAL);
+    }
+    if healthy == total {
+        (value, TONE_OK)
+    } else if healthy == 0 {
+        (value, TONE_BROKEN)
+    } else {
+        (value, TONE_DEGRADED)
+    }
+}
+
+/// Mirror prefixes as `usable/total 可用`. The source doubles as the switch:
+/// an empty `mirrorSource` means the feature is off, not broken.
+pub(crate) fn mirror_summary(enabled: bool, total: usize, usable: usize) -> (String, i32) {
+    if !enabled {
+        return ("已关闭".into(), TONE_NEUTRAL);
+    }
+    if total == 0 {
+        return ("更新中".into(), TONE_NEUTRAL);
+    }
+    let value = format!("{usable}/{total} 可用");
+    if usable == total {
+        (value, TONE_OK)
+    } else if usable == 0 {
+        (value, TONE_BROKEN)
+    } else {
+        (value, TONE_DEGRADED)
     }
 }
 

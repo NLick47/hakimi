@@ -64,6 +64,14 @@ struct MirrorFailure {
     until: Instant,
 }
 
+#[derive(Debug, Clone)]
+pub struct MirrorStatus {
+    pub prefix: String,
+    /// Zero means the prefix is usable
+    pub cooldown_secs: u64,
+    pub failures: u32,
+}
+
 impl MirrorFailure {
     /// Back off further on every repeat: a half-dead mirror that recovers just
     /// long enough to answer once should not cost a timeout every few minutes
@@ -106,6 +114,36 @@ impl MirrorList {
             .iter()
             .filter(|mirror| down.get(*mirror).is_none_or(|state| now >= state.until))
             .cloned()
+            .collect()
+    }
+
+    /// One row per configured prefix, in list order, including cooling ones
+    pub fn status(&self) -> Vec<MirrorStatus> {
+        let now = Instant::now();
+        let down = self.down.read();
+        self.mirrors
+            .read()
+            .iter()
+            .map(|prefix| {
+                let (cooldown_secs, failures) = down
+                    .get(prefix)
+                    .filter(|state| now < state.until)
+                    .map_or((0, 0), |state| {
+                        (
+                            state
+                                .until
+                                .saturating_duration_since(now)
+                                .as_secs()
+                                .max(1),
+                            state.failures,
+                        )
+                    });
+                MirrorStatus {
+                    prefix: prefix.clone(),
+                    cooldown_secs,
+                    failures,
+                }
+            })
             .collect()
     }
 
@@ -359,5 +397,24 @@ mod tests {
             mirrors.available().is_empty(),
             "a mirror cooling down takes no part in rewrites"
         );
+    }
+
+    #[test]
+    fn status_agrees_with_available_and_clears_on_success() {
+        let mirrors = MirrorList::load(None);
+        let all = mirrors.all();
+        assert!(mirrors.status().iter().all(|row| row.cooldown_secs == 0));
+
+        mirrors.cool_down(&all[0]);
+        let status = mirrors.status();
+        assert_eq!(status.len(), all.len());
+        assert!(status[0].cooldown_secs > 0);
+        assert_eq!(status[0].failures, 1);
+        assert_eq!(status[1].cooldown_secs, 0);
+        assert_eq!(mirrors.available().len(), all.len() - 1);
+
+        mirrors.note_success(&all[0]);
+        assert_eq!(mirrors.status()[0].cooldown_secs, 0);
+        assert_eq!(mirrors.available().len(), all.len());
     }
 }

@@ -1,7 +1,10 @@
 use super::*;
-use crate::model::SITE_ICONS;
+use crate::model::{SITE_ICONS, TONE_BROKEN, TONE_DEGRADED, TONE_NEUTRAL, TONE_OK};
 use crate::ui_state::{BAD_COLOR, IDLE_COLOR, OK_COLOR, SLOW_COLOR};
 use hakimi_core::config::{DomainRule, RouteAttempt, RoutePolicy};
+use hakimi_core::mirror::MirrorStatus;
+use hakimi_core::resolver::EffectiveEndpoint;
+use hakimi_core::strategy::DohSource;
 
 fn domains(patterns: &[&str]) -> serde_json::Value {
     serde_json::Value::Array(
@@ -736,4 +739,144 @@ fn comma_separated_fields_split_on_both_commas() {
         parse_sni_hosts("a.example.com，B.Example.com ").unwrap(),
         ["a.example.com", "b.example.com"]
     );
+}
+
+/// The status card counts, it does not judge: an endpoint nobody has queried
+/// yet is neutral, never a failure — otherwise the panel flashes red every
+/// time the window opens.
+#[test]
+fn doh_summary_separates_unprobed_from_failed() {
+    assert_eq!(doh_summary(2, 0, 0), ("检测中".to_string(), TONE_NEUTRAL));
+    assert_eq!(doh_summary(2, 2, 2), ("2/2 可用".to_string(), TONE_OK));
+    assert_eq!(
+        doh_summary(4, 4, 3),
+        ("3/4 可用".to_string(), TONE_DEGRADED)
+    );
+    assert_eq!(doh_summary(4, 4, 0), ("0/4 可用".to_string(), TONE_BROKEN));
+    // Half probed and healthy so far: still counting, no verdict yet — and a
+    // lone failure while the rest are in flight must not read as 0/4 broken.
+    assert_eq!(doh_summary(4, 2, 2), ("2/4 可用".to_string(), TONE_NEUTRAL));
+    assert_eq!(doh_summary(4, 1, 0), ("0/4 可用".to_string(), TONE_NEUTRAL));
+    assert_eq!(doh_summary(0, 0, 0), ("未配置".to_string(), TONE_BROKEN));
+}
+
+/// The source doubles as the switch, so an empty one reads as off rather than
+/// as a mirror list that failed to load.
+#[test]
+fn mirror_summary_treats_an_empty_source_as_off() {
+    assert_eq!(
+        mirror_summary(false, 5, 5),
+        ("已关闭".to_string(), TONE_NEUTRAL)
+    );
+    assert_eq!(
+        mirror_summary(true, 0, 0),
+        ("更新中".to_string(), TONE_NEUTRAL)
+    );
+    assert_eq!(
+        mirror_summary(true, 2, 2),
+        ("2/2 可用".to_string(), TONE_OK)
+    );
+    assert_eq!(
+        mirror_summary(true, 3, 2),
+        ("2/3 可用".to_string(), TONE_DEGRADED)
+    );
+    assert_eq!(
+        mirror_summary(true, 3, 0),
+        ("0/3 可用".to_string(), TONE_BROKEN)
+    );
+}
+
+fn doh_endpoint(name: &str, url: &str) -> EffectiveEndpoint {
+    EffectiveEndpoint {
+        name: name.into(),
+        url: url.into(),
+        bootstrap_ip: None,
+        source: DohSource::Primary,
+    }
+}
+
+/// A health record is keyed by URL. Matching by name would leave the failed
+/// endpoint reading "检测中" forever, which is exactly what a half-configured
+/// fallback looks like in the panel.
+#[test]
+fn doh_rows_keep_unprobed_neutral_and_show_the_failure_detail() {
+    let endpoints = vec![
+        doh_endpoint("cleanbrowsing", "https://doh.cleanbrowsing.org/doh/security-filter"),
+        doh_endpoint("fallback", "https://doh.example/query"),
+    ];
+
+    let unprobed = doh_entries(&endpoints, &[]);
+    assert_eq!(unprobed.len(), 2);
+    assert_eq!(
+        (unprobed[0].value.as_str(), unprobed[0].tone),
+        ("检测中", TONE_NEUTRAL)
+    );
+    assert_eq!(unprobed[0].detail, "doh.cleanbrowsing.org");
+
+    let observed = vec![DohObservation {
+        url: endpoints[1].url.clone(),
+        healthy: false,
+        latency_ms: None,
+        last_error: Some("TCP 超时".into()),
+    }];
+    let rows = doh_entries(&endpoints, &observed);
+    assert_eq!(
+        (rows[0].value.as_str(), rows[0].tone),
+        ("检测中", TONE_NEUTRAL)
+    );
+    assert_eq!((rows[1].value.as_str(), rows[1].tone), ("失败", TONE_BROKEN));
+    assert_eq!(rows[1].detail, "TCP 超时");
+}
+
+#[test]
+fn doh_rows_format_latency_and_explain_an_empty_config() {
+    let endpoints = vec![doh_endpoint("cleanbrowsing", "https://doh.cleanbrowsing.org")];
+    let observed = vec![DohObservation {
+        url: endpoints[0].url.clone(),
+        healthy: true,
+        latency_ms: Some(28),
+        last_error: None,
+    }];
+    let rows = doh_entries(&endpoints, &observed);
+    assert_eq!((rows[0].value.as_str(), rows[0].tone), ("28 ms", TONE_OK));
+    assert_eq!(rows[0].detail, "doh.cleanbrowsing.org");
+
+    let none = doh_entries(&[], &[]);
+    assert_eq!(none.len(), 1);
+    assert_eq!(none[0].label, "未配置 DoH");
+}
+
+/// An empty source is off, not a broken mirror list. A cooling prefix must read
+/// as degraded with its retry time, and a repeatedly failing one as broken.
+#[test]
+fn mirror_rows_separate_off_updating_and_cooldown() {
+    let off = mirror_entries(false, &[]);
+    assert_eq!(off.len(), 1);
+    assert_eq!((off[0].value.as_str(), off[0].tone), ("已关闭", TONE_NEUTRAL));
+    assert_eq!(mirror_entries(true, &[])[0].value, "更新中");
+
+    let status = vec![
+        MirrorStatus {
+            prefix: "https://gh-proxy.com".into(),
+            cooldown_secs: 0,
+            failures: 0,
+        },
+        MirrorStatus {
+            prefix: "https://ghfast.top/".into(),
+            cooldown_secs: 292,
+            failures: 2,
+        },
+        MirrorStatus {
+            prefix: "https://dead.example".into(),
+            cooldown_secs: 900,
+            failures: 3,
+        },
+    ];
+    let rows = mirror_entries(true, &status);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].label, "gh-proxy.com");
+    assert_eq!((rows[0].value.as_str(), rows[0].tone), ("可用", TONE_OK));
+    assert_eq!(rows[1].value, "冷却 4:52");
+    assert_eq!(rows[1].tone, TONE_DEGRADED);
+    assert_eq!(rows[2].tone, TONE_BROKEN);
 }

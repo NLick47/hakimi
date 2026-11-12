@@ -35,8 +35,9 @@ pub(crate) use model::build_snapshot;
 #[cfg(test)]
 pub(crate) use model::icon_key_for;
 pub(crate) use model::{
-    build_sites, builtin_group_ids, finish_snapshot, format_route, normalize_domain_host,
-    parse_route, route_from_preset, route_preset_index, text, SiteData, SweepState,
+    build_sites, builtin_group_ids, doh_entries, doh_summary, finish_snapshot, format_route,
+    mirror_entries, mirror_summary, normalize_domain_host, parse_route, route_from_preset,
+    route_preset_index, text, DohObservation, NetEntry, NetStatus, SiteData, SweepState,
 };
 
 pub(crate) fn data_dir() -> Option<PathBuf> {
@@ -313,6 +314,42 @@ fn build_site_entry(site: &SiteData) -> SiteEntry {
     }
 }
 
+fn build_net_row(row: &NetEntry) -> NetRow {
+    NetRow {
+        label: SharedString::from(row.label.as_str()),
+        detail: SharedString::from(row.detail.as_str()),
+        value: SharedString::from(row.value.as_str()),
+        tone: row.tone,
+    }
+}
+
+fn sync_net_rows(
+    slot: &RefCell<Option<Rc<VecModel<NetRow>>>>,
+    app: &AppWindow,
+    setter: fn(&AppWindow, ModelRc<NetRow>),
+    old: Option<&[NetEntry]>,
+    rows: &[NetEntry],
+) {
+    if old == Some(rows) {
+        return;
+    }
+    let mut slot = slot.borrow_mut();
+    let model = slot.get_or_insert_with(|| {
+        let model = Rc::new(VecModel::default());
+        setter(app, ModelRc::new(model.clone()));
+        model
+    });
+    if old.is_some_and(|old| old.len() == rows.len()) {
+        for (index, row) in rows.iter().enumerate() {
+            if old.is_some_and(|old| old[index] != *row) {
+                model.set_row_data(index, build_net_row(row));
+            }
+        }
+    } else {
+        model.set_vec(rows.iter().map(build_net_row).collect::<Vec<_>>());
+    }
+}
+
 thread_local! {
     // The tray lives for the whole process; dropping the handle would remove
     // the platform icon while the app keeps running.
@@ -324,6 +361,8 @@ thread_local! {
     // and the scroll position all survive, and no-op snapshots cost nothing.
     static SITES_MODEL: std::cell::RefCell<Option<Rc<VecModel<SiteEntry>>>> =
         const { std::cell::RefCell::new(None) };
+    static DOH_MODEL: RefCell<Option<Rc<VecModel<NetRow>>>> = const { RefCell::new(None) };
+    static MIRROR_MODEL: RefCell<Option<Rc<VecModel<NetRow>>>> = const { RefCell::new(None) };
     static PREV_STATE: std::cell::RefCell<Option<UiState>> =
         const { std::cell::RefCell::new(None) };
     // The window exists only while it is shown. Closing it drops the component
@@ -1130,6 +1169,7 @@ struct UiState {
     running: bool,
     ca: (bool, bool, bool),
     settings: SettingsValues,
+    net: NetStatus,
 }
 
 /// Applies a snapshot to the window, updating only what actually changed.
@@ -1142,6 +1182,7 @@ fn apply_ui_update(
     running: bool,
     ca: (bool, bool, bool),
     settings: SettingsValues,
+    net: NetStatus,
 ) {
     let sites_summary = format!(
         "{} 个 · 已启用 {}",
@@ -1156,6 +1197,7 @@ fn apply_ui_update(
                 && prev.running == running
                 && prev.ca == ca
                 && prev.settings == settings
+                && prev.net == net
         })
     });
     if unchanged {
@@ -1285,6 +1327,33 @@ fn apply_ui_update(
     }
     // Sidebar counters. Cheap to write, and they only move when a probe lands.
     set_stats(app, &sites);
+    // Network health. The values are already strings, so a change is four
+    // property writes and nothing else.
+    if prev.as_ref().map(|state| &state.net) != Some(&net) {
+        app.set_stat_doh(SharedString::from(net.doh.as_str()));
+        app.set_stat_doh_tone(net.doh_tone);
+        app.set_stat_mirror(SharedString::from(net.mirror.as_str()));
+        app.set_stat_mirror_tone(net.mirror_tone);
+        let old_net = prev.as_ref().map(|state| &state.net);
+        DOH_MODEL.with(|slot| {
+            sync_net_rows(
+                slot,
+                app,
+                AppWindow::set_doh_rows,
+                old_net.map(|state| state.doh_entries.as_slice()),
+                &net.doh_entries,
+            )
+        });
+        MIRROR_MODEL.with(|slot| {
+            sync_net_rows(
+                slot,
+                app,
+                AppWindow::set_mirror_rows,
+                old_net.map(|state| state.mirror_entries.as_slice()),
+                &net.mirror_entries,
+            )
+        });
+    }
 
     PREV_STATE.with(|slot| {
         *slot.borrow_mut() = Some(UiState {
@@ -1294,6 +1363,7 @@ fn apply_ui_update(
             running,
             ca,
             settings,
+            net,
         });
     });
 }
@@ -2130,6 +2200,50 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
         sites.iter().filter(|site| site.enabled).count()
     )));
     set_stats(&app, &sites);
+    // Offscreen sample for the status card: one healthy row and one degraded,
+    // so the palette can be reviewed in a single shot.
+    app.set_stat_doh(SharedString::from("4/4 可用"));
+    app.set_stat_doh_tone(1);
+    app.set_stat_mirror(SharedString::from("1/2 可用"));
+    app.set_stat_mirror_tone(2);
+    app.set_doh_rows(ModelRc::new(VecModel::from(vec![
+        NetRow {
+            label: "cleanbrowsing".into(),
+            detail: "doh.cleanbrowsing.org".into(),
+            value: "28 ms".into(),
+            tone: 1,
+        },
+        NetRow {
+            label: "applied-privacy".into(),
+            detail: "doh.applied-privacy.net".into(),
+            value: "41 ms".into(),
+            tone: 1,
+        },
+        NetRow {
+            label: "custom 1".into(),
+            detail: "请求超时".into(),
+            value: "失败".into(),
+            tone: 3,
+        },
+    ])));
+    app.set_mirror_rows(ModelRc::new(VecModel::from(vec![
+        NetRow {
+            label: "gh-proxy.com".into(),
+            detail: "https://gh-proxy.com".into(),
+            value: "可用".into(),
+            tone: 1,
+        },
+        NetRow {
+            label: "ghfast.top".into(),
+            detail: "https://ghfast.top".into(),
+            value: "冷却 4:52".into(),
+            tone: 2,
+        },
+    ])));
+    if let Ok(value) = std::env::var("HAKIMI_UI_NET") {
+        app.set_doh_open(value != "mirror");
+        app.set_mirror_open(value != "doh");
+    }
     if std::env::var("HAKIMI_UI_SITES").is_ok() {
         app.set_sites_expanded(true);
     }
@@ -2236,6 +2350,50 @@ struct RefreshCache {
     selected: usize,
     ca: (bool, bool, bool),
     settings: SettingsValues,
+}
+
+/// Reads the two sidebar health rows. Deliberately kept outside the
+/// status-JSON cache: DoH health and mirror cooldowns both move without bumping
+/// either revision that cache keys on, so a revision hit would freeze the
+/// panel on the first values it ever saw.
+fn network_status(runtime: &HakimiRuntime, settings: &SettingsValues) -> NetStatus {
+    let resolver = runtime.resolver();
+    let endpoints = resolver.effective_endpoints();
+    let health = resolver.health_snapshot();
+    let (doh, doh_tone) = doh_summary(
+        endpoints.len(),
+        health.len(),
+        health.iter().filter(|entry| entry.healthy).count(),
+    );
+    let observations: Vec<DohObservation> = health
+        .iter()
+        .map(|row| DohObservation {
+            url: row.url.clone(),
+            healthy: row.healthy,
+            latency_ms: row.latency_ms,
+            last_error: row.last_error.clone(),
+        })
+        .collect();
+    let doh_rows = doh_entries(endpoints.as_ref(), &observations);
+
+    let mirrors = runtime.mirrors();
+    let status = mirrors.status();
+    let enabled = !settings.mirror_source.trim().is_empty();
+    let (mirror, mirror_tone) = mirror_summary(
+        enabled,
+        status.len(),
+        status.iter().filter(|row| row.cooldown_secs == 0).count(),
+    );
+    let mirror_rows = mirror_entries(enabled, &status);
+
+    NetStatus {
+        doh,
+        doh_tone,
+        mirror,
+        mirror_tone,
+        doh_entries: doh_rows,
+        mirror_entries: mirror_rows,
+    }
 }
 
 /// Re-reads the world and applies it to the window. Runs on the UI thread on a
@@ -2353,7 +2511,8 @@ fn refresh(
 
     let auto_start = settings.auto_start;
     let (sites, subtitle) = finish_snapshot(raw_sites, selected, running, starting, Some(phase));
-    apply_ui_update(app, sites, subtitle, running, ca_state, settings);
+    let net = network_status(runtime, &settings);
+    apply_ui_update(app, sites, subtitle, running, ca_state, settings, net);
     // The switch describes the stored intent; Windows can disable the entry
     // from its Startup apps page without touching the file, so surface that
     // instead of letting the switch claim it will run.

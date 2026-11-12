@@ -35,6 +35,13 @@ export struct SiteEntry {
     domains: [DomainEntry],
 }
 
+export struct NetRow {
+    label: string,
+    detail: string,
+    value: string,
+    tone: int,
+}
+
 // -- settings controls --------------------------------------------------------
 
 component InlineField inherits Rectangle {
@@ -360,7 +367,7 @@ component ActionButton inherits Rectangle {
     border-width: emphasis ? 0px : 1px;
     border-color: emphasis ? transparent : #D6DBE0;
     background: emphasis
-        ? (touch.pressed ? #294A62 : touch.has-hover ? #466E8A : #385D78)
+        ? (touch.pressed ? #004C93 : touch.has-hover ? #1A6FC4 : #005FB8)
         : (touch.pressed ? #ECEEF0 : touch.has-hover ? #F2F4F6 : #FFFFFF);
     animate background { duration: 100ms; }
 
@@ -518,26 +525,26 @@ component ToggleRow inherits Rectangle {
 
 component Chevron inherits Rectangle {
     in property <bool> open;
-    width: 10px;
-    height: 10px;
+    width: 8px;
+    height: 8px;
 
     Path {
-        width: 10px;
-        height: 10px;
-        commands: "M 3.8 2.2 L 7.8 5.8 L 3.8 9.4";
-        stroke: root.open ? #5C6670 : #98A1AB;
-        stroke-width: 1.4px;
+        width: 8px;
+        height: 8px;
+        commands: "M 3 1.8 L 6.2 4.6 L 3 7.4";
+        stroke: root.open ? #7A848F : #AAB1B9;
+        stroke-width: 1.1px;
         stroke-line-cap: round;
         stroke-line-join: round;
         opacity: root.open ? 0 : 1;
         animate opacity { duration: 120ms; }
     }
     Path {
-        width: 10px;
-        height: 10px;
-        commands: "M 2.2 3.8 L 5.4 6.8 L 8.6 3.8";
-        stroke: #5C6670;
-        stroke-width: 1.4px;
+        width: 8px;
+        height: 8px;
+        commands: "M 1.8 3 L 4.3 5.4 L 6.8 3";
+        stroke: #7A848F;
+        stroke-width: 1.1px;
         stroke-line-cap: round;
         stroke-line-join: round;
         opacity: root.open ? 1 : 0;
@@ -620,6 +627,125 @@ component StatRow inherits Rectangle {
             font-size: 12px;
             color: root.value-color;
             vertical-alignment: center;
+        }
+    }
+}
+
+/// One clickable status row. 0 neutral, 1 healthy, 2 degraded, 3 broken.
+component StatusRow inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <int> tone: 0;
+    in property <bool> open;
+    callback toggled();
+    property <color> dot-color: root.tone == 1 ? #1B7F4D
+        : root.tone == 2 ? #B88325
+        : root.tone == 3 ? #C05B5B
+        : #A0A8B0;
+
+    height: 28px;
+    background: touch.has-hover ? #F5F7F9 : transparent;
+
+    touch := TouchArea {
+        clicked => { root.toggled(); }
+    }
+
+    HorizontalLayout {
+        spacing: 8px;
+        Rectangle {
+            width: 5px;
+            Rectangle {
+                width: 5px;
+                height: 5px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 2.5px;
+                background: root.dot-color;
+            }
+        }
+        Text {
+            text: root.label;
+            font-size: 12px;
+            color: #3B434C;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        HorizontalLayout {
+            spacing: 4px;
+            Text {
+                text: root.value;
+                font-size: 12px;
+                color: #1B1F24;
+                vertical-alignment: center;
+            }
+            Chevron {
+                open: root.open;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+    }
+}
+
+/// An address row: short name and verdict above, host or last error below.
+component NetRowView inherits Rectangle {
+    in property <string> label;
+    in property <string> detail;
+    in property <string> value;
+    in property <int> tone: 0;
+    property <color> dot-color: root.tone == 1 ? #1B7F4D
+        : root.tone == 2 ? #B88325
+        : root.tone == 3 ? #C05B5B
+        : #A0A8B0;
+    property <color> value-color: root.tone == 1 || root.tone == 0 ? #6B7480 : root.dot-color;
+
+    height: 36px;
+    background: transparent;
+
+    touch := TouchArea { }
+
+    HorizontalLayout {
+        spacing: 8px;
+
+        Rectangle {
+            width: 5px;
+            if root.tone >= 2: Rectangle {
+                width: 5px;
+                height: 5px;
+                y: 9px;
+                border-radius: 2.5px;
+                background: root.dot-color;
+            }
+        }
+
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: start;
+            padding-top: 5px;
+            spacing: 1px;
+
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: root.label;
+                    font-size: 12px;
+                    color: #3B434C;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.value;
+                    font-size: 11px;
+                    color: root.value-color;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                }
+            }
+            Text {
+                text: root.detail;
+                font-size: 11px;
+                color: #6B7480;
+                overflow: elide;
+            }
         }
     }
 }
@@ -790,6 +916,19 @@ export component AppWindow inherits Window {
     in property <string> stat-slow: "0";
     in property <string> stat-bad: "0";
 
+    // Network health for the sidebar status card, pre-formatted by the host:
+    // a value plus the tone that colours it (0 neutral, 1 healthy, 2 degraded,
+    // 3 broken). These move on their own — DoH health and mirror cooldowns do
+    // not bump either revision the refresh cache keys on.
+    in property <string> stat-doh: "检测中";
+    in property <int> stat-doh-tone: 0;
+    in property <string> stat-mirror: "检测中";
+    in property <int> stat-mirror-tone: 0;
+    in property <[NetRow]> doh-rows;
+    in property <[NetRow]> mirror-rows;
+    in-out property <bool> doh-open: false;
+    in-out property <bool> mirror-open: false;
+
     // Settings values, edited in place on the settings page.
     in-out property <string> cfg-proxy-port;
     in-out property <string> cfg-doh-primary;
@@ -958,132 +1097,202 @@ export component AppWindow inherits Window {
                     background: #E5E8EC;
                 }
 
-                VerticalLayout {
-                    padding: 16px;
-                    spacing: 14px;
+                ScrollView {
+                    vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 14px;
+                        alignment: start;
 
-                    Rectangle {
-                        background: #FFFFFF;
-                        border-radius: 6px;
-                        border-width: 1px;
-                        border-color: #E1E4E8;
+                        Rectangle {
+                            background: #FFFFFF;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: #E1E4E8;
 
-                        VerticalLayout {
-                            padding: 16px;
-                            spacing: 14px;
+                            VerticalLayout {
+                                padding: 16px;
+                                spacing: 14px;
 
-                            Text {
-                                text: root.running ? "加速已开启" : "加速已暂停";
-                                font-size: 14px;
-                                font-weight: 500;
-                                color: #1B1F24;
-                                horizontal-alignment: left;
-                            }
-
-                            ActionButton {
-                                label: root.running ? "停止加速" : "开启加速";
-                                emphasis: !root.running;
-                                clicked => { root.toggle-master(); }
-                            }
-                        }
-                    }
-
-                    if (!root.ca-installed || !root.proxy-ok): Rectangle {
-                        background: #FFF6E5;
-                        border-radius: 6px;
-                        border-width: 1px;
-                        border-color: #F0DFC0;
-
-                        VerticalLayout {
-                            padding: 10px;
-                            spacing: 6px;
-
-                            Text {
-                                text: "环境检查未通过，部分加速可能不生效";
-                                font-size: 11.5px;
-                                color: #8A6116;
-                                wrap: word-wrap;
-                            }
-                            HorizontalLayout {
-                                alignment: end;
-                                TextButton {
-                                    label: "去修复";
-                                    clicked => { root.open-fix(); }
+                                Text {
+                                    text: root.running ? "加速已开启" : "加速已暂停";
+                                    font-size: 14px;
+                                    font-weight: 500;
+                                    color: #1B1F24;
+                                    horizontal-alignment: left;
                                 }
-                            }
-                        }
-                    }
 
-                    if root.proxy-interrupted: Rectangle {
-                        background: #FDECEA;
-                        border-radius: 6px;
-                        border-width: 1px;
-                        border-color: #F2C8C2;
-
-                        VerticalLayout {
-                            padding: 10px;
-                            spacing: 6px;
-
-                            Text {
-                                text: "加速已中断";
-                                font-size: 11.5px;
-                                font-weight: 500;
-                                color: #A32D2D;
-                            }
-                            Text {
-                                text: "系统代理被其他程序修改，已自动暂停加速。";
-                                font-size: 11px;
-                                color: #7A4B45;
-                                wrap: word-wrap;
-                            }
-                            HorizontalLayout {
-                                alignment: end;
-                                spacing: 8px;
-                                TextButton {
-                                    label: "知道了";
-                                    clicked => { root.dismiss-interrupt(); }
-                                }
-                                TextButton {
-                                    label: "重新开启";
+                                ActionButton {
+                                    label: root.running ? "停止加速" : "开启加速";
+                                    emphasis: !root.running;
                                     clicked => { root.toggle-master(); }
                                 }
                             }
                         }
-                    }
 
-                    Rectangle {
-                        background: #FFFFFF;
-                        border-radius: 6px;
-                        border-width: 1px;
-                        border-color: #E1E4E8;
+                        if (!root.ca-installed || !root.proxy-ok): Rectangle {
+                            background: #FFF6E5;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: #F0DFC0;
 
-                        VerticalLayout {
-                            padding: 16px;
-                            spacing: 10px;
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 6px;
 
-                            Text {
-                                text: "概览";
-                                font-size: 13px;
-                                font-weight: 500;
-                                color: #4F5963;
-                            }
-                            StatRow { label: "站点"; value: root.stat-sites; }
-                            StatRow { label: "已启用"; value: root.stat-enabled; }
-                            StatRow { label: "域名"; value: root.stat-domains; }
-                            StatRow {
-                                label: "较慢";
-                                value: root.stat-slow;
-                                value-color: root.stat-slow == "0" ? #8A95A2 : #B88325;
-                            }
-                            StatRow {
-                                label: "超时";
-                                value: root.stat-bad;
-                                value-color: root.stat-bad == "0" ? #8A95A2 : #C05B5B;
+                                Text {
+                                    text: "环境检查未通过，部分加速可能不生效";
+                                    font-size: 11.5px;
+                                    color: #8A6116;
+                                    wrap: word-wrap;
+                                }
+                                HorizontalLayout {
+                                    alignment: end;
+                                    TextButton {
+                                        label: "去修复";
+                                        clicked => { root.open-fix(); }
+                                    }
+                                }
                             }
                         }
-                    }
 
-                    Rectangle { vertical-stretch: 1; }
+                        if root.proxy-interrupted: Rectangle {
+                            background: #FDECEA;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: #F2C8C2;
+
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 6px;
+
+                                Text {
+                                    text: "加速已中断";
+                                    font-size: 11.5px;
+                                    font-weight: 500;
+                                    color: #A32D2D;
+                                }
+                                Text {
+                                    text: "系统代理被其他程序修改，已自动暂停加速。";
+                                    font-size: 11px;
+                                    color: #7A4B45;
+                                    wrap: word-wrap;
+                                }
+                                HorizontalLayout {
+                                    alignment: end;
+                                    spacing: 8px;
+                                    TextButton {
+                                        label: "知道了";
+                                        clicked => { root.dismiss-interrupt(); }
+                                    }
+                                    TextButton {
+                                        label: "重新开启";
+                                        clicked => { root.toggle-master(); }
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            background: #FFFFFF;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: #E1E4E8;
+
+                            VerticalLayout {
+                                padding: 16px;
+                                spacing: 10px;
+                                alignment: start;
+
+                                Text {
+                                    text: "概览";
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    color: #6B7480;
+                                }
+
+                                VerticalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    StatRow { label: "站点"; value: root.stat-sites; }
+                                    StatRow { label: "已启用"; value: root.stat-enabled; }
+                                    StatRow { label: "域名"; value: root.stat-domains; }
+                                    StatRow {
+                                        label: "较慢";
+                                        value: root.stat-slow;
+                                        value-color: root.stat-slow == "0" ? #8A95A2 : #B88325;
+                                    }
+                                    StatRow {
+                                        label: "超时";
+                                        value: root.stat-bad;
+                                        value-color: root.stat-bad == "0" ? #8A95A2 : #C05B5B;
+                                    }
+                                }
+
+                                Rectangle { height: 1px; background: #EFF1F3; }
+
+                                StatusRow {
+                                    label: "DoH";
+                                    value: root.stat-doh;
+                                    tone: root.stat-doh-tone;
+                                    open: root.doh-open;
+                                    toggled => {
+                                        root.doh-open = !root.doh-open;
+                                        if root.doh-open {
+                                            root.mirror-open = false;
+                                        }
+                                    }
+                                }
+
+                                if root.doh-open: VerticalLayout {
+                                    spacing: 0px;
+                                    Rectangle { height: 1px; background: #EFF1F3; }
+                                    for row[index] in root.doh-rows: VerticalLayout {
+                                        spacing: 0px;
+                                        if index > 0: Rectangle { height: 1px; background: #F4F6F8; }
+                                        NetRowView {
+                                            label: row.label;
+                                            detail: row.detail;
+                                            value: row.value;
+                                            tone: row.tone;
+                                        }
+                                    }
+                                }
+
+                                Rectangle { height: 1px; background: #EFF1F3; }
+
+                                StatusRow {
+                                    label: "镜像";
+                                    value: root.stat-mirror;
+                                    tone: root.stat-mirror-tone;
+                                    open: root.mirror-open;
+                                    toggled => {
+                                        root.mirror-open = !root.mirror-open;
+                                        if root.mirror-open {
+                                            root.doh-open = false;
+                                        }
+                                    }
+                                }
+
+                                if root.mirror-open: VerticalLayout {
+                                    spacing: 0px;
+                                    Rectangle { height: 1px; background: #EFF1F3; }
+                                    for row[index] in root.mirror-rows: VerticalLayout {
+                                        spacing: 0px;
+                                        if index > 0: Rectangle { height: 1px; background: #F4F6F8; }
+                                        NetRowView {
+                                            label: row.label;
+                                            detail: row.detail;
+                                            value: row.value;
+                                            tone: row.tone;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle { vertical-stretch: 1; }
+                    }
                 }
             }
 
