@@ -148,16 +148,28 @@ impl RouteCursor {
             }
         };
         let add_cache = |candidates: &mut Vec<Candidate>| {
-            if let Some(ip) = last_good {
-                if candidates.len() < max
-                    && !contains_ip(candidates, ip)
-                    && !engine.ip_rejected(&domain, ip)
-                {
-                    candidates.push(Candidate {
-                        ip,
-                        source: IpSource::Cache,
-                    });
-                }
+            let Some(entry) = last_good.as_ref() else {
+                return;
+            };
+            // The catalog is the source that produced this address; if it no
+            // longer serves it for the domain, the resolver owns the name now
+            // and the remembered address must not be dialled.
+            if !engine.catalog_still_serves(&domain, entry.ip, entry.source) {
+                tracing::debug!(
+                    domain = %domain,
+                    ip = %entry.ip,
+                    "remembered route left the IP catalog; dialling the resolver's addresses instead"
+                );
+                return;
+            }
+            if candidates.len() < max
+                && !contains_ip(candidates, entry.ip)
+                && !engine.ip_rejected(&domain, entry.ip)
+            {
+                candidates.push(Candidate {
+                    ip: entry.ip,
+                    source: IpSource::Cache,
+                });
             }
         };
         // 8.1 / 8.2: after a catalog update the new remote IPs are attempted before the

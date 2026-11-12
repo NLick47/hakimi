@@ -519,6 +519,18 @@ impl DecisionEngine {
             self.forget_plan(domain, port, tls);
             return None;
         }
+        // The catalog may have stopped speaking for this address since the
+        // plan was cached (an origin host under a CDN wildcard, a refreshed
+        // list). Dialling it would reuse a route the catalog refuses.
+        if !self.catalog_still_serves(&plan.domain, plan.ip, plan.source) {
+            tracing::debug!(
+                domain = %plan.domain,
+                ip = %plan.ip,
+                "cached route left the IP catalog; re-planning"
+            );
+            self.forget_plan(domain, port, tls);
+            return None;
+        }
         let plan = plan;
 
         // A catalog update marks affected domains skipOnce: do not reuse the old route
@@ -864,6 +876,31 @@ impl DecisionEngine {
             .get(domain)
             .and_then(|by_ip| by_ip.get(&ip))
             .is_some_and(|at| at.elapsed() < IP_REJECTION_TTL)
+    }
+
+    /// True while a *remembered* address may still be dialled for `domain`.
+    ///
+    /// `last_good` and the plan cache remember which source produced an
+    /// address. One that came from the remote catalog is only valid while that
+    /// catalog still gives it for the domain: origin hosts under a CDN
+    /// wildcard are deliberately left to the resolver (see `catalog::ip`), and
+    /// a remembered CDN address for such a host would be dialled forever.
+    /// Fastly answers it with `500 unknown domain` — a response that looks like
+    /// a healthy route, keeps re-saving itself as `last_good` and pushes the
+    /// resolver's correct answer out of the candidate list. That is exactly
+    /// how `objects-origin.githubusercontent.com` uploads stayed broken while
+    /// every handshake "succeeded".
+    ///
+    /// Only catalog-sourced addresses are checked: cache/DoH addresses were
+    /// never the catalog's to revoke. Without a loaded catalog there is
+    /// nothing to compare against, so the remembered address stays the best
+    /// information available.
+    pub(super) fn catalog_still_serves(&self, domain: &str, ip: IpAddr, source: IpSource) -> bool {
+        if source != IpSource::Remote {
+            return true;
+        }
+        let (ips, available) = self.remote.remote_ips_with_catalog(domain);
+        !available || ips.as_ref().is_some_and(|ips| ips.contains(&ip))
     }
 
     /// True while this fake-SNI name is not worth dialling for `domain`.
@@ -1397,11 +1434,12 @@ impl DecisionEngine {
         if let Some(answer) = self.cache.doh_answer(domain, 1) {
             ips.extend(answer.ips);
         }
-        if let Some(ip) = self
-            .cache
-            .last_good_route(domain, config.advanced.last_good_days)
-        {
-            ips.push(ip);
+        if let Some(entry) = self.cache.last_good(domain, config.advanced.last_good_days) {
+            // A remembered address the catalog no longer serves must not
+            // become the challenger either.
+            if self.catalog_still_serves(domain, entry.ip, entry.source) {
+                ips.push(entry.ip);
+            }
         }
         ips.retain(|ip| *ip != current && !self.ip_rejected(domain, *ip));
         ips.sort_unstable();

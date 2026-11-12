@@ -15,6 +15,38 @@ pub const IP_CATALOG_SCHEMA: u32 = 1;
 pub const MAX_IPS_PER_DOMAIN: usize = 8;
 pub const MAX_IPS_ENTRIES: usize = 4096;
 
+/// Suffixes whose wildcard IP entry describes a CDN edge, not every name under
+/// the suffix.
+///
+/// GitHub serves most `*.githubusercontent.com` names from Fastly
+/// (`185.199.108-111.133`), and the catalog stores that one list under the
+/// wildcard. A few names under the same suffix are *origin* hosts: they CNAME
+/// to `github.com` and are answered by GitHub's own edges. Handing them the
+/// Fastly addresses makes Fastly reject the request with
+/// `500 unknown domain`, which broke web-UI file uploads to
+/// `objects-origin.githubusercontent.com`.
+///
+/// Names under these suffixes therefore never inherit the wildcard list; the
+/// resolver (DoH) answers them correctly, and that is the source that should
+/// own them.
+const ORIGIN_UNDER_CDN_SUFFIX: &[&str] = &["githubusercontent.com"];
+
+/// Whether `host` is an origin host that must not inherit the wildcard entry
+/// covering `suffix`.
+///
+/// GitHub's convention is `<purpose>-origin.<suffix>`. The check stays
+/// deliberately narrow: a host whose first label ends in `-origin` is an
+/// origin, while `media.githubusercontent.com` and the other CDN names keep
+/// the wildcard addresses.
+fn is_origin_under_cdn(host: &str, suffix: &str) -> bool {
+    let Some(label_end) = host.find('.') else {
+        return false;
+    };
+    let first_label = &host[..label_end];
+    let rest = &host[label_end + 1..];
+    rest == suffix && first_label.ends_with("-origin")
+}
+
 /// JSON shape from section 7.1 of the design document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpCatalogRaw {
@@ -64,6 +96,14 @@ impl IpCatalog {
         for (index, byte) in host.bytes().enumerate() {
             if byte == b'.' {
                 if let Some(key) = self.wildcards.get(&host[index + 1..]) {
+                    // An origin host under a CDN wildcard must not receive the
+                    // CDN's edge addresses; the resolver owns those names.
+                    if ORIGIN_UNDER_CDN_SUFFIX
+                        .iter()
+                        .any(|suffix| is_origin_under_cdn(host, suffix))
+                    {
+                        return None;
+                    }
                     return self.ips.get_key_value(key);
                 }
             }
@@ -494,6 +534,92 @@ mod tests {
             "the wildcard entry must serve the subdomain"
         );
         assert_eq!(found.unwrap().1.len(), 1);
+    }
+
+    /// GitHub serves `*.githubusercontent.com` from one Fastly edge list, but
+    /// its `-origin` hosts CNAME to github.com and are answered elsewhere. A
+    /// catalog lookup must leave those to the resolver: handing them the CDN
+    /// addresses made Fastly reject uploads with `500 unknown domain`.
+    #[test]
+    fn origin_hosts_do_not_inherit_the_cdn_wildcard() {
+        let catalog = validate(
+            raw(r#"{
+                    "v": 1,
+                    "groups": {"github": ["*.githubusercontent.com"]},
+                    "ips": {"*.githubusercontent.com": ["185.199.108.133"]}
+                }"#),
+            &AppConfig::default(),
+        )
+        .unwrap();
+
+        assert!(
+            catalog
+                .lookup_ips("objects-origin.githubusercontent.com")
+                .is_none(),
+            "an origin host must resolve through DoH, not the CDN wildcard"
+        );
+        // Ordinary CDN names keep the wildcard addresses.
+        for host in [
+            "raw.githubusercontent.com",
+            "media.githubusercontent.com",
+            "avatars.githubusercontent.com",
+            "private-user-images.githubusercontent.com",
+        ] {
+            assert!(
+                catalog.lookup_ips(host).is_some(),
+                "{host} is a CDN name and must keep the wildcard"
+            );
+        }
+    }
+
+    /// An exact entry still wins: the rule only refuses the *wildcard*
+    /// inheritance, so a catalog that names an origin host explicitly (with
+    /// its real addresses) keeps working.
+    #[test]
+    fn an_exact_origin_entry_is_still_honoured() {
+        let catalog = validate(
+            raw(r#"{
+                    "v": 1,
+                    "groups": {"github": ["*.githubusercontent.com", "objects-origin.githubusercontent.com"]},
+                    "ips": {
+                        "*.githubusercontent.com": ["185.199.108.133"],
+                        "objects-origin.githubusercontent.com": ["140.82.112.22"]
+                    }
+                }"#),
+            &AppConfig::default(),
+        )
+        .unwrap();
+
+        let (key, ips) = catalog
+            .lookup_ips("objects-origin.githubusercontent.com")
+            .expect("an explicit entry must be honoured");
+        assert_eq!(key, "objects-origin.githubusercontent.com");
+        assert_eq!(ips[0].to_string(), "140.82.112.22");
+    }
+
+    /// The `-origin` rule is a GitHub convention, not a general one: a name
+    /// that merely contains "origin" elsewhere stays on the wildcard.
+    #[test]
+    fn only_the_leading_origin_label_is_special() {
+        let catalog = validate(
+            raw(r#"{
+                    "v": 1,
+                    "groups": {"g": ["*.example.com"]},
+                    "ips": {"*.example.com": ["1.1.1.1"]}
+                }"#),
+            &AppConfig::default(),
+        )
+        .unwrap();
+        for host in [
+            "origin.example.com",
+            "cdn-origin.example.com",
+            "a.origin.example.com",
+        ] {
+            assert!(
+                catalog.lookup_ips(host).is_some(),
+                "{host} must keep the wildcard entry"
+            );
+        }
     }
 
     #[test]

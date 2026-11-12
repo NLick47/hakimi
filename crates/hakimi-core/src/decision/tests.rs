@@ -2679,6 +2679,82 @@ async fn an_expired_last_good_is_not_a_candidate() {
     );
 }
 
+/// A remembered `last_good` address with `source: Remote` is only meaningful
+/// while the IP catalog still offers it. Once the catalog stops serving the
+/// domain (a rule retired, an origin moved to a new edge), the stale address
+/// must be dropped instead of dialled: it is exactly the poisoned entry that
+/// turns a healthy endpoint into a repeat 500.
+#[tokio::test]
+async fn a_remote_last_good_the_catalog_no_longer_serves_is_not_a_candidate() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    *h.remote.catalog.lock() = true;
+    let stale_ip: IpAddr = "185.199.110.133".parse().unwrap();
+    let doh_ip: IpAddr = "140.82.113.21".parse().unwrap();
+    // The catalog is loaded but no longer answers for this domain.
+    *h.remote.ips.lock() = None;
+    h.cache.put_last_good(LastGoodEntry {
+        domain: "example.com".into(),
+        ip: stale_ip,
+        source: IpSource::Remote,
+        saved_at: now(),
+        catalog_version: 0,
+    });
+    h.resolver.answers.lock().push_back(Ok(DohResolution {
+        ips: vec![doh_ip],
+        source: DohSource::Primary,
+        endpoint: "primary".into(),
+        stale: false,
+        ttl: 60,
+        fallback_used: false,
+    }));
+
+    let mut cursor = match h.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let first = cursor
+        .next_plan()
+        .await
+        .expect("the resolver must still offer an address");
+    assert_eq!(
+        (first.ip, first.source),
+        (doh_ip, IpSource::Doh),
+        "a remembered route the catalog no longer serves must be dropped in favour of the resolver"
+    );
+    assert!(
+        cursor.next_plan().await.is_none(),
+        "the stale remembered address must not reappear as a candidate"
+    );
+}
+
+/// The same verdict applies to a plan remembered after a successful connect:
+/// `cached_plan` must refuse to reuse it once the catalog stops serving the
+/// domain, so the next request re-routes through the resolver.
+#[test]
+fn a_cached_plan_the_catalog_no_longer_serves_is_forgotten() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    *h.remote.catalog.lock() = true;
+    *h.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+    h.engine
+        .remember_plan_arc(Arc::new(test_plan(TlsMode::Direct, None)));
+    assert!(
+        h.engine.cached_plan("example.com", 443, true).is_some(),
+        "the plan must be served while the catalog still offers the address"
+    );
+
+    // The catalog reloads and the rule that served this domain is gone.
+    *h.remote.ips.lock() = None;
+    assert!(
+        h.engine.cached_plan("example.com", 443, true).is_none(),
+        "a plan the catalog no longer serves must be forgotten, not reused"
+    );
+    assert_eq!(
+        h.engine.plan_cache_len(),
+        0,
+        "the forgotten plan must be removed from the cache"
+    );
+}
+
 /// `ip_rejected` is the same verdict for every source: a black-listed address
 /// is out whether the cache, the catalog or DoH offered it.
 #[tokio::test]

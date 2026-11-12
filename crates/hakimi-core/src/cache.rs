@@ -620,12 +620,17 @@ impl CacheManager {
     /// One read-lock acquisition for the two pieces of route state a new cursor
     /// needs. `skip_once` is only consumed by the caller when it is present, so
     /// the common empty-set path never takes the write lock.
-    pub fn route_hints(&self, domain: &str, max_age_days: i64) -> (bool, Option<IpAddr>) {
+    ///
+    /// The whole entry, not just the address: the cursor has to know *which
+    /// source* produced the remembered address before it dials it (an address
+    /// from the remote catalog is only valid while that catalog still serves
+    /// it for the domain — see `DecisionEngine::catalog_still_serves`).
+    pub fn route_hints(&self, domain: &str, max_age_days: i64) -> (bool, Option<LastGoodEntry>) {
         let now = now();
         let data = self.data.read();
         let skip_once = data.skip_once.contains(domain);
         let last_good = data.last_good.get(domain).and_then(|entry| {
-            within_age(now, entry.saved_at, max_age_days).then_some(entry.ip)
+            within_age(now, entry.saved_at, max_age_days).then(|| entry.clone())
         });
         (skip_once, last_good)
     }
