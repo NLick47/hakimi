@@ -14,6 +14,9 @@ dev-shot = []
 
 [dependencies]
 slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-default", "renderer-femtovg", "renderer-software", "system-tray", "raw-window-handle-06"] }
+# Site logos ship as up-to-96px PNGs but draw at 20px. Pre-resampling them is
+# what keeps the logo edges clean; the renderer has no mipmaps of its own.
+image = { version = "0.25", default-features = false, features = ["png"] }
 hakimi-core = { path = "../hakimi-core" }
 anyhow.workspace = true
 serde_json.workspace = true

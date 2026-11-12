@@ -224,7 +224,7 @@ fn bundled_logos_and_group_lookups_stay_in_sync() {
 /// would quietly turn every tile of that site back into a letter.
 #[test]
 fn every_bundled_logo_decodes() {
-    load_assets();
+    load_assets(1.0);
     ASSETS.with(|assets| {
         let images = assets.borrow();
         for (key, _) in ICON_ASSETS {

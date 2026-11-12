@@ -766,15 +766,19 @@ component SiteBadge inherits Rectangle {
     clip: true;
 
     if icon.width > 0: Image {
-        width: parent.width * 0.66;
-        height: parent.width * 0.66;
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
+        // 4px on each side leaves a 20px logo in the 28px badge. Both sizes
+        // are multiples of four, so the logo covers whole device pixels at
+        // 100/125/150/175/200% scaling instead of landing on half pixels.
+        width: parent.width - 8px;
+        height: parent.width - 8px;
+        x: 4px;
+        y: 4px;
+        image-rendering: smooth;
         source: root.icon;
     }
     if icon.width == 0: Text {
         text: root.initial;
-        font-size: 10px;
+        font-size: 12px;
         color: #FFFFFF;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -1365,8 +1369,8 @@ export component AppWindow inherits Window {
                                             background: transparent;
 
                                             Rectangle {
-                                                x: 76px;
-                                                width: parent.width - 92px;
+                                                x: 78px;
+                                                width: parent.width - 94px;
                                                 height: parent.height;
                                                 background: #ECEEF0;
                                             }
@@ -1398,12 +1402,12 @@ export component AppWindow inherits Window {
                                                 }
 
                                                 Rectangle {
-                                                    width: 26px;
+                                                    width: 28px;
                                                     height: parent.height;
 
                                                     Rectangle {
-                                                        width: 26px;
-                                                        height: 26px;
+                                                        width: 28px;
+                                                        height: 28px;
                                                         y: (parent.height - self.height) / 2;
                                                         border-radius: 6px;
                                                         background: site.icon.width > 0 ? #FFFFFF : site.tile-color;
@@ -1412,10 +1416,15 @@ export component AppWindow inherits Window {
                                                         clip: true;
 
                                                         if site.icon.width > 0: Image {
-                                                            width: 17px;
-                                                            height: 17px;
-                                                            x: (parent.width - self.width) / 2;
-                                                            y: (parent.height - self.height) / 2;
+                                                            // 20px in a 28px tile centres at a whole
+                                                            // 4px offset; both are multiples of four,
+                                                            // so the block lands on device pixels at
+                                                            // every Windows scale factor.
+                                                            width: 20px;
+                                                            height: 20px;
+                                                            x: 4px;
+                                                            y: 4px;
+                                                            image-rendering: smooth;
                                                             source: site.icon;
                                                         }
                                                         if site.icon.width == 0: Text {
@@ -1489,7 +1498,7 @@ export component AppWindow inherits Window {
 
                                                     HorizontalLayout {
                                                         // aligned under the site name column
-                                                        padding-left: 76px;
+                                                        padding-left: 78px;
                                                         padding-right: 14px;
                                                         spacing: 10px;
 
@@ -1910,7 +1919,7 @@ export component AppWindow inherits Window {
                                                 VerticalLayout {
                                                     alignment: center;
                                                     SiteBadge {
-                                                        badge: 24px;
+                                                        badge: 28px;
                                                         icon: site.icon;
                                                         initial: site.initial;
                                                         tile-color: site.tile-color;

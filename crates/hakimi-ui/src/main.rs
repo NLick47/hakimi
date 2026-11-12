@@ -356,6 +356,8 @@ thread_local! {
     static TRAY: std::cell::RefCell<Option<TrayRoot>> = const { std::cell::RefCell::new(None) };
     static ASSETS: std::cell::RefCell<HashMap<String, slint::Image>> =
         std::cell::RefCell::new(HashMap::new());
+    // Device pixels per logical pixel the cached logos were resampled for.
+    static ICON_SCALE: Cell<f32> = const { Cell::new(0.0) };
     // Persistent models live on the UI thread so refreshes can be per-row:
     // unchanged rows keep their identity, so hover state, running animations
     // and the scroll position all survive, and no-op snapshots cost nothing.
@@ -950,7 +952,9 @@ fn wire_window(app: &AppWindow, ctx: &UiContext) {
 /// and every UI allocation while the proxy runtime keeps running.
 fn build_window(ctx: &UiContext) -> Result<WindowShell> {
     let app = AppWindow::new()?;
-    load_assets();
+    // The real scale factor only arrives after the window is shown; 2x is a
+    // good first frame and the refresh tick reloads at the exact one.
+    load_assets(2.0);
     app.set_cfg_data_dir(SharedString::from(
         ctx.runtime.paths().root().display().to_string(),
     ));
@@ -989,6 +993,9 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
     let closing = Rc::new(Cell::new(false));
     let timer = slint::Timer::default();
     {
+        // Scale factor changes are only delivered through winit events, not
+        // through a callback on the public Slint window; compare on each tick.
+        let applied_scale = Rc::new(Cell::new(0.0f32));
         let weak = app.as_weak();
         let runtime = ctx.runtime.clone();
         let expanded = ctx.expanded.clone();
@@ -1033,6 +1040,23 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
                     }
                     return;
                 }
+                let scale = window.scale_factor();
+                let previous = applied_scale.replace(scale);
+                if previous > 0.0 && (scale - previous).abs() > 0.001 {
+                    // Dragged to a monitor with a different DPI: winit keeps
+                    // the physical size, so the window would jump size. Keep
+                    // the logical size instead, as native apps do.
+                    let logical = window.size().to_logical(previous);
+                    window.set_size(slint::LogicalSize::new(logical.width, logical.height));
+                }
+                if (asset_scale() - scale).abs() > 0.01 {
+                    // Resample the logos for this DPI (they are cached
+                    // texture-sized), then drop the row cache so every entry
+                    // picks the new images up.
+                    load_assets(scale);
+                    PREV_STATE.with(|slot| *slot.borrow_mut() = None);
+                    REFRESH_CACHE.with(|slot| *slot.borrow_mut() = None);
+                }
                 refresh(&app, &runtime, &expanded.borrow(), &sweep);
             },
         );
@@ -1068,7 +1092,7 @@ fn show_main_window(ctx: &UiContext) {
     if let Some((closing, weak)) = existing {
         if !closing.get() {
             if let Some(app) = weak.upgrade() {
-                load_assets();
+                load_assets(app.window().scale_factor());
                 reveal_window(&app);
                 refresh(&app, &ctx.runtime, &ctx.expanded.borrow(), &ctx.sweep);
             }
@@ -1409,16 +1433,71 @@ const ICON_ASSETS: [(&str, &[u8]); 13] = [
 
 const HF_LOGO: &[u8] = include_bytes!("../assets/hf.png");
 
-pub(crate) fn load_assets() {
+/// On-screen size of a site logo, in logical pixels. Kept a multiple of four
+/// so it lands on whole device pixels at the 100/125/150/175/200% steps Windows
+/// offers. The `.slint` side uses the same value for the list tile and badge.
+const SITE_ICON_LOGICAL: f32 = 20.0;
+
+/// Resample a logo to the exact device-pixel size it will be drawn at. The
+/// renderers only do bilinear sampling and have no mipmaps, so handing them
+/// the bundled 96px PNG and letting them shrink it five times aliases every
+/// curve into a staircase. Doing the reduction here also means the texture is
+/// sampled 1:1 at the current DPI, which is what keeps the edges crisp.
+fn site_icon(bytes: &[u8], device_px: u32) -> Option<slint::Image> {
+    let source = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+        .ok()?
+        .to_rgba8();
+    let mut premultiplied = source.clone();
+    for (pixel, out) in source.pixels().zip(premultiplied.pixels_mut()) {
+        let alpha = u32::from(pixel[3]);
+        for channel in 0..3 {
+            out[channel] = ((u32::from(pixel[channel]) * alpha + 127) / 255) as u8;
+        }
+    }
+    let mut resized = image::imageops::resize(
+        &premultiplied,
+        device_px,
+        device_px,
+        image::imageops::FilterType::Lanczos3,
+    );
+    // Lanczos ringing can push a channel above the (premultiplied) alpha.
+    for pixel in resized.pixels_mut() {
+        let alpha = pixel[3];
+        for channel in 0..3 {
+            pixel[channel] = pixel[channel].min(alpha);
+        }
+    }
+    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+        resized.as_raw(),
+        device_px,
+        device_px,
+    );
+    Some(slint::Image::from_rgba8_premultiplied(buffer))
+}
+
+/// The scale factor the cached logos were built for, or 0 before the first
+/// load. The refresh tick compares it with the window to notice a move to a
+/// monitor with a different DPI.
+pub(crate) fn asset_scale() -> f32 {
+    ICON_SCALE.with(Cell::get)
+}
+
+/// Decodes and resamples every bundled logo for `scale`. The window's scale
+/// factor is not known before it is shown, so the caller starts with an
+/// estimate (2x) and the refresh tick reloads once the real one arrives.
+pub(crate) fn load_assets(scale: f32) {
     ASSETS.with(|assets| {
         let mut map = assets.borrow_mut();
         // Icons persist until release_ui_caches clears them; re-decoding the
         // whole set on every tray reveal is wasted work.
-        if !map.is_empty() {
+        if !map.is_empty() && (asset_scale() - scale).abs() < 0.01 {
             return;
         }
+        ICON_SCALE.with(|cell| cell.set(scale));
+        map.clear();
+        let device_px = (SITE_ICON_LOGICAL * scale).round().clamp(16.0, 160.0) as u32;
         for &(key, bytes) in &ICON_ASSETS {
-            if let Ok(image) = slint::Image::load_from_data(bytes, Some("png")) {
+            if let Some(image) = site_icon(bytes, device_px) {
                 map.insert(key.to_string(), image);
             }
         }
@@ -2119,7 +2198,7 @@ fn sample_config() -> Value {
 fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     use_light_appearance();
     let app = AppWindow::new()?;
-    load_assets();
+    load_assets(1.0);
 
     let status = sample_status();
     let config = sample_config();
