@@ -1404,6 +1404,9 @@ fn release_ui_caches(app: &AppWindow) {
         }
     });
     app.set_sites(ModelRc::new(VecModel::default()));
+    // These two are bound to the window as well; a rebuilt window must get new ones.
+    DOH_MODEL.with(|slot| *slot.borrow_mut() = None);
+    MIRROR_MODEL.with(|slot| *slot.borrow_mut() = None);
     PREV_STATE.with(|slot| *slot.borrow_mut() = None);
     REFRESH_CACHE.with(|slot| *slot.borrow_mut() = None);
     CONFIG_CACHE.with(|slot| *slot.borrow_mut() = None);
