@@ -580,6 +580,9 @@ class SettingRow(
     }
 
     fun setValue(text: String, color: Int = Palette.TEXT_2) {
+        // Same guard as setSubtitle: the poll rewrites every row each tick,
+        // and even an unchanged TextView still costs a full layout pass.
+        if (valueView.text.toString() == text && valueView.currentTextColor == color) return
         valueView.text = text
         valueView.setTextColor(color)
     }

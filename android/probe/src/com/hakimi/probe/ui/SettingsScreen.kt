@@ -33,6 +33,7 @@ class SettingsScreen(private val context: Context, private val host: Host) {
     private var scopeCacheValue = ""
     private lateinit var certRow: SettingRow
     private lateinit var certInfo: TextView
+    private var certInfoCache = ""
 
     private lateinit var portRow: SettingRow
     private lateinit var ipCatalogRow: SettingRow
@@ -311,7 +312,7 @@ class SettingsScreen(private val context: Context, private val host: Host) {
             }
         )
 
-        certInfo.text = buildString {
+        val certInfoText = buildString {
             append(data.caSubject.ifEmpty { "—" })
             if (data.caFingerprintSha256.isNotEmpty()) {
                 append("\nSHA-256  ").append(CaTrust.displaySha256(data.caFingerprintSha256))
@@ -319,6 +320,14 @@ class SettingsScreen(private val context: Context, private val host: Host) {
             if (data.caNotAfter.isNotEmpty()) {
                 append("\n到期  ").append(data.caNotAfter.take(10))
             }
+        }
+        // This is the only multi-line view in the page, so a text change
+        // moves every row below it. Re-setting identical text would still
+        // relayout, and a selectable TextView that churns can drag the
+        // ScrollView along; only touch it on a real change.
+        if (certInfoCache != certInfoText) {
+            certInfoCache = certInfoText
+            certInfo.text = certInfoText
         }
 
         portRow.setValue(data.port.toString())

@@ -379,6 +379,14 @@ class MainActivity : Activity(), Host {
             handler.post {
                 pollInFlight = false
                 if (isFinishing || isDestroyed) return@post
+                // A failed FFI read comes back empty, and an empty status
+                // parses into a blank snapshot: every derived value would
+                // flip for one tick, including the multi-line CA block, which
+                // yanks the settings scroll each second on memory-pressed
+                // 32-bit devices. Hold the last good snapshot instead.
+                if ((status.isEmpty() || config.isEmpty()) && data.siteCount > 0) {
+                    return@post
+                }
                 if (parsed.siteCount == 0 && data.siteCount > 0 &&
                     status.contains("\"error\"")
                 ) {
