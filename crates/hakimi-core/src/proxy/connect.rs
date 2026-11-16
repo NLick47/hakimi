@@ -47,8 +47,7 @@ struct DnsCacheEntry {
 ///
 /// Two levels so the lookup can borrow the host instead of allocating a
 /// lowercased copy of it on every call.
-fn dns_cache() -> &'static parking_lot::Mutex<HashMap<String, HashMap<u16, DnsCacheEntry>>>
-{
+fn dns_cache() -> &'static parking_lot::Mutex<HashMap<String, HashMap<u16, DnsCacheEntry>>> {
     static CACHE: std::sync::OnceLock<
         parking_lot::Mutex<HashMap<String, HashMap<u16, DnsCacheEntry>>>,
     > = std::sync::OnceLock::new();
@@ -79,14 +78,8 @@ pub(super) async fn lookup_host_cached(
     if !addresses.is_empty() {
         let shared: Arc<[SocketAddr]> = Arc::from(addresses.as_slice());
         let mut cache = dns_cache().lock();
+        prune_dns_cache(&mut cache);
         let ports = cache.entry(host.to_ascii_lowercase()).or_default();
-        if ports.len() >= DNS_CACHE_MAX {
-            let now = Instant::now();
-            ports.retain(|_, entry| now.duration_since(entry.fetched_at) < DNS_CACHE_TTL);
-            if ports.len() >= DNS_CACHE_MAX {
-                ports.clear();
-            }
-        }
         ports.insert(
             port,
             DnsCacheEntry {
@@ -99,6 +92,26 @@ pub(super) async fn lookup_host_cached(
     Ok(Arc::from(addresses.as_slice()))
 }
 
+/// Keep the resolver cache within its cap.
+///
+/// The cap covers the entries of every host, not the ports of one host, so a
+/// proxy that bypasses many names cannot grow the cache without bound.
+fn prune_dns_cache(cache: &mut HashMap<String, HashMap<u16, DnsCacheEntry>>) {
+    let total: usize = cache.values().map(|ports| ports.len()).sum();
+    if total < DNS_CACHE_MAX {
+        return;
+    }
+    let now = Instant::now();
+    for ports in cache.values_mut() {
+        ports.retain(|_, entry| now.duration_since(entry.fetched_at) < DNS_CACHE_TTL);
+    }
+    cache.retain(|_, ports| !ports.is_empty());
+    let total: usize = cache.values().map(|ports| ports.len()).sum();
+    if total >= DNS_CACHE_MAX {
+        cache.clear();
+    }
+}
+
 /// The cached addresses for this host and port, if they are still fresh.
 ///
 /// The stored key is lowercased, so a host that carries uppercase letters
@@ -106,15 +119,18 @@ pub(super) async fn lookup_host_cached(
 /// already normalized host, and that path allocates nothing.
 fn cached_addresses(host: &str, port: u16) -> Option<Arc<[SocketAddr]>> {
     let cache = dns_cache().lock();
-    let entry = cache.get(host).and_then(|ports| ports.get(&port)).or_else(|| {
-        if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            cache
-                .get(&host.to_ascii_lowercase())
-                .and_then(|ports| ports.get(&port))
-        } else {
-            None
-        }
-    })?;
+    let entry = cache
+        .get(host)
+        .and_then(|ports| ports.get(&port))
+        .or_else(|| {
+            if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                cache
+                    .get(&host.to_ascii_lowercase())
+                    .and_then(|ports| ports.get(&port))
+            } else {
+                None
+            }
+        })?;
     (entry.fetched_at.elapsed() < DNS_CACHE_TTL).then(|| entry.addresses.clone())
 }
 
@@ -863,4 +879,159 @@ pub(crate) fn upstream_failure(
     };
     ctx.status.record(diagnostics.clone());
     upstream::diagnostics_error_page(&plan.domain, &diagnostics, ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::hint::black_box;
+
+    /// The cached addresses are shared, not copied, and the lookup does not
+    /// allocate a key.
+    #[tokio::test]
+    async fn the_dns_cache_answers_a_repeated_lookup() {
+        clear_dns_cache();
+        let first = lookup_host_cached("localhost", 443)
+            .await
+            .expect("localhost resolves");
+        assert!(!first.is_empty());
+        let second = lookup_host_cached("localhost", 443)
+            .await
+            .expect("localhost resolves");
+        // The second answer is the very same allocation.
+        assert!(Arc::ptr_eq(&first, &second));
+
+        // A different port is a different entry.
+        let other = lookup_host_cached("localhost", 8443)
+            .await
+            .expect("localhost resolves");
+        assert!(!Arc::ptr_eq(&first, &other));
+        clear_dns_cache();
+    }
+
+    /// The addresses of both families alternate, and the family of the first
+    /// address stays in front.
+    #[test]
+    fn interleaved_addresses_alternate_the_families() {
+        let addresses: Vec<SocketAddr> = vec![
+            "[2001:db8::1]:443".parse().unwrap(),
+            "192.0.2.1:443".parse().unwrap(),
+            "[2001:db8::2]:443".parse().unwrap(),
+            "192.0.2.2:443".parse().unwrap(),
+            "[2001:db8::3]:443".parse().unwrap(),
+        ];
+        let out = interleave_by_family(&addresses, |address| address.is_ipv4());
+        let families: Vec<bool> = out.iter().map(|address| address.is_ipv4()).collect();
+        // The IPv6 address leads because it came first.
+        assert_eq!(families, vec![false, true, false, true, false]);
+
+        // With an IPv4 address first the order flips.
+        let addresses: Vec<SocketAddr> = vec![
+            "192.0.2.1:443".parse().unwrap(),
+            "[2001:db8::1]:443".parse().unwrap(),
+            "192.0.2.2:443".parse().unwrap(),
+            "[2001:db8::2]:443".parse().unwrap(),
+        ];
+        let out = interleave_by_family(&addresses, |address| address.is_ipv4());
+        let families: Vec<bool> = out.iter().map(|address| address.is_ipv4()).collect();
+        assert_eq!(families, vec![true, false, true, false]);
+
+        // A single address and a pair are returned unchanged.
+        let one: Vec<SocketAddr> = vec!["192.0.2.1:443".parse().unwrap()];
+        assert_eq!(interleave_by_family(&one, |address| address.is_ipv4()), one);
+        let two: Vec<SocketAddr> = vec![
+            "[2001:db8::1]:443".parse().unwrap(),
+            "192.0.2.1:443".parse().unwrap(),
+        ];
+        assert_eq!(interleave_by_family(&two, |address| address.is_ipv4()), two);
+    }
+
+    /// The new implementation must produce exactly what the previous one
+    /// produced, for every mix of families and lengths.
+    #[test]
+    fn interleaving_matches_the_previous_implementation() {
+        fn previous<T: Clone, F: Fn(&T) -> bool>(items: &[T], is_preferred_family: F) -> Vec<T> {
+            if items.len() < 3 {
+                return items.to_vec();
+            }
+            let preferred_first = is_preferred_family(&items[0]);
+            let mut preferred = Vec::new();
+            let mut other = Vec::new();
+            for item in items {
+                if is_preferred_family(item) == preferred_first {
+                    preferred.push(item.clone());
+                } else {
+                    other.push(item.clone());
+                }
+            }
+            let mut preferred = preferred.into_iter();
+            let mut other = other.into_iter();
+            let mut out = Vec::new();
+            out.extend(preferred.next());
+            loop {
+                match other.next() {
+                    Some(item) => out.push(item),
+                    None => break,
+                }
+                match preferred.next() {
+                    Some(item) => out.push(item),
+                    None => break,
+                }
+            }
+            out.extend(preferred);
+            out.extend(other);
+            out
+        }
+
+        // Every mix of the two families up to a length of eight, and every
+        // order of it.
+        for length in 0..=8usize {
+            for mask in 0..(1u32 << length) {
+                let items: Vec<bool> = (0..length).map(|index| (mask >> index) & 1 == 1).collect();
+                let out = interleave_by_family(&items, |item| *item);
+                assert_eq!(out, previous(&items, |item| *item), "mask {mask:#b}");
+            }
+        }
+    }
+
+    /// The cache stays bounded: the cap covers the entries of every host, not
+    /// the ports of one host.
+    #[test]
+    fn the_dns_cache_stays_bounded() {
+        let mut cache: HashMap<String, HashMap<u16, DnsCacheEntry>> = HashMap::new();
+        for index in 0..(DNS_CACHE_MAX + 64) {
+            cache
+                .entry(format!("host{index}.invalid"))
+                .or_default()
+                .insert(
+                    443,
+                    DnsCacheEntry {
+                        addresses: Arc::from(Vec::<SocketAddr>::new()),
+                        fetched_at: Instant::now(),
+                    },
+                );
+        }
+        prune_dns_cache(&mut cache);
+        let total: usize = cache.values().map(|ports| ports.len()).sum();
+        assert!(
+            total <= DNS_CACHE_MAX,
+            "the cache held {total} entries, the cap is {DNS_CACHE_MAX}"
+        );
+    }
+
+    #[test]
+    #[ignore = "micro benchmark"]
+    fn bench_dns_cache_and_interleave() {
+        let addresses: Vec<SocketAddr> = vec![
+            "[2001:db8::1]:443".parse().unwrap(),
+            "192.0.2.1:443".parse().unwrap(),
+            "[2001:db8::2]:443".parse().unwrap(),
+            "192.0.2.2:443".parse().unwrap(),
+        ];
+        crate::bench::measure("connect.interleave_by_family", 1_000_000, || {
+            black_box(interleave_by_family(&addresses, |address| {
+                address.is_ipv4()
+            }));
+        });
+    }
 }
