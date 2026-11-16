@@ -1524,17 +1524,15 @@ impl RouteConnector {
     /// normal candidate stagger. A follower of the single-flight discovery
     /// uses the leader's plan and never looks at this one, so the lookup is
     /// done by the branches that consume it.
-    fn cached_plan_for(
-        &self,
-        cursor: &mut RouteCursor,
-        tls: bool,
-    ) -> Option<Arc<ConnectPlan>> {
+    fn cached_plan_for(&self, cursor: &mut RouteCursor, tls: bool) -> Option<Arc<ConnectPlan>> {
         // A catalog update asked this domain to try its new remote IPs before
         // any cached route.
         if cursor.skip_once() {
             return None;
         }
-        let plan = self.engine.cached_plan(cursor.domain(), cursor.port(), tls)?;
+        let plan = self
+            .engine
+            .cached_plan(cursor.domain(), cursor.port(), tls)?;
         // The cached route will be inserted as the first race future, so do
         // not generate the same plan again from the cursor.
         cursor.skip_plan(&plan);

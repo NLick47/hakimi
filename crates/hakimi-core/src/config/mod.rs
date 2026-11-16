@@ -1831,6 +1831,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_group_index_points_at_the_same_group_as_a_scan() {
+        let mut config = AppConfig::default();
+        config.canonicalize();
+        for (position, group) in config.groups.iter().enumerate() {
+            let index = config
+                .group_index_of(&group.id)
+                .unwrap_or_else(|| panic!("group {} is missing from the index", group.id));
+            assert_eq!(index, position);
+            assert_eq!(config.group(&group.id).unwrap().id, group.id);
+        }
+        assert!(config.group_index_of("no-such-group").is_none());
+    }
+
+    #[test]
+    fn the_group_index_follows_a_renamed_group() {
+        let mut config = AppConfig::default();
+        config.canonicalize();
+        let position = config
+            .groups
+            .iter()
+            .position(|group| group.id == "pixiv")
+            .expect("the default config has a pixiv group");
+        let original = config.groups[position].id.clone();
+        // A caller that renames a group in place leaves the index pointing at
+        // the old name; the lookup must not hand out the wrong group.
+        config.groups[position].id = "renamed".into();
+        assert!(config.group_index_of(&original).is_none());
+        assert!(config.group(&original).is_none());
+        // The renamed group is still reachable by its new name after the
+        // index is rebuilt.
+        config.canonicalize();
+        assert!(config.group("renamed").is_some());
+    }
+
+    #[test]
+    fn the_group_index_keeps_the_first_group_of_a_duplicated_id() {
+        let mut config = AppConfig::default();
+        config.canonicalize();
+        let first = config.group_index_of("pixiv").unwrap();
+        // A second group with the same id must not shadow the first one: a
+        // linear scan would have found the first.
+        config.groups.push(GroupConfig {
+            id: "pixiv".into(),
+            ..GroupConfig {
+                id: "pixiv".into(),
+                name: "duplicate".into(),
+                domains: Vec::new(),
+                enabled: true,
+                homepage: None,
+                default_route: RoutePolicy::direct(),
+            }
+        });
+        config.canonicalize();
+        assert_eq!(config.group_index_of("pixiv").unwrap(), first);
+    }
+
+    #[test]
+    #[ignore = "micro benchmark"]
+    fn bench_group_lookup() {
+        use std::hint::black_box;
+
+        let mut config = AppConfig::default();
+        config.canonicalize();
+        // The last group: a scan has to walk the whole list to find it.
+        let id = config.groups[config.groups.len() - 1].id.clone();
+
+        crate::bench::measure("config.group.scan", 1_000_000, || {
+            black_box(config.groups.iter().find(|group| group.id == id));
+        });
+        crate::bench::measure("config.group.index.lookup", 1_000_000, || {
+            black_box(config.group(&id));
+        });
+
+        // The config allows far more groups than the defaults ship. The scan
+        // grows with the list, the index does not.
+        let mut wide = AppConfig::default();
+        wide.canonicalize();
+        while wide.groups.len() < MAX_GROUPS {
+            let index = wide.groups.len();
+            wide.groups.push(GroupConfig {
+                id: format!("extra-{index}"),
+                name: format!("extra {index}"),
+                domains: Vec::new(),
+                enabled: true,
+                homepage: None,
+                default_route: RoutePolicy::direct(),
+            });
+        }
+        wide.canonicalize();
+        let wide_id = wide.groups[wide.groups.len() - 1].id.clone();
+        crate::bench::measure("config.group.scan.128", 200_000, || {
+            black_box(wide.groups.iter().find(|group| group.id == wide_id));
+        });
+        crate::bench::measure("config.group.index.lookup.128", 200_000, || {
+            black_box(wide.group(&wide_id));
+        });
+    }
+
+    #[test]
     fn defaults_validate_and_match_document() {
         let config = AppConfig::default();
         config.validate().unwrap();

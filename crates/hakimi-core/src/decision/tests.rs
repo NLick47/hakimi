@@ -1978,6 +1978,183 @@ fn bench_plan_cache_lookup() {
     });
 }
 
+/// The identity of a plan, used by the skip set of a route cursor.
+///
+/// The cursor consults it once per generated plan, and the plan is inserted
+/// when it is skipped and removed when it is reached.
+#[test]
+#[ignore = "micro benchmark"]
+fn bench_plan_identity() {
+    use std::hint::black_box;
+
+    let plan = test_plan(TlsMode::Direct, None);
+
+    // The identity as it was: the whole plan formatted into a string.
+    fn formatted(plan: &ConnectPlan) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        plan.ech_config.hash(&mut hasher);
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            plan.domain,
+            plan.port,
+            plan.tls,
+            plan.ip,
+            plan.mode.as_str(),
+            plan.sni.as_deref().unwrap_or(""),
+            hasher.finish()
+        )
+    }
+
+    crate::bench::measure("plan.identity.string", 1_000_000, || {
+        black_box(formatted(&plan));
+    });
+    crate::bench::measure("plan.identity.hash", 1_000_000, || {
+        black_box(plan.identity());
+    });
+}
+
+/// Two plans must never share an identity, and the same plan must always
+/// produce the same one.
+#[test]
+fn a_plan_identity_tells_every_field_apart() {
+    let base = test_plan(TlsMode::Direct, None);
+    let mut other = base.clone();
+    other.domain = "other.example".into();
+    assert_ne!(base.identity(), other.identity());
+    other = base.clone();
+    other.ip = "2.2.2.2".parse().unwrap();
+    assert_ne!(base.identity(), other.identity());
+    other = base.clone();
+    other.port = 8443;
+    assert_ne!(base.identity(), other.identity());
+    other = base.clone();
+    other.mode = TlsMode::Ech;
+    assert_ne!(base.identity(), other.identity());
+    other = base.clone();
+    other.sni = Some("www.bing.com".into());
+    assert_ne!(base.identity(), other.identity());
+    other = base.clone();
+    other.tls = false;
+    assert_ne!(base.identity(), other.identity());
+    // The same plan always produces the same identity.
+    assert_eq!(base.identity(), base.clone().identity());
+}
+
+/// How long the plan cache holds its write lock while it is pruned.
+///
+/// The prune sorts every entry to find the oldest ones. Doing that under the
+/// write lock blocked every routing decision for the length of the sort; the
+/// sort now runs without the lock.
+#[test]
+#[ignore = "micro benchmark"]
+fn bench_plan_cache_prune() {
+    use std::hint::black_box;
+
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let ttl = Duration::from_secs(600);
+
+    // The prune as it was before the change: everything under the write lock.
+    type PlanCache = HashMap<String, HashMap<(u16, bool), (Instant, Arc<ConnectPlan>)>>;
+    fn prune_under_lock(cache: &mut PlanCache, ttl: Duration, to: usize) {
+        let mut retained = 0;
+        cache.retain(|_, inner| {
+            inner.retain(|_, (at, _)| at.elapsed() < ttl);
+            retained += inner.len();
+            !inner.is_empty()
+        });
+        if retained < PLAN_CACHE_MAX {
+            return;
+        }
+        let mut ages: Vec<(String, u16, bool, Instant)> = Vec::new();
+        for (domain, inner) in cache.iter() {
+            for ((port, tls), (at, _)) in inner.iter() {
+                ages.push((domain.clone(), *port, *tls, *at));
+            }
+        }
+        ages.sort_by_key(|(_, _, _, at)| *at);
+        let excess = retained - to;
+        for (domain, port, tls, _) in ages.into_iter().take(excess) {
+            let mut empty = false;
+            if let Some(inner) = cache.get_mut(&domain) {
+                inner.remove(&(port, tls));
+                empty = inner.is_empty();
+            }
+            if empty {
+                cache.remove(&domain);
+            }
+        }
+    }
+
+    let fill_to_cap = |engine: &DecisionEngine, prefix: &str| {
+        let mut counter = 0usize;
+        while engine
+            .plan_cache
+            .read()
+            .values()
+            .map(|inner| inner.len())
+            .sum::<usize>()
+            < PLAN_CACHE_MAX
+                - 1
+        {
+            let mut plan = test_plan(TlsMode::Direct, None);
+            plan.domain = format!("{prefix}{counter}.example");
+            counter += 1;
+            engine.remember_plan_arc(Arc::new(plan));
+        }
+    };
+
+    // The old prune, with the whole sort inside the write lock. The cache
+    // sits exactly on the cap, which is the state the old code pruned.
+    fill_to_cap(&h.engine, "old-");
+    {
+        let mut cache = h.engine.plan_cache.write();
+        let mut plan = test_plan(TlsMode::Direct, None);
+        plan.domain = "over-cap.example".into();
+        cache
+            .entry(plan.domain.clone())
+            .or_default()
+            .insert((443, true), (Instant::now(), Arc::new(plan)));
+    }
+    let started = Instant::now();
+    {
+        let mut cache = h.engine.plan_cache.write();
+        prune_under_lock(&mut cache, ttl, super::engine::PLAN_CACHE_PRUNE_TO);
+    }
+    let old_total = started.elapsed();
+
+    // The new prune: the sort runs without the lock.
+    fill_to_cap(&h.engine, "new-");
+    let mut plan = test_plan(TlsMode::Direct, None);
+    plan.domain = "trigger.example".into();
+    let started = Instant::now();
+    h.engine.remember_plan_arc(Arc::new(plan));
+    let new_total = started.elapsed();
+
+    // The part of the new prune that no longer holds the lock: the sort.
+    let sort_time = {
+        let cache = h.engine.plan_cache.read();
+        let mut ages: Vec<(String, u16, bool, Instant)> = Vec::new();
+        for (domain, inner) in cache.iter() {
+            for ((port, tls), (at, _)) in inner.iter() {
+                ages.push((domain.clone(), *port, *tls, *at));
+            }
+        }
+        let started = Instant::now();
+        ages.sort_by_key(|(_, _, _, at)| *at);
+        black_box(ages.len());
+        started.elapsed()
+    };
+
+    println!(
+        "plan cache prune over {PLAN_CACHE_MAX} entries:\n  \
+         old: {old_total:?} with the write lock held for all of it\n  \
+         new: {new_total:?} with the write lock held for about {:?}\n  \
+         the sort that moved out of the lock took {sort_time:?}",
+        new_total.saturating_sub(sort_time)
+    );
+}
+
 /// A total failure must be published only after the racing attempts reported
 /// back.
 ///
