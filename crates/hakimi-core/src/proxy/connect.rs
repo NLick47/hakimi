@@ -240,7 +240,7 @@ pub(super) async fn handle_connect(
     } else {
         None
     };
-    if direct_only || !ctx.ca.installed() {
+    if direct_only || !ctx.ca.installed_async().await {
         return tunnel_direct_group(req, &ctx, host, port, cached_plan).await;
     }
 

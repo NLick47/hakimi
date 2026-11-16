@@ -208,24 +208,63 @@ impl CertificateAuthority {
     /// first read after start or after [`Self::invalidate_status`] — runs the
     /// probe itself, because guessing "untrusted" there would be wrong.
     pub fn installed(self: &Arc<Self>) -> bool {
-        // Trust state changes only when the user (de)installs the CA. The
-        // flag is the common true case: every CONNECT passes through here,
-        // and the test hook below costs a process env lock plus an
-        // allocation. The two checks are order-equivalent.
+        match self.trust_state() {
+            Some(installed) => installed,
+            // No snapshot at all: the answer needs a real probe.
+            None => self.status().installed,
+        }
+    }
+
+    /// Trust state for the CONNECT path.
+    ///
+    /// The only difference to [`Self::installed`] is the cold case: with no
+    /// snapshot at all the answer needs a real probe, and `trust_status`
+    /// shells out to `security(1)` for tens to hundreds of milliseconds.
+    /// Running that on a Tokio worker stalls every other task pinned to the
+    /// same thread, so the probe goes to the blocking pool and the caller
+    /// waits for the result without occupying a worker.
+    pub async fn installed_async(self: &Arc<Self>) -> bool {
+        match self.trust_state() {
+            Some(installed) => installed,
+            None => {
+                let this = Arc::clone(self);
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => handle
+                        .spawn_blocking(move || this.status().installed)
+                        .await
+                        .unwrap_or(false),
+                    // No runtime (one-shot CLI commands, unit tests): the probe
+                    // runs here, which is the only option left.
+                    Err(_) => self.status().installed,
+                }
+            }
+        }
+    }
+
+    /// The trust state when it is known without a probe.
+    ///
+    /// Trust state changes only when the user (de)installs the CA. The flag is
+    /// the common true case: every CONNECT passes through here, and the test
+    /// hook below costs a process env lock plus an allocation. The two checks
+    /// are order-equivalent.
+    ///
+    /// `None` means that nothing has been probed yet, so only a real probe can
+    /// answer.
+    fn trust_state(self: &Arc<Self>) -> Option<bool> {
         if self.installed_flag.load(Ordering::Relaxed) {
-            return true;
+            return Some(true);
         }
         // Test hook: a harness cannot install a CA without a user prompt.
         if crate::hooks::assume_ca_installed() {
-            return true;
+            return Some(true);
         }
         match self.cached_snapshot() {
-            None => self.status().installed,
+            None => None,
             Some((status, age)) => {
                 if age >= CA_STATUS_TTL {
                     self.schedule_probe();
                 }
-                status.installed
+                Some(status.installed)
             }
         }
     }
