@@ -500,6 +500,15 @@ struct WindowShell {
     closing: Rc<Cell<bool>>,
 }
 
+/// Remembers the window geometry for the next rebuild. Only call while the
+/// window is on screen: a minimized window reports its iconic position
+/// (-32000,-32000 on Windows), which would strand the next window off screen.
+fn remember_window_geometry(window: &slint::Window) {
+    WINDOW_STATE.with(|slot| {
+        *slot.borrow_mut() = Some((window.position(), window.size()));
+    });
+}
+
 /// Everything a window (re)build needs from the process.
 #[derive(Clone)]
 struct UiContext {
@@ -1009,11 +1018,11 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
                     return;
                 };
                 let window = app.window();
-                if window.is_minimized() {
-                    // A minimized window keeps its taskbar entry and state;
-                    // there is nothing to paint, so just skip the refresh.
-                    return;
-                }
+                // Closed must win over minimized: a window closed from the
+                // taskbar while minimized is hidden but still reports
+                // minimized, because Windows leaves `IsIconic` set on a hidden
+                // iconic window. Treating that as merely minimized never
+                // released the UI.
                 if !window.is_visible() {
                     if !closing.replace(true) {
                         // Closed to the tray: remember the window geometry and
@@ -1022,9 +1031,12 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
                         // returns; the runtime and the tray stay alive.
                         PAGE_STATE.with(|page| page.set(app.get_page()));
                         SITES_EXPANDED_STATE.with(|flag| flag.set(app.get_sites_expanded()));
-                        WINDOW_STATE.with(|slot| {
-                            *slot.borrow_mut() = Some((window.position(), window.size()));
-                        });
+                        // A minimized window reports its off-screen iconic
+                        // position, so keep the geometry an earlier tick
+                        // recorded for the next rebuild.
+                        if !window.is_minimized() {
+                            remember_window_geometry(&window);
+                        }
                         release_ui_caches(&app);
                         let _ = slint::invoke_from_event_loop(move || {
                             WINDOW.with(|slot| {
@@ -1040,6 +1052,14 @@ fn build_window(ctx: &UiContext) -> Result<WindowShell> {
                     }
                     return;
                 }
+                if window.is_minimized() {
+                    // A minimized window keeps its taskbar entry and state;
+                    // there is nothing to paint, so just skip the refresh.
+                    return;
+                }
+                // Record the on-screen geometry every tick: a close from the
+                // taskbar while minimized has no usable position to read then.
+                remember_window_geometry(&window);
                 let scale = window.scale_factor();
                 let previous = applied_scale.replace(scale);
                 if previous > 0.0 && (scale - previous).abs() > 0.001 {
