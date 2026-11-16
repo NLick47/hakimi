@@ -3,11 +3,11 @@
 //! Field renames live in serde (`alias`), not here — migrations only upgrade
 //! shapes. Every `apply` is idempotent and leaves user-customized values alone.
 
-use super::{AdvancedConfig, AppConfig, GroupConfig, ImageRelayRule, RoutePolicy};
+use super::{AdvancedConfig, AppConfig, DownloadConfig, GroupConfig, ImageRelayRule, RoutePolicy};
 
 /// Shape version this build writes. Bump when adding a migration; files
 /// without the field deserialize as 0 and catch up in one load.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 type MigrationFn = fn(&mut AppConfig) -> bool;
 
@@ -51,6 +51,12 @@ static MIGRATIONS: &[Migration] = &[
         describe: "a half-created pixiv relay adopts the shipped address",
         applies_below: Some(4),
         apply: migrate_pixiv_relay,
+    },
+    Migration {
+        version: "0.1.11",
+        describe: "download chunks adopt the 512 KiB default",
+        applies_below: Some(5),
+        apply: migrate_download_chunk_default,
     },
 ];
 
@@ -129,6 +135,20 @@ fn migrate_http1_hosts_asset_cdn(config: &mut AppConfig) -> bool {
     ];
     let current = AdvancedConfig::default().http1_hosts;
     fold_default(&mut config.advanced.http1_hosts, &old, &current)
+}
+
+/// The first chunked-download default was 128 KiB. A file that customized any
+/// download field materialized the whole `download` object, old chunk size
+/// included, so those installs would keep paying a round trip per 128 KiB even
+/// after the default moved to 512 KiB. Anything other than the old default is
+/// a deliberate choice and is left alone.
+fn migrate_download_chunk_default(config: &mut AppConfig) -> bool {
+    let current = DownloadConfig::default().chunk_bytes;
+    fold_default(
+        &mut config.advanced.download.chunk_bytes,
+        &(128 * 1024),
+        &current,
+    )
 }
 
 fn migrate_poipiku_auto(config: &mut AppConfig) -> bool {
@@ -235,6 +255,27 @@ mod tests {
         assert!(!run_migrations(&mut config).is_empty());
         assert!(run_migrations(&mut config).is_empty());
         assert_eq!(config.schema_version, SCHEMA_VERSION);
+    }
+
+    /// A file that materialized the old 128 KiB chunk default — because it
+    /// customized another download field — folds onto the new default. A chunk
+    /// size the user actually chose survives.
+    #[test]
+    fn the_old_download_chunk_default_folds_onto_the_new_one() {
+        let mut config = AppConfig::default();
+        config.schema_version = 4;
+        config.advanced.download.chunk_bytes = 128 * 1024;
+        assert!(!run_migrations(&mut config).is_empty());
+        assert_eq!(
+            config.advanced.download.chunk_bytes,
+            DownloadConfig::default().chunk_bytes
+        );
+
+        let mut custom = AppConfig::default();
+        custom.schema_version = 4;
+        custom.advanced.download.chunk_bytes = 1024 * 1024;
+        run_migrations(&mut custom);
+        assert_eq!(custom.advanced.download.chunk_bytes, 1024 * 1024);
     }
 
     /// The first version of the settings card created the rule on the first

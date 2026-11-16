@@ -398,12 +398,17 @@ impl Default for DownloadConfig {
             enabled: true,
             // a few MB on a slow link takes minutes on one connection
             min_size_bytes: 2 * 1024 * 1024,
-            // the first chunk streams single-connection for about one chunk
+            // The first chunk streams single-connection for about one chunk
             // duration, so a smaller chunk shortens the 1x phase; a larger one
             // makes completion arrive in sparse bursts and the progress bar
-            // oscillates between 0 and a jump
+            // oscillates between 0 and a jump.
             segments: 6,
-            chunk_bytes: 128 * 1024,
+            // Each chunk is one HTTP request. At 128 KiB a 10 MB asset paid
+            // ~80 round trips, so on a 300–450 ms link the request latency
+            // dominated and six connections could not fill the pipe. 512 KiB
+            // keeps the progress granularity while cutting the request count
+            // by four.
+            chunk_bytes: 512 * 1024,
             stall_timeout_secs: 20,
             max_conns: 32,
             mirror_source: DEFAULT_MIRROR_SOURCE.to_string(),
@@ -2696,6 +2701,27 @@ mod tests {
         manager.update(manager.snapshot().as_ref().clone()).unwrap();
         let text = std::fs::read_to_string(paths.config_file()).unwrap();
         assert!(!text.contains("http1Hosts"));
+    }
+
+    /// A file that customized any download field materialized the whole
+    /// `download` object, the old 128 KiB chunk size included. Loading it must
+    /// adopt the new 512 KiB default and drop the stale value from disk.
+    #[test]
+    fn a_materialized_old_chunk_default_adopts_the_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let mut legacy = AppConfig::default();
+        legacy.schema_version = 4;
+        legacy.advanced.download.chunk_bytes = 128 * 1024;
+        std::fs::write(paths.config_file(), serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        let manager = ConfigManager::load(paths.config_file()).unwrap();
+        assert_eq!(
+            manager.snapshot().advanced.download.chunk_bytes,
+            DownloadConfig::default().chunk_bytes
+        );
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(!text.contains("131072"), "{text}");
     }
 
     #[test]
