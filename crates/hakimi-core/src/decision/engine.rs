@@ -1159,25 +1159,40 @@ impl DecisionEngine {
         // Bounded map: when full, drop the least valuable entries — the ones
         // with the worst measured quality — instead of wiping everything. A
         // flood of dead IPs must never erase knowledge of a proven route.
+        //
+        // The ranking sorts every entry, so it runs outside the write lock:
+        // the lock covers the update and the removal, not the whole ranking.
         let total = self.ip_score_count.load(Ordering::Relaxed);
         if total > IP_SCORE_CAP {
-            let mut ranked: Vec<((String, IpAddr), f64)> = scores
-                .iter()
-                .flat_map(|(domain, by_ip)| {
-                    by_ip
-                        .iter()
-                        .map(|(ip, score)| ((domain.clone(), *ip), score.rank()))
-                })
-                .collect();
+            drop(scores);
+            let mut ranked: Vec<((String, IpAddr), f64)> = {
+                let scores = self.ip_scores.read();
+                scores
+                    .iter()
+                    .flat_map(|(domain, by_ip)| {
+                        by_ip
+                            .iter()
+                            .map(|(ip, score)| ((domain.clone(), *ip), score.rank()))
+                    })
+                    .collect()
+            };
             ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let victims: Vec<(String, IpAddr)> = ranked
+                .into_iter()
+                .take(total - IP_SCORE_PRUNE_TO)
+                .map(|((domain, ip), _)| (domain, ip))
+                .collect();
             let mut removed = 0usize;
-            for ((domain, ip), _) in ranked.into_iter().take(total - IP_SCORE_PRUNE_TO) {
-                if let Some(by_ip) = scores.get_mut(&domain) {
-                    if by_ip.remove(&ip).is_some() {
-                        removed += 1;
-                    }
-                    if by_ip.is_empty() {
-                        scores.remove(&domain);
+            {
+                let mut scores = self.ip_scores.write();
+                for (domain, ip) in victims {
+                    if let Some(by_ip) = scores.get_mut(&domain) {
+                        if by_ip.remove(&ip).is_some() {
+                            removed += 1;
+                        }
+                        if by_ip.is_empty() {
+                            scores.remove(&domain);
+                        }
                     }
                 }
             }
@@ -1190,63 +1205,82 @@ impl DecisionEngine {
     /// allocation, so a successful connection no longer deep-copies the
     /// domain, group and SNI strings.
     pub(super) fn remember_plan_arc(&self, plan: Arc<ConnectPlan>) {
-        let mut cache = self.plan_cache.write();
-        let mut total = self.plan_cache_count.load(Ordering::Relaxed);
-        if total >= PLAN_CACHE_MAX {
-            let ttl = Duration::from_secs(self.config.snapshot().advanced.plan_cache_secs);
+        let domain = plan_cache_domain(&plan.domain).into_owned();
+        let port = plan.port;
+        let tls = plan.tls;
+        let entry = (Instant::now(), plan);
+        {
+            let mut cache = self.plan_cache.write();
+            match cache.get_mut(&domain) {
+                Some(inner) => {
+                    if inner.insert((port, tls), entry).is_none() {
+                        self.plan_cache_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                None => {
+                    let mut inner = HashMap::new();
+                    inner.insert((port, tls), entry);
+                    cache.insert(domain, inner);
+                    self.plan_cache_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        // The cache is bounded, and pruning it means sorting every entry to
+        // find the oldest ones. That sort must not run under the write lock:
+        // every routing decision reads the plan cache, and a full sort of a
+        // few thousand entries blocked all of them.
+        if self.plan_cache_count.load(Ordering::Relaxed) >= PLAN_CACHE_MAX {
+            self.prune_plan_cache();
+        }
+    }
+
+    /// Drop the expired and the oldest entries of the plan cache.
+    ///
+    /// The write lock is only held for the map edits; the sort of the entry
+    /// ages happens without it.
+    fn prune_plan_cache(&self) {
+        let ttl = Duration::from_secs(self.config.snapshot().advanced.plan_cache_secs);
+        // Phase 1: drop the expired entries and collect the ages of the rest.
+        let mut ages: Vec<(String, u16, bool, Instant)> = Vec::new();
+        {
+            let mut cache = self.plan_cache.write();
             let mut retained = 0;
             cache.retain(|_, inner| {
                 inner.retain(|_, (at, _)| at.elapsed() < ttl);
                 retained += inner.len();
                 !inner.is_empty()
             });
-            total = retained;
-            // A crawler can push more than the cap of *fresh* plans in the TTL
-            // window; keep the newest instead of scanning the full map on every
-            // subsequent success.
-            if total >= PLAN_CACHE_MAX {
-                let mut ages: Vec<(String, u16, bool, Instant)> = Vec::new();
-                for (domain, inner) in cache.iter() {
-                    for ((port, tls), (at, _)) in inner.iter() {
-                        ages.push((domain.clone(), *port, *tls, *at));
-                    }
-                }
-                ages.sort_by_key(|(_, _, _, at)| *at);
-                let excess = total - PLAN_CACHE_PRUNE_TO;
-                let mut removed = 0;
-                for (domain, port, tls, _) in ages.into_iter().take(excess) {
-                    let mut empty = false;
-                    if let Some(inner) = cache.get_mut(&domain) {
-                        if inner.remove(&(port, tls)).is_some() {
-                            removed += 1;
-                        }
-                        empty = inner.is_empty();
-                    }
-                    if empty {
-                        cache.remove(&domain);
-                    }
-                }
-                total = total.saturating_sub(removed);
+            self.plan_cache_count.store(retained, Ordering::Relaxed);
+            if retained < PLAN_CACHE_MAX {
+                return;
             }
-            self.plan_cache_count.store(total, Ordering::Relaxed);
-        }
-        let domain = plan_cache_domain(&plan.domain).into_owned();
-        let port = plan.port;
-        let tls = plan.tls;
-        let entry = (Instant::now(), plan);
-        match cache.get_mut(&domain) {
-            Some(inner) => {
-                if inner.insert((port, tls), entry).is_none() {
-                    self.plan_cache_count.fetch_add(1, Ordering::Relaxed);
+            for (domain, inner) in cache.iter() {
+                for ((port, tls), (at, _)) in inner.iter() {
+                    ages.push((domain.clone(), *port, *tls, *at));
                 }
-            }
-            None => {
-                let mut inner = HashMap::new();
-                inner.insert((port, tls), entry);
-                cache.insert(domain, inner);
-                self.plan_cache_count.fetch_add(1, Ordering::Relaxed);
             }
         }
+        // Phase 2: the sort runs without the lock.
+        ages.sort_by_key(|(_, _, _, at)| *at);
+        let excess = ages.len().saturating_sub(PLAN_CACHE_PRUNE_TO);
+        // Phase 3: apply the eviction.
+        let mut removed = 0usize;
+        {
+            let mut cache = self.plan_cache.write();
+            for (domain, port, tls, _) in ages.into_iter().take(excess) {
+                let mut empty = false;
+                if let Some(inner) = cache.get_mut(&domain) {
+                    if inner.remove(&(port, tls)).is_some() {
+                        removed += 1;
+                    }
+                    empty = inner.is_empty();
+                }
+                if empty {
+                    cache.remove(&domain);
+                }
+            }
+        }
+        self.plan_cache_count.fetch_sub(removed, Ordering::Relaxed);
     }
 
     /// Remember the route that just succeeded so the background task can
@@ -1261,15 +1295,24 @@ impl DecisionEngine {
         if !plan.tls {
             return;
         }
-        let mut quality = self.route_quality.write();
-        if quality.len() >= ROUTE_QUALITY_CAP && !quality.contains_key(&plan.domain) {
-            let oldest = quality
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_seen)
-                .map(|(domain, _)| domain.clone());
-            if let Some(domain) = oldest {
-                quality.remove(&domain);
+        // The table is bounded, and the eviction picks the least recently seen
+        // route. That scan runs under a read lock so it does not block the
+        // other readers of the table; the write lock below only covers the
+        // eviction and the update.
+        let oldest = {
+            let quality = self.route_quality.read();
+            if quality.len() >= ROUTE_QUALITY_CAP && !quality.contains_key(&plan.domain) {
+                quality
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_seen)
+                    .map(|(domain, _)| domain.clone())
+            } else {
+                None
             }
+        };
+        let mut quality = self.route_quality.write();
+        if let Some(domain) = oldest {
+            quality.remove(&domain);
         }
         if let Some(entry) = quality.get_mut(&plan.domain) {
             if entry.plan.ip != plan.ip {

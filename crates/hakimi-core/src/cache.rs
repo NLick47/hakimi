@@ -561,21 +561,27 @@ impl CacheManager {
         }
     }
 
-    /// [`Self::prune_by_age`] for the qtype-bucketed DoH maps: the cap and
-    /// the oldest-first order apply to the *total* entry count across every
-    /// bucket, not per bucket.
-    fn prune_doh<V>(
-        map: &mut HashMap<u16, HashMap<String, V>>,
+    /// The entries a prune of the qtype-bucketed DoH maps would drop, oldest
+    /// first.
+    ///
+    /// The cap and the oldest-first order apply to the *total* entry count
+    /// across every bucket, not per bucket.
+    ///
+    /// Collecting the entries needs the map, sorting them does not: the caller
+    /// sorts outside the lock and applies the result afterwards. Sorting under
+    /// the cache's write lock blocked every reader of the cache — including
+    /// the routing path — for the length of a full sort.
+    fn doh_prune_candidates<V>(
+        map: &HashMap<u16, HashMap<String, V>>,
         max: usize,
-        to: usize,
         at: impl Fn(&V) -> DateTime<Utc>,
-    ) {
+    ) -> Option<Vec<(u16, String, DateTime<Utc>)>> {
         let total: usize = map.values().map(|bucket| bucket.len()).sum();
         if total <= max {
-            return;
+            return None;
         }
         let at = &at;
-        let mut by_age: Vec<(u16, String, DateTime<Utc>)> = map
+        let candidates: Vec<(u16, String, DateTime<Utc>)> = map
             .iter()
             .flat_map(|(qtype, bucket)| {
                 bucket
@@ -583,9 +589,15 @@ impl CacheManager {
                     .map(move |(domain, value)| (*qtype, domain.clone(), at(value)))
             })
             .collect();
-        by_age.sort_by_key(|(_, _, at)| *at);
-        let overflow = total - to;
-        for (qtype, domain, _) in by_age.into_iter().take(overflow) {
+        Some(candidates)
+    }
+
+    /// Drop the entries a DoH prune selected.
+    fn apply_doh_prune<V>(
+        map: &mut HashMap<u16, HashMap<String, V>>,
+        victims: Vec<(u16, String)>,
+    ) {
+        for (qtype, domain) in victims {
             let empty = map.get_mut(&qtype).is_some_and(|bucket| {
                 bucket.remove(&domain);
                 bucket.is_empty()
@@ -766,14 +778,29 @@ impl CacheManager {
     }
 
     pub fn put_doh_answer(&self, answer: CachedAnswer) {
+        let candidates = {
+            let mut data = self.data.write();
+            data.doh
+                .entry(answer.qtype)
+                .or_default()
+                .insert(answer.domain.clone(), answer);
+            Self::doh_prune_candidates(&data.doh, MAX_DOH_ANSWERS, |answer| {
+                answer.fetched_at
+            })
+        };
+        let Some(mut candidates) = candidates else {
+            return;
+        };
+        // The sort runs without the cache's write lock.
+        candidates.sort_by_key(|(_, _, at)| *at);
+        let overflow = candidates.len().saturating_sub(DOH_PRUNE_TO);
+        let victims: Vec<(u16, String)> = candidates
+            .into_iter()
+            .take(overflow)
+            .map(|(qtype, domain, _)| (qtype, domain))
+            .collect();
         let mut data = self.data.write();
-        data.doh
-            .entry(answer.qtype)
-            .or_default()
-            .insert(answer.domain.clone(), answer);
-        Self::prune_doh(&mut data.doh, MAX_DOH_ANSWERS, DOH_PRUNE_TO, |answer| {
-            answer.fetched_at
-        });
+        Self::apply_doh_prune(&mut data.doh, victims);
     }
 
     /// True while a fresh negative result for this domain/qtype exists.
@@ -809,24 +836,36 @@ impl CacheManager {
         if ttl_secs == 0 {
             return;
         }
+        let candidates = {
+            let mut data = self.data.write();
+            data.doh_negative
+                .entry(qtype)
+                .or_default()
+                .insert(
+                    domain.to_string(),
+                    CachedNegative {
+                        ttl_secs,
+                        authoritative,
+                        fetched_at: now(),
+                    },
+                );
+            Self::doh_prune_candidates(&data.doh_negative, MAX_DOH_NEGATIVE, |entry| {
+                entry.fetched_at
+            })
+        };
+        let Some(mut candidates) = candidates else {
+            return;
+        };
+        // The sort runs without the cache's write lock.
+        candidates.sort_by_key(|(_, _, at)| *at);
+        let overflow = candidates.len().saturating_sub(DOH_NEGATIVE_PRUNE_TO);
+        let victims: Vec<(u16, String)> = candidates
+            .into_iter()
+            .take(overflow)
+            .map(|(qtype, domain, _)| (qtype, domain))
+            .collect();
         let mut data = self.data.write();
-        data.doh_negative
-            .entry(qtype)
-            .or_default()
-            .insert(
-                domain.to_string(),
-                CachedNegative {
-                    ttl_secs,
-                    authoritative,
-                    fetched_at: now(),
-                },
-            );
-        Self::prune_doh(
-            &mut data.doh_negative,
-            MAX_DOH_NEGATIVE,
-            DOH_NEGATIVE_PRUNE_TO,
-            |entry| entry.fetched_at,
-        );
+        Self::apply_doh_prune(&mut data.doh_negative, victims);
     }
 
     pub fn clear_doh_negative(&self, domain: &str, qtype: u16) {
