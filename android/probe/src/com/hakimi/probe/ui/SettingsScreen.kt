@@ -41,6 +41,8 @@ class SettingsScreen(private val context: Context, private val host: Host) {
     private lateinit var resetCatalogRow: SettingRow
     private lateinit var mirrorRow: SwitchRow
     private lateinit var mirrorSourceRow: SettingRow
+    private lateinit var downloadEnabledRow: SwitchRow
+    private lateinit var downloadSegmentsRow: SettingRow
     private lateinit var relayEnabledRow: SwitchRow
     private lateinit var relayBaseRow: SettingRow
     private lateinit var relayHostsRow: SettingRow
@@ -196,7 +198,14 @@ class SettingsScreen(private val context: Context, private val host: Host) {
                 mirrorSource()
             )
         }
-        content.addView(rowsCard(mirrorRow, mirrorSourceRow))
+        downloadEnabledRow = SwitchRow(context, "分段下载")
+        downloadEnabledRow.onCheckedChange = { host.setDownloadEnabled(it) }
+        downloadSegmentsRow = SettingRow(context, "下载线程")
+        downloadSegmentsRow.clickOnce { showDownloadThreads() }
+        content.addView(rowsCard(
+            mirrorRow, mirrorSourceRow,
+            downloadEnabledRow, downloadSegmentsRow
+        ))
         content.addView(space(10f))
 
         content.addView(section("并发连接"))
@@ -370,6 +379,17 @@ class SettingsScreen(private val context: Context, private val host: Host) {
             if (mirrorEnabled) Palette.TEXT_2 else Palette.MUTED
         )
 
+        val download = downloadConfig()
+        val downloadEnabled = download?.optBoolean("enabled", true) != false
+        // Keep the tap the user just made visible until the save settles.
+        if (!host.savingConfig) {
+            downloadEnabledRow.setChecked(downloadEnabled)
+            downloadSegmentsRow.setValue(
+                downloadSegments().toString(),
+                if (downloadEnabled) Palette.TEXT_2 else Palette.MUTED
+            )
+        }
+
         val always = Prefs.systemAlwaysOn(context)
         alwaysOnRow.setValue(
             if (always) "已开启" else "未开启",
@@ -388,6 +408,10 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         resetCatalogRow.setBusy(host.savingConfig)
         mirrorRow.setBusy(host.savingConfig)
         mirrorSourceRow.setBusy(host.savingConfig)
+        downloadEnabledRow.setBusy(host.savingConfig)
+        // The thread count has no effect while segmentation is off; a row that
+        // still opens a picker would imply otherwise.
+        downloadSegmentsRow.setBusy(host.savingConfig || !downloadEnabled)
         relayEnabledRow.setBusy(host.savingConfig)
         relayBaseRow.setBusy(host.savingConfig)
         relayHostsRow.setBusy(host.savingConfig)
@@ -525,6 +549,65 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         ?.optJSONObject("download")
         ?.optString("mirrorSource")
         .orEmpty()
+
+    private fun downloadConfig(): JSONObject? = host.core.configJson
+        .optJSONObject("advanced")
+        ?.optJSONObject("download")
+
+    /// A config written while every download field still matched the defaults
+    /// has no `download` object at all, so the shipped value is the fallback.
+    /// The runtime clamps to 2..8; a hand-edited value outside that range must
+    /// not leave the row showing something else.
+    private fun downloadSegments(): Int =
+        (downloadConfig()?.optInt("segments", 6) ?: 6).coerceIn(2, 8)
+
+    /// The same sheet / selected-row language as the 运行模式 chooser, with the
+    /// options laid out as a compact grid so seven values do not become a long
+    /// full-height list.
+    private fun showDownloadThreads() {
+        val current = downloadSegments()
+        val sheet = Sheet(context, "下载线程", "同时下载的分段数")
+        val grid = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+
+        (2..8).chunked(4).forEachIndexed { rowIndex, values ->
+            val row = context.row()
+            values.forEachIndexed { index, value ->
+                val active = value == current
+                val cell = context.text(
+                    value.toString(),
+                    15f,
+                    if (active) Palette.ACCENT_DIM else Palette.TEXT,
+                    medium = true
+                ).apply {
+                    gravity = Gravity.CENTER
+                    background = if (active) {
+                        context.rounded(Palette.ACCENT_SOFT, 10f, Palette.ACCENT, 1f)
+                    } else {
+                        context.rounded(Palette.SURFACE_2, 10f, Palette.BORDER, 1f)
+                    }
+                    clickOnce(300L) {
+                        sheet.dismiss()
+                        downloadSegmentsRow.setValue(value.toString(), Palette.TEXT_2)
+                        host.setDownloadSegments(value)
+                    }
+                }
+                row.addView(cell, LinearLayout.LayoutParams(0, context.dp(46f), 1f).apply {
+                    marginEnd = if (index == values.lastIndex) 0 else context.dp(8f)
+                })
+            }
+            // Keep the last row's cells on the same four-column grid.
+            repeat(4 - values.size) {
+                row.addView(View(context), LinearLayout.LayoutParams(0, 1, 1f))
+            }
+            grid.addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { if (rowIndex > 0) topMargin = context.dp(8f) })
+        }
+
+        sheet.add(grid)
+        sheet.show()
+    }
 
     /// Joined for the edit dialog; the same comma-separated shape the desktop
     /// settings field uses.

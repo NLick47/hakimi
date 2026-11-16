@@ -15,7 +15,8 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use hakimi_core::config::{
-    AppConfig, DomainRule, GroupConfig, RouteAttempt, RoutePolicy, DEFAULT_MIRROR_SOURCE,
+    AppConfig, DomainRule, DownloadConfig, GroupConfig, RouteAttempt, RoutePolicy,
+    DEFAULT_MIRROR_SOURCE,
 };
 use hakimi_core::instance::{InstanceLock, InstanceLockError};
 use hakimi_core::runtime::HakimiRuntime;
@@ -1302,6 +1303,12 @@ fn apply_ui_update(
         if changed(|s| &s.mirror_source) {
             app.set_cfg_mirror_source(SharedString::from(settings.mirror_source.clone()));
         }
+        if old.is_none_or(|prev| prev.download_enabled != settings.download_enabled) {
+            app.set_cfg_download_enabled(settings.download_enabled);
+        }
+        if changed(|s| &s.download_segments) {
+            app.set_cfg_download_segments(SharedString::from(settings.download_segments.clone()));
+        }
         if old.is_none_or(|prev| prev.relay_enabled != settings.relay_enabled) {
             app.set_cfg_relay_enabled(settings.relay_enabled);
         }
@@ -1538,6 +1545,11 @@ pub(crate) struct SettingsValues {
     pub catalog_doh: String,
     pub mirror_source: String,
     pub download_mirror: bool,
+    /// Chunked-download controls. The chunk size stays an internal default;
+    /// the card only exposes whether segmentation runs and how many
+    /// connections work in parallel.
+    pub download_enabled: bool,
+    pub download_segments: String,
     pub relay_enabled: bool,
     pub relay_listen: String,
     pub relay_target: String,
@@ -1566,11 +1578,27 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
             .unwrap_or_default()
     };
     // the source URL doubles as the switch: empty means the mirror is off
-    let mirror_source = config
+    let download = config
         .get("advanced")
-        .and_then(|advanced| advanced.get("download"))
+        .and_then(|advanced| advanced.get("download"));
+    let mirror_source = download
         .map(|download| text(download, "mirrorSource"))
         .unwrap_or_default();
+    // `download` is omitted while every field still matches the defaults, so
+    // an absent section (or field) must read back as the shipped value rather
+    // than an empty input the user would have to fill in by hand.
+    let download_defaults = DownloadConfig::default();
+    let download_enabled = download
+        .and_then(|download| download.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(download_defaults.enabled);
+    let download_segments = download
+        .and_then(|download| download.get("segments"))
+        .and_then(Value::as_u64)
+        .unwrap_or(download_defaults.segments as u64)
+        // The runtime clamps to 2..=8; showing a hand-edited 1 or 64 would
+        // leave no pill selected while the proxy runs something else.
+        .clamp(2, 8);
     let relay = config
         .get("advanced")
         .and_then(|advanced| advanced.get("relay"));
@@ -1610,6 +1638,8 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
         catalog_doh: field("catalogs", "doh"),
         download_mirror: !mirror_source.trim().is_empty(),
         mirror_source,
+        download_enabled,
+        download_segments: download_segments.to_string(),
         relay_enabled: relay
             .and_then(|value| value.get("enabled"))
             .and_then(Value::as_bool)
@@ -1713,6 +1743,16 @@ fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Opti
             "advanced.download.mirrorSource" => {
                 config.advanced.download.mirror_source = value.to_string()
             }
+            "advanced.download.segments" => {
+                let segments: usize = value
+                    .trim()
+                    .parse()
+                    .context("下载线程需为 2–8 之间的整数")?;
+                if !(2..=8).contains(&segments) {
+                    bail!("下载线程需在 2–8 之间");
+                }
+                config.advanced.download.segments = segments;
+            }
             "advanced.relay.listen" => {
                 // Empty clears the field; an enabled relay then fails
                 // validation, which is the message the user needs.
@@ -1791,6 +1831,9 @@ fn apply_setting_bool(runtime: &HakimiRuntime, key: &str, value: bool) -> Option
                 } else {
                     String::new()
                 };
+            }
+            "advanced.download.enabled" => {
+                config.advanced.download.enabled = value;
             }
             "advanced.relay.enabled" => {
                 config.advanced.relay.enabled = value;
@@ -2243,6 +2286,8 @@ fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
     app.set_cfg_catalog_doh(SharedString::from(settings.catalog_doh.clone()));
     app.set_cfg_download_mirror(settings.download_mirror);
     app.set_cfg_mirror_source(SharedString::from(settings.mirror_source.clone()));
+    app.set_cfg_download_enabled(settings.download_enabled);
+    app.set_cfg_download_segments(SharedString::from(settings.download_segments.clone()));
     app.set_cfg_relay_enabled(settings.relay_enabled);
     app.set_cfg_relay_listen(SharedString::from(settings.relay_listen.clone()));
     app.set_cfg_relay_target(SharedString::from(settings.relay_target.clone()));

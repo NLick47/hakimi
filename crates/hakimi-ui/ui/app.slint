@@ -867,6 +867,83 @@ component ChoicePill inherits Rectangle {
     }
 }
 
+component ThreadsRow inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <length> label-width: 132px;
+    callback picked(string);
+
+    height: 52px;
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        spacing: 12px;
+
+        VerticalLayout {
+            width: root.label-width;
+            alignment: center;
+            Text {
+                text: root.label;
+                font-size: 13px;
+                color: #1B1F24;
+                overflow: elide;
+            }
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+
+        VerticalLayout {
+            alignment: center;
+            HorizontalLayout {
+                spacing: 6px;
+                ChoicePill {
+                    label: "2";
+                    min-width: 34px;
+                    active: root.value == "2";
+                    clicked => { root.picked("2"); }
+                }
+                ChoicePill {
+                    label: "3";
+                    min-width: 34px;
+                    active: root.value == "3";
+                    clicked => { root.picked("3"); }
+                }
+                ChoicePill {
+                    label: "4";
+                    min-width: 34px;
+                    active: root.value == "4";
+                    clicked => { root.picked("4"); }
+                }
+                ChoicePill {
+                    label: "5";
+                    min-width: 34px;
+                    active: root.value == "5";
+                    clicked => { root.picked("5"); }
+                }
+                ChoicePill {
+                    label: "6";
+                    min-width: 34px;
+                    active: root.value == "6";
+                    clicked => { root.picked("6"); }
+                }
+                ChoicePill {
+                    label: "7";
+                    min-width: 34px;
+                    active: root.value == "7";
+                    clicked => { root.picked("7"); }
+                }
+                ChoicePill {
+                    label: "8";
+                    min-width: 34px;
+                    active: root.value == "8";
+                    clicked => { root.picked("8"); }
+                }
+            }
+        }
+    }
+}
+
 // -- app window --------------------------------------------------------------
 
 export component AppWindow inherits Window {
@@ -941,6 +1018,10 @@ export component AppWindow inherits Window {
     in-out property <string> cfg-catalog-doh;
     in-out property <bool> cfg-download-mirror;
     in-out property <string> cfg-mirror-source;
+    // Chunked download: the chunk size stays an internal default; the only
+    // user-facing knob is how many connections work in parallel.
+    in-out property <bool> cfg-download-enabled;
+    in-out property <string> cfg-download-segments;
     // Local raw relay for clients that ignore the HTTP proxy (cloudflared).
     in-out property <bool> cfg-relay-enabled;
     in-out property <string> cfg-relay-listen;
@@ -2357,6 +2438,41 @@ export component AppWindow inherits Window {
                                     text <=> root.cfg-mirror-source;
                                     commit(value) => {
                                         root.save-string("advanced.download.mirrorSource", value);
+                                    }
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "分段下载";
+                            font-size: 13px;
+                            font-weight: 500;
+                            color: #4F5963;
+                        }
+                        Rectangle {
+                            border-radius: 6px;
+                            background: #FFFFFF;
+                            border-width: 1px;
+                            border-color: #E1E4E8;
+
+                            VerticalLayout {
+                                spacing: 0px;
+
+                                ToggleRow {
+                                    label: "启用分段下载";
+                                    hint: "大文件分块并行拉取；仅对 ≥ 2 MiB 且支持 Range 的下载生效";
+                                    checked: root.cfg-download-enabled;
+                                    toggled(value) => {
+                                        root.save-bool("advanced.download.enabled", value);
+                                    }
+                                }
+                                RowLine { }
+                                ThreadsRow {
+                                    label: "下载线程";
+                                    value: root.cfg-download-segments;
+                                    label-width: root.settings-label;
+                                    picked(value) => {
+                                        root.save-string("advanced.download.segments", value);
                                     }
                                 }
                             }

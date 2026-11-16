@@ -845,8 +845,7 @@ class MainActivity : Activity(), Host {
             return
         }
         val next = runCatching { JSONObject(data.configJson.toString()) }.getOrNull()
-        val download = next?.optJSONObject("advanced")?.optJSONObject("download")
-        if (next == null || download == null) {
+        if (next == null) {
             showSnack("配置尚未就绪", error = true)
             return
         }
@@ -855,13 +854,65 @@ class MainActivity : Activity(), Host {
             showSnack("无法读取默认镜像列表地址，请在「镜像列表」中手动填写", error = true)
             return
         }
-        download.put("mirrorSource", source)
+        downloadForWrite(next).put("mirrorSource", source)
         applyConfig(next) { ok, error ->
             when {
                 !ok -> showSnack(error ?: "保存失败", error = true)
                 enabled -> showSnack("镜像加速已开启")
                 else -> showSnack("镜像加速已关闭")
             }
+        }
+    }
+
+    override fun setDownloadEnabled(enabled: Boolean) {
+        if (configSaving) {
+            showSnack("正在保存设置，请稍候")
+            return
+        }
+        val next = runCatching { JSONObject(data.configJson.toString()) }.getOrNull()
+        if (next == null) {
+            showSnack("配置尚未就绪", error = true)
+            return
+        }
+        downloadForWrite(next).put("enabled", enabled)
+        applyConfig(next) { ok, error ->
+            when {
+                !ok -> showSnack(error ?: "保存失败", error = true)
+                enabled -> showSnack("分段下载已开启")
+                else -> showSnack("分段下载已关闭")
+            }
+        }
+    }
+
+    override fun setDownloadSegments(segments: Int) {
+        if (segments !in 2..8) {
+            showSnack("下载线程需在 2–8 之间", error = true)
+            return
+        }
+        if (configSaving) {
+            showSnack("正在保存设置，请稍候")
+            return
+        }
+        val next = runCatching { JSONObject(data.configJson.toString()) }.getOrNull()
+        if (next == null) {
+            showSnack("配置尚未就绪", error = true)
+            return
+        }
+        downloadForWrite(next).put("segments", segments)
+        applyConfig(next) { ok, error ->
+            showSnack(if (ok) "设置已保存" else (error ?: "保存失败"), error = !ok)
+        }
+    }
+
+    /// A config written while the download fields all matched the defaults
+    /// omits `advanced.download`; the switch and the stepper create the
+    /// section on first write instead of refusing with "配置尚未就绪".
+    private fun downloadForWrite(next: JSONObject): JSONObject {
+        val advanced = next.optJSONObject("advanced") ?: JSONObject().also {
+            next.put("advanced", it)
+        }
+        return advanced.optJSONObject("download") ?: JSONObject().also {
+            advanced.put("download", it)
         }
     }
 
@@ -1083,13 +1134,7 @@ class MainActivity : Activity(), Host {
                         showSnack("镜像列表地址必须以 http:// 或 https:// 开头", error = true)
                         false
                     } else {
-                        val download = next.optJSONObject("advanced")
-                            ?.optJSONObject("download")
-                        if (download == null) {
-                            showSnack("配置尚未就绪", error = true)
-                            return@input
-                        }
-                        download.put("mirrorSource", value)
+                        downloadForWrite(next).put("mirrorSource", value)
                         true
                     }
                 }

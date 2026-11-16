@@ -712,6 +712,29 @@ fn startup_switches_default_to_off_and_follow_the_config() {
     assert!(values.auto_start && values.start_hidden && values.auto_connect);
 }
 
+/// The download card must show the shipped thread count even though a file
+/// whose `advanced.download` still matches the defaults omits the whole
+/// section.
+#[test]
+fn download_controls_show_defaults_and_follow_the_config() {
+    let values = crate::settings_values(&serde_json::json!({ "advanced": {} }));
+    assert!(values.download_enabled);
+    assert_eq!(values.download_segments, "6");
+
+    let mut config = AppConfig::default();
+    config.advanced.download.enabled = false;
+    config.advanced.download.segments = 8;
+    let json = serde_json::to_value(&config).unwrap();
+    let values = crate::settings_values(&json);
+    assert!(!values.download_enabled);
+    assert_eq!(values.download_segments, "8");
+
+    // The runtime clamps to 2..=8; the picker must show the effective value.
+    config.advanced.download.segments = 1;
+    let json = serde_json::to_value(&config).unwrap();
+    assert_eq!(crate::settings_values(&json).download_segments, "2");
+}
+
 /// The card must render the shipped relay without the user typing anything:
 /// the values come from the config snapshot, which carries the defaults.
 #[test]
