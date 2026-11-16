@@ -1177,17 +1177,21 @@ impl DecisionEngine {
                     .collect()
             };
             ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let victims: Vec<(String, IpAddr)> = ranked
+            let victims: Vec<(String, IpAddr, f64)> = ranked
                 .into_iter()
                 .take(total - IP_SCORE_PRUNE_TO)
-                .map(|((domain, ip), _)| (domain, ip))
+                .map(|((domain, ip), score)| (domain, ip, score))
                 .collect();
             let mut removed = 0usize;
             {
                 let mut scores = self.ip_scores.write();
-                for (domain, ip) in victims {
+                for (domain, ip, score) in victims {
                     if let Some(by_ip) = scores.get_mut(&domain) {
-                        if by_ip.remove(&ip).is_some() {
+                        // Only drop the observation that was ranked. A
+                        // connection that reported during the unlocked sort
+                        // changed it, and that one is worth keeping.
+                        let stale = by_ip.get(&ip).is_some_and(|entry| entry.rank() == score);
+                        if stale && by_ip.remove(&ip).is_some() {
                             removed += 1;
                         }
                         if by_ip.is_empty() {
@@ -1267,10 +1271,14 @@ impl DecisionEngine {
         let mut removed = 0usize;
         {
             let mut cache = self.plan_cache.write();
-            for (domain, port, tls, _) in ages.into_iter().take(excess) {
+            for (domain, port, tls, at) in ages.into_iter().take(excess) {
                 let mut empty = false;
                 if let Some(inner) = cache.get_mut(&domain) {
-                    if inner.remove(&(port, tls)).is_some() {
+                    // Only drop the entry that was ranked. A connection that
+                    // succeeded during the unlocked sort replaced it with a
+                    // fresher one, and that one is worth keeping.
+                    let stale = inner.get(&(port, tls)).is_some_and(|(seen, _)| *seen == at);
+                    if stale && inner.remove(&(port, tls)).is_some() {
                         removed += 1;
                     }
                     empty = inner.is_empty();
