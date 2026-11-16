@@ -93,14 +93,17 @@ impl IpGate {
 
     /// Plans that may start now, capped at `limit`. Queued plans of a dead
     /// address are dropped here as a safety net.
-    pub fn drain_ready(&mut self, limit: usize) -> Vec<ConnectPlan> {
-        let mut ready = Vec::new();
+    ///
+    /// The result is appended to `out`, which the caller reuses: the race loop
+    /// asks for plans on every turn, and most turns find nothing to start.
+    pub fn drain_ready(&mut self, limit: usize, out: &mut Vec<ConnectPlan>) {
+        out.clear();
         let mut index = 0;
-        while index < self.waiting.len() && ready.len() < limit {
+        while index < self.waiting.len() && out.len() < limit {
             match self.states.get(&self.waiting[index].ip).copied() {
                 Some(AddressState::Open) => {
                     if let Some(plan) = self.waiting.remove(index) {
-                        ready.push(plan);
+                        out.push(plan);
                     }
                 }
                 Some(AddressState::Dead) => {
@@ -110,7 +113,6 @@ impl IpGate {
                 _ => index += 1,
             }
         }
-        ready
     }
 
     /// True when no queued plan can ever start again.
@@ -170,7 +172,8 @@ mod tests {
         gate.admit(plan("1.1.1.1", "c"));
         // The first variant failed after TCP came up, so the address is usable.
         gate.record_failure(first.ip, FailureReason::TlsReset);
-        let ready = gate.drain_ready(8);
+        let mut ready = Vec::new();
+        gate.drain_ready(8, &mut ready);
         assert_eq!(ready.len(), 2, "the two queued variants must start");
         assert!(gate.admit(direct("1.1.1.1")).is_some(), "later plans pass");
         assert!(gate.is_idle());
@@ -189,7 +192,9 @@ mod tests {
             gate.admit(direct("1.1.1.1")).is_none(),
             "no new plan may start on a retired address"
         );
-        assert!(gate.drain_ready(8).is_empty());
+        let mut ready = Vec::new();
+        gate.drain_ready(8, &mut ready);
+        assert!(ready.is_empty());
     }
 
     #[test]
@@ -198,7 +203,9 @@ mod tests {
         let first = gate.admit(plan("1.1.1.1", "a")).unwrap();
         gate.admit(plan("1.1.1.1", "b"));
         gate.record_failure(first.ip, FailureReason::TlsReset);
-        assert_eq!(gate.drain_ready(8).len(), 1, "b must still be tried");
+        let mut ready = Vec::new();
+        gate.drain_ready(8, &mut ready);
+        assert_eq!(ready.len(), 1, "b must still be tried");
         assert!(gate.admit(direct("1.1.1.1")).is_some());
     }
 
@@ -213,7 +220,8 @@ mod tests {
         gate.record_failure(dead.ip, FailureReason::TcpTimeout);
         gate.record_failure(live.ip, FailureReason::SniRejected);
 
-        let ready = gate.drain_ready(8);
+        let mut ready = Vec::new();
+        gate.drain_ready(8, &mut ready);
         assert_eq!(ready.len(), 1, "only the reachable address keeps variants");
         assert_eq!(ready[0].ip, live.ip);
         assert!(gate.is_idle());
@@ -226,8 +234,11 @@ mod tests {
         gate.admit(plan("1.1.1.1", "b"));
         gate.admit(plan("1.1.1.1", "c"));
         gate.record_failure(first.ip, FailureReason::TlsError);
-        assert_eq!(gate.drain_ready(1).len(), 1);
-        assert_eq!(gate.drain_ready(8).len(), 1);
+        let mut ready = Vec::new();
+        gate.drain_ready(1, &mut ready);
+        assert_eq!(ready.len(), 1);
+        gate.drain_ready(8, &mut ready);
+        assert_eq!(ready.len(), 1);
         assert!(gate.is_idle());
     }
 }

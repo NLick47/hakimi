@@ -257,6 +257,14 @@ pub fn network_id() -> String {
     network_id_cache().read().as_ref().to_string()
 }
 
+/// The cached network id, shared instead of copied.
+///
+/// The cache already holds an `Arc<str>`; handing that out lets the cold
+/// connection path keep the id without a fresh `String` per cursor.
+pub fn network_id_arc() -> Arc<str> {
+    Arc::clone(&network_id_cache().read())
+}
+
 /// Re-probe the OS, publish the result to the cached accessor, and return it.
 /// Called by the network-change monitor.
 pub fn refresh_network_id() -> String {

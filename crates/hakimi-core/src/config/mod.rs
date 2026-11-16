@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,6 +42,13 @@ pub struct AppConfig {
     pub catalogs: CatalogSources,
     pub proxy: ProxyConfig,
     pub groups: Vec<GroupConfig>,
+    /// Group id to its position in `groups`.
+    ///
+    /// Resolving a group used to scan the list, and the routing path resolves
+    /// one per new connection. The index is rebuilt whenever the config is
+    /// canonicalised, so it always describes the groups next to it.
+    #[serde(skip)]
+    pub(crate) group_index: HashMap<String, usize>,
     /// Monotonic local catalog revision. Incremented when accepted remote IP catalog content
     /// changes; cached IPs remember the revision that produced them.
     pub catalog_version: u64,
@@ -63,6 +71,7 @@ impl Default for AppConfig {
             catalogs: CatalogSources::default(),
             proxy: ProxyConfig::default(),
             groups: default_groups(),
+            group_index: HashMap::new(),
             catalog_version: 0,
             advanced: AdvancedConfig::default(),
             log: LogConfig::default(),
@@ -1007,6 +1016,16 @@ impl AppConfig {
                 };
             }
         }
+        // Rebuild the group index. A duplicated id keeps the first group, the
+        // same one a linear scan would have found.
+        self.group_index = self
+            .groups
+            .iter()
+            .enumerate()
+            .fold(HashMap::new(), |mut index, (position, group)| {
+                index.entry(group.id.clone()).or_insert(position);
+                index
+            });
     }
 
     /// Image relays are hand-editable, so every rule is checked here instead of
@@ -1337,7 +1356,22 @@ impl AppConfig {
     }
 
     pub fn group(&self, id: &str) -> Option<&GroupConfig> {
+        if let Some(index) = self.group_index_of(id) {
+            return self.groups.get(index);
+        }
         self.groups.iter().find(|group| group.id == id)
+    }
+
+    /// The position of the group with this id in [`Self::groups`].
+    pub fn group_index_of(&self, id: &str) -> Option<usize> {
+        let index = *self.group_index.get(id)?;
+        // The index is rebuilt together with the groups, so a mismatch can
+        // only come from a caller that renamed a group in place. Checking the
+        // id keeps the lookup correct without giving up the constant time.
+        self.groups
+            .get(index)
+            .filter(|group| group.id == id)
+            .map(|_| index)
     }
 
     pub fn group_mut(&mut self, id: &str) -> Option<&mut GroupConfig> {

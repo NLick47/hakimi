@@ -32,20 +32,24 @@ pub struct ConnectPlan {
 }
 
 impl ConnectPlan {
-    pub(super) fn identity(&self) -> String {
+    /// A key that tells two plans apart.
+    ///
+    /// The skip set is consulted once per generated plan, and formatting the
+    /// whole plan into a string allocated on every call — twice per candidate,
+    /// because a plan is inserted when it is skipped and removed when it is
+    /// reached. Hashing the same fields answers the same question without
+    /// the allocation.
+    pub(super) fn identity(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.domain.hash(&mut hasher);
+        self.port.hash(&mut hasher);
+        self.tls.hash(&mut hasher);
+        self.ip.hash(&mut hasher);
+        self.mode.hash(&mut hasher);
+        self.sni.as_deref().unwrap_or("").hash(&mut hasher);
         self.ech_config.hash(&mut hasher);
-        format!(
-            "{}|{}|{}|{}|{}|{}|{}",
-            self.domain,
-            self.port,
-            self.tls,
-            self.ip,
-            self.mode.as_str(),
-            self.sni.as_deref().unwrap_or(""),
-            hasher.finish()
-        )
+        hasher.finish()
     }
 }
 

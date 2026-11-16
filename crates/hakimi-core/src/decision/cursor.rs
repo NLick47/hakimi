@@ -6,7 +6,7 @@ use crate::config::{AppConfig, EchSource, GroupConfig, RouteAttempt, RoutePolicy
 use crate::resolver::EchOutcome;
 use crate::status::AttemptRecord;
 use crate::strategy::{FailureReason, IpSource, TlsMode};
-use crate::util::{network_id, now};
+use crate::util::{network_id_arc, now};
 
 use super::engine::DecisionEngine;
 use super::plan::{ConnectPlan, DecisionOutcome};
@@ -82,11 +82,11 @@ pub struct RouteCursor {
     sni_candidates: Vec<Option<String>>,
     sni_attempt: Option<usize>,
     sni_index: usize,
-    network: String,
+    network: Arc<str>,
     attempts: Vec<AttemptRecord>,
     last_reason: Option<FailureReason>,
     last_detail: Option<String>,
-    skipped: HashSet<String>,
+    skipped: HashSet<u64>,
     finished: bool,
     /// True once the plan list ran out.
     ///
@@ -153,8 +153,15 @@ impl RouteCursor {
             };
             // The catalog is the source that produced this address; if it no
             // longer serves it for the domain, the resolver owns the name now
-            // and the remembered address must not be dialled.
-            if !engine.catalog_still_serves(&domain, entry.ip, entry.source) {
+            // and the remembered address must not be dialled. The catalog was
+            // already read for the candidate list, so the snapshot is reused
+            // instead of looking the domain up a second time.
+            if !engine.catalog_still_serves_in(
+                remote.as_deref(),
+                remote_available,
+                entry.ip,
+                entry.source,
+            ) {
                 tracing::debug!(
                     domain = %domain,
                     ip = %entry.ip,
@@ -270,7 +277,7 @@ impl RouteCursor {
             sni_candidates: Vec::new(),
             sni_attempt: None,
             sni_index: 0,
-            network: network_id(),
+            network: network_id_arc(),
             attempts: Vec::new(),
             last_reason: None,
             last_detail: None,
@@ -760,7 +767,7 @@ impl RouteCursor {
             self.engine.cache.put_sni(crate::cache::CachedSni {
                 group: self.group().id.clone(),
                 domain: self.domain.clone(),
-                network_id: self.network.clone(),
+                network_id: self.network.to_string(),
                 sni: plan.sni.clone(),
                 saved_at: now(),
             });

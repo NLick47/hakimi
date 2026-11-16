@@ -1121,6 +1121,15 @@ impl UpstreamPool {
                 clients.remove(&host);
             }
         }
+        // The host is usually already known, and `entry` would allocate a
+        // fresh key for it on every request.
+        if let Some(entry) = clients.get(host) {
+            return if http1 {
+                entry.http1.clone()
+            } else {
+                entry.auto.clone()
+            };
+        }
         let entry = clients
             .entry(host.to_owned())
             .or_insert_with(|| RejectedClient {
@@ -1508,6 +1517,30 @@ impl RouteConnector {
         }
     }
 
+    /// The cached plan for this cursor's route, if the plan cache still holds
+    /// one that the engine would accept.
+    ///
+    /// The cached route starts the race immediately instead of waiting for the
+    /// normal candidate stagger. A follower of the single-flight discovery
+    /// uses the leader's plan and never looks at this one, so the lookup is
+    /// done by the branches that consume it.
+    fn cached_plan_for(
+        &self,
+        cursor: &mut RouteCursor,
+        tls: bool,
+    ) -> Option<Arc<ConnectPlan>> {
+        // A catalog update asked this domain to try its new remote IPs before
+        // any cached route.
+        if cursor.skip_once() {
+            return None;
+        }
+        let plan = self.engine.cached_plan(cursor.domain(), cursor.port(), tls)?;
+        // The cached route will be inserted as the first race future, so do
+        // not generate the same plan again from the cursor.
+        cursor.skip_plan(&plan);
+        Some(plan)
+    }
+
     async fn connect_group(
         &self,
         mut cursor: RouteCursor,
@@ -1523,21 +1556,17 @@ impl RouteConnector {
         // cached route can otherwise add seconds to a page load before the
         // healthy candidates are even tried; instead the cached route gets the
         // same hedge window as any other first candidate.
-        let cached_plan = if cursor.skip_once() {
-            None
-        } else {
-            self.engine.cached_plan(cursor.domain(), cursor.port(), tls)
-        };
-        if let Some(plan) = cached_plan.as_ref() {
-            // The cached route will be inserted as the first race future, so
-            // do not generate the same plan again from the cursor.
-            cursor.skip_plan(plan);
-        }
-
+        //
+        // Resolving the cached plan costs a config read, a plan-cache read,
+        // a rejection read, a catalog read, a cache read, a domain match and
+        // a scan over the groups. A follower of the single-flight discovery
+        // uses the leader's plan and never looks at this one, so the work is
+        // done in the branches that consume it.
         let key = format!("{}|{}|{}", cursor.domain(), cursor.port(), tls);
         if !self.single_flight {
             // Recovery path: race on our own. The shared discovery may be
             // stalled, and this request exists to escape that stall.
+            let cached_plan = self.cached_plan_for(&mut cursor, tls);
             let domain = cursor.domain().to_string();
             let started = std::time::Instant::now();
             let outcome = self
@@ -1570,6 +1599,7 @@ impl RouteConnector {
                 key: key.clone(),
                 entry: inflight.clone(),
             };
+            let cached_plan = self.cached_plan_for(&mut cursor, tls);
             let domain = cursor.domain().to_string();
             let started = std::time::Instant::now();
             let outcome = self
@@ -1664,6 +1694,9 @@ impl RouteConnector {
 
         let mut gate = IpGate::new();
         let mut pending: FuturesUnordered<PlanFuture> = FuturesUnordered::new();
+        // Reused across the turns of the race loop: most turns find no plan
+        // ready to start, and a fresh vector per turn was pure allocation.
+        let mut ready: Vec<ConnectPlan> = Vec::new();
         let mut exhausted = false;
         // Plans generated together form one initial hedge wave. Plans that arrive
         // after a failed handshake start immediately instead of sleeping again.
@@ -1698,7 +1731,8 @@ impl RouteConnector {
             // They start without a stagger: the address is already proven, and
             // the point of the batch is to compare SNI candidates.
             let window = RACE_SIZE.saturating_sub(pending.len());
-            for plan in gate.drain_ready(window) {
+            gate.drain_ready(window, &mut ready);
+            for plan in ready.drain(..) {
                 launch(
                     self,
                     &mut pending,
@@ -1856,8 +1890,10 @@ impl RouteConnector {
                 .await
                 .map_err(|_| anyhow!("resolving {host}:{port} timed out"))?
                 .with_context(|| format!("resolving {host}:{port}"))?;
-        let addresses: Vec<std::net::IpAddr> = super::connect::interleave_by_family(
-            resolved.iter().map(|address| address.ip()).collect(),
+        let resolved_ips: Vec<std::net::IpAddr> =
+            resolved.iter().map(|address| address.ip()).collect();
+        let addresses = super::connect::interleave_by_family(
+            &resolved_ips,
             std::net::IpAddr::is_ipv4,
         );
         // Staggered race across resolved addresses (Happy-Eyeballs style): a black-holed

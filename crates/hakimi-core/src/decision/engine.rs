@@ -441,7 +441,16 @@ impl DecisionEngine {
                 }),
             });
         };
-        let Some(group) = config.group(group_id) else {
+        let Some(group_index) = config.group_index_of(group_id) else {
+            return Route::Blocked(self.config_failure(
+                Some(group_id.to_string()),
+                &normalized,
+                &config,
+                FailureReason::ConfigInvalid,
+                "matched group no longer exists in the configuration".into(),
+            ));
+        };
+        let Some(group) = config.groups.get(group_index) else {
             return Route::Blocked(self.config_failure(
                 Some(group_id.to_string()),
                 &normalized,
@@ -481,11 +490,6 @@ impl DecisionEngine {
         );
         // The cursor keeps an index into this immutable config snapshot, so a
         // new connection does not clone the whole group (and all its domains).
-        let group_index = config
-            .groups
-            .iter()
-            .position(|candidate| std::ptr::eq(candidate, group))
-            .expect("matched group must come from the config snapshot");
         Route::Group(Box::new(RouteCursor::new(
             self.clone(),
             normalized.into_owned(),
@@ -900,7 +904,25 @@ impl DecisionEngine {
             return true;
         }
         let (ips, available) = self.remote.remote_ips_with_catalog(domain);
-        !available || ips.as_ref().is_some_and(|ips| ips.contains(&ip))
+        self.catalog_still_serves_in(ips.as_deref(), available, ip, source)
+    }
+
+    /// Whether the catalog still serves `ip` for the domain, given a snapshot
+    /// the caller already read.
+    ///
+    /// The routing path reads the catalog once per connection and would
+    /// otherwise read it again for the same domain.
+    pub(super) fn catalog_still_serves_in(
+        &self,
+        ips: Option<&[IpAddr]>,
+        available: bool,
+        ip: IpAddr,
+        source: IpSource,
+    ) -> bool {
+        if source != IpSource::Remote {
+            return true;
+        }
+        !available || ips.is_some_and(|ips| ips.contains(&ip))
     }
 
     /// True while this fake-SNI name is not worth dialling for `domain`.

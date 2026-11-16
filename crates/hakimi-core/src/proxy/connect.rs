@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -37,16 +38,21 @@ const DNS_CACHE_MAX: usize = 512;
 
 #[derive(Debug, Clone)]
 struct DnsCacheEntry {
-    addresses: Vec<SocketAddr>,
+    /// Shared so a cache hit hands the addresses out without copying them.
+    addresses: Arc<[SocketAddr]>,
     fetched_at: Instant,
 }
 
-fn dns_cache() -> &'static parking_lot::Mutex<std::collections::HashMap<(String, u16), DnsCacheEntry>>
+/// Resolver answers, keyed by host and then by port.
+///
+/// Two levels so the lookup can borrow the host instead of allocating a
+/// lowercased copy of it on every call.
+fn dns_cache() -> &'static parking_lot::Mutex<HashMap<String, HashMap<u16, DnsCacheEntry>>>
 {
     static CACHE: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<(String, u16), DnsCacheEntry>>,
+        parking_lot::Mutex<HashMap<String, HashMap<u16, DnsCacheEntry>>>,
     > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+    CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
 }
 
 /// Forget every cached resolver answer; called when the network changes
@@ -59,12 +65,9 @@ pub(crate) fn clear_dns_cache() {
 pub(super) async fn lookup_host_cached(
     host: &str,
     port: u16,
-) -> std::io::Result<Vec<SocketAddr>> {
-    let key = (host.to_ascii_lowercase(), port);
-    if let Some(entry) = dns_cache().lock().get(&key).cloned() {
-        if entry.fetched_at.elapsed() < DNS_CACHE_TTL {
-            return Ok(entry.addresses);
-        }
+) -> std::io::Result<Arc<[SocketAddr]>> {
+    if let Some(addresses) = cached_addresses(host, port) {
+        return Ok(addresses);
     }
     let resolved = tokio::net::lookup_host((host, port)).await?;
     let mut addresses: Vec<SocketAddr> = Vec::new();
@@ -74,23 +77,45 @@ pub(super) async fn lookup_host_cached(
         }
     }
     if !addresses.is_empty() {
+        let shared: Arc<[SocketAddr]> = Arc::from(addresses.as_slice());
         let mut cache = dns_cache().lock();
-        if cache.len() >= DNS_CACHE_MAX {
+        let ports = cache.entry(host.to_ascii_lowercase()).or_default();
+        if ports.len() >= DNS_CACHE_MAX {
             let now = Instant::now();
-            cache.retain(|_, entry| now.duration_since(entry.fetched_at) < DNS_CACHE_TTL);
-            if cache.len() >= DNS_CACHE_MAX {
-                cache.clear();
+            ports.retain(|_, entry| now.duration_since(entry.fetched_at) < DNS_CACHE_TTL);
+            if ports.len() >= DNS_CACHE_MAX {
+                ports.clear();
             }
         }
-        cache.insert(
-            key,
+        ports.insert(
+            port,
             DnsCacheEntry {
-                addresses: addresses.clone(),
+                addresses: shared.clone(),
                 fetched_at: Instant::now(),
             },
         );
+        return Ok(shared);
     }
-    Ok(addresses)
+    Ok(Arc::from(addresses.as_slice()))
+}
+
+/// The cached addresses for this host and port, if they are still fresh.
+///
+/// The stored key is lowercased, so a host that carries uppercase letters
+/// needs the same spelling before it can be found. The common caller passes an
+/// already normalized host, and that path allocates nothing.
+fn cached_addresses(host: &str, port: u16) -> Option<Arc<[SocketAddr]>> {
+    let cache = dns_cache().lock();
+    let entry = cache.get(host).and_then(|ports| ports.get(&port)).or_else(|| {
+        if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            cache
+                .get(&host.to_ascii_lowercase())
+                .and_then(|ports| ports.get(&port))
+        } else {
+            None
+        }
+    })?;
+    (entry.fetched_at.elapsed() < DNS_CACHE_TTL).then(|| entry.addresses.clone())
 }
 
 /// Context attached to a raw CONNECT tunnel. Raw tunnels bypass the pooled HTTP
@@ -506,39 +531,55 @@ pub(super) async fn connect_tcp_upstream(
 
 /// RFC 8305: 首选地址族保持首位, 两族交替排布
 /// 黑洞的 AAAA 不会挡住排在后面的全部 IPv4
-pub(super) fn interleave_by_family<T, F>(items: Vec<T>, is_preferred_family: F) -> Vec<T>
+///
+/// The two families are interleaved by walking the input with one cursor per
+/// family, so only the result is allocated.
+pub(super) fn interleave_by_family<T, F>(items: &[T], is_preferred_family: F) -> Vec<T>
 where
+    T: Clone,
     F: Fn(&T) -> bool,
 {
     if items.len() < 3 {
-        return items;
+        return items.to_vec();
     }
     let preferred_first = is_preferred_family(&items[0]);
-    let mut preferred = Vec::new();
-    let mut other = Vec::new();
-    for item in items {
-        if is_preferred_family(&item) == preferred_first {
-            preferred.push(item);
-        } else {
-            other.push(item);
-        }
-    }
-    let mut preferred = preferred.into_iter();
-    let mut other = other.into_iter();
-    let mut out = Vec::new();
-    out.extend(preferred.next());
+    let mut out = Vec::with_capacity(items.len());
+    let mut preferred_at = 0usize;
+    let mut other_at = 0usize;
     loop {
-        match other.next() {
-            Some(item) => out.push(item),
-            None => break,
+        while preferred_at < items.len()
+            && is_preferred_family(&items[preferred_at]) != preferred_first
+        {
+            preferred_at += 1;
         }
-        match preferred.next() {
-            Some(item) => out.push(item),
-            None => break,
+        if preferred_at >= items.len() {
+            break;
         }
+        out.push(items[preferred_at].clone());
+        preferred_at += 1;
+
+        while other_at < items.len() && is_preferred_family(&items[other_at]) == preferred_first {
+            other_at += 1;
+        }
+        if other_at >= items.len() {
+            break;
+        }
+        out.push(items[other_at].clone());
+        other_at += 1;
     }
-    out.extend(preferred);
-    out.extend(other);
+    // Whichever family is left over keeps its own order at the end.
+    while preferred_at < items.len() {
+        if is_preferred_family(&items[preferred_at]) == preferred_first {
+            out.push(items[preferred_at].clone());
+        }
+        preferred_at += 1;
+    }
+    while other_at < items.len() {
+        if is_preferred_family(&items[other_at]) != preferred_first {
+            out.push(items[other_at].clone());
+        }
+        other_at += 1;
+    }
     out
 }
 
@@ -563,7 +604,7 @@ pub(super) async fn connect_host_staggered(
             return Err((true, format!("resolving {host}:{port} timed out")));
         }
     };
-    let addresses = interleave_by_family(resolved, |address| address.is_ipv4());
+    let addresses = interleave_by_family(&resolved, |address| address.is_ipv4());
     if addresses.is_empty() {
         return Err((false, format!("no address found for {host}")));
     }
