@@ -215,6 +215,9 @@ pub(crate) fn candidate_uri(uri: &Uri) -> bool {
     if host.eq_ignore_ascii_case("codeload.github.com") {
         return true;
     }
+    if github_artifact_entry(uri) {
+        return true;
+    }
     if host.eq_ignore_ascii_case("github.com") {
         let path = uri.path();
         return path.contains("/releases/download/") || path.contains("/releases/latest/download/");
@@ -227,6 +230,27 @@ pub(crate) fn candidate_uri(uri: &Uri) -> bool {
         && host
             .get(host.len() - SUFFIX.len()..)
             .is_some_and(|tail| tail.eq_ignore_ascii_case(SUFFIX))
+}
+
+/// A GitHub Actions artifact download endpoint.
+///
+/// The endpoint does not carry bytes: it answers with a 302 to a short-lived
+/// signed Azure Blob URL. The proxy follows that redirect itself (see
+/// `forward_with_uri`), so the entry URI is what must be recognized here.
+/// Matching is deliberately loose on the path — the redirect target check in
+/// the follow path is the real gate — while the host stays on GitHub.
+pub(crate) fn github_artifact_entry(uri: &Uri) -> bool {
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let host = crate::domain::bare_host(host).trim_end_matches('.');
+    if !host.eq_ignore_ascii_case("github.com") && !host.eq_ignore_ascii_case("api.github.com") {
+        return false;
+    }
+    // /{owner}/{repo}/actions/runs/{id}/artifacts/{id}
+    // /{owner}/{repo}/suites/{id}/artifacts/{id}
+    // /repos/{owner}/{repo}/actions/artifacts/{id}/zip
+    uri.path().contains("/artifacts/")
 }
 
 /// The narrow subset that may go through a mirror: release assets and source
@@ -1279,9 +1303,9 @@ impl hyper::body::Body for SegmentedBody {
 mod tests {
     use super::{
         candidate_uri, claim, content_encoded, credential_headers, expected_chunk_len,
-        headers_eligible, host_header, mirror_candidate, mirror_origins, parse_content_range,
-        range_request_headers, response_eligible, response_eligible_from, run_merger, signed_url,
-        Shared, Source, Worker, MIB, NEXT_AFTER_STREAM_CHUNK,
+        github_artifact_entry, headers_eligible, host_header, mirror_candidate, mirror_origins,
+        parse_content_range, range_request_headers, response_eligible, response_eligible_from,
+        run_merger, signed_url, Shared, Source, Worker, MIB, NEXT_AFTER_STREAM_CHUNK,
     };
     use crate::cache::{CacheManager, LastGoodEntry};
     use crate::catalog::RemoteIpProvider;
@@ -1696,6 +1720,31 @@ mod tests {
         assert!(!candidate_uri(&uri));
         let uri: Uri = "https://pixiv.net/x".parse().unwrap();
         assert!(!candidate_uri(&uri));
+    }
+
+    /// An Actions artifact endpoint carries no bytes itself: it answers with a
+    /// redirect to Azure Blob. The proxy follows that redirect and segments the
+    /// storage response, so the entry URI has to qualify here.
+    #[test]
+    fn github_artifact_endpoints_are_download_candidates() {
+        for url in [
+            "https://github.com/owner/repo/actions/runs/1/artifacts/2",
+            "https://github.com/owner/repo/suites/1/artifacts/2",
+            "https://api.github.com/repos/owner/repo/actions/artifacts/2/zip",
+        ] {
+            let uri: Uri = url.parse().unwrap();
+            assert!(github_artifact_entry(&uri), "{url}");
+            assert!(candidate_uri(&uri), "{url}");
+        }
+        for url in [
+            "https://github.com/owner/repo/actions",
+            "https://api.github.com/repos/owner/repo/actions/workflows",
+            "https://example.com/owner/repo/actions/runs/1/artifacts/2",
+        ] {
+            let uri: Uri = url.parse().unwrap();
+            assert!(!github_artifact_entry(&uri), "{url}");
+            assert!(!candidate_uri(&uri), "{url}");
+        }
     }
 
     #[test]

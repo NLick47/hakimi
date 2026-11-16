@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use http::uri::{Authority, PathAndQuery, Scheme, Uri};
-use http::{header, HeaderMap, HeaderName, Method, Request, Response, StatusCode};
+use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{Either, Full};
 use hyper::body::Incoming;
 use hyper::upgrade::{self, OnUpgrade};
@@ -420,6 +420,20 @@ async fn forward_with_uri(
     let segment_candidate = is_get && !has_range && super::download::candidate_uri(&rule_uri);
     let (mut parts, body) = req.into_parts();
     sanitize_request_headers(&mut parts.headers, upgrade_requested);
+    // An Actions artifact download answers with a 302 to Azure Blob. Capture
+    // the browser headers that request needs before `parts` is moved; the rest
+    // (cookies, authorization) must not follow the redirect to a third party.
+    let artifact_entry = super::download::github_artifact_entry(&rule_uri);
+    let artifact_user_agent = if artifact_entry {
+        parts.headers.get(header::USER_AGENT).cloned()
+    } else {
+        None
+    };
+    let artifact_range = if artifact_entry {
+        parts.headers.get(header::RANGE).cloned()
+    } else {
+        None
+    };
     // One lazy snapshot, shared by both lookups; other requests never take it.
     let mut config = None;
     let plan = if super::download::mirror_candidate(&rule_uri) {
@@ -483,7 +497,7 @@ async fn forward_with_uri(
         )
     };
 
-    let response_uri;
+    let mut response_uri;
     let mut response;
     let mut served_by_mirror = false;
     let mut served_by_third_party = false;
@@ -614,6 +628,30 @@ async fn forward_with_uri(
             .map_err(|error| format!("upstream request to {host}:{port} failed: {error}"))?;
     }
 
+    // GitHub answers an Actions artifact download with a 302 to a short-lived
+    // signed Azure Blob URL. The PAC has no rule for the storage host, so the
+    // browser would connect directly and the proxy would never see — or
+    // segment — the bytes. Follow that one redirect here instead; on any
+    // failure the original 302 is returned untouched and the browser keeps
+    // today's direct path.
+    let mut artifact_headers: Option<HeaderMap> = None;
+    if artifact_entry && !served_by_mirror && !relayed {
+        if let Some((followed, target, download_headers)) = follow_github_artifact_redirect(
+            ctx,
+            &method,
+            &response,
+            artifact_user_agent.as_ref(),
+            artifact_range.as_ref(),
+        )
+        .await
+        {
+            response = followed;
+            response_uri = target;
+            artifact_headers = Some(download_headers);
+            served_by_third_party = true;
+        }
+    }
+
     if served_by_third_party {
         super::third_party::strip_response_cookies(response.headers_mut());
     }
@@ -661,6 +699,10 @@ async fn forward_with_uri(
     if !relayed && super::download::segment_eligible(ctx, &rule_uri, is_get, has_range, &response) {
         let base_headers = if served_by_mirror {
             &mirror_headers
+        } else if let Some(headers) = artifact_headers.as_ref() {
+            // The storage host never sees the GitHub session; its range
+            // requests replay only the sanitized redirect headers.
+            headers
         } else {
             &direct_headers
         };
@@ -883,6 +925,108 @@ async fn send_once(
         .send_with_uri(request, upgrade_requested, uri)
         .await
         .map_err(|error| format!("request to {} failed: {error}", uri.path()))
+}
+
+/// Follow the one redirect a GitHub Actions artifact download uses.
+///
+/// The artifact endpoint does not carry bytes: it answers with a 302 to a
+/// short-lived signed Azure Blob URL. The signed URL is self-contained, so the
+/// follow request gets only the download-relevant headers — forwarding the
+/// GitHub cookie or Authorization header to a storage provider would leak the
+/// session. The returned headers are reused as the base for the segment range
+/// requests, which therefore reach Azure without any GitHub credentials.
+async fn follow_github_artifact_redirect(
+    ctx: &ProxyContext,
+    method: &Method,
+    response: &Response<UpstreamResponseBody>,
+    user_agent: Option<&HeaderValue>,
+    range: Option<&HeaderValue>,
+) -> Option<(Response<UpstreamResponseBody>, Uri, HeaderMap)> {
+    if *method != Method::GET && *method != Method::HEAD {
+        return None;
+    }
+    if !response.status().is_redirection() {
+        return None;
+    }
+    let target: Uri = response
+        .headers()
+        .get(header::LOCATION)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()?;
+    if !artifact_storage_uri(&target) {
+        return None;
+    }
+    let mut headers = HeaderMap::new();
+    if let Some(user_agent) = user_agent {
+        headers.insert(header::USER_AGENT, user_agent.clone());
+    }
+    headers.insert(header::ACCEPT, HeaderValue::from_static("*/*"));
+    // Identity keeps the storage response sliceable: a gzip/br body would be
+    // ineligible for byte ranges.
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
+    if let Some(range) = range {
+        headers.insert(header::RANGE, range.clone());
+    }
+    match send_once(ctx, method, &headers, &target, false).await {
+        Ok(followed) if followed.status().is_success() => {
+            // The path carries no secret; the signed query is deliberately
+            // absent from this log line.
+            tracing::info!(
+                host = target.host().unwrap_or(""),
+                path = target.path(),
+                "followed a GitHub artifact redirect"
+            );
+            Some((followed, target, headers))
+        }
+        Ok(followed) => {
+            tracing::info!(
+                status = %followed.status(),
+                host = target.host().unwrap_or(""),
+                "GitHub artifact redirect did not yield a storage response"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::info!(
+                error = %error,
+                host = target.host().unwrap_or(""),
+                "following a GitHub artifact redirect failed"
+            );
+            None
+        }
+    }
+}
+
+/// The storage endpoint GitHub redirects artifact downloads to.
+///
+/// This is deliberately exact: following arbitrary redirects would turn the
+/// proxy into an open relay, and a broad `*.blob.core.windows.net` rule would
+/// catch every unrelated Azure storage account. GitHub numbers its artifact
+/// accounts (`productionresultssa1`, `…sa12`, …) and keeps the objects under
+/// `/actions-results/`.
+fn artifact_storage_uri(uri: &Uri) -> bool {
+    if uri.scheme_str() != Some("https") {
+        return false;
+    }
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let host = crate::domain::bare_host(host).trim_end_matches('.');
+    let Some(account) = host.strip_suffix(".blob.core.windows.net") else {
+        return false;
+    };
+    let Some(region) = account.strip_prefix("productionresultssa") else {
+        return false;
+    };
+    if region.is_empty() || !region.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    uri.path().starts_with("/actions-results/")
 }
 
 fn into_proxy_response(
@@ -1186,8 +1330,9 @@ fn attempt_row(attempt: &AttemptRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        authority, build_mitm_uri, build_upstream_uri, host_header_name, is_upgrade, same_host,
-        sanitize_request_headers, sanitize_response_headers, target_host, target_of, MitmTarget, Target,
+        artifact_storage_uri, authority, build_mitm_uri, build_upstream_uri, host_header_name,
+        is_upgrade, same_host, sanitize_request_headers, sanitize_response_headers, target_host,
+        target_of, MitmTarget, Target,
     };
     use http::uri::{PathAndQuery, Scheme};
     use http::{header, HeaderMap, Request, Uri};
@@ -1205,6 +1350,31 @@ mod tests {
         assert!(same_host("example.com.", "example.com"));
         assert!(!same_host("evil.example", "example.com"));
         assert!(!same_host("example.com.evil", "example.com"));
+    }
+
+    /// Only GitHub's numbered artifact accounts under `/actions-results/` may
+    /// be followed. Anything else keeps the browser's direct redirect, which
+    /// is what keeps the proxy from becoming an open redirect follower.
+    #[test]
+    fn only_github_artifact_storage_is_followed() {
+        for url in [
+            "https://productionresultssa12.blob.core.windows.net/actions-results/x/y",
+            "https://productionresultssa1.blob.core.windows.net/actions-results/x/y",
+        ] {
+            let uri: Uri = url.parse().unwrap();
+            assert!(artifact_storage_uri(&uri), "{url}");
+        }
+        for url in [
+            "https://productionresultssa.blob.core.windows.net/actions-results/x",
+            "https://productionresultssa12.blob.core.windows.net/other/x",
+            "https://evilproductionresultssa12.blob.core.windows.net/actions-results/x",
+            "https://productionresultssa12.blob.core.windows.net.evil.com/actions-results/x",
+            "http://productionresultssa12.blob.core.windows.net/actions-results/x",
+            "https://example.com/actions-results/x",
+        ] {
+            let uri: Uri = url.parse().unwrap();
+            assert!(!artifact_storage_uri(&uri), "{url}");
+        }
     }
 
     #[test]
