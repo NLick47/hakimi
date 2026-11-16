@@ -202,21 +202,25 @@ fn host_header(uri: &Uri) -> Option<HeaderValue> {
 }
 
 /// Built-in download host rules (hardcoded in v1)
-fn candidate_uri(uri: &Uri) -> bool {
+///
+/// Runs on every request, so it compares without allocating: lowercasing the
+/// host into a fresh `String` cost one allocation per request for a check
+/// that only ever compares.
+pub(crate) fn candidate_uri(uri: &Uri) -> bool {
     let Some(host) = uri.host() else {
         return false;
     };
-    let host = crate::domain::bare_host(host)
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    if host == "codeload.github.com" {
+    let host = crate::domain::bare_host(host).trim_end_matches('.');
+    if host.eq_ignore_ascii_case("codeload.github.com") {
         return true;
     }
-    if host == "github.com" {
+    if host.eq_ignore_ascii_case("github.com") {
         let path = uri.path();
         return path.contains("/releases/download/") || path.contains("/releases/latest/download/");
     }
-    host.ends_with(".githubusercontent.com")
+    const SUFFIX: &str = ".githubusercontent.com";
+    host.len() > SUFFIX.len()
+        && host[host.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
 }
 
 /// The narrow subset that may go through a mirror: release assets and source

@@ -413,6 +413,11 @@ async fn forward_with_uri(
     let is_get = req.method() == Method::GET;
     let has_range = req.headers().contains_key(header::RANGE);
     let rule_uri = upstream_uri;
+    // A segmented download replays the request as range requests, which need
+    // the credential headers. Only a GitHub release asset can ever be
+    // segmented, so the host decides it here: cloning four header values for
+    // every ordinary request was work nothing ever read.
+    let segment_candidate = is_get && !has_range && super::download::candidate_uri(&rule_uri);
     let (mut parts, body) = req.into_parts();
     sanitize_request_headers(&mut parts.headers, upgrade_requested);
     // One lazy snapshot, shared by both lookups; other requests never take it.
@@ -466,9 +471,14 @@ async fn forward_with_uri(
         // No mirror runs on this request, and the direct retry below is only
         // reachable from the mirrored branch. The segment base needs just the
         // handful of credential headers, so keep that small subset instead of
-        // deep-cloning the whole browser HeaderMap on every request.
+        // deep-cloning the whole browser HeaderMap on every request — and
+        // only when the request can be segmented at all.
         (
-            super::download::credential_headers(&parts.headers),
+            if segment_candidate {
+                super::download::credential_headers(&parts.headers)
+            } else {
+                HeaderMap::new()
+            },
             HeaderMap::new(),
         )
     };
