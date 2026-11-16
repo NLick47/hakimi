@@ -219,8 +219,13 @@ pub(crate) fn candidate_uri(uri: &Uri) -> bool {
         return path.contains("/releases/download/") || path.contains("/releases/latest/download/");
     }
     const SUFFIX: &str = ".githubusercontent.com";
+    // `str::get` returns `None` for an index that is not a character
+    // boundary, so a host whose last bytes are part of a multi-byte
+    // character cannot panic the comparison.
     host.len() > SUFFIX.len()
-        && host[host.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
+        && host
+            .get(host.len() - SUFFIX.len()..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(SUFFIX))
 }
 
 /// The narrow subset that may go through a mirror: release assets and source
