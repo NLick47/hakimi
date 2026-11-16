@@ -24,7 +24,7 @@
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
-        android:label="Hakimi"
+        android:label="${appLabel}"
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
         android:networkSecurityConfig="@xml/network_security_config"
@@ -32,7 +32,7 @@
         android:theme="@style/Theme.Hakimi">
 
         <activity
-            android:name=".MainActivity"
+            android:name="com.hakimi.probe.MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
             android:windowSoftInputMode="adjustResize">
@@ -43,7 +43,7 @@
         </activity>
 
         <service
-            android:name=".ProxyService"
+            android:name="com.hakimi.probe.ProxyService"
             android:exported="false"
             android:stopWithTask="false"
             android:foregroundServiceType="specialUse">
@@ -53,7 +53,7 @@
         </service>
 
         <receiver
-            android:name=".BootReceiver"
+            android:name="com.hakimi.probe.BootReceiver"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
@@ -62,7 +62,7 @@
         </receiver>
 
         <service
-            android:name=".HakimiVpnService"
+            android:name="com.hakimi.probe.HakimiVpnService"
             android:exported="true"
             android:permission="android.permission.BIND_VPN_SERVICE"
             android:stopWithTask="false"

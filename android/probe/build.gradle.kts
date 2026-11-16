@@ -46,6 +46,7 @@ android {
         targetSdk = 35
         versionCode = versionCodeFor(appVersion)
         versionName = appVersion
+        manifestPlaceholders["appLabel"] = "Hakimi"
     }
 
     sourceSets {
@@ -78,6 +79,8 @@ android {
         getByName("debug") {
             isDebuggable = true
             signingConfig = signingConfigs.getByName("debug")
+            applicationIdSuffix = ".debug"
+            manifestPlaceholders["appLabel"] = "Hakimi-debug"
         }
     }
 
