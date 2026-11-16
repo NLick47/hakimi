@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,7 @@ use http::header;
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use http_body_util::Full;
 use hyper::body::{Frame, Incoming, SizeHint};
+use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
@@ -410,7 +411,10 @@ struct Shared {
 impl Shared {
     fn set_fatal(&self, reason: &str) {
         {
-            let mut slot = self.reason.lock().unwrap();
+            // `parking_lot` instead of `std::sync::Mutex`: this runs on a Tokio
+            // worker, and a contended standard mutex parks the thread instead
+            // of spinning briefly.
+            let mut slot = self.reason.lock();
             if slot.is_none() {
                 *slot = Some(reason.to_string());
             }
@@ -864,7 +868,6 @@ async fn send_merge_error(shared: &Shared, out_tx: &mpsc::Sender<Result<Bytes, S
     let reason = shared
         .reason
         .lock()
-        .unwrap()
         .clone()
         .unwrap_or_else(|| "download interrupted".into());
     let _ = out_tx.send(Err(reason)).await;
@@ -1299,8 +1302,9 @@ mod tests {
     use std::future::Future;
     use std::net::IpAddr;
     use std::sync::atomic::{AtomicU64, AtomicUsize};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::task::{Context, Poll};
+    use parking_lot::Mutex;
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
