@@ -1338,6 +1338,9 @@ async fn the_recovery_connector_races_on_its_own() {
     let ca = CertificateAuthority::load_or_create(&paths).unwrap();
     let roots = dir.path().join("extra-root.pem");
     std::fs::write(&roots, ca.ca_pem()).unwrap();
+    // The root bundle is a process-global environment variable: the guard
+    // keeps two tests from overwriting each other's roots.
+    let _root_guard = crate::hooks::extra_root_guard().await;
     std::env::set_var("HAKIMI_EXTRA_ROOT_CA", &roots);
 
     let live_tls = ca.server_config("upstream.test").unwrap();
@@ -1464,6 +1467,9 @@ async fn concurrent_cold_connections_share_one_discovery() {
     // The proxy has to trust the local CA for the working candidate.
     let roots = dir.path().join("extra-root.pem");
     std::fs::write(&roots, ca.ca_pem()).unwrap();
+    // The root bundle is a process-global environment variable: the guard
+    // keeps two tests from overwriting each other's roots.
+    let _root_guard = crate::hooks::extra_root_guard().await;
     std::env::set_var("HAKIMI_EXTRA_ROOT_CA", &roots);
 
     // The working candidate: a TLS server on 127.0.0.1.

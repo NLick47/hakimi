@@ -107,6 +107,23 @@ pub fn extra_root_path() -> Option<PathBuf> {
     }
 }
 
+/// Serializes the tests that install a private root bundle.
+///
+/// `HAKIMI_EXTRA_ROOT_CA` is a process-global environment variable, and the
+/// TLS context reads it when it is built. Two tests that install different
+/// bundles therefore raced: the second one won the variable, and the first
+/// one then rejected the certificate of its own mock server. The guard has to
+/// be held for the whole test, because the roots are read whenever a TLS
+/// context is built.
+///
+/// The mutex is an async one on purpose: the guard is held across the awaits
+/// of the test, which a blocking mutex must not be.
+#[cfg(test)]
+pub(crate) async fn extra_root_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
+}
+
 /// Load the extra roots from `HAKIMI_EXTRA_ROOT_CA`.
 ///
 /// An unreadable or malformed file is reported once and then ignored: a broken
