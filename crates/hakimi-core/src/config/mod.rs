@@ -975,6 +975,26 @@ pub fn default_groups() -> Vec<GroupConfig> {
             true,
             "https://x.com/",
         ),
+        group(
+            "google",
+            "Google",
+            vec![
+                DomainRule::routed(
+                    "www.google.com",
+                    RoutePolicy::sni(vec!["www.google.com.".to_string()]),
+                ),
+                DomainRule::routed(
+                    "www.google.com.hk",
+                    RoutePolicy::sni(vec!["www.google.com.hk.".to_string()]),
+                ),
+            ],
+            RoutePolicy::sni(vec![
+                "www.google.com.".to_string(),
+                "www.google.com.hk.".to_string(),
+            ]),
+            true,
+            "https://www.google.com/",
+        ),
     ]
 }
 
@@ -1938,7 +1958,7 @@ mod tests {
     fn defaults_validate_and_match_document() {
         let config = AppConfig::default();
         config.validate().unwrap();
-        assert_eq!(config.groups.len(), 10);
+        assert_eq!(config.groups.len(), 11);
         let x = config.group("x-com").unwrap();
         assert!(x.enabled);
         assert!(x.domains.iter().any(|rule| rule.pattern == "*.twimg.com"));

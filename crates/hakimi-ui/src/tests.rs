@@ -196,6 +196,7 @@ fn icon_keys_match_whole_ids_and_slugs_only() {
     // Must not hand the E-Hentai logo to a slug that merely contains "eh".
     assert_eq!(icon_key_for("mehta-com"), "");
     // Sites that ship their own logo match by id.
+    assert_eq!(icon_key_for("google"), "google");
     assert_eq!(icon_key_for("hanime"), "hanime");
     assert_eq!(icon_key_for("nhentai"), "nhentai");
     // The catalog id and the homepage slug must reach the same logo.
