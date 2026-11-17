@@ -36,6 +36,8 @@ class SettingsScreen(private val context: Context, private val host: Host) {
     private var certInfoCache = ""
 
     private lateinit var portRow: SettingRow
+    private lateinit var dohPrimaryRow: SettingRow
+    private lateinit var dohFallbackRow: SettingRow
     private lateinit var ipCatalogRow: SettingRow
     private lateinit var dohCatalogRow: SettingRow
     private lateinit var resetCatalogRow: SettingRow
@@ -116,6 +118,24 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         portRow.clickOnce {
             host.editSetting("proxy.port", "本地端口", "1–65535，修改前需要先停止加速", host.core.port.toString())
         }
+        dohPrimaryRow = SettingRow(context, "首选 DoH 端点", "慢时并行补查")
+        dohPrimaryRow.clickOnce {
+            host.editSetting(
+                "doh.primary",
+                "首选 DoH 端点",
+                "慢时并行补查",
+                configString("doh", "primary")
+            )
+        }
+        dohFallbackRow = SettingRow(context, "次选 DoH 端点", "并行补查，答案合并")
+        dohFallbackRow.clickOnce {
+            host.editSetting(
+                "doh.fallback",
+                "次选 DoH 端点",
+                "并行补查，答案合并",
+                configString("doh", "fallback")
+            )
+        }
         ipCatalogRow = SettingRow(context, "IP 目录", "留空则停用远程 IP 目录")
         ipCatalogRow.clickOnce {
             host.editSetting(
@@ -136,7 +156,10 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         }
         resetCatalogRow = SettingRow(context, "恢复默认目录", "把 IP/DoH 目录恢复为内置地址")
         resetCatalogRow.clickOnce { host.resetCatalogs() }
-        content.addView(rowsCard(portRow, ipCatalogRow, dohCatalogRow, resetCatalogRow))
+        content.addView(rowsCard(
+            portRow, dohPrimaryRow, dohFallbackRow,
+            ipCatalogRow, dohCatalogRow, resetCatalogRow
+        ))
         content.addView(space(10f))
 
         content.addView(section("图片中转"))
@@ -340,6 +363,8 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         }
 
         portRow.setValue(data.port.toString())
+        dohPrimaryRow.setValue(shorten(configString("doh", "primary")).ifEmpty { "未设置" })
+        dohFallbackRow.setValue(shorten(configString("doh", "fallback")).ifEmpty { "未设置" })
         ipCatalogRow.setValue(shorten(configString("catalogs", "ip")).ifEmpty { "未设置" })
         dohCatalogRow.setValue(shorten(configString("catalogs", "doh")).ifEmpty { "未设置" })
 
@@ -403,6 +428,8 @@ class SettingsScreen(private val context: Context, private val host: Host) {
         )
 
         portRow.setBusy(host.savingConfig)
+        dohPrimaryRow.setBusy(host.savingConfig)
+        dohFallbackRow.setBusy(host.savingConfig)
         ipCatalogRow.setBusy(host.savingConfig)
         dohCatalogRow.setBusy(host.savingConfig)
         resetCatalogRow.setBusy(host.savingConfig)

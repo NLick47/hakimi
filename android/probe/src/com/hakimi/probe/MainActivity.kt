@@ -1093,21 +1093,16 @@ class MainActivity : Activity(), Host {
                         true
                     }
                 }
-                "doh.primary" -> {
-                    if (raw.isBlank()) {
+                "doh.primary", "doh.fallback" -> {
+                    val value = raw.trim()
+                    if (value.isEmpty()) {
                         showSnack("DoH 地址不能为空", error = true)
                         false
-                    } else {
-                        dohObj.put("primary", raw)
-                        true
-                    }
-                }
-                "doh.fallback" -> {
-                    if (raw.isBlank()) {
-                        showSnack("备用 DoH 地址不能为空", error = true)
+                    } else if (!value.startsWith("https://", ignoreCase = true)) {
+                        showSnack("DoH 地址必须以 https:// 开头", error = true)
                         false
                     } else {
-                        dohObj.put("fallback", raw)
+                        dohObj.put(key.substringAfter('.'), value)
                         true
                     }
                 }

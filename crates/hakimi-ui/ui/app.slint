@@ -2210,8 +2210,8 @@ export component AppWindow inherits Window {
                                 }
                                 RowLine { }
                                 FieldRow {
-                                    label: "主加密 DNS";
-                                    hint: "HTTPS DoH 端点";
+                                    label: "首选 DoH 端点";
+                                    hint: "慢时并行补查";
                                     setting-key: "doh.primary";
                                     error-key: root.cfg-error-key;
                                     placeholder: "https://…";
@@ -2222,8 +2222,8 @@ export component AppWindow inherits Window {
                                 }
                                 RowLine { }
                                 FieldRow {
-                                    label: "备用 DNS";
-                                    hint: "主端点不可用时回退";
+                                    label: "次选 DoH 端点";
+                                    hint: "并行补查后合并";
                                     setting-key: "doh.fallback";
                                     error-key: root.cfg-error-key;
                                     placeholder: "https://…";
