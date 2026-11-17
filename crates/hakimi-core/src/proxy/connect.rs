@@ -31,6 +31,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RAW_RACE_SIZE: usize = 8;
 const RAW_RACE_STAGGER: Duration = Duration::from_millis(150);
 
+/// The browser starts its TLS handshake immediately after the CONNECT
+/// response, so an accept that outlives this bound is a stalled client.
+/// Without the bound the task, the socket and a concurrency slot stay pinned
+/// for as long as the client stays alive.
+const MITM_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Short-TTL cache for system resolver answers. Bypass hosts otherwise pay a
 /// blocking `getaddrinfo` on every new connection. Cleared on network changes
 const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -280,10 +286,13 @@ pub(super) async fn handle_connect(
             async {
                 let upgraded = on_upgrade.await.context("waiting for CONNECT upgrade")?;
                 let acceptor = TlsAcceptor::from(tls_config);
-                let tls = acceptor
-                    .accept(TokioIo::new(upgraded))
-                    .await
-                    .context("accepting browser TLS")?;
+                let tls = tokio::time::timeout(
+                    MITM_ACCEPT_TIMEOUT,
+                    acceptor.accept(TokioIo::new(upgraded)),
+                )
+                .await
+                .context("waiting for the browser TLS handshake")?
+                .context("accepting browser TLS")?;
                 let alpn = tls
                     .get_ref()
                     .1
