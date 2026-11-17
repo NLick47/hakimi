@@ -342,6 +342,26 @@ type EndpointCache = Option<(u64, u64, Arc<Vec<EffectiveEndpoint>>)>;
 /// every health check.
 const MAX_DOH_CLIENTS: usize = 16;
 
+/// How long a DoH connection stays in the pool while it is idle.
+///
+/// reqwest's default is 90s, which is shorter than the gap between two
+/// resolution bursts in normal browsing. The DoH connection is reused for
+/// every query to that endpoint, so dropping it costs a TCP+TLS handshake
+/// (two round trips and a certificate verification) on the critical path of
+/// the next cold domain.
+const DOH_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Idle connections kept per DoH endpoint.
+const DOH_POOL_MAX_IDLE: usize = 4;
+
+/// HTTP/2 keep-alive ping for the DoH connection.
+///
+/// The upstream pool already pings its HTTP/2 connections; without the same
+/// treatment a DoH connection can be reaped by the middlebox between two
+/// bursts and the next query fails on a socket that looked healthy.
+const DOH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const DOH_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct CachedDohClient {
     client: reqwest::Client,
     source: DohSource,
@@ -1636,6 +1656,21 @@ impl Resolver {
             .redirect(reqwest::redirect::Policy::none())
             // DoH must bypass the OS proxy: otherwise it could recurse into our own listener.
             .no_proxy()
+            // Keep the pooled connection between resolution bursts. reqwest
+            // defaults to 90s, and a proxy resolves a handful of names every
+            // few minutes: with the default every burst started from an empty
+            // pool and paid one or two fresh TCP+TLS handshakes to the DoH
+            // endpoint before the first query could even be sent. That is two
+            // round trips plus a WebPKI verification on the critical path of
+            // the first byte.
+            .pool_idle_timeout(DOH_POOL_IDLE_TIMEOUT)
+            .pool_max_idle_per_host(DOH_POOL_MAX_IDLE)
+            // A half-open HTTP/2 connection can sit in the pool until the
+            // next query fails on it. The upstream client already solves this
+            // with a keep-alive ping; the DoH client needs the same.
+            .http2_keep_alive_interval(DOH_KEEPALIVE_INTERVAL)
+            .http2_keep_alive_timeout(DOH_KEEPALIVE_TIMEOUT)
+            .http2_keep_alive_while_idle(true)
             .user_agent(format!("hakimi/{}", env!("CARGO_PKG_VERSION")));
         // Test hook: extra roots for a local harness (off by default).
         for root in crate::hooks::extra_roots() {
