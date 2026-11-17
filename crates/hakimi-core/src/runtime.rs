@@ -773,12 +773,16 @@ impl HakimiRuntime {
         let Some(url) = self.pac_url() else {
             return;
         };
-        // This is a one-shot check at startup, not a periodic probe.
+        // This is a one-shot check at startup, not a periodic probe. The
+        // readable mirror is checked too: Chromium reads it directly, so a
+        // stale takeover can still be live there after the WinINet blob lost
+        // the PAC (for example when a write was not persisted).
         let ours = self
             .system_proxy
             .status(Some(ProxyMode::Pac), Some(url.clone()))
             .map(|status| status.applied)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || self.system_proxy.legacy_pac_url().as_deref() == Some(url.as_str());
         if ours {
             tracing::info!("stale PAC takeover found; switching it off");
             self.system_proxy.pac_disable();
@@ -945,7 +949,12 @@ impl HakimiRuntime {
                     }
                     tracing::info!(mode = %status.mode, "system proxy applied");
                 } else {
-                    tracing::warn!(mode = %status.mode, "system proxy setting was not applied");
+                    tracing::warn!(
+                        mode = %status.mode,
+                        expected = ?status.expected,
+                        current = ?status.current,
+                        "system proxy setting was not applied"
+                    );
                 }
             }
             Err(error) => {
