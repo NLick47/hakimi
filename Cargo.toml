@@ -93,13 +93,14 @@ opt-level = "s"
 # (`hakimi-ffi` uses catch_unwind) and Android keeps it for the JNI shell.
 [profile.desktop-release]
 inherits = "release"
+opt-level = "z"
 panic = "abort"
 strip = "symbols"
 lto = "fat"
 codegen-units = 1
 
 [profile.desktop-release.package."*"]
-opt-level = "s"
+opt-level = "z"
 
 # Android ships inside an APK, so it trades throughput for size. Panic
 # strategy stays `unwind`: the JNI shell uses `catch_unwind` to turn a panic
