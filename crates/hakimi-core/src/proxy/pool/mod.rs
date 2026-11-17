@@ -79,7 +79,7 @@ const HEDGE_AFTER: Duration = Duration::from_secs(5);
 /// The guard lives on the response body rather than on the send future: the
 /// body is what holds the pipe, and a request whose headers arrived quickly
 /// still queues the next one for as long as its body streams.
-struct InflightGuard {
+pub(crate) struct InflightGuard {
     counter: Arc<AtomicUsize>,
 }
 
@@ -121,12 +121,22 @@ pub(crate) enum UpstreamResponseBody {
 }
 
 impl UpstreamResponseBody {
-    /// Splits out the underlying stream plus any attached concurrency permit.
-    /// Segmented downloads use the first upstream stream as segment 0.
-    pub(crate) fn into_incoming(self) -> (Incoming, Option<OwnedSemaphorePermit>) {
+    /// Splits out the underlying stream, the attached concurrency permit and
+    /// the in-flight guard. Segmented downloads use the first upstream stream
+    /// as segment 0 and keep the permit and the guard for as long as the
+    /// streaming worker occupies the pipe.
+    pub(crate) fn into_incoming(
+        self,
+    ) -> (
+        Incoming,
+        Option<OwnedSemaphorePermit>,
+        Option<InflightGuard>,
+    ) {
         match self {
-            UpstreamResponseBody::Plain(body) => (body.inner, None),
-            UpstreamResponseBody::Limited(limited) => (limited.inner, Some(limited.permit)),
+            UpstreamResponseBody::Plain(body) => (body.inner, None, body._inflight),
+            UpstreamResponseBody::Limited(limited) => {
+                (limited.inner, Some(limited.permit), limited._inflight)
+            }
         }
     }
 }

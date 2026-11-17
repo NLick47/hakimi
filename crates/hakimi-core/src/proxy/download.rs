@@ -519,6 +519,10 @@ struct Worker {
     /// A pooled response can carry an image-host concurrency permit, held until
     /// the streaming segment exits
     _upstream_permit: Option<OwnedSemaphorePermit>,
+    /// The host's in-flight guard from the original response: the streaming
+    /// connection occupies the pipe until this worker exits, so the counter
+    /// must stay raised with it
+    _inflight: Option<super::pool::InflightGuard>,
 }
 
 impl Worker {
@@ -1225,13 +1229,14 @@ pub(crate) async fn segment(
         host,
     });
 
-    let (incoming, upstream_permit) = body.into_incoming();
+    let (incoming, upstream_permit, inflight) = body.into_incoming();
     tokio::spawn(
         Worker {
             shared: shared.clone(),
             source: Source::Stream(incoming),
             carry: None,
             _upstream_permit: upstream_permit,
+            _inflight: inflight,
         }
         .run(),
     );
@@ -1247,6 +1252,7 @@ pub(crate) async fn segment(
                 source: Source::None,
                 carry: None,
                 _upstream_permit: None,
+                _inflight: None,
             }
             .run(),
         );
@@ -1826,6 +1832,7 @@ mod tests {
             source: Source::None,
             carry: None,
             _upstream_permit: None,
+            _inflight: None,
         };
         let merger = tokio::spawn(run_merger(shared.clone(), order_rx, out_tx));
 
@@ -1910,6 +1917,7 @@ mod tests {
             source: Source::None,
             carry: None,
             _upstream_permit: None,
+            _inflight: None,
         };
         let merger = tokio::spawn(run_merger(shared.clone(), order_rx, out_tx));
 
@@ -2119,6 +2127,7 @@ mod tests {
                 source: Source::None,
                 carry: None,
                 _upstream_permit: None,
+                _inflight: None,
             }
             .run(),
         );
@@ -2135,6 +2144,7 @@ mod tests {
                 source: Source::Stream(incoming),
                 carry: None,
                 _upstream_permit: None,
+                _inflight: None,
             }
             .run(),
         );
