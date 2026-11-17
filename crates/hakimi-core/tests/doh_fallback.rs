@@ -1467,3 +1467,55 @@ async fn a_slow_aaaa_answer_is_cached_after_the_short_window() {
     assert!(second.ips.iter().any(std::net::IpAddr::is_ipv6));
     assert_eq!(second.source, DohSource::Cache);
 }
+
+/// An expired ECH config inside the stale-while-revalidate window must be
+/// served without waiting for DoH. Both endpoints stall forever, so a resolver
+/// that queried on the handshake path would never return; the stale path
+/// returns immediately and leaves the stalled query in the background.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_ech_is_served_without_waiting_for_doh() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path());
+    paths.ensure().unwrap();
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    let roots = dir.path().join("extra-root.pem");
+    std::fs::write(&roots, ca.ca_pem()).unwrap();
+    std::env::set_var("HAKIMI_EXTRA_ROOT_CA", &roots);
+
+    let tls = ca.server_config("127.0.0.1").unwrap();
+    let primary = DohServer::spawn_mode(tls.clone(), DohMode::Stall).await;
+    let fallback = DohServer::spawn_mode(tls, DohMode::Stall).await;
+
+    let config = Arc::new(ConfigManager::load_or_create(&paths).unwrap());
+    config
+        .mutate(|config| {
+            config.doh.primary = format!("https://127.0.0.1:{}/dns-query", primary.addr.port());
+            config.doh.fallback = format!("https://127.0.0.1:{}/dns-query", fallback.addr.port());
+            config.catalogs.timeout_secs = 3;
+            Ok(())
+        })
+        .unwrap();
+    let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
+    // Expired (ttl 1s, age 10s) but still inside the 60 s grace window.
+    cache.put_ech(CachedEch {
+        domain: "example.com".into(),
+        ech_config: vec![9, 9, 9, 9],
+        ttl_secs: 1,
+        fetched_at: now() - chrono::Duration::seconds(10),
+    });
+    let catalogs = CatalogManager::load(&paths, config.clone(), cache.clone()).unwrap();
+    let resolver = Resolver::new(cache, config, catalogs);
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        resolver.ech_config("example.com", false),
+    )
+    .await
+    .expect("an expired-but-usable ECH must not wait for the stalled DoH query")
+    .expect("the stale config is a valid outcome");
+    assert_eq!(outcome.config, vec![9, 9, 9, 9]);
+    assert!(outcome.stale, "the served config must be marked stale");
+
+    std::mem::forget(dir);
+}

@@ -669,6 +669,33 @@ impl Resolver {
         Ok(None)
     }
 
+    /// An expired ECH config inside the stale-while-revalidate window. Serving
+    /// it keeps an expired config off the handshake's critical path while DoH
+    /// refreshes it in the background. `None` means no usable stale entry.
+    fn stale_ech(&self, domain: &str) -> Option<EchOutcome> {
+        // An authoritative NODATA proves the config is gone; serving a stale
+        // one here would defeat that, so fall through to the live query path
+        // that already refuses to resurrect it.
+        if self.cache.doh_negative_authoritative(domain, TYPE_HTTPS) {
+            return None;
+        }
+        let cached = self.cache.ech(domain, false)?;
+        let at = now();
+        if cached.is_fresh(at) || cached.ttl_secs == 0 {
+            return None;
+        }
+        let age = at.signed_duration_since(cached.fetched_at).num_seconds();
+        if age > cached.ttl_secs as i64 + STALE_WHILE_REVALIDATE_SECS {
+            return None;
+        }
+        Some(EchOutcome {
+            config: cached.ech_config,
+            source: DohSource::Cache,
+            endpoint: None,
+            stale: true,
+        })
+    }
+
     async fn query_lock(&self, key: String) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let mut locks = self.query_locks.lock();
@@ -735,6 +762,47 @@ impl Resolver {
                     domain = %domain,
                     error = %error,
                     "background DoH refresh failed; keeping the stale answer"
+                );
+            }
+        });
+    }
+
+    /// Refresh an expired ECH config off the handshake path. Shares the
+    /// per-domain single-flight lock with foreground queries and a backoff map
+    /// so a burst of stale hits cannot spawn a DoH attempt each.
+    fn spawn_ech_refresh(&self, domain: String, allow_shared: bool) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let domain = normalize_query_name(&domain);
+        let key = format!("ech|{domain}");
+        {
+            let at = Instant::now();
+            let mut refresh_after = self.stale_refresh_after.lock();
+            if refresh_after.get(&key).is_some_and(|until| *until > at) {
+                return;
+            }
+            if refresh_after.len() >= STALE_REFRESH_BACKOFF_MAX {
+                refresh_after.retain(|_, until| *until > at);
+                if refresh_after.len() >= STALE_REFRESH_BACKOFF_MAX {
+                    refresh_after.clear();
+                }
+            }
+            refresh_after.insert(key.clone(), at + STALE_REFRESH_BACKOFF);
+        }
+        let resolver = self.clone();
+        handle.spawn(async move {
+            let Some(_guard) = resolver.try_query_lock(key) else {
+                return;
+            };
+            if resolver.fresh_ech(&domain).ok().flatten().is_some() {
+                return;
+            }
+            if let Err(error) = resolver.fetch_ech_live(&domain, allow_shared).await {
+                tracing::debug!(
+                    domain = %domain,
+                    error = %error,
+                    "background ECH refresh failed; keeping the stale config"
                 );
             }
         });
@@ -928,11 +996,21 @@ impl Resolver {
         if let Some(outcome) = self.fresh_ech(&domain)? {
             return Ok(outcome);
         }
+        // An expired-but-usable config is served immediately while DoH
+        // refreshes it in the background. This keeps an expiry off the
+        // handshake's critical path instead of blocking on a live query.
+        if let Some(outcome) = self.stale_ech(&domain) {
+            self.spawn_ech_refresh(domain.clone(), allow_shared);
+            return Ok(outcome);
+        }
         let _guard = self.query_lock(format!("ech|{domain}")).await;
         if let Some(outcome) = self.fresh_ech(&domain)? {
             return Ok(outcome);
         }
+        self.fetch_ech_live(&domain, allow_shared).await
+    }
 
+    async fn fetch_ech_live(&self, domain: &str, allow_shared: bool) -> Result<EchOutcome> {
         let mut live_error: Option<anyhow::Error> = None;
         let mut live_failed = false;
         // A remembered authoritative NODATA proves the HTTPS RR and its ECH
@@ -952,7 +1030,7 @@ impl Resolver {
                 live_failed |= !query.authoritative;
                 if let Some(ech) = query.answer.ech {
                     self.cache.put_ech(CachedEch {
-                        domain: domain.clone(),
+                        domain: domain.to_string(),
                         ech_config: ech.clone(),
                         // Same floor as the address cache: a zero-TTL HTTPS
                         // RR must not turn every handshake into a live race
@@ -980,7 +1058,7 @@ impl Resolver {
                     // Cache the shared config under the requesting host too, so subsequent
                     // decisions for this host skip the (always empty) HTTPS RR query.
                     self.cache.put_ech(CachedEch {
-                        domain: domain.clone(),
+                        domain: domain.to_string(),
                         ech_config: outcome.config.clone(),
                         ttl_secs: SHARED_ECH_TTL_SECS,
                         fetched_at: now(),
@@ -2502,5 +2580,42 @@ mod tests {
         assert_eq!(entry.failures, 0);
         assert!(entry.cooldown_until.is_none());
         assert_eq!(resolver.endpoint_order(&endpoints)[0], 0);
+    }
+
+    #[test]
+    fn stale_ech_serves_the_grace_window_but_not_fresh_or_nodata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, cache, resolver) = resolver(dir.path());
+        let config = vec![0xfe, 0x0d, 0x00, 0x01];
+        let put = |age: i64, ttl: u32| {
+            cache.put_ech(CachedEch {
+                domain: "example.test".into(),
+                ech_config: config.clone(),
+                ttl_secs: ttl,
+                fetched_at: now() - chrono::Duration::seconds(age),
+            });
+        };
+
+        put(0, 300);
+        assert!(resolver.stale_ech("example.test").is_none(), "fresh is not stale");
+
+        put(310, 300);
+        let served = resolver.stale_ech("example.test").expect("expired within grace");
+        assert!(served.stale);
+        assert_eq!(served.config, config);
+
+        // Past TTL + STALE_WHILE_REVALIDATE_SECS the grace is over: the live
+        // path (with its own failure fallback) must decide instead.
+        put(400, 300);
+        assert!(resolver.stale_ech("example.test").is_none(), "grace window expired");
+
+        // An authoritative NODATA proves the config is gone; never resurrect
+        // a cached one even inside the grace window.
+        put(310, 300);
+        cache.put_doh_negative("example.test", TYPE_HTTPS, 300, true);
+        assert!(
+            resolver.stale_ech("example.test").is_none(),
+            "authoritative NODATA must suppress stale ECH"
+        );
     }
 }
