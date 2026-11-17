@@ -12,7 +12,7 @@ use crate::domain::{normalize_hostname, DomainMatcher, DomainPattern};
 use crate::util::is_public_ip;
 
 pub const IP_CATALOG_SCHEMA: u32 = 1;
-pub const MAX_IPS_PER_DOMAIN: usize = 8;
+pub const MAX_IPS_PER_DOMAIN: usize = 16;
 pub const MAX_IPS_ENTRIES: usize = 4096;
 
 /// Suffixes whose wildcard IP entry describes a CDN edge, not every name under
@@ -479,7 +479,7 @@ mod tests {
 
         let too_many = format!(
             r#"{{"v":1,"groups":{{"g":["example.com"]}},"ips":{{"example.com":[{}]}}}}"#,
-            (0..9)
+            (0..=MAX_IPS_PER_DOMAIN)
                 .map(|i| format!("\"1.1.1.{}\"", i + 1))
                 .collect::<Vec<_>>()
                 .join(",")
