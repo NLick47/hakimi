@@ -1328,8 +1328,8 @@ async fn a_stalled_discovery_releases_its_followers() {
 }
 
 /// The recovery pool replays requests whose shared discovery stalled. Its
-/// connector therefore has to race on its own instead of queueing behind the
-/// very discovery it is escaping.
+/// connector therefore races against its own discovery map, not against the
+/// stalled one, but it still shares one race among concurrent replays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_recovery_connector_races_on_its_own() {
     let dir = tempfile::tempdir().unwrap();
@@ -1401,10 +1401,17 @@ async fn the_recovery_connector_races_on_its_own() {
 
     let tls = TlsContext::new().unwrap();
     let pool = Arc::new(UpstreamPool::new(engine.clone(), tls, &config.snapshot()));
-    // Wiring guard: only the recovery connector may skip single-flight.
-    assert!(pool.auto_connector.single_flight);
-    assert!(pool.http1_connector.single_flight);
-    assert!(!pool.recovery_connector.single_flight);
+    // Wiring guard: the recovery connector owns a second discovery map, so it
+    // single-flights its own requests without queueing behind the stalled
+    // discovery of the normal pools.
+    assert!(!Arc::ptr_eq(
+        &pool.auto_connector.discovery,
+        &pool.recovery_connector.discovery
+    ));
+    assert!(Arc::ptr_eq(
+        &pool.auto_connector.discovery,
+        &pool.http1_connector.discovery
+    ));
 
     let uri = format!("https://upstream.test:{port}/");
     let request = |method: Method| {
@@ -1591,6 +1598,132 @@ async fn concurrent_cold_connections_share_one_discovery() {
         started.elapsed() < Duration::from_millis(1_000),
         "the stalled cached route blocked the healthy candidate for {:?}",
         started.elapsed()
+    );
+}
+
+/// A host that was marked slow sends every later request to the recovery
+/// pool. Those requests must share one route race among themselves: without a
+/// single flight each of them raced the candidates on its own, so a burst
+/// dialled the dead address once per request instead of once per burst.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_recovery_requests_share_one_race() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = crate::paths::Paths::new(dir.path());
+    paths.ensure().unwrap();
+    let ca = CertificateAuthority::load_or_create(&paths).unwrap();
+    let roots = dir.path().join("extra-root.pem");
+    std::fs::write(&roots, ca.ca_pem()).unwrap();
+    // The root bundle is a process-global environment variable: the guard
+    // keeps two tests from overwriting each other's roots.
+    let _root_guard = crate::hooks::extra_root_guard().await;
+    std::env::set_var("HAKIMI_EXTRA_ROOT_CA", &roots);
+
+    let live_tls = ca.server_config("upstream.test").unwrap();
+    let live = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = live.local_addr().unwrap().port();
+    let acceptor = tokio_rustls::TlsAcceptor::from(live_tls);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = live.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let service = hyper::service::service_fn(
+                    |_req: hyper::Request<hyper::body::Incoming>| async {
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                            http_body_util::Full::new(Bytes::from_static(b"ok")),
+                        ))
+                    },
+                );
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), service)
+                .await;
+            });
+        }
+    });
+
+    // The stale candidate: accepts TCP but never answers TLS, so the race has
+    // to try it before the working address.
+    let dead = TcpListener::bind(("::1", port)).await.unwrap();
+    let dead_accepts = Arc::new(AtomicUsize::new(0));
+    let counter = dead_accepts.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = dead.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(socket);
+            });
+        }
+    });
+
+    let (engine, config) = engine_for(dir.path());
+    engine.cache.put_last_good(LastGoodEntry {
+        domain: "upstream.test".into(),
+        ip: "::1".parse().unwrap(),
+        source: IpSource::Cache,
+        saved_at: now(),
+        catalog_version: 0,
+    });
+    let engine = DecisionEngine::new(
+        engine.config.clone(),
+        engine.cache.clone(),
+        Arc::new(StubRemote),
+        engine.resolver.clone(),
+        engine.prober.clone(),
+        engine.status.clone(),
+    );
+    let cached = Arc::new(ConnectPlan {
+        domain: "upstream.test".into(),
+        group_id: "test".into(),
+        ip: "::1".parse().unwrap(),
+        port,
+        mode: TlsMode::Direct,
+        sni: None,
+        ech_config: None,
+        tls: true,
+        source: IpSource::Cache,
+        rule_index: None,
+    });
+    engine.note_tunnel_success(&cached, 5);
+
+    let tls = TlsContext::new().unwrap();
+    let pool = Arc::new(UpstreamPool::new(engine, tls, &config.snapshot()));
+    // Every request now takes the recovery path.
+    pool.mark_slow("upstream.test");
+
+    let uri = format!("https://upstream.test:{port}/");
+    let mut tasks = Vec::new();
+    for _ in 0..10 {
+        let pool = pool.clone();
+        let uri = uri.clone();
+        tasks.push(tokio::spawn(async move {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(&uri)
+                .body(Either::Right(Full::new(Bytes::new())))
+                .unwrap();
+            pool.send(request, false)
+                .await
+                .map(|response| response.status())
+                .map_err(|error| error)
+        }));
+    }
+    for (index, task) in tasks.into_iter().enumerate() {
+        let outcome = task.await.unwrap();
+        assert!(outcome.is_ok(), "request {index} failed: {outcome:?}");
+        assert_eq!(outcome.unwrap(), http::StatusCode::OK);
+    }
+    assert_eq!(
+        dead_accepts.load(Ordering::SeqCst),
+        1,
+        "the recovery burst must share one race, not one race per request"
     );
 }
 

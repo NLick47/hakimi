@@ -541,19 +541,29 @@ impl UpstreamPool {
             http1_hosts: http1_hosts.clone(),
             discovery: discovery.clone(),
             stats: stats.clone(),
-            single_flight: true,
         };
-        // Same behaviour as the normal connector except for single-flight: the
-        // recovery pool replays requests whose shared discovery stalled, so its
-        // connections must not queue behind that stalled discovery again.
+        // The recovery connector keeps its own discovery map.
+        //
+        // It must not queue behind the shared discovery it is escaping: a
+        // replay exists because that discovery stalled, so joining it again
+        // would wait on the very stall the replay is meant to leave.
+        //
+        // It must also not race on its own: a host that got marked slow sends
+        // every later request to this connector, and N concurrent requests
+        // would then run N independent route races (each one a DoH query plus
+        // up to eight addresses times five handshake variants). A separate
+        // map gives both properties: the recovery requests share one race
+        // among themselves, and that race is independent of the stalled one.
+        let recovery_discovery = Arc::new(Discovery {
+            inflight: Mutex::new(HashMap::new()),
+        });
         let recovery_connector = RouteConnector {
             engine: engine.clone(),
             tls: tls.clone(),
             http1_only: false,
             http1_hosts: http1_hosts.clone(),
-            discovery: discovery.clone(),
+            discovery: recovery_discovery,
             stats: stats.clone(),
-            single_flight: false,
         };
         let http1_connector = RouteConnector {
             engine: engine.clone(),
@@ -562,7 +572,6 @@ impl UpstreamPool {
             http1_hosts: http1_hosts.clone(),
             discovery: discovery.clone(),
             stats: stats.clone(),
-            single_flight: true,
         };
         Arc::new(Self {
             clients: RwLock::new(PoolClients {
@@ -1384,12 +1393,11 @@ struct RouteConnector {
     tls: Arc<TlsContext>,
     http1_only: bool,
     http1_hosts: Arc<Http1Hosts>,
+    /// The single-flight map for this connector's route discoveries. The
+    /// recovery connector owns a second one so it never queues behind the
+    /// discovery it is escaping.
     discovery: Arc<Discovery>,
     stats: Arc<UpstreamStats>,
-    /// Recovery connectors skip the single-flight discovery: a replay exists
-    /// because the shared route discovery stalled, so joining it again would
-    /// wait on the very stall the replay is meant to escape.
-    single_flight: bool,
 }
 
 impl Service<Uri> for RouteConnector {
@@ -1561,24 +1569,6 @@ impl RouteConnector {
         // uses the leader's plan and never looks at this one, so the work is
         // done in the branches that consume it.
         let key = format!("{}|{}|{}", cursor.domain(), cursor.port(), tls);
-        if !self.single_flight {
-            // Recovery path: race on our own. The shared discovery may be
-            // stalled, and this request exists to escape that stall.
-            let cached_plan = self.cached_plan_for(&mut cursor, tls);
-            let domain = cursor.domain().to_string();
-            let started = std::time::Instant::now();
-            let outcome = self
-                .race_plans(cursor, cached_plan, force_http1, timeout)
-                .await;
-            if started.elapsed() > SLOW_DISCOVERY {
-                tracing::warn!(
-                    domain = %domain,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "recovery route discovery was slow"
-                );
-            }
-            return outcome.map(|(_, io)| io).map_err(anyhow::Error::msg);
-        }
         let (inflight, leader) = {
             let mut map = self.discovery.inflight.lock();
             if let Some(existing) = map.get(&key) {
