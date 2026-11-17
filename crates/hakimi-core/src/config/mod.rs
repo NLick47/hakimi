@@ -993,7 +993,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
                 "www.google.com.hk.".to_string(),
             ]),
             true,
-            "https://www.google.com/",
+            "https://www.google.com.hk/",
         ),
     ]
 }
