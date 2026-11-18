@@ -1462,12 +1462,12 @@ impl HakimiRuntime {
             }
         });
 
-        // WinINet keeps serving a cached PAC until told the settings changed
+        // WinINet keeps serving a cached PAC until told the settings changed.
         let runtime = self.clone();
         let mut receiver = shutdown.subscribe();
         self.spawn(async move {
             let mut watch = PacWatch::default();
-            let mut ticker = tokio::time::interval(Duration::from_millis(200));
+            let mut ticker = tokio::time::interval(Duration::from_secs(2));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
