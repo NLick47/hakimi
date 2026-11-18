@@ -4,19 +4,20 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "hakimi desktop UI: Slint, Fluent style, one switch and a site list"
+description = "hakimi desktop UI: windui, one switch and a site list"
 build = "build.rs"
 
 [features]
-# Offscreen `--shot` rendering is a development aid. Debug builds always keep
-# it; release builds include it only when this feature is explicitly enabled.
+# Offscreen `--screenshot` rendering is a development aid. windui's
+# `screenshot_from_args()` handles it without any extra feature here; this
+# feature is kept only so debug/release gating stays explicit in main.rs.
 dev-shot = []
 
 [dependencies]
-slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-default", "renderer-femtovg", "renderer-software", "system-tray", "raw-window-handle-06"] }
-# Site logos ship as up-to-96px PNGs but draw at 20px. Pre-resampling them is
-# what keeps the logo edges clean; the renderer has no mipmaps of its own.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# Lightweight cross-platform GUI: tiny-skia rendering + native windows/text.
+# Default features off (PNG site logos, no SVG); `d2d` adds the Direct2D GPU
+# renderer that `Renderer::Auto` tries first before falling back to software.
+windui = { version = "0.33", default-features = false, features = ["d2d"] }
 hakimi-core = { path = "../hakimi-core" }
 anyhow.workspace = true
 serde_json.workspace = true
@@ -26,19 +27,28 @@ reqwest.workspace = true
 tracing.workspace = true
 
 [build-dependencies]
-slint-build = "1.16"
-
+# Only used on Windows to embed the application icon as an RT_ICON resource so
+# Explorer, shortcuts and the taskbar show it before a window exists.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSAppearance", "NSRunningApplication"] }
+objc2-foundation = { version = "0.3", features = ["NSGeometry"] }
+# `NSResponder` gates the `applicationShouldHandleReopen:` delegate method that
+# restores the window when the Dock icon is clicked; `NSWindow` is what that
+# method orders front.
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSAppearance",
+    "NSRunningApplication",
+    "NSResponder",
+    "NSWindow",
+] }
 
 [target.'cfg(windows)'.dependencies]
-raw-window-handle = "0.6"
-# The login item is a Startup-folder shortcut, so the shell link object is
-# created through COM instead of touching the registry.
+# The login item is a Startup-folder shortcut created through COM, and the
+# title bar colours come from DWM. windui brings its own raw-window-handle.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
@@ -51,3 +61,4 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Registry",
     "Win32_UI_WindowsAndMessaging",
 ] }
+raw-window-handle = "0.6"

@@ -3,15 +3,12 @@
     windows_subsystem = "windows"
 )]
 
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use hakimi_core::config::{
@@ -21,32 +18,40 @@ use hakimi_core::config::{
 use hakimi_core::instance::{InstanceLock, InstanceLockError};
 use hakimi_core::runtime::HakimiRuntime;
 use serde_json::Value;
-use slint::{Color, Model, ModelRc, SharedString, VecModel};
-use ui_state::SettlePhase;
+use windui::prelude::*;
 
-slint::include_modules!();
-
+mod app_state;
+mod assets;
 mod autostart;
+mod macos_reopen;
 mod model;
+mod theme;
+mod tray;
 mod ui_state;
 mod update;
+mod view;
 
-#[cfg(any(debug_assertions, feature = "dev-shot", test))]
+pub(crate) use app_state::{Action, AppContext, EditorRowState, UiSignals};
+#[cfg(test)]
 pub(crate) use model::build_snapshot;
 #[cfg(test)]
 pub(crate) use model::icon_key_for;
 pub(crate) use model::{
     build_sites, builtin_group_ids, doh_entries, doh_summary, finish_snapshot, format_route,
     mirror_entries, mirror_summary, normalize_domain_host, parse_route, route_from_preset,
-    route_preset_index, text, DohObservation, NetEntry, NetStatus, SiteData, SweepState,
+    route_preset_index, text, DohObservation, NetStatus, SiteData, SweepState,
 };
+#[cfg(test)]
+pub(crate) use ui_state::SettlePhase;
 
 pub(crate) fn data_dir() -> Option<PathBuf> {
     std::env::var_os("HAKIMI_DATA_DIR").map(PathBuf::from)
 }
 
-/// The window is a fixed light (Acrylic/Fluent) surface, so keep the macOS title bar
-/// in the same appearance even when the system is in dark mode.
+// -- native-window helpers (framework-agnostic; kept from the Slint build) ----
+
+/// The window is a fixed light surface, so keep the macOS title bar in the same
+/// appearance even when the system is in dark mode.
 #[cfg(target_os = "macos")]
 fn use_light_appearance() {
     use objc2::MainThreadMarker;
@@ -64,26 +69,20 @@ fn use_light_appearance() {
 #[cfg(not(target_os = "macos"))]
 fn use_light_appearance() {}
 
-/// The window is a fixed light surface, so a system-dark title bar reads as a
-/// rendering bug and its controls become hard to see. Force the non-client
-/// area to the same palette instead of following the system theme.
+/// A fixed light surface needs a light title bar too; otherwise a system-dark
+/// caption reads as a rendering bug. windui does not expose a window handle at
+/// construction, so call this from the first UI tick once the HWND exists.
 #[cfg(windows)]
-fn apply_light_title_bar(window: &slint::Window) {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+fn apply_light_title_bar() {
     use windows_sys::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
         DWMWA_USE_IMMERSIVE_DARK_MODE,
     };
 
-    let window_handle = window.window_handle();
-    let Ok(handle) = window_handle.window_handle() else {
+    let Some(handle) = windui::platform::native_window_handle() else {
         return;
     };
-    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
-        return;
-    };
-    let hwnd = win32.hwnd.get() as *mut core::ffi::c_void;
-
+    let hwnd = handle as *mut core::ffi::c_void;
     let set = |attribute: u32, value: &u32| unsafe {
         DwmSetWindowAttribute(
             hwnd,
@@ -92,11 +91,9 @@ fn apply_light_title_bar(window: &slint::Window) {
             std::mem::size_of::<u32>() as u32,
         ) == 0
     };
-
     let light = 0u32;
     if !set(DWMWA_USE_IMMERSIVE_DARK_MODE as u32, &light) {
-        // Windows 10 builds before 20H1 used attribute 19.
-        let _ = set(19, &light);
+        let _ = set(19, &light); // pre-20H1 attribute
     }
     // COLORREF is 0x00BBGGRR.
     let _ = set(DWMWA_CAPTION_COLOR as u32, &0x00F5_F4F3); // #F3F4F5
@@ -104,9 +101,10 @@ fn apply_light_title_bar(window: &slint::Window) {
     let _ = set(DWMWA_BORDER_COLOR as u32, &0x00E8_E4E1); // #E1E4E8
 }
 
-/// Raise the app after a tray click. AppKit only activates the app when the
-/// click lands on its own window or menu, so a background app stays behind
-/// whatever else is on screen.
+#[cfg(not(windows))]
+fn apply_light_title_bar() {}
+
+/// Raise the app after a tray click on macOS.
 #[cfg(target_os = "macos")]
 fn activate_app() {
     use objc2::MainThreadMarker;
@@ -123,9 +121,8 @@ fn activate_app() {
 #[cfg(not(target_os = "macos"))]
 fn activate_app() {}
 
-/// The app keeps running in the menu bar after the window closes. Switch to an
-/// accessory app so closing the window also removes the Dock icon; the tray
-/// and the proxy stay alive.
+/// Switch to an accessory app while the window is closed so the Dock icon goes
+/// away; the tray and the proxy stay alive.
 #[cfg(target_os = "macos")]
 fn set_dock_visible(visible: bool) {
     use objc2::MainThreadMarker;
@@ -135,1408 +132,91 @@ fn set_dock_visible(visible: bool) {
         return;
     };
     let app = NSApplication::sharedApplication(mtm);
+    let current = app.activationPolicy();
     let policy = if visible {
         NSApplicationActivationPolicy::Regular
     } else {
         NSApplicationActivationPolicy::Accessory
     };
-    let _ = app.setActivationPolicy(policy);
+    tracing::info!(visible, ?current, ?policy, "DBG set_dock_visible");
+    if current != policy {
+        let _ = app.setActivationPolicy(policy);
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
 fn set_dock_visible(_visible: bool) {}
 
-/// While the window is closed the app is an accessory app without a Dock icon.
-/// Reopening it from Finder (or `open`) still sends
-/// `applicationShouldHandleReopen:` to the delegate, so hook that method to
-/// bring the window back. Winit installs its own delegate but does not
-/// implement this method, and replacing the delegate would break winit's
-/// event loop, so the method is added to the existing delegate class.
+/// Top-left corner that centres a `width` x `height` window on the primary
+/// screen, in the framework's macOS convention (origin top-left, y down).
+///
+/// Computed before the window exists so it can be passed to `App::position`:
+/// centring from the first tick would move an already-visible window, which
+/// reads as the window jumping across the screen.
 #[cfg(target_os = "macos")]
-mod macos_reopen {
-    use std::cell::{Cell, RefCell};
-    use std::ffi::CString;
-    use std::rc::Rc;
+fn centered_position(width: i32, height: i32) -> Option<(i32, i32)> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSScreen;
 
-    use objc2::encode::{Encode, Encoding};
-    use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
-    use objc2::{sel, MainThreadMarker};
+    let mtm = MainThreadMarker::new()?;
+    let primary = NSScreen::screens(mtm).firstObject()?;
+    let screen = primary.visibleFrame();
+    let full = primary.frame();
+    // `App::position` places the window frame, and the title bar adds to the
+    // content height the app declares. Centring the frame therefore centres the
+    // whole window, title bar included.
+    let title_bar = 32.0;
+    let frame_h = height as f64 + title_bar;
+    // AppKit measures y from the bottom of the screen; `App::position` from the
+    // top of the primary screen.
+    let x = screen.origin.x + (screen.size.width - width as f64) / 2.0;
+    let y_from_bottom = screen.origin.y + (screen.size.height - frame_h) / 2.0;
+    let y = full.size.height - y_from_bottom - frame_h;
+    Some((x.round() as i32, y.round() as i32))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn centered_position(_width: i32, _height: i32) -> Option<(i32, i32)> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn quit_app() {
+    use objc2::MainThreadMarker;
     use objc2_app_kit::NSApplication;
 
-    thread_local! {
-        // The callback rebuilds the window through the same path as the tray
-        // menu, so both entry points share the window's lifecycle bookkeeping.
-        static SHOW_MAIN: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
-        static INSTALLED: Cell<bool> = const { Cell::new(false) };
-    }
-
-    unsafe extern "C-unwind" fn should_reopen(
-        _this: *mut AnyObject,
-        _cmd: Sel,
-        _sender: *mut NSApplication,
-        _has_visible_windows: Bool,
-    ) -> Bool {
-        SHOW_MAIN.with(|slot| {
-            if let Some(show) = slot.borrow().clone() {
-                show();
-            }
-        });
-        Bool::YES
-    }
-
-    pub(super) fn install(show_main: impl Fn() + 'static) {
-        SHOW_MAIN.with(|slot| *slot.borrow_mut() = Some(Rc::new(show_main)));
-
-        if INSTALLED.with(Cell::get) {
-            return;
-        }
-        let Some(mtm) = MainThreadMarker::new() else {
-            return;
-        };
-        let app = NSApplication::sharedApplication(mtm);
-        let Some(delegate) = app.delegate() else {
-            return;
-        };
-
-        let sel = sel!(applicationShouldHandleReopen:hasVisibleWindows:);
-        let object: &AnyObject = delegate.as_ref();
-        let class: &'static AnyClass = object.class();
-        if class.instance_method(sel).is_some() {
-            INSTALLED.with(|flag| flag.set(true));
-            return;
-        }
-
-        // Encoding order is return value, self, selector, then arguments.
-        // BOOL is `_Bool` on Apple Silicon and `signed char` on Intel, so ask
-        // objc2 instead of hardcoding "B@:@B".
-        let types = CString::new(format!(
-            "{}{}{}{}{}",
-            Bool::ENCODING,
-            Encoding::Object,
-            Encoding::Sel,
-            Encoding::Object,
-            Bool::ENCODING
-        ))
-        .expect("method encoding cannot contain a NUL byte");
-        let imp: objc2::runtime::Imp = unsafe {
-            std::mem::transmute::<
-                unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut NSApplication, Bool) -> Bool,
-                objc2::runtime::Imp,
-            >(should_reopen)
-        };
-        let added = unsafe {
-            objc2::ffi::class_addMethod(
-                class as *const AnyClass as *mut AnyClass,
-                sel,
-                imp,
-                types.as_ptr(),
-            )
-        };
-        if added.as_bool() {
-            INSTALLED.with(|flag| flag.set(true));
-        } else {
-            eprintln!("hakimi-ui: could not install the macOS reopen handler");
-        }
-    }
-}
-
-/// Bring the main window back to the front. A minimized window is still
-/// "shown" as far as Slint is concerned, so `show()` alone is a no-op: the
-/// minimized state has to be dropped first.
-fn reveal_window(app: &AppWindow) {
-    let window = app.window();
-    window.set_minimized(false);
-    let _ = window.show();
-    activate_window(&window);
-    activate_app();
-}
-
-/// Windows does not let a background app raise itself with `show()` alone.
-/// The tray click is a user input to this process, so restoring and setting
-/// the foreground window is allowed here.
-#[cfg(windows)]
-fn activate_window(window: &slint::Window) {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SetForegroundWindow, ShowWindow, SW_RESTORE,
+    let Some(mtm) = MainThreadMarker::new() else {
+        std::process::exit(0);
     };
+    NSApplication::sharedApplication(mtm).terminate(None);
+}
 
-    let window_handle = window.window_handle();
-    let Ok(handle) = window_handle.window_handle() else {
+#[cfg(not(target_os = "macos"))]
+fn quit_app() {
+    std::process::exit(0);
+}
+
+#[cfg(target_os = "macos")]
+fn minimize_window() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+
+    let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
-        return;
-    };
-    let hwnd = win32.hwnd.get() as *mut core::ffi::c_void;
-    unsafe {
-        ShowWindow(hwnd, SW_RESTORE);
-        SetForegroundWindow(hwnd);
+    let app = NSApplication::sharedApplication(mtm);
+    if let Some(window) = app.keyWindow() {
+        window.performMiniaturize(None);
     }
 }
 
-#[cfg(not(windows))]
-fn activate_window(_window: &slint::Window) {}
+#[cfg(not(target_os = "macos"))]
+fn minimize_window() {}
 
-fn color(hex: &str) -> Color {
-    let value = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0x88_88_88);
-    Color::from_argb_encoded(0xFF00_0000 | value)
-}
-// Plain-data snapshots cross the thread boundary; Slint types are built on the UI thread.
+// -- settings derivation (framework-agnostic) ---------------------------------
 
-fn build_site_entry(site: &SiteData) -> SiteEntry {
-    let domains: Vec<DomainEntry> = site
-        .domains
-        .iter()
-        .map(|row| DomainEntry {
-            host: SharedString::from(row.host.clone()),
-            status: SharedString::from(row.status.clone()),
-            status_color: color(row.status_hex),
-            latency: SharedString::from(row.latency.clone()),
-        })
-        .collect();
-    SiteEntry {
-        id: SharedString::from(site.id.clone()),
-        name: SharedString::from(site.name.clone()),
-        icon: ASSETS
-            .with(|assets| assets.borrow().get(&site.icon_key).cloned())
-            .unwrap_or_default(),
-        initial: SharedString::from(site.initial.clone()),
-        tile_color: color(site.tile_hex),
-        summary: SharedString::from(site.summary.clone()),
-        summary_color: color(site.summary_hex),
-        enabled: site.enabled,
-        open: site.open,
-        first: site.first,
-        last: site.last,
-        url: SharedString::from(site.url.clone()),
-        custom: site.custom,
-        domains: ModelRc::new(VecModel::from(domains)),
-    }
-}
-
-fn build_net_row(row: &NetEntry) -> NetRow {
-    NetRow {
-        label: SharedString::from(row.label.as_str()),
-        detail: SharedString::from(row.detail.as_str()),
-        value: SharedString::from(row.value.as_str()),
-        tone: row.tone,
-    }
-}
-
-fn sync_net_rows(
-    slot: &RefCell<Option<Rc<VecModel<NetRow>>>>,
-    app: &AppWindow,
-    setter: fn(&AppWindow, ModelRc<NetRow>),
-    old: Option<&[NetEntry]>,
-    rows: &[NetEntry],
-) {
-    if old == Some(rows) {
-        return;
-    }
-    let mut slot = slot.borrow_mut();
-    let model = slot.get_or_insert_with(|| {
-        let model = Rc::new(VecModel::default());
-        setter(app, ModelRc::new(model.clone()));
-        model
-    });
-    if old.is_some_and(|old| old.len() == rows.len()) {
-        for (index, row) in rows.iter().enumerate() {
-            if old.is_some_and(|old| old[index] != *row) {
-                model.set_row_data(index, build_net_row(row));
-            }
-        }
-    } else {
-        model.set_vec(rows.iter().map(build_net_row).collect::<Vec<_>>());
-    }
-}
-
-thread_local! {
-    // The tray lives for the whole process; dropping the handle would remove
-    // the platform icon while the app keeps running.
-    static TRAY: std::cell::RefCell<Option<TrayRoot>> = const { std::cell::RefCell::new(None) };
-    static ASSETS: std::cell::RefCell<HashMap<String, slint::Image>> =
-        std::cell::RefCell::new(HashMap::new());
-    // Device pixels per logical pixel the cached logos were resampled for.
-    static ICON_SCALE: Cell<f32> = const { Cell::new(0.0) };
-    // Persistent models live on the UI thread so refreshes can be per-row:
-    // unchanged rows keep their identity, so hover state, running animations
-    // and the scroll position all survive, and no-op snapshots cost nothing.
-    static SITES_MODEL: std::cell::RefCell<Option<Rc<VecModel<SiteEntry>>>> =
-        const { std::cell::RefCell::new(None) };
-    static DOH_MODEL: RefCell<Option<Rc<VecModel<NetRow>>>> = const { RefCell::new(None) };
-    static MIRROR_MODEL: RefCell<Option<Rc<VecModel<NetRow>>>> = const { RefCell::new(None) };
-    static PREV_STATE: std::cell::RefCell<Option<UiState>> =
-        const { std::cell::RefCell::new(None) };
-    // The window exists only while it is shown. Closing it drops the component
-    // and its renderer; the tray rebuilds a fresh one from the same runtime.
-    static WINDOW: std::cell::RefCell<Option<WindowShell>> =
-        const { std::cell::RefCell::new(None) };
-    static NEXT_WINDOW_ID: Cell<u64> = const { Cell::new(0) };
-    // Rows of the currently open site editor. Slint models are not mutable from
-    // the UI, so callbacks mutate this VecModel and the view re-renders.
-    static EDITOR_ROWS: RefCell<Option<Rc<VecModel<EditorDomain>>>> =
-        const { RefCell::new(None) };
-    // UI state that must survive a window rebuild.
-    static PAGE_STATE: Cell<i32> = const { Cell::new(0) };
-    static SITES_EXPANDED_STATE: Cell<bool> = const { Cell::new(false) };
-    static WINDOW_STATE: std::cell::RefCell<Option<(slint::PhysicalPosition, slint::PhysicalSize)>> =
-        const { std::cell::RefCell::new(None) };
-    // The update check outlives window rebuilds: its result is still valid
-    // after the user closes and reopens the window from the tray.
-    static UPDATE: RefCell<UpdateUi> = RefCell::new(UpdateUi::default());
-    static UPDATE_LAST_ATTEMPT: Cell<Option<Instant>> = const { Cell::new(None) };
-}
-
-/// How long a completed check suppresses the automatic one.
-const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-
-struct UpdateUi {
-    checking: bool,
-    available: Option<update::Release>,
-    status: String,
-}
-
-impl Default for UpdateUi {
-    fn default() -> Self {
-        Self {
-            checking: false,
-            available: None,
-            status: "尚未检查".to_string(),
-        }
-    }
-}
-
-/// Mirrors the process-wide update state into a window. Properties are only
-/// written here, so a rebuilt window picks up a check that finished while it
-/// did not exist.
-fn apply_update(app: &AppWindow) {
-    UPDATE.with(|slot| {
-        let state = slot.borrow();
-        app.set_update_checking(state.checking);
-        app.set_update_available(state.available.is_some());
-        app.set_update_status(SharedString::from(state.status.clone()));
-    });
-}
-
-/// Runs one check off the UI thread. Duplicate requests (a click landing while
-/// the automatic check is in flight) are ignored instead of stacking up.
-/// Returns true when this call started a check.
-fn start_update_check(spawner: &tokio::runtime::Handle) -> bool {
-    if UPDATE.with(|slot| slot.borrow().checking) {
-        return false;
-    }
-    UPDATE.with(|slot| {
-        let mut state = slot.borrow_mut();
-        state.checking = true;
-        state.status = "正在检查更新…".to_string();
-    });
-    tracing::info!("checking for updates");
-
-    spawner.spawn(async move {
-        let outcome = update::check().await;
-        let _ = slint::invoke_from_event_loop(move || {
-            UPDATE.with(|slot| {
-                let mut state = slot.borrow_mut();
-                state.checking = false;
-                match outcome {
-                    Ok(update::CheckOutcome::Available(release)) => {
-                        state.status = format!("发现新版本 v{}", release.version);
-                        state.available = Some(release);
-                    }
-                    Ok(update::CheckOutcome::UpToDate) => {
-                        state.status = "已是最新版本".to_string();
-                        state.available = None;
-                    }
-                    Err(error) => {
-                        tracing::info!(
-                            error = %format!("{error:#}"),
-                            "the update check failed"
-                        );
-                        state.status = "暂时无法检查更新".to_string();
-                        state.available = None;
-                    }
-                }
-            });
-            // The window that started the check may have been closed while it
-            // was in flight; apply the result to whichever window is live now.
-            apply_update_to_live_window();
-        });
-    });
-    true
-}
-
-/// Automatic checks run at most once a day, whether or not a window exists:
-/// a silent autostart would otherwise never check for updates. A failed
-/// attempt also counts, so an offline machine is not retried every tick.
-/// Returns true when a check was started.
-fn maybe_auto_update(spawner: &tokio::runtime::Handle) -> bool {
-    let due = UPDATE_LAST_ATTEMPT
-        .with(|slot| slot.get().is_none_or(|at| at.elapsed() >= UPDATE_INTERVAL));
-    if !due {
-        return false;
-    }
-    UPDATE_LAST_ATTEMPT.with(|slot| slot.set(Some(Instant::now())));
-    start_update_check(spawner)
-}
-
-/// Mirrors the update state into whichever window is live, if any.
-fn apply_update_to_live_window() {
-    WINDOW.with(|slot| {
-        if let Some(shell) = slot.borrow().as_ref() {
-            apply_update(&shell.app);
-        }
-    });
-}
-
-struct WindowShell {
-    app: AppWindow,
-    /// Keeps the visible window fresh; dropped together with the window. The
-    /// field is never read: holding it is what keeps the timer registered.
-    _timer: slint::Timer,
-    id: u64,
-    /// Set by the timer when the close transition has been handled. A tray
-    /// click that races the queued drop rebuilds instead of revealing a
-    /// window that is about to disappear.
-    closing: Rc<Cell<bool>>,
-}
-
-/// Remembers the window geometry for the next rebuild. Only call while the
-/// window is on screen: a minimized window reports its iconic position
-/// (-32000,-32000 on Windows), which would strand the next window off screen.
-fn remember_window_geometry(window: &slint::Window) {
-    WINDOW_STATE.with(|slot| {
-        *slot.borrow_mut() = Some((window.position(), window.size()));
-    });
-}
-
-/// Everything a window (re)build needs from the process.
-#[derive(Clone)]
-struct UiContext {
-    runtime: Arc<HakimiRuntime>,
-    spawner: tokio::runtime::Handle,
-    expanded: Rc<std::cell::RefCell<HashSet<String>>>,
-    sweep: Arc<SweepState>,
-}
-
-/// Wires every window callback. Called for the initial window and again each
-/// time the tray recreates it after a close, so no callback may capture the
-/// window by value.
-fn wire_window(app: &AppWindow, ctx: &UiContext) {
-    let runtime = ctx.runtime.clone();
-    let spawner = ctx.spawner.clone();
-    let expanded = ctx.expanded.clone();
-    let sweep = ctx.sweep.clone();
-
-    // -- callbacks: direct calls, applied in the same frame --
-    {
-        let weak = app.as_weak();
-        app.on_open_fix(move || {
-            // Remember the manual visit in the model: the periodic environment
-            // sync derives the page from state and would otherwise slam it shut
-            // on the very next tick.
-            MODEL.with(|m| m.borrow_mut().open_fix());
-            if let Some(app) = weak.upgrade() {
-                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
-            }
-        });
-        let weak = app.as_weak();
-        app.on_dismiss_interrupt(move || {
-            MODEL.with(|m| m.borrow_mut().dismiss_interrupt());
-            if let Some(app) = weak.upgrade() {
-                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_toggle_master(move || {
-            // Turning acceleration on with nothing selected would claim to run
-            // an empty set. Leave the switch off; the subtitle explains why.
-            let turning_on = MODEL.with(|m| m.borrow().accel() != ui_state::AccelState::Running);
-            if turning_on && !runtime.config().snapshot().groups.iter().any(|g| g.enabled) {
-                return;
-            }
-            // Use the last known environment (fresh within a second of the
-            // probe stream) so the click never waits on a subprocess.
-            let effects = MODEL.with(|m| {
-                let env = m.borrow().env().clone();
-                m.borrow_mut().toggle(env)
-            });
-            ui_state::execute(&effects, &runtime);
-            if let Some(app) = weak.upgrade() {
-                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_toggle_group(move |id, enabled| {
-            // Selection only changes the acceleration set. Probing is an
-            // explicit action ("检测选中"), never a side effect of a checkbox.
-            let _ = runtime.set_group_enabled(id.as_str(), enabled);
-            if let Some(app) = weak.upgrade() {
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_select_all(move |enabled| {
-            // Select-all only changes the set; it never starts a test.
-            let _ = runtime.config().mutate(|config| {
-                for group in &mut config.groups {
-                    group.enabled = enabled;
-                }
-                Ok(())
-            });
-            if !enabled {
-                // Nothing is selected: stop claiming acceleration.
-                let effects = MODEL.with(|m| m.borrow_mut().stop());
-                ui_state::execute(&effects, &runtime);
-            }
-            if let Some(app) = weak.upgrade() {
-                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_toggle_open(move |id| {
-            let mut set = expanded.borrow_mut();
-            let id = id.to_string();
-            if !set.remove(&id) {
-                set.insert(id);
-            }
-            drop(set);
-            if let Some(app) = weak.upgrade() {
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let spawner = spawner.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_probe_selected(move || {
-            // One atomic sweep on the runtime: the UI only flips the phase and
-            // awaits completion, no per-domain bookkeeping here.
-            // A second click while one sweep is running must not spawn another:
-            // two concurrent sweeps would race the settle/commit state machine.
-            if sweep.running.swap(true, Ordering::SeqCst) {
-                return;
-            }
-            if let Some(app) = weak.upgrade() {
-                // Flip the rows to 检测中 now; the sweep runs off-thread.
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
-            }
-            let runtime = runtime.clone();
-            let done = sweep.clone();
-            spawner.spawn(async move {
-                runtime.probe_sweep().await;
-                done.running.store(false, Ordering::SeqCst);
-                done.commit_once.store(true, Ordering::SeqCst);
-            });
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let weak = app.as_weak();
-        app.on_finish_onboarding(move || {
-            let effects = MODEL.with(|m| m.borrow_mut().dismiss_fix());
-            ui_state::execute(&effects, &runtime);
-            if let Some(app) = weak.upgrade() {
-                MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let reapplying = Arc::new(AtomicBool::new(false));
-        app.on_reapply_proxy(move || {
-            // One re-apply at a time: the OS write runs several subprocesses
-            // and must not interleave with itself.
-            if reapplying.swap(true, Ordering::SeqCst) {
-                return;
-            }
-            let runtime = runtime.clone();
-            let reapplying = reapplying.clone();
-            std::thread::spawn(move || {
-                let result = runtime.apply_system_proxy();
-                reapplying.store(false, Ordering::SeqCst);
-                if let Err(error) = result {
-                    eprintln!("hakimi-ui: manual system proxy re-apply failed: {error:#}");
-                }
-            });
-        });
-    }
-    app.on_open_site(|url| {
-        std::thread::spawn(move || {
-            let _ = open::that(url.to_string());
-        });
-    });
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_settings_action(move |kind| {
-            let Some(app) = weak.upgrade() else { return };
-            // Installing may raise a system password prompt; keep that off the
-            // UI thread. The outcome is posted back as one of three short
-            // states, so a dismissed dialog can never read as success.
-            app.set_ca_busy(true);
-            app.set_ca_action_error(SharedString::new());
-            app.set_ob_installing(true);
-            tracing::info!(kind, "ca action requested");
-
-            let runtime = runtime.clone();
-            // The expanded-row set is an Rc owned by the UI thread; carry a
-            // plain copy across so the refresh keeps the same rows open.
-            let open_ids: Vec<String> = expanded.borrow().iter().cloned().collect();
-            let weak = app.as_weak();
-            let sweep = sweep.clone();
-            std::thread::spawn(move || {
-                let started = std::time::Instant::now();
-                let outcome = match kind {
-                    1 => ca_outcome(runtime.ca_install().map(|status| status.installed), true),
-                    2 => ca_outcome(runtime.ca_uninstall().map(|status| status.installed), false),
-                    3 => ca_outcome(runtime.ca_repair().map(|status| status.installed), true),
-                    _ => CaOutcome::Done,
-                };
-                tracing::info!(
-                    kind,
-                    outcome = ?outcome,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "ca action finished"
-                );
-                let message = outcome.message();
-                let _ = slint::invoke_from_event_loop(move || {
-                    let Some(app) = weak.upgrade() else { return };
-                    app.set_ca_busy(false);
-                    app.set_ob_installing(false);
-                    if let Some(message) = message {
-                        app.set_ca_action_error(SharedString::from(message));
-                    }
-                    // Re-read the trust state now instead of waiting a tick.
-                    let open: HashSet<String> = open_ids.into_iter().collect();
-                    refresh(&app, &runtime, &open, &sweep);
-                });
-            });
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_save_string(move |key, value| {
-            let key = key.to_string();
-            let value = value.trim().to_string();
-            let error = apply_setting_string(&runtime, &key, &value);
-            if let Some(app) = weak.upgrade() {
-                let failed = error.is_some();
-                app.set_cfg_error(SharedString::from(error.unwrap_or_default()));
-                // Lets the offending field draw a red border instead of only
-                // showing a message at the bottom of the page.
-                app.set_cfg_error_key(SharedString::from(if failed {
-                    key.clone()
-                } else {
-                    String::new()
-                }));
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_save_bool(move |key, value| {
-            let key = key.to_string();
-            let error = apply_setting_bool(&runtime, &key, value);
-            if let Some(app) = weak.upgrade() {
-                let failed = error.is_some();
-                app.set_cfg_error(SharedString::from(error.unwrap_or_default()));
-                app.set_cfg_error_key(SharedString::from(if failed {
-                    key.clone()
-                } else {
-                    String::new()
-                }));
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        app.on_open_data_dir(move || {
-            let dir = runtime.paths().root().to_path_buf();
-            std::thread::spawn(move || {
-                let _ = open::that(dir);
-            });
-        });
-    }
-    {
-        let spawner = spawner.clone();
-        let weak = app.as_weak();
-        app.on_check_update(move || {
-            // A manual check resets the daily timer: the next automatic one
-            // is a day after this click, not sooner.
-            UPDATE_LAST_ATTEMPT.with(|slot| slot.set(Some(Instant::now())));
-            if start_update_check(&spawner) {
-                if let Some(app) = weak.upgrade() {
-                    apply_update(&app);
-                }
-            }
-        });
-    }
-    {
-        app.on_open_update(move || {
-            let url = UPDATE.with(|slot| {
-                slot.borrow()
-                    .available
-                    .as_ref()
-                    .map(|release| release.url.clone())
-            });
-            if let Some(url) = url {
-                std::thread::spawn(move || {
-                    let _ = open::that(url);
-                });
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let weak = app.as_weak();
-        app.on_open_editor(move |id| {
-            let Some(app) = weak.upgrade() else { return };
-            let config = runtime.config().snapshot();
-            let builtins = builtin_group_ids();
-            match config.group(id.as_str()) {
-                Some(group) => {
-                    app.set_editor_is_new(false);
-                    app.set_editor_id(SharedString::from(group.id.clone()));
-                    app.set_editor_name(SharedString::from(group.name.clone()));
-                    set_editor_rows(
-                        &app,
-                        group.domains.iter().map(editor_domain_from_rule).collect(),
-                    );
-                    app.set_editor_homepage(SharedString::from(
-                        group.homepage.clone().unwrap_or_default(),
-                    ));
-                    let preset = route_preset_index(&group.default_route);
-                    app.set_editor_default_preset(preset);
-                    app.set_editor_default_custom(SharedString::from(if preset == 4 {
-                        format_route(&group.default_route)
-                    } else {
-                        String::new()
-                    }));
-                    app.set_editor_deletable(!builtins.contains(&group.id));
-                }
-                None => {
-                    app.set_editor_is_new(true);
-                    app.set_editor_id(SharedString::new());
-                    app.set_editor_name(SharedString::new());
-                    set_editor_rows(
-                        &app,
-                        vec![EditorDomain {
-                            pattern: SharedString::new(),
-                            route: 0,
-                            route_label: SharedString::from(domain_route_label(0)),
-                            sni: SharedString::new(),
-                            custom: SharedString::new(),
-                        }],
-                    );
-                    app.set_editor_homepage(SharedString::new());
-                    app.set_editor_default_preset(0);
-                    app.set_editor_default_custom(SharedString::new());
-                    app.set_editor_deletable(false);
-                }
-            }
-            app.set_editor_error(SharedString::new());
-            app.set_editor_open(true);
-        });
-    }
-    {
-        let weak = app.as_weak();
-        app.on_close_editor(move || {
-            if let Some(app) = weak.upgrade() {
-                app.set_editor_open(false);
-                app.set_editor_error(SharedString::new());
-            }
-        });
-    }
-    app.on_editor_add_domain(|| {
-        with_editor_rows(|model| {
-            model.push(EditorDomain {
-                pattern: SharedString::new(),
-                route: 0,
-                route_label: SharedString::from(domain_route_label(0)),
-                sni: SharedString::new(),
-                custom: SharedString::new(),
-            });
-        });
-    });
-    app.on_editor_remove_domain(|index| {
-        with_editor_rows(|model| {
-            if model.row_count() > 1 {
-                model.remove(index.max(0) as usize);
-            }
-        });
-    });
-    app.on_editor_domain_pattern(|index, text| {
-        update_editor_row(index.max(0) as usize, |row| row.pattern = text);
-    });
-    app.on_editor_set_domain_route(|index, route| {
-        update_editor_row(index.max(0) as usize, |row| {
-            row.route = route.clamp(0, 4);
-            row.route_label = SharedString::from(domain_route_label(row.route));
-        });
-    });
-    app.on_editor_domain_sni(|index, text| {
-        update_editor_row(index.max(0) as usize, |row| row.sni = text);
-    });
-    app.on_editor_domain_custom(|index, text| {
-        update_editor_row(index.max(0) as usize, |row| row.custom = text);
-    });
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let sweep = sweep.clone();
-        let weak = app.as_weak();
-        app.on_save_editor(move || {
-            let Some(app) = weak.upgrade() else { return };
-            let result = save_site(&runtime, &app);
-            match result {
-                Ok(()) => {
-                    app.set_editor_open(false);
-                    app.set_editor_error(SharedString::new());
-                    refresh(&app, &runtime, &expanded.borrow(), &sweep);
-                }
-                Err(error) => {
-                    tracing::warn!(error = %format!("{error:#}"), "site save rejected");
-                    app.set_editor_error(SharedString::from(format!("{error:#}")));
-                }
-            }
-        });
-    }
-    {
-        let runtime = runtime.clone();
-        let expanded = expanded.clone();
-        let weak = app.as_weak();
-        let sweep = sweep.clone();
-        app.on_delete_site(move |id| {
-            let Some(app) = weak.upgrade() else { return };
-            match runtime.remove_group(id.as_str()) {
-                Ok(_) => {
-                    tracing::info!(id = %id, "site removed");
-                    app.set_editor_open(false);
-                    app.set_editor_error(SharedString::new());
-                    refresh(&app, &runtime, &expanded.borrow(), &sweep);
-                }
-                Err(error) => app.set_editor_error(SharedString::from(format!("{error:#}"))),
-            }
-        });
-    }
-}
-
-/// Builds a window and its 1-second refresh timer. The shell owns both; when
-/// the user closes the window the component is dropped, releasing the renderer
-/// and every UI allocation while the proxy runtime keeps running.
-fn build_window(ctx: &UiContext) -> Result<WindowShell> {
-    let app = AppWindow::new()?;
-    // The real scale factor only arrives after the window is shown; 2x is a
-    // good first frame and the refresh tick reloads at the exact one.
-    load_assets(2.0);
-    app.set_cfg_data_dir(SharedString::from(
-        ctx.runtime.paths().root().display().to_string(),
-    ));
-    app.set_cfg_version(SharedString::from(env!("CARGO_PKG_VERSION")));
-    app.set_cfg_core_version(SharedString::from(hakimi_core::VERSION));
-
-    wire_window(&app, ctx);
-
-    #[cfg(target_os = "macos")]
-    app.window().on_close_requested(|| {
-        // Closing the window parks the app in the tray. Remove the Dock icon
-        // at the same time; showing the window switches back to Regular.
-        set_dock_visible(false);
-        slint::CloseRequestResponse::HideWindow
-    });
-
-    // Restore the UI state the previous window left behind.
-    app.set_page(PAGE_STATE.with(Cell::get));
-    app.set_sites_expanded(SITES_EXPANDED_STATE.with(Cell::get));
-    if let Some((position, size)) = WINDOW_STATE.with(|slot| slot.borrow().as_ref().cloned()) {
-        app.window().set_position(position);
-        app.window().set_size(size);
-    }
-
-    MODEL.with(|m| ui_state::sync_window(&m.borrow(), &app));
-    refresh(&app, &ctx.runtime, &ctx.expanded.borrow(), &ctx.sweep);
-    // Start a due check first so its "checking" state is mirrored after.
-    maybe_auto_update(&ctx.spawner);
-    apply_update(&app);
-
-    let id = NEXT_WINDOW_ID.with(|next| {
-        let id = next.get() + 1;
-        next.set(id);
-        id
-    });
-    let closing = Rc::new(Cell::new(false));
-    let timer = slint::Timer::default();
-    {
-        // Scale factor changes are only delivered through winit events, not
-        // through a callback on the public Slint window; compare on each tick.
-        let applied_scale = Rc::new(Cell::new(0.0f32));
-        let weak = app.as_weak();
-        let runtime = ctx.runtime.clone();
-        let expanded = ctx.expanded.clone();
-        let sweep = ctx.sweep.clone();
-        let closing = closing.clone();
-        timer.start(
-            slint::TimerMode::Repeated,
-            Duration::from_millis(1000),
-            move || {
-                let Some(app) = weak.upgrade() else {
-                    return;
-                };
-                let window = app.window();
-                // Closed must win over minimized: a window closed from the
-                // taskbar while minimized is hidden but still reports
-                // minimized, because Windows leaves `IsIconic` set on a hidden
-                // iconic window. Treating that as merely minimized never
-                // released the UI.
-                if !window.is_visible() {
-                    if !closing.replace(true) {
-                        // Closed to the tray: remember the window geometry and
-                        // the UI state, then free the rows/caches. The
-                        // component itself is dropped after this callback
-                        // returns; the runtime and the tray stay alive.
-                        PAGE_STATE.with(|page| page.set(app.get_page()));
-                        SITES_EXPANDED_STATE.with(|flag| flag.set(app.get_sites_expanded()));
-                        // A minimized window reports its off-screen iconic
-                        // position, so keep the geometry an earlier tick
-                        // recorded for the next rebuild.
-                        if !window.is_minimized() {
-                            remember_window_geometry(&window);
-                        }
-                        release_ui_caches(&app);
-                        let _ = slint::invoke_from_event_loop(move || {
-                            WINDOW.with(|slot| {
-                                // A tray click may have raced the drop and
-                                // built a newer window; never clear that one.
-                                let stale =
-                                    slot.borrow().as_ref().is_some_and(|shell| shell.id == id);
-                                if stale {
-                                    *slot.borrow_mut() = None;
-                                }
-                            });
-                        });
-                    }
-                    return;
-                }
-                if window.is_minimized() {
-                    // A minimized window keeps its taskbar entry and state;
-                    // there is nothing to paint, so just skip the refresh.
-                    return;
-                }
-                // Record the on-screen geometry every tick: a close from the
-                // taskbar while minimized has no usable position to read then.
-                remember_window_geometry(&window);
-                let scale = window.scale_factor();
-                let previous = applied_scale.replace(scale);
-                if previous > 0.0 && (scale - previous).abs() > 0.001 {
-                    // Dragged to a monitor with a different DPI: winit keeps
-                    // the physical size, so the window would jump size. Keep
-                    // the logical size instead, as native apps do.
-                    let logical = window.size().to_logical(previous);
-                    window.set_size(slint::LogicalSize::new(logical.width, logical.height));
-                }
-                if (asset_scale() - scale).abs() > 0.01 {
-                    // Resample the logos for this DPI (they are cached
-                    // texture-sized), then drop the row cache so every entry
-                    // picks the new images up.
-                    load_assets(scale);
-                    PREV_STATE.with(|slot| *slot.borrow_mut() = None);
-                    REFRESH_CACHE.with(|slot| *slot.borrow_mut() = None);
-                }
-                refresh(&app, &runtime, &expanded.borrow(), &sweep);
-            },
-        );
-    }
-    // The native window may not have an HWND yet when build_window returns;
-    // apply the title-bar palette after the first event-loop turn.
-    #[cfg(windows)]
-    {
-        let weak = app.as_weak();
-        slint::Timer::single_shot(Duration::from_millis(100), move || {
-            if let Some(app) = weak.upgrade() {
-                apply_light_title_bar(&app.window());
-            }
-        });
-    }
-    Ok(WindowShell {
-        app,
-        _timer: timer,
-        id,
-        closing,
-    })
-}
-
-/// Shows the main window, rebuilding it when it was previously closed to the
-/// tray. Used by the tray menu and the macOS reopen callback.
-fn show_main_window(ctx: &UiContext) {
-    set_dock_visible(true);
-    let existing = WINDOW.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|shell| (shell.closing.clone(), shell.app.as_weak()))
-    });
-    if let Some((closing, weak)) = existing {
-        if !closing.get() {
-            if let Some(app) = weak.upgrade() {
-                load_assets(app.window().scale_factor());
-                reveal_window(&app);
-                refresh(&app, &ctx.runtime, &ctx.expanded.borrow(), &ctx.sweep);
-            }
-            return;
-        }
-    }
-    // No live window (closed to the tray, or closing): build one.
-    match build_window(ctx) {
-        Ok(shell) => {
-            if let Err(error) = shell.app.show() {
-                eprintln!("hakimi-ui: showing the window failed: {error}");
-                return;
-            }
-            reveal_window(&shell.app);
-            #[cfg(windows)]
-            {
-                // The raw HWND may not exist yet when show() returns from a
-                // tray rebuild; retry once the event loop has created the
-                // native window.
-                let weak = shell.app.as_weak();
-                slint::Timer::single_shot(Duration::from_millis(120), move || {
-                    if let Some(app) = weak.upgrade() {
-                        activate_window(&app.window());
-                    }
-                });
-            }
-            WINDOW.with(|slot| *slot.borrow_mut() = Some(shell));
-        }
-        Err(error) => eprintln!("hakimi-ui: rebuilding the window failed: {error:#}"),
-    }
-}
-
-fn set_tray_startup_flags(auto_start: bool, start_hidden: bool) {
-    TRAY.with(|slot| {
-        if let Some(tray) = slot.borrow().as_ref() {
-            tray.set_auto_start(auto_start);
-            tray.set_start_hidden(start_hidden);
-        }
-    });
-}
-
-/// Mirrors the startup switches into the tray menu, which mirrors them again
-/// when clicked without a window present.
-fn sync_tray_settings(runtime: &HakimiRuntime) {
-    let startup = &runtime.config().snapshot().advanced.startup;
-    set_tray_startup_flags(startup.auto_start, startup.start_hidden);
-}
-
-/// Shows a settings error in whichever window is live, if any. Used by the
-/// tray switches, which have no window of their own.
-fn report_setting_error(key: &str, error: Option<String>) {
-    WINDOW.with(|slot| {
-        if let Some(shell) = slot.borrow().as_ref() {
-            let app = &shell.app;
-            let current_key = app.get_cfg_error_key();
-            if error.is_some() || current_key.as_str() == key {
-                let failed = error.is_some();
-                app.set_cfg_error(SharedString::from(error.unwrap_or_default()));
-                app.set_cfg_error_key(SharedString::from(if failed {
-                    key.to_string()
-                } else {
-                    String::new()
-                }));
-            }
-        }
-    });
-}
-
-/// Sidebar counters for the desktop layout.
-fn set_stats(app: &AppWindow, sites: &[SiteData]) {
-    let domains: usize = sites.iter().map(|site| site.domains.len()).sum();
-    let slow = sites
-        .iter()
-        .flat_map(|site| &site.domains)
-        .filter(|domain| domain.status == "较慢")
-        .count();
-    let bad = sites
-        .iter()
-        .flat_map(|site| &site.domains)
-        .filter(|domain| domain.status == "超时")
-        .count();
-    app.set_stat_sites(SharedString::from(format!("{}", sites.len())));
-    app.set_stat_enabled(SharedString::from(format!(
-        "{}",
-        sites.iter().filter(|site| site.enabled).count()
-    )));
-    app.set_stat_domains(SharedString::from(format!("{domains}")));
-    app.set_stat_slow(SharedString::from(format!("{slow}")));
-    app.set_stat_bad(SharedString::from(format!("{bad}")));
-}
-
-/// The plain-data snapshot used to decide whether the UI needs touching at all.
-#[derive(Clone, PartialEq)]
-struct UiState {
-    sites: Vec<SiteData>,
-    subtitle: String,
-    sites_summary: String,
-    running: bool,
-    ca: (bool, bool, bool),
-    settings: SettingsValues,
-    net: NetStatus,
-}
-
-/// Applies a snapshot to the window, updating only what actually changed.
-/// The snapshot is consumed (moved) so an unchanged tick costs one comparison
-/// and zero clones.
-fn apply_ui_update(
-    app: &AppWindow,
-    sites: Vec<SiteData>,
-    subtitle: String,
-    running: bool,
-    ca: (bool, bool, bool),
-    settings: SettingsValues,
-    net: NetStatus,
-) {
-    let sites_summary = format!(
-        "{} 个 · 已启用 {}",
-        sites.len(),
-        sites.iter().filter(|site| site.enabled).count()
-    );
-    let unchanged = PREV_STATE.with(|slot| {
-        slot.borrow().as_ref().is_some_and(|prev| {
-            prev.sites == sites
-                && prev.subtitle == subtitle
-                && prev.sites_summary == sites_summary
-                && prev.running == running
-                && prev.ca == ca
-                && prev.settings == settings
-                && prev.net == net
-        })
-    });
-    if unchanged {
-        return;
-    }
-
-    let prev = PREV_STATE.with(|slot| slot.borrow_mut().take());
-    let prev_sites: Option<&[SiteData]> = prev.as_ref().map(|state| state.sites.as_slice());
-    if prev_sites != Some(sites.as_slice()) {
-        SITES_MODEL.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            let model = slot.get_or_insert_with(|| {
-                let model = Rc::new(VecModel::default());
-                app.set_sites(ModelRc::new(model.clone()));
-                model
-            });
-            match prev_sites {
-                Some(old) if old.len() == sites.len() => {
-                    for index in 0..sites.len() {
-                        if old[index] != sites[index] {
-                            model.set_row_data(index, build_site_entry(&sites[index]));
-                        }
-                    }
-                }
-                _ => {
-                    let entries: Vec<SiteEntry> = sites.iter().map(build_site_entry).collect();
-                    model.set_vec(entries);
-                }
-            }
-        });
-    }
-
-    // Settings text fields only get written when the underlying value actually
-    // changed, so a half-typed input is never clobbered by the refresh tick.
-    if prev.as_ref().map(|state| &state.settings) != Some(&settings) {
-        let old = prev.as_ref().map(|state| &state.settings);
-        let changed = |pick: fn(&SettingsValues) -> &String| {
-            old.is_none_or(|prev| pick(prev) != pick(&settings))
-        };
-        if changed(|s| &s.proxy_port) {
-            app.set_cfg_proxy_port(SharedString::from(settings.proxy_port.clone()));
-        }
-        if changed(|s| &s.doh_primary) {
-            app.set_cfg_doh_primary(SharedString::from(settings.doh_primary.clone()));
-        }
-        if changed(|s| &s.doh_fallback) {
-            app.set_cfg_doh_fallback(SharedString::from(settings.doh_fallback.clone()));
-        }
-        if changed(|s| &s.catalog_ip) {
-            app.set_cfg_catalog_ip(SharedString::from(settings.catalog_ip.clone()));
-        }
-        if changed(|s| &s.catalog_doh) {
-            app.set_cfg_catalog_doh(SharedString::from(settings.catalog_doh.clone()));
-        }
-        if old.is_none_or(|prev| prev.download_mirror != settings.download_mirror) {
-            app.set_cfg_download_mirror(settings.download_mirror);
-        }
-        if changed(|s| &s.mirror_source) {
-            app.set_cfg_mirror_source(SharedString::from(settings.mirror_source.clone()));
-        }
-        if old.is_none_or(|prev| prev.download_enabled != settings.download_enabled) {
-            app.set_cfg_download_enabled(settings.download_enabled);
-        }
-        if changed(|s| &s.download_segments) {
-            app.set_cfg_download_segments(SharedString::from(settings.download_segments.clone()));
-        }
-        if old.is_none_or(|prev| prev.relay_enabled != settings.relay_enabled) {
-            app.set_cfg_relay_enabled(settings.relay_enabled);
-        }
-        if changed(|s| &s.relay_listen) {
-            app.set_cfg_relay_listen(SharedString::from(settings.relay_listen.clone()));
-        }
-        if changed(|s| &s.relay_target) {
-            app.set_cfg_relay_target(SharedString::from(settings.relay_target.clone()));
-        }
-        if changed(|s| &s.http1_hosts) {
-            app.set_cfg_http1_hosts(SharedString::from(settings.http1_hosts.clone()));
-        }
-        if old.is_none_or(|prev| prev.image_relay_enabled != settings.image_relay_enabled) {
-            app.set_cfg_image_relay_enabled(settings.image_relay_enabled);
-        }
-        if changed(|s| &s.image_relay_base) {
-            app.set_cfg_image_relay_base(SharedString::from(settings.image_relay_base.clone()));
-        }
-        if changed(|s| &s.image_relay_hosts) {
-            app.set_cfg_image_relay_hosts(SharedString::from(settings.image_relay_hosts.clone()));
-        }
-        if changed(|s| &s.image_relay_user_agent) {
-            app.set_cfg_image_relay_ua(SharedString::from(
-                settings.image_relay_user_agent.clone(),
-            ));
-        }
-        if changed(|s| &s.image_relay_paths) {
-            app.set_cfg_image_relay_paths(SharedString::from(settings.image_relay_paths.clone()));
-        }
-        if old.is_none_or(|prev| prev.image_relay_fallback != settings.image_relay_fallback) {
-            app.set_cfg_image_relay_fallback(settings.image_relay_fallback);
-        }
-        let auto_start_changed = old.is_none_or(|prev| prev.auto_start != settings.auto_start);
-        let start_hidden_changed =
-            old.is_none_or(|prev| prev.start_hidden != settings.start_hidden);
-        if auto_start_changed {
-            app.set_cfg_auto_start(settings.auto_start);
-        }
-        if start_hidden_changed {
-            app.set_cfg_start_hidden(settings.start_hidden);
-        }
-        if auto_start_changed || start_hidden_changed {
-            set_tray_startup_flags(settings.auto_start, settings.start_hidden);
-        }
-        if old.is_none_or(|prev| prev.auto_connect != settings.auto_connect) {
-            app.set_cfg_auto_connect(settings.auto_connect);
-        }
-    }
-
-    if prev.as_ref().map(|state| state.ca) != Some(ca) {
-        app.set_ca_installed(ca.2);
-    }
-
-    if prev.as_ref().map(|state| state.running) != Some(running) {
-        app.set_running(running);
-        TRAY.with(|tray| {
-            if let Some(tray) = tray.borrow().as_ref() {
-                tray.set_running(running);
-            }
-        });
-    }
-    if prev.as_ref().map(|state| state.subtitle.as_str()) != Some(subtitle.as_str()) {
-        app.set_status_subtitle(SharedString::from(subtitle.clone()));
-    }
-    if prev.as_ref().map(|state| state.sites_summary.as_str()) != Some(sites_summary.as_str()) {
-        app.set_sites_summary(SharedString::from(sites_summary.clone()));
-    }
-    // Sidebar counters. Cheap to write, and they only move when a probe lands.
-    set_stats(app, &sites);
-    // Network health. The values are already strings, so a change is four
-    // property writes and nothing else.
-    if prev.as_ref().map(|state| &state.net) != Some(&net) {
-        app.set_stat_doh(SharedString::from(net.doh.as_str()));
-        app.set_stat_doh_tone(net.doh_tone);
-        app.set_stat_mirror(SharedString::from(net.mirror.as_str()));
-        app.set_stat_mirror_tone(net.mirror_tone);
-        let old_net = prev.as_ref().map(|state| &state.net);
-        DOH_MODEL.with(|slot| {
-            sync_net_rows(
-                slot,
-                app,
-                AppWindow::set_doh_rows,
-                old_net.map(|state| state.doh_entries.as_slice()),
-                &net.doh_entries,
-            )
-        });
-        MIRROR_MODEL.with(|slot| {
-            sync_net_rows(
-                slot,
-                app,
-                AppWindow::set_mirror_rows,
-                old_net.map(|state| state.mirror_entries.as_slice()),
-                &net.mirror_entries,
-            )
-        });
-    }
-
-    PREV_STATE.with(|slot| {
-        *slot.borrow_mut() = Some(UiState {
-            sites,
-            subtitle,
-            sites_summary,
-            running,
-            ca,
-            settings,
-            net,
-        });
-    });
-}
-
-/// Drops the rows and snapshots only the hidden window owns. The proxy's
-/// memory is deliberately left alone: forcing the process working set out
-/// would page out its hot code and connection state, hurt live traffic, and
-/// still not reduce committed memory. These UI structures really are
-/// disposable and are rebuilt from the runtime on the next visible tick.
-fn release_ui_caches(app: &AppWindow) {
-    SITES_MODEL.with(|cell| {
-        if let Some(model) = cell.borrow_mut().take() {
-            model.set_vec(Vec::new());
-        }
-    });
-    app.set_sites(ModelRc::new(VecModel::default()));
-    // These two are bound to the window as well; a rebuilt window must get new ones.
-    DOH_MODEL.with(|slot| *slot.borrow_mut() = None);
-    MIRROR_MODEL.with(|slot| *slot.borrow_mut() = None);
-    PREV_STATE.with(|slot| *slot.borrow_mut() = None);
-    REFRESH_CACHE.with(|slot| *slot.borrow_mut() = None);
-    CONFIG_CACHE.with(|slot| *slot.borrow_mut() = None);
-    ASSETS.with(|assets| assets.borrow_mut().clear());
-}
-
-/// Site logos are embedded in the executable. `CARGO_MANIFEST_DIR` is an
-/// absolute path on the build machine, so loading them from disk would fail
-/// once the binary is copied to another machine.
-const ICON_ASSETS: [(&str, &[u8]); 14] = [
-    ("google", include_bytes!("../assets/google.png")),
-    ("pixiv", include_bytes!("../assets/pixiv.png")),
-    ("hitomi", include_bytes!("../assets/hitomi.png")),
-    ("poipiku", include_bytes!("../assets/poipiku.png")),
-    ("booth", include_bytes!("../assets/booth.png")),
-    ("steam", include_bytes!("../assets/steam.png")),
-    ("github", include_bytes!("../assets/github.png")),
-    ("ao3", include_bytes!("../assets/ao3.png")),
-    ("eh", include_bytes!("../assets/eh.png")),
-    ("hanime", include_bytes!("../assets/hanime.png")),
-    ("nhentai", include_bytes!("../assets/nhentai.png")),
-    // The catalog calls the site `hf`; a group created from its homepage gets
-    // the `huggingface-co` slug instead, so both spellings share one image.
-    ("hf", HF_LOGO),
-    ("huggingface", HF_LOGO),
-    ("x", include_bytes!("../assets/x.png")),
-];
-
-const HF_LOGO: &[u8] = include_bytes!("../assets/hf.png");
-
-/// On-screen size of a site logo, in logical pixels. Kept a multiple of four
-/// so it lands on whole device pixels at the 100/125/150/175/200% steps Windows
-/// offers. The `.slint` side uses the same value for the list tile and badge.
-const SITE_ICON_LOGICAL: f32 = 20.0;
-
-/// Resample a logo to the exact device-pixel size it will be drawn at. The
-/// renderers only do bilinear sampling and have no mipmaps, so handing them
-/// the bundled 96px PNG and letting them shrink it five times aliases every
-/// curve into a staircase. Doing the reduction here also means the texture is
-/// sampled 1:1 at the current DPI, which is what keeps the edges crisp.
-fn site_icon(bytes: &[u8], device_px: u32) -> Option<slint::Image> {
-    let source = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
-        .ok()?
-        .to_rgba8();
-    let mut premultiplied = source.clone();
-    for (pixel, out) in source.pixels().zip(premultiplied.pixels_mut()) {
-        let alpha = u32::from(pixel[3]);
-        for channel in 0..3 {
-            out[channel] = ((u32::from(pixel[channel]) * alpha + 127) / 255) as u8;
-        }
-    }
-    let mut resized = image::imageops::resize(
-        &premultiplied,
-        device_px,
-        device_px,
-        image::imageops::FilterType::Lanczos3,
-    );
-    // Lanczos ringing can push a channel above the (premultiplied) alpha.
-    for pixel in resized.pixels_mut() {
-        let alpha = pixel[3];
-        for channel in 0..3 {
-            pixel[channel] = pixel[channel].min(alpha);
-        }
-    }
-    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-        resized.as_raw(),
-        device_px,
-        device_px,
-    );
-    Some(slint::Image::from_rgba8_premultiplied(buffer))
-}
-
-/// The scale factor the cached logos were built for, or 0 before the first
-/// load. The refresh tick compares it with the window to notice a move to a
-/// monitor with a different DPI.
-pub(crate) fn asset_scale() -> f32 {
-    ICON_SCALE.with(Cell::get)
-}
-
-/// Decodes and resamples every bundled logo for `scale`. The window's scale
-/// factor is not known before it is shown, so the caller starts with an
-/// estimate (2x) and the refresh tick reloads once the real one arrives.
-pub(crate) fn load_assets(scale: f32) {
-    ASSETS.with(|assets| {
-        let mut map = assets.borrow_mut();
-        // Icons persist until release_ui_caches clears them; re-decoding the
-        // whole set on every tray reveal is wasted work.
-        if !map.is_empty() && (asset_scale() - scale).abs() < 0.01 {
-            return;
-        }
-        ICON_SCALE.with(|cell| cell.set(scale));
-        map.clear();
-        let device_px = (SITE_ICON_LOGICAL * scale).round().clamp(16.0, 160.0) as u32;
-        for &(key, bytes) in &ICON_ASSETS {
-            if let Some(image) = site_icon(bytes, device_px) {
-                map.insert(key.to_string(), image);
-            }
-        }
-    });
-}
-
-/// Settings values pushed into the window. Text fields keep the raw string so
-/// the user can type freely; validation happens on commit.
+/// Settings values pushed into the UI. Text fields keep the raw string so the
+/// user can type freely; validation happens on commit.
 #[derive(Clone, PartialEq)]
 pub(crate) struct SettingsValues {
     pub proxy_port: String,
@@ -1546,20 +226,12 @@ pub(crate) struct SettingsValues {
     pub catalog_doh: String,
     pub mirror_source: String,
     pub download_mirror: bool,
-    /// Chunked-download controls. The chunk size stays an internal default;
-    /// the card only exposes whether segmentation runs and how many
-    /// connections work in parallel.
     pub download_enabled: bool,
     pub download_segments: String,
     pub relay_enabled: bool,
     pub relay_listen: String,
     pub relay_target: String,
-    /// Host patterns forced onto independent HTTP/1.1 connections, joined with
-    /// commas for editing. This list belongs to the user: the defaults cover
-    /// the built-in sites, and an edit applies without a restart.
     pub http1_hosts: String,
-    /// The `pixiv` image relay rule. Only this rule is edited here; hand-written
-    /// rules with other ids are left alone.
     pub image_relay_enabled: bool,
     pub image_relay_base: String,
     pub image_relay_hosts: String,
@@ -1578,17 +250,24 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
             .map(|value| text(value, key))
             .unwrap_or_default()
     };
-    // the source URL doubles as the switch: empty means the mirror is off
+    let catalog_defaults = hakimi_core::config::CatalogSources::default();
+    let catalog = |key: &str| match config.get("catalogs").and_then(|value| value.get(key)) {
+        Some(Value::String(url)) => url.clone(),
+        Some(_) => String::new(),
+        None => match key {
+            "ip" => catalog_defaults.ip.clone(),
+            _ => catalog_defaults.doh.clone(),
+        },
+    };
     let download = config
         .get("advanced")
         .and_then(|advanced| advanced.get("download"));
-    let mirror_source = download
-        .map(|download| text(download, "mirrorSource"))
-        .unwrap_or_default();
-    // `download` is omitted while every field still matches the defaults, so
-    // an absent section (or field) must read back as the shipped value rather
-    // than an empty input the user would have to fill in by hand.
     let download_defaults = DownloadConfig::default();
+    let mirror_source = match download.and_then(|download| download.get("mirrorSource")) {
+        Some(Value::String(source)) => source.clone(),
+        Some(_) => String::new(),
+        None => download_defaults.mirror_source.clone(),
+    };
     let download_enabled = download
         .and_then(|download| download.get("enabled"))
         .and_then(Value::as_bool)
@@ -1597,8 +276,6 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
         .and_then(|download| download.get("segments"))
         .and_then(Value::as_u64)
         .unwrap_or(download_defaults.segments as u64)
-        // The runtime clamps to 2..=8; showing a hand-edited 1 or 64 would
-        // leave no pill selected while the proxy runs something else.
         .clamp(2, 8);
     let relay = config
         .get("advanced")
@@ -1608,8 +285,6 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
             .map(|value| text(value, key))
             .unwrap_or_default()
     };
-    // The persisted file omits `advanced` fields that still equal the
-    // defaults, so an absent `startup` section means "all off".
     let startup = config
         .get("advanced")
         .and_then(|advanced| advanced.get("startup"));
@@ -1619,7 +294,6 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
             .and_then(Value::as_bool)
             .unwrap_or(false)
     };
-    // The card edits the `pixiv` rule only; a missing rule means "not set up".
     let relay_rule = config
         .get("advanced")
         .and_then(|advanced| advanced.get("imageRelays"))
@@ -1635,8 +309,8 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
         proxy_port: field("proxy", "port"),
         doh_primary: field("doh", "primary"),
         doh_fallback: field("doh", "fallback"),
-        catalog_ip: field("catalogs", "ip"),
-        catalog_doh: field("catalogs", "doh"),
+        catalog_ip: catalog("ip"),
+        catalog_doh: catalog("doh"),
         download_mirror: !mirror_source.trim().is_empty(),
         mirror_source,
         download_enabled,
@@ -1695,13 +369,11 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
     }
 }
 
-// -- settings writes ------------------------------------------------------------
-
-/// Commit one text setting. Returns `Some(error)` when the value was rejected;
-/// the refresh tick then restores the field to the stored value.
 /// The image relay the settings card owns. Creating it lazily keeps a fresh
 /// install free of a rule the user never asked for.
-fn pixiv_image_relay(config: &mut hakimi_core::config::AppConfig) -> &mut hakimi_core::config::ImageRelayRule {
+fn pixiv_image_relay(
+    config: &mut hakimi_core::config::AppConfig,
+) -> &mut hakimi_core::config::ImageRelayRule {
     let index = config
         .advanced
         .image_relays
@@ -1714,9 +386,6 @@ fn pixiv_image_relay(config: &mut hakimi_core::config::AppConfig) -> &mut hakimi
                 .advanced
                 .image_relays
                 .push(hakimi_core::config::ImageRelayRule {
-                    // The shipped values, but off: the rule only exists here
-                    // because the user emptied the list, so re-enabling it is
-                    // their call.
                     enabled: false,
                     ..hakimi_core::config::ImageRelayRule::pixiv_default()
                 });
@@ -1727,6 +396,20 @@ fn pixiv_image_relay(config: &mut hakimi_core::config::AppConfig) -> &mut hakimi
 }
 
 fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Option<String> {
+    // A field that was empty and is committed empty again is not an edit: the
+    // commit fires on focus loss, so merely clicking a blank field would rewrite
+    // the config and persist whatever empty value was read back. Only a real
+    // change reaches the writer.
+    if matches!(key, "catalogs.ip" | "catalogs.doh") && value.trim().is_empty() {
+        let current = runtime.config().snapshot();
+        let existing = match key {
+            "catalogs.ip" => &current.catalogs.ip,
+            _ => &current.catalogs.doh,
+        };
+        if existing.trim().is_empty() {
+            return None;
+        }
+    }
     let result = runtime.config().mutate(|config| {
         match key {
             "proxy.port" => {
@@ -1755,8 +438,6 @@ fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Opti
                 config.advanced.download.segments = segments;
             }
             "advanced.relay.listen" => {
-                // Empty clears the field; an enabled relay then fails
-                // validation, which is the message the user needs.
                 config.advanced.relay.listen = if value.trim().is_empty() {
                     None
                 } else {
@@ -1776,9 +457,6 @@ fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Opti
                 };
             }
             "advanced.http1Hosts" => {
-                // Comma-separated, the same shape the fake-SNI field uses.
-                // Empty is allowed and means "no host gets its own connections",
-                // which is a legitimate choice rather than an error.
                 config.advanced.http1_hosts = split_entries(value);
             }
             "advanced.imageRelays.pixiv.base" => {
@@ -1791,7 +469,6 @@ fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Opti
                 pixiv_image_relay(config).paths = split_entries(value);
             }
             "advanced.imageRelays.pixiv.userAgent" => {
-                // Empty means "keep the browser's UA", not "send an empty one".
                 pixiv_image_relay(config).user_agent =
                     (!value.is_empty()).then(|| value.to_string());
             }
@@ -1800,29 +477,19 @@ fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Opti
         Ok(())
     });
     if result.is_ok() && key == "advanced.download.mirrorSource" {
-        // A new list URL must be fetched now, not on the six-hour tick.
         runtime.request_mirror_refresh();
     }
     if result.is_ok() && key == "advanced.http1Hosts" {
-        // The pool swaps its matcher in place, so an edited list applies to the
-        // next request. `mutate` only wrote the file; hand the new snapshot to
-        // the runtime so the running proxy sees it without a restart.
         if let Err(error) = runtime.update_config(runtime.config().snapshot().as_ref().clone()) {
             return Some(format!("{error:#}"));
         }
     }
     match result {
-        Ok(_) => {
-            // Bind/port changes land on the next launch: the running proxy is
-            // already bound and the PAC points at the live address.
-            None
-        }
+        Ok(_) => None,
         Err(error) => Some(format!("{error:#}")),
     }
 }
 
-/// Commit one boolean setting. The download mirror is the only one: on restores
-/// the default list URL, off clears it, because the URL doubles as the switch.
 fn apply_setting_bool(runtime: &HakimiRuntime, key: &str, value: bool) -> Option<String> {
     let result = runtime.config().mutate(|config| {
         match key {
@@ -1838,9 +505,6 @@ fn apply_setting_bool(runtime: &HakimiRuntime, key: &str, value: bool) -> Option
             }
             "advanced.relay.enabled" => {
                 config.advanced.relay.enabled = value;
-                // Turning it on without a usable address is a validation error
-                // the user can fix; turning it on with the fields still blank
-                // is the common first click, so seed the usual defaults.
                 if value {
                     if config.advanced.relay.listen.is_none() {
                         config.advanced.relay.listen =
@@ -1859,8 +523,6 @@ fn apply_setting_bool(runtime: &HakimiRuntime, key: &str, value: bool) -> Option
                 pixiv_image_relay(config).fallback_direct = value;
             }
             "advanced.startup.autoStart" => {
-                // The OS entry is the actual effect: registering first keeps
-                // the file and the switch honest when the write fails.
                 autostart::apply(value)?;
                 config.advanced.startup.auto_start = value;
             }
@@ -1883,8 +545,8 @@ fn apply_setting_bool(runtime: &HakimiRuntime, key: &str, value: bool) -> Option
     }
 }
 
-/// How a CA action ended. The UI only shows these three states — no stderr,
-/// no password diagnostics; the user just needs to know whether it worked.
+// -- CA outcome (framework-agnostic) ------------------------------------------
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum CaOutcome {
     Done,
@@ -1902,9 +564,6 @@ impl CaOutcome {
     }
 }
 
-/// Judge an install/uninstall/repair by what the trust store says afterwards,
-/// not by the exit status: `security` can report success after a dismissed
-/// dialog, and a leftover trusted copy would still verify.
 fn ca_outcome(result: Result<bool>, want_installed: bool) -> CaOutcome {
     match result {
         Ok(installed) if installed == want_installed => CaOutcome::Done,
@@ -1920,13 +579,11 @@ fn ca_outcome(result: Result<bool>, want_installed: bool) -> CaOutcome {
     }
 }
 
-// -- site editor ----------------------------------------------------------------
+// -- site editor logic (framework-agnostic) -----------------------------------
 
-/// Site editor input, kept independent of Slint so it can be unit tested.
 #[derive(Clone)]
 struct DomainDraft {
     pattern: String,
-    /// 0 inherit, 1 direct, 2 ECH, 3 SNI, 4 custom.
     preset: i32,
     sni: String,
     custom: String,
@@ -1938,23 +595,10 @@ struct SiteDraft {
     name: String,
     domains: Vec<DomainDraft>,
     homepage: String,
-    /// 0 auto, 1 direct, 2 ECH, 3 SNI, 4 custom.
     default_preset: i32,
     default_custom: String,
 }
 
-fn domain_route_label(preset: i32) -> &'static str {
-    match preset {
-        1 => "直连",
-        2 => "ECH",
-        3 => "SNI 伪装",
-        4 => "自定义",
-        _ => "继承默认",
-    }
-}
-
-/// Recognize the preset-shaped fake-SNI routes; anything else stays custom so
-/// the editor never silently rewrites a hand-written attempt list.
 fn domain_sni_hosts(route: &RoutePolicy) -> Option<Vec<String>> {
     match route.attempts.as_slice() {
         [RouteAttempt::Sni { sni }] => Some(sni.clone()),
@@ -1963,71 +607,6 @@ fn domain_sni_hosts(route: &RoutePolicy) -> Option<Vec<String>> {
     }
 }
 
-fn editor_domain_from_rule(rule: &DomainRule) -> EditorDomain {
-    let (preset, sni, custom) = match &rule.route {
-        None => (0, String::new(), String::new()),
-        Some(route) if route == &RoutePolicy::direct() => (1, String::new(), String::new()),
-        Some(route) if route == &RoutePolicy::ech_shared() => (2, String::new(), String::new()),
-        Some(route) => match domain_sni_hosts(route) {
-            Some(hosts) => (3, hosts.join(", "), String::new()),
-            None => (4, String::new(), format_route(route)),
-        },
-    };
-    EditorDomain {
-        pattern: rule.pattern.clone().into(),
-        route: preset,
-        route_label: domain_route_label(preset).into(),
-        sni: sni.into(),
-        custom: custom.into(),
-    }
-}
-
-fn set_editor_rows(app: &AppWindow, rows: Vec<EditorDomain>) {
-    let model = Rc::new(VecModel::from(rows));
-    app.set_editor_domain_rows(ModelRc::from(model.clone()));
-    EDITOR_ROWS.with(|cell| *cell.borrow_mut() = Some(model));
-}
-
-fn with_editor_rows(f: impl FnOnce(&VecModel<EditorDomain>)) {
-    EDITOR_ROWS.with(|cell| {
-        if let Some(model) = cell.borrow().as_ref() {
-            f(model);
-        }
-    });
-}
-
-fn update_editor_row(index: usize, update: impl FnOnce(&mut EditorDomain)) {
-    with_editor_rows(|model| {
-        if let Some(mut row) = model.row_data(index) {
-            update(&mut row);
-            model.set_row_data(index, row);
-        }
-    });
-}
-
-fn editor_rows_snapshot() -> Vec<DomainDraft> {
-    EDITOR_ROWS.with(|cell| {
-        cell.borrow()
-            .as_ref()
-            .map(|model| {
-                (0..model.row_count())
-                    .filter_map(|index| model.row_data(index))
-                    .map(|row| DomainDraft {
-                        pattern: row.pattern.to_string(),
-                        preset: row.route,
-                        sni: row.sni.to_string(),
-                        custom: row.custom.to_string(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
-}
-
-/// Splits a comma separated settings field.
-///
-/// A Chinese input method emits `，`, which used to stay inside the entry: a
-/// host list failed validation, a path list silently matched nothing.
 fn split_entries(raw: &str) -> Vec<String> {
     raw.split(|c| c == ',' || c == '，')
         .map(str::trim)
@@ -2128,33 +707,6 @@ fn build_group(config: &AppConfig, draft: &SiteDraft) -> Result<GroupConfig> {
     Ok(group)
 }
 
-/// Read the editor fields and persist the group.
-fn save_site(runtime: &HakimiRuntime, app: &AppWindow) -> Result<()> {
-    let draft = SiteDraft {
-        id: app.get_editor_id().to_string(),
-        is_new: app.get_editor_is_new(),
-        name: app.get_editor_name().to_string(),
-        domains: editor_rows_snapshot(),
-        homepage: app.get_editor_homepage().to_string(),
-        default_preset: app.get_editor_default_preset(),
-        default_custom: app.get_editor_default_custom().to_string(),
-    };
-    let config = runtime.config().snapshot();
-    let group = build_group(&config, &draft)?;
-    tracing::info!(
-        id = %group.id,
-        name = %group.name,
-        domains = group.domains.len(),
-        default_route = ?group.default_route,
-        is_new = draft.is_new,
-        "site saved"
-    );
-    runtime.upsert_group(group)?;
-    Ok(())
-}
-
-/// Derive a config-safe group id from the first domain, e.g.
-/// `www.example.com` -> `www-example-com`.
 fn unique_group_id(config: &hakimi_core::config::AppConfig, domain: &str) -> String {
     let base: String = domain
         .trim_start_matches("*.")
@@ -2184,326 +736,33 @@ fn unique_group_id(config: &hakimi_core::config::AppConfig, domain: &str) -> Str
     format!("{base}-{stamp}")
 }
 
-// -- offscreen rendering (development aid) ------------------------------------
-
-#[cfg(any(debug_assertions, feature = "dev-shot"))]
-fn sample_status() -> Value {
-    serde_json::json!({
-        "ca": { "present": true, "supported": true, "installed": false },
-        "domains": [
-            { "domain": "www.pixiv.net", "state": "normal", "latencyMs": 23 },
-            { "domain": "i.pximg.net", "state": "normal", "latencyMs": 31 },
-            { "domain": "s.pximg.net", "state": "normal", "latencyMs": 44 },
-            { "domain": "booth.pximg.net", "state": "normal", "latencyMs": 38 },
-            { "domain": "novel.pixiv.net", "state": "normal", "latencyMs": 52 },
-            { "domain": "e-hentai.org", "state": "normal", "latencyMs": 48 },
-            { "domain": "forums.e-hentai.org", "state": "normal", "latencyMs": 212 },
-            { "domain": "exhentai.org", "state": "normal", "latencyMs": 61 },
-            { "domain": "hitomi.la", "state": "normal", "latencyMs": 95 },
-            { "domain": "ltn.gold-usergeneratedcontent.net", "state": "failed" },
-            { "domain": "github.com", "state": "normal", "latencyMs": 120 },
-            { "domain": "raw.githubusercontent.com", "state": "normal", "latencyMs": 145 },
-            { "domain": "api.github.com", "state": "normal", "latencyMs": 132 },
-            { "domain": "ao3.org", "state": "normal", "latencyMs": 180 },
-            { "domain": "archiveofourown.org", "state": "normal", "latencyMs": 175 },
-            { "domain": "steamcommunity.com", "state": "normal", "latencyMs": 88 },
-            { "domain": "store.steampowered.com", "state": "normal", "latencyMs": 96 },
-            { "domain": "poipiku.me", "state": "normal", "latencyMs": 71 },
-            { "domain": "poipiku.art", "state": "normal", "latencyMs": 66 }
-        ]
-    })
-}
-
-#[cfg(any(debug_assertions, feature = "dev-shot"))]
-fn sample_config() -> Value {
-    serde_json::json!({
-        "proxy": { "port": 8443 },
-        "doh": {
-            "primary": "https://doh.cleanbrowsing.org/doh/security-filter/",
-            "fallback": "https://doh.applied-privacy.net/query"
-        },
-        "catalogs": {
-            "ip": "https://gitee.com/hakimi/catalogs/ip.json",
-            "doh": "https://gitee.com/hakimi/catalogs/doh.json"
-        },
-        "advanced": {
-            "download": { "mirrorSource": "https://gitee.com/hakimi/catalogs/mirrors.json" }
-        },
-        "groups": [
-            { "id": "pixiv", "name": "Pixiv", "enabled": true,
-              "defaultRoute": { "attempts": [{ "mode": "direct" }] },
-              "domains": [
-                { "pattern": "www.pixiv.net", "route": { "attempts": [{ "mode": "ech", "ech": "shared" }, { "mode": "direct" }] } },
-                { "pattern": "i.pximg.net", "route": { "attempts": [{ "mode": "sni", "sni": ["www.baidu.com"] }, { "mode": "direct" }] } },
-                { "pattern": "s.pximg.net", "route": { "attempts": [{ "mode": "sni", "sni": ["www.baidu.com"] }, { "mode": "direct" }] } }
-              ] },
-            { "id": "eh", "name": "E-Hentai", "enabled": true,
-              "defaultRoute": { "attempts": [{ "mode": "direct" }, { "mode": "ech", "ech": "own" }, { "mode": "sni" }] },
-              "domains": [{ "pattern": "e-hentai.org" }, { "pattern": "exhentai.org" }] },
-            { "id": "hitomi", "name": "Hitomi", "enabled": true,
-              "defaultRoute": { "attempts": [{ "mode": "direct" }, { "mode": "ech", "ech": "own" }, { "mode": "sni" }] },
-              "domains": [{ "pattern": "hitomi.la" }] },
-            { "id": "github", "name": "GitHub", "enabled": true,
-              "defaultRoute": { "attempts": [{ "mode": "direct" }, { "mode": "ech", "ech": "own" }, { "mode": "sni" }] },
-              "domains": [{ "pattern": "github.com" }, { "pattern": "raw.githubusercontent.com" }] },
-            { "id": "ao3", "name": "AO3", "enabled": true,
-              "defaultRoute": { "attempts": [{ "mode": "ech", "ech": "shared" }, { "mode": "direct" }] },
-              "domains": [{ "pattern": "archiveofourown.org" }] },
-            { "id": "steam", "name": "Steam", "enabled": true,
-              "defaultRoute": { "attempts": [{ "mode": "direct" }, { "mode": "ech", "ech": "own" }, { "mode": "sni" }] },
-              "domains": [{ "pattern": "steamcommunity.com" }, { "pattern": "store.steampowered.com" }] },
-            { "id": "poipiku", "name": "Poipiku", "enabled": true,
-              "defaultRoute": { "attempts": [{ "mode": "direct" }] },
-              "domains": [{ "pattern": "poipiku.com" }] }
-        ]
-    })
-}
-
-/// Renders the window into a raw RGBA file so the layout can be reviewed
-/// without a display. Usage: `hakimi-ui --shot <prefix> [--page N] [--running]`.
-#[cfg(any(debug_assertions, feature = "dev-shot"))]
-fn shot(prefix: &str, page: i32, running: bool) -> Result<()> {
-    use_light_appearance();
-    let app = AppWindow::new()?;
-    load_assets(1.0);
-
-    let status = sample_status();
-    let config = sample_config();
-    let mut expanded = HashSet::new();
-    if page == 0 {
-        expanded.insert("pixiv".to_string());
-    }
-
-    let (sites, subtitle) = build_snapshot(&status, &config, &expanded, running, false, None);
-    let entries: Vec<SiteEntry> = sites.iter().map(build_site_entry).collect();
-    let ca = &status["ca"];
-    let settings = settings_values(&config);
-
-    app.set_sites(ModelRc::new(VecModel::from(entries)));
-    app.set_cfg_proxy_port(SharedString::from(settings.proxy_port.clone()));
-    app.set_cfg_doh_primary(SharedString::from(settings.doh_primary.clone()));
-    app.set_cfg_doh_fallback(SharedString::from(settings.doh_fallback.clone()));
-    app.set_cfg_catalog_ip(SharedString::from(settings.catalog_ip.clone()));
-    app.set_cfg_catalog_doh(SharedString::from(settings.catalog_doh.clone()));
-    app.set_cfg_download_mirror(settings.download_mirror);
-    app.set_cfg_mirror_source(SharedString::from(settings.mirror_source.clone()));
-    app.set_cfg_download_enabled(settings.download_enabled);
-    app.set_cfg_download_segments(SharedString::from(settings.download_segments.clone()));
-    app.set_cfg_relay_enabled(settings.relay_enabled);
-    app.set_cfg_relay_listen(SharedString::from(settings.relay_listen.clone()));
-    app.set_cfg_relay_target(SharedString::from(settings.relay_target.clone()));
-    app.set_cfg_http1_hosts(SharedString::from(settings.http1_hosts.clone()));
-    app.set_cfg_image_relay_enabled(settings.image_relay_enabled);
-    app.set_cfg_image_relay_base(SharedString::from(settings.image_relay_base.clone()));
-    app.set_cfg_image_relay_hosts(SharedString::from(settings.image_relay_hosts.clone()));
-    app.set_cfg_image_relay_paths(SharedString::from(settings.image_relay_paths.clone()));
-    app.set_cfg_image_relay_ua(SharedString::from(
-        settings.image_relay_user_agent.clone(),
-    ));
-    app.set_cfg_image_relay_fallback(settings.image_relay_fallback);
-    app.set_cfg_data_dir(SharedString::from("~/Library/Application Support/hakimi"));
-    app.set_cfg_version(SharedString::from(env!("CARGO_PKG_VERSION")));
-    app.set_cfg_core_version(SharedString::from(hakimi_core::VERSION));
-    if std::env::var("HAKIMI_UI_AUTOSTART_WARN").is_ok() {
-        app.set_cfg_auto_start(true);
-        app.set_auto_start_warning(SharedString::from(
-            "已被系统启动应用设置禁用，请在任务管理器 → 启动应用中重新启用",
-        ));
-    }
-    if std::env::var("HAKIMI_UI_UPDATE").is_ok() {
-        app.set_update_available(true);
-        app.set_update_status(SharedString::from("发现新版本 v0.2.0"));
-    }
-    app.set_status_subtitle(SharedString::from(subtitle));
-    app.set_running(running);
-    app.set_page(page);
-    if let Ok(section) = std::env::var("HAKIMI_UI_SECTION") {
-        app.set_settings_section(section.parse::<i32>()?.clamp(0, 3));
-    }
-    // Offscreen states for reviewing the environment-check UI.
-    let broken = std::env::var("HAKIMI_UI_BROKEN").is_ok();
-    let fix_page = std::env::var("HAKIMI_UI_FIXPAGE").is_ok();
-    app.set_ca_installed(
-        !broken
-            && !fix_page
-            && ca
-                .get("installed")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-    );
-    if broken || fix_page {
-        app.set_ca_error(SharedString::from("已导入，但尚未受信任"));
-    }
-    app.set_show_onboarding(fix_page || std::env::var("HAKIMI_UI_FIXMANUAL").is_ok());
-    app.set_fix_blocked(fix_page);
-    if let Ok(message) = std::env::var("HAKIMI_UI_CA_ERROR") {
-        app.set_ca_action_error(SharedString::from(message));
-    }
-    if std::env::var("HAKIMI_UI_CA_BUSY").is_ok() {
-        app.set_ca_busy(true);
-    }
-    app.set_sites_summary(SharedString::from(format!(
-        "{} 个 · 已启用 {}",
-        sites.len(),
-        sites.iter().filter(|site| site.enabled).count()
-    )));
-    set_stats(&app, &sites);
-    // Offscreen sample for the status card: one healthy row and one degraded,
-    // so the palette can be reviewed in a single shot.
-    app.set_stat_doh(SharedString::from("4/4 可用"));
-    app.set_stat_doh_tone(1);
-    app.set_stat_mirror(SharedString::from("1/2 可用"));
-    app.set_stat_mirror_tone(2);
-    app.set_doh_rows(ModelRc::new(VecModel::from(vec![
-        NetRow {
-            label: "cleanbrowsing".into(),
-            detail: "doh.cleanbrowsing.org".into(),
-            value: "28 ms".into(),
-            tone: 1,
-        },
-        NetRow {
-            label: "applied-privacy".into(),
-            detail: "doh.applied-privacy.net".into(),
-            value: "41 ms".into(),
-            tone: 1,
-        },
-        NetRow {
-            label: "custom 1".into(),
-            detail: "请求超时".into(),
-            value: "失败".into(),
-            tone: 3,
-        },
-    ])));
-    app.set_mirror_rows(ModelRc::new(VecModel::from(vec![
-        NetRow {
-            label: "gh-proxy.com".into(),
-            detail: "https://gh-proxy.com".into(),
-            value: "可用".into(),
-            tone: 1,
-        },
-        NetRow {
-            label: "ghfast.top".into(),
-            detail: "https://ghfast.top".into(),
-            value: "冷却 4:52".into(),
-            tone: 2,
-        },
-    ])));
-    if let Ok(value) = std::env::var("HAKIMI_UI_NET") {
-        app.set_doh_open(value != "mirror");
-        app.set_mirror_open(value != "doh");
-    }
-    if std::env::var("HAKIMI_UI_SITES").is_ok() {
-        app.set_sites_expanded(true);
-    }
-    match std::env::var("HAKIMI_UI_EDITOR").as_deref() {
-        Ok("new") => {
-            app.set_editor_is_new(true);
-            set_editor_rows(
-                &app,
-                vec![EditorDomain {
-                    pattern: SharedString::new(),
-                    route: 0,
-                    route_label: SharedString::from(domain_route_label(0)),
-                    sni: SharedString::new(),
-                    custom: SharedString::new(),
-                }],
-            );
-            app.set_editor_default_preset(0);
-            app.set_editor_default_custom(SharedString::new());
-            app.set_editor_homepage(SharedString::new());
-            app.set_editor_open(true);
-        }
-        Ok(_) => {
-            app.set_editor_is_new(false);
-            app.set_editor_id(SharedString::from("pixiv"));
-            app.set_editor_name(SharedString::from("Pixiv"));
-            set_editor_rows(
-                &app,
-                vec![
-                    editor_domain_from_rule(&DomainRule::routed(
-                        "pixiv.net",
-                        RoutePolicy::ech_shared(),
-                    )),
-                    editor_domain_from_rule(&DomainRule::routed(
-                        "www.pixiv.net",
-                        RoutePolicy::ech_shared(),
-                    )),
-                    editor_domain_from_rule(&DomainRule::routed(
-                        "*.pixiv.net",
-                        RoutePolicy::ech_shared(),
-                    )),
-                    editor_domain_from_rule(&DomainRule::routed(
-                        "i.pximg.net",
-                        RoutePolicy::sni(vec!["www.baidu.com".into()]),
-                    )),
-                    editor_domain_from_rule(&DomainRule::routed(
-                        "s.pximg.net",
-                        RoutePolicy::sni(vec!["www.baidu.com".into()]),
-                    )),
-                ],
-            );
-            app.set_editor_default_preset(0);
-            app.set_editor_default_custom(SharedString::new());
-            app.set_editor_homepage(SharedString::from("https://www.pixiv.net/"));
-            app.set_editor_deletable(false);
-            app.set_editor_open(true);
-        }
-        Err(_) => {}
-    }
-    app.show()?;
-    // let the first render pass settle
-    for _ in 0..8 {
-        std::thread::sleep(Duration::from_millis(60));
-    }
-
-    let buffer = app.window().take_snapshot()?;
-    let mut bytes = Vec::with_capacity(buffer.as_slice().len() * 4);
-    for pixel in buffer.as_slice() {
-        bytes.extend_from_slice(&[pixel.r, pixel.g, pixel.b, pixel.a]);
-    }
-    std::fs::write(format!("{prefix}.rgba"), bytes)?;
-    println!(
-        "wrote {prefix}.rgba ({}x{})",
-        buffer.width(),
-        buffer.height()
-    );
-    Ok(())
-}
+// -- refresh derivation (framework-agnostic) ----------------------------------
 
 thread_local! {
-    // Shared handles, not clones: the config JSON can be large and the refresh
-    // path only borrows it.
-    static CONFIG_CACHE: std::cell::RefCell<Option<(u64, Rc<Value>)>> =
-        const { std::cell::RefCell::new(None) };
-    // The last built (unsettled) site snapshot. While neither the status nor
-    // the config has changed, the refresh tick reuses it instead of
-    // re-serializing the whole status every second.
-    static REFRESH_CACHE: std::cell::RefCell<Option<RefreshCache>> =
-        const { std::cell::RefCell::new(None) };
-    // The acceleration state machine lives on the UI thread.
-    static MODEL: std::cell::RefCell<ui_state::AppModel> =
-        std::cell::RefCell::new(ui_state::AppModel::default());
+    static CONFIG_CACHE: RefCell<Option<(u64, Arc<Value>)>> =
+        const { RefCell::new(None) };
+    static REFRESH_CACHE: RefCell<Option<RefreshCache>> =
+        const { RefCell::new(None) };
+    static MODEL: RefCell<ui_state::AppModel> =
+        RefCell::new(ui_state::AppModel::default());
+    static UPDATE_LAST_ATTEMPT: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
-/// The last raw (unsettled) snapshot, keyed by everything that can change it.
-/// A refresh tick that hits this reuses the rows and skips `status_json`; a
-/// config-only change (enabling/disabling a site) reuses the cached status
-/// JSON and rebuilds just the rows.
 struct RefreshCache {
     status_revision: u64,
     config_revision: u64,
     expanded: HashSet<String>,
-    status: Rc<Value>,
+    status: Arc<Value>,
     raw_sites: Vec<SiteData>,
     selected: usize,
-    ca: (bool, bool, bool),
     settings: SettingsValues,
 }
 
-/// Reads the two sidebar health rows. Deliberately kept outside the
-/// status-JSON cache: DoH health and mirror cooldowns both move without bumping
-/// either revision that cache keys on, so a revision hit would freeze the
-/// panel on the first values it ever saw.
+const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+const WINDOW_WIDTH: i32 = 760;
+const WINDOW_HEIGHT: i32 = 600;
+
 fn network_status(runtime: &HakimiRuntime, settings: &SettingsValues) -> NetStatus {
     let resolver = runtime.resolver();
     let endpoints = resolver.effective_endpoints();
@@ -2544,41 +803,43 @@ fn network_status(runtime: &HakimiRuntime, settings: &SettingsValues) -> NetStat
     }
 }
 
-/// Re-reads the world and applies it to the window. Runs on the UI thread on a
-/// one-second timer; `apply_ui_update` diffs, and this cache keeps an idle tick
-/// from rebuilding a snapshot that cannot have changed.
-fn refresh(
-    app: &AppWindow,
-    runtime: &Arc<HakimiRuntime>,
-    expanded: &HashSet<String>,
-    sweep: &SweepState,
-) {
+fn cached_config(revision: u64, fetch: impl FnOnce() -> Value) -> Arc<Value> {
+    CONFIG_CACHE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        match slot.as_ref() {
+            Some((cached_revision, config)) if *cached_revision == revision => config.clone(),
+            _ => {
+                let config = Arc::new(fetch());
+                *slot = Some((revision, config.clone()));
+                config
+            }
+        }
+    })
+}
+
+/// Compute a fresh UI snapshot from the runtime. The revision cache avoids
+/// re-serialising the whole status on an idle tick.
+fn refresh_snapshot(ctx: &AppContext) -> app_state::UiSnapshot {
+    let runtime = &ctx.runtime;
     let status_revision = runtime.status_revision();
     let config_revision = runtime.config_revision();
     let running = runtime.is_started() && !runtime.status().paused();
-    // Running intent without a started runtime means "still starting": the
-    // summaries must not claim a stale 待检测/健康 state while the proxy is
-    // coming up.
     let starting = MODEL.with(|m| m.borrow().accel()) == ui_state::AccelState::Running && !running;
     let phase = if starting {
-        SettlePhase::Starting
+        ui_state::SettlePhase::Starting
     } else {
-        sweep.phase()
+        ctx.sweep.phase()
     };
+    let expanded = &*ctx.expanded.borrow();
 
-    // The status snapshot is the expensive part. A config-only change (a site
-    // toggle) keeps the same status revision, so the cached JSON is reused and
-    // only the display rows are rebuilt.
     let cached_status = REFRESH_CACHE.with(|cell| {
-        let slot = cell.borrow();
-        slot.as_ref()
+        cell.borrow()
+            .as_ref()
             .filter(|cache| cache.status_revision == status_revision)
             .map(|cache| cache.status.clone())
     });
-
     let cached = REFRESH_CACHE.with(|cell| {
-        let slot = cell.borrow();
-        slot.as_ref().and_then(|cache| {
+        cell.borrow().as_ref().and_then(|cache| {
             (cache.status_revision == status_revision
                 && cache.config_revision == config_revision
                 && &cache.expanded == expanded)
@@ -2586,32 +847,27 @@ fn refresh(
                     (
                         cache.raw_sites.clone(),
                         cache.selected,
-                        cache.ca,
                         cache.settings.clone(),
                     )
                 })
         })
     });
-
-    // Expanding or collapsing a site only flips its `open` flag. Patch the
-    // cached rows instead of walking every group and domain again.
     let expanded_only = REFRESH_CACHE.with(|cell| {
-        let slot = cell.borrow();
-        slot.as_ref().and_then(|cache| {
+        cell.borrow().as_ref().and_then(|cache| {
             (cache.status_revision == status_revision
                 && cache.config_revision == config_revision
-                && cache.expanded != *expanded)
+                && &cache.expanded != expanded)
                 .then(|| {
                     let mut sites = cache.raw_sites.clone();
                     for site in &mut sites {
                         site.open = expanded.contains(&site.id);
                     }
-                    (sites, cache.selected, cache.ca, cache.settings.clone())
+                    (sites, cache.selected, cache.settings.clone())
                 })
         })
     });
 
-    let (raw_sites, selected, ca_state, settings) = if let Some(hit) = expanded_only {
+    let (raw_sites, selected, settings) = if let Some(hit) = expanded_only {
         REFRESH_CACHE.with(|cell| {
             if let Some(cache) = cell.borrow_mut().as_mut() {
                 cache.expanded = expanded.clone();
@@ -2621,24 +877,11 @@ fn refresh(
         hit
     } else {
         match cached {
-            // Nothing the window renders has changed: reuse the rows and let
-            // finish_snapshot's settle pass decide whether a pending summary
-            // has been stable long enough to commit.
             Some(hit) => hit,
             None => {
-                let status = cached_status.unwrap_or_else(|| Rc::new(runtime.status_json()));
+                let status = cached_status.unwrap_or_else(|| Arc::new(runtime.status_json()));
                 let config = cached_config(config_revision, || runtime.config_json());
                 let (raw_sites, selected) = build_sites(&status, &config, expanded);
-                let ca = &status["ca"];
-                let ca_state = (
-                    ca.get("present").and_then(Value::as_bool).unwrap_or(false),
-                    ca.get("supported")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    ca.get("installed")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                );
                 let settings = settings_values(&config);
                 REFRESH_CACHE.with(|cell| {
                     *cell.borrow_mut() = Some(RefreshCache {
@@ -2648,61 +891,710 @@ fn refresh(
                         status: status.clone(),
                         raw_sites: raw_sites.clone(),
                         selected,
-                        ca: ca_state,
                         settings: settings.clone(),
                     });
                 });
-                (raw_sites, selected, ca_state, settings)
+                (raw_sites, selected, settings)
             }
         }
     };
 
-    let auto_start = settings.auto_start;
     let (sites, subtitle) = finish_snapshot(raw_sites, selected, running, starting, Some(phase));
     let net = network_status(runtime, &settings);
-    apply_ui_update(app, sites, subtitle, running, ca_state, settings, net);
-    // The switch describes the stored intent; Windows can disable the entry
-    // from its Startup apps page without touching the file, so surface that
-    // instead of letting the switch claim it will run.
-    let warning = if auto_start {
-        autostart::login_state().problem().unwrap_or_default()
-    } else {
-        ""
-    };
-    if app.get_auto_start_warning().as_str() != warning {
-        if !warning.is_empty() {
-            tracing::info!(warning, "startup entry warning");
-        }
-        app.set_auto_start_warning(SharedString::from(warning));
+    let sites_summary = format!(
+        "{} 个 · 已启用 {}",
+        sites.len(),
+        sites.iter().filter(|site| site.enabled).count()
+    );
+
+    app_state::UiSnapshot {
+        sites,
+        subtitle,
+        sites_summary,
+        running,
+        config_revision,
+        settings,
+        net_doh: net.doh,
+        net_doh_tone: net.doh_tone,
+        net_mirror: net.mirror,
+        net_mirror_tone: net.mirror_tone,
+        doh_rows: net.doh_entries,
+        mirror_rows: net.mirror_entries,
     }
-    // Environment state comes from the probe thread; the window already
-    // mirrors the model, so there is nothing else to do here.
 }
 
-fn cached_config(revision: u64, fetch: impl FnOnce() -> Value) -> Rc<Value> {
-    CONFIG_CACHE.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        match slot.as_ref() {
-            Some((cached_revision, config)) if *cached_revision == revision => config.clone(),
-            _ => {
-                let config = Rc::new(fetch());
-                *slot = Some((revision, config.clone()));
-                config
+/// The application: owns the signals and handles every Action on the UI thread.
+struct Ui {
+    signals: UiSignals,
+    ctx: AppContext,
+    /// Shared cell holding the channel sender. The channel is created after the
+    /// App, so the handler receives a clone of this cell and the sender is
+    /// stashed into it immediately after `app.channel()` returns.
+    tx: std::rc::Rc<RefCell<Option<Sender<Action>>>>,
+    /// Guards against a second update check. Shared with the tokio task, so it
+    /// must be atomic rather than a thread-local (the worker has its own TLS).
+    update_in_flight: Arc<AtomicBool>,
+    hidden: Arc<AtomicBool>,
+    quitting: Arc<AtomicBool>,
+    shutdown: Arc<tokio::sync::Notify>,
+    settings_revision: std::cell::Cell<Option<u64>>,
+    /// Set when the window closes; the next tick reclaims the editor signals.
+    ///
+    /// They cannot be freed inside `on_close_request`: clearing `editor_rows`
+    /// only marks the keyed list for rebuild, and the rows still on screen read
+    /// their `visible_signal`s during that frame's layout. One tick later the
+    /// nodes are gone and the slots are safe to dispose.
+    reclaim_editor_rows: std::cell::Cell<bool>,
+}
+
+impl Ui {
+    fn tx(&self) -> Sender<Action> {
+        self.tx
+            .borrow()
+            .clone()
+            .expect("UI channel sender installed before any action")
+    }
+
+    fn apply_snapshot(&self, snap: app_state::UiSnapshot) {
+        let s = &self.signals;
+        let domains: usize = snap.sites.iter().map(|site| site.domains.len()).sum();
+        let slow = snap
+            .sites
+            .iter()
+            .flat_map(|site| &site.domains)
+            .filter(|d| d.status == "较慢")
+            .count();
+        let bad = snap
+            .sites
+            .iter()
+            .flat_map(|site| &site.domains)
+            .filter(|d| d.status == "超时")
+            .count();
+        // Only write signals whose value actually changed. Writing an unchanged
+        // signal still marks the reactive tree dirty, which rebuilds every site
+        // row (and re-decodes every logo) on each idle tick — the source of
+        // scroll jank. A no-op tick must touch zero signals.
+        let set_str = |sig: Signal<String>, value: String| {
+            if sig.get() != value { sig.set(value); }
+        };
+        let set_i32 = |sig: Signal<i32>, value: i32| {
+            if sig.get() != value { sig.set(value); }
+        };
+        let set_bool = |sig: Signal<bool>, value: bool| {
+            if sig.get() != value { sig.set(value); }
+        };
+        set_str(s.stat_sites, snap.sites.len().to_string());
+        set_str(s.stat_enabled, snap.sites.iter().filter(|site| site.enabled).count().to_string());
+        set_str(s.stat_domains, domains.to_string());
+        set_str(s.stat_slow, slow.to_string());
+        set_str(s.stat_bad, bad.to_string());
+        let all_selected = !snap.sites.is_empty() && snap.sites.iter().all(|site| site.enabled);
+        if s.sites.get() != snap.sites { s.sites.set(snap.sites); }
+        set_str(s.status_subtitle, snap.subtitle);
+        set_str(s.sites_summary, snap.sites_summary);
+        set_bool(s.running, snap.running);
+        set_str(s.stat_doh, snap.net_doh);
+        set_i32(s.stat_doh_tone, snap.net_doh_tone);
+        set_str(s.stat_mirror, snap.net_mirror);
+        set_i32(s.stat_mirror_tone, snap.net_mirror_tone);
+        if s.doh_rows.get() != snap.doh_rows { s.doh_rows.set(snap.doh_rows); }
+        if s.mirror_rows.get() != snap.mirror_rows { s.mirror_rows.set(snap.mirror_rows); }
+
+        // Settings fields are rewritten only when the configuration actually
+        // changed. Comparing values is not enough: clearing a field makes the
+        // signal differ from the stored value, and the next one-second refresh
+        // would put the old text back before the commit ever runs.
+        let st = &snap.settings;
+        let config_changed = self.settings_revision.replace(Some(snap.config_revision))
+            != Some(snap.config_revision);
+        let assign_str = |sig: Signal<String>, value: &str| {
+            if config_changed && sig.get() != value {
+                sig.set(value.to_string());
+            }
+        };
+        assign_str(s.cfg_proxy_port, &st.proxy_port);
+        assign_str(s.cfg_doh_primary, &st.doh_primary);
+        assign_str(s.cfg_doh_fallback, &st.doh_fallback);
+        assign_str(s.cfg_catalog_ip, &st.catalog_ip);
+        assign_str(s.cfg_catalog_doh, &st.catalog_doh);
+        assign_str(s.cfg_mirror_source, &st.mirror_source);
+        let segments: i32 = st.download_segments.parse().unwrap_or(2);
+        if config_changed && s.cfg_download_segments.get() != segments {
+            s.cfg_download_segments.set(segments);
+        }
+        assign_str(s.cfg_relay_listen, &st.relay_listen);
+        assign_str(s.cfg_relay_target, &st.relay_target);
+        assign_str(s.cfg_http1_hosts, &st.http1_hosts);
+        assign_str(s.cfg_image_relay_base, &st.image_relay_base);
+        assign_str(s.cfg_image_relay_hosts, &st.image_relay_hosts);
+        assign_str(s.cfg_image_relay_paths, &st.image_relay_paths);
+        assign_str(s.cfg_image_relay_ua, &st.image_relay_user_agent);
+        if s.cfg_download_mirror.get() != st.download_mirror {
+            s.cfg_download_mirror.set(st.download_mirror);
+        }
+        if s.cfg_download_enabled.get() != st.download_enabled {
+            s.cfg_download_enabled.set(st.download_enabled);
+        }
+        if s.cfg_relay_enabled.get() != st.relay_enabled {
+            s.cfg_relay_enabled.set(st.relay_enabled);
+        }
+        if s.cfg_image_relay_enabled.get() != st.image_relay_enabled {
+            s.cfg_image_relay_enabled.set(st.image_relay_enabled);
+        }
+        if s.cfg_image_relay_fallback.get() != st.image_relay_fallback {
+            s.cfg_image_relay_fallback.set(st.image_relay_fallback);
+        }
+        if s.cfg_auto_start.get() != st.auto_start {
+            s.cfg_auto_start.set(st.auto_start);
+        }
+        if s.cfg_start_hidden.get() != st.start_hidden {
+            s.cfg_start_hidden.set(st.start_hidden);
+        }
+        if s.cfg_auto_connect.get() != st.auto_connect {
+            s.cfg_auto_connect.set(st.auto_connect);
+        }
+
+        // Windows can disable the Startup entry from Task Manager without
+        // touching the file; surface it instead of claiming it will run.
+        let warning = if st.auto_start {
+            autostart::login_state().problem().unwrap_or_default().to_string()
+        } else {
+            String::new()
+        };
+        if s.auto_start_warning.get() != warning {
+            s.auto_start_warning.set(warning);
+        }
+
+        if s.select_all.get() != all_selected {
+            s.select_all.set(all_selected);
+        }
+        let startup_error = if s.cfg_error_key.get() == "advanced.startup.autoStart" {
+            s.cfg_error.get()
+        } else {
+            s.auto_start_warning.get()
+        };
+        if s.startup_error.get() != startup_error {
+            s.startup_error.set(startup_error);
+        }
+    }
+
+    fn refresh(&self) {
+        let snap = refresh_snapshot(&self.ctx);
+        self.apply_snapshot(snap);
+    }
+
+    fn release_view_state(&self) {
+        let s = &self.signals;
+        // Keep the page subtree mounted while the window is hidden: tearing it
+        // down switches the switcher to the blank Closed page, so the next tray
+        // reveal shows one blank frame before the content is rebuilt. The
+        // window is orderOut'd, so the retained tree is not visible anyway.
+        // window_open and root stay as-is.
+        if s.editor_open.get() {
+            s.editor_open.set(false);
+        }
+        if !s.editor_rows.get().is_empty() {
+            s.editor_rows.set(Vec::new());
+        }
+        self.reclaim_editor_rows.set(true);
+        s.editor_error.set(String::new());
+
+        REFRESH_CACHE.with(|cell| *cell.borrow_mut() = None);
+        if !s.doh_rows.get().is_empty() {
+            s.doh_rows.set(Vec::new());
+        }
+        if !s.mirror_rows.get().is_empty() {
+            s.mirror_rows.set(Vec::new());
+        }
+        if s.doh_open.get() {
+            s.doh_open.set(false);
+        }
+        if s.mirror_open.get() {
+            s.mirror_open.set(false);
+        }
+    }
+
+    fn request_quit(&self) {
+        if self.quitting.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        tracing::info!("quit requested");
+        let runtime = self.ctx.runtime.clone();
+        let shutdown = self.shutdown.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match rt {
+                Ok(rt) => {
+                    if let Err(error) = rt.block_on(runtime.stop()) {
+                        tracing::warn!(error = %format!("{error:#}"), "runtime stop on quit failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "could not build a shutdown runtime");
+                }
+            }
+            shutdown.notify_one();
+            quit_app();
+        });
+    }
+
+    fn sync_model(&self) {
+        MODEL.with(|m| ui_state::sync_window(&m.borrow(), &self.signals));
+    }
+
+    /// Recompute the page-root key after any action that can change which
+    /// subtree is mounted. Must be a plain signal write: the switcher keys on
+    /// the signal's version, which a derived map would not advance.
+    fn sync_root(&self) {
+        let s = &self.signals;
+        let root = if !s.window_open.get() {
+            0 // Closed
+        } else if s.show_onboarding.get() {
+            3 // Fix
+        } else if s.page.get() == 1 {
+            2 // Settings
+        } else {
+            1 // Home
+        };
+        if s.root.get() != root {
+            tracing::info!(
+                from = s.root.get(),
+                to = root,
+                window_open = s.window_open.get(),
+                show_onboarding = s.show_onboarding.get(),
+                page = s.page.get(),
+                editor_open = s.editor_open.get(),
+                "DBG sync_root: root changed"
+            );
+            s.root.set(root);
+        }
+    }
+
+    fn handle(&self, action: Action) {
+        let s = &self.signals;
+        let runtime = &self.ctx.runtime;
+        let tx = self.tx();
+        match action {
+            Action::OpenFix => {
+                s.ca_action_error.set(String::new());
+                MODEL.with(|m| m.borrow_mut().open_fix());
+                self.sync_model();
+            }
+            Action::DismissInterrupt => {
+                MODEL.with(|m| m.borrow_mut().dismiss_interrupt());
+                self.sync_model();
+            }
+            Action::FinishOnboarding => {
+                let effects = MODEL.with(|m| m.borrow_mut().dismiss_fix());
+                ui_state::execute(&effects, runtime);
+                self.sync_model();
+            }
+            Action::SetPage(page) => s.page.set(page),
+            Action::SetSection(section) => s.settings_section.set(section),
+            Action::ShowMain => {
+                tracing::info!(
+                    window_open_before = s.window_open.get(),
+                    root_before = s.root.get(),
+                    "DBG ShowMain: handling"
+                );
+                set_dock_visible(true);
+                activate_app();
+                if !s.window_open.get() {
+                    s.window_open.set(true);
+                }
+                self.refresh();
+                self.sync_root();
+                tracing::info!(root_after = s.root.get(), "DBG ShowMain: done");
+            }
+            Action::Quit => self.request_quit(),
+            Action::ToggleMaster => {
+                let turning_on =
+                    MODEL.with(|m| m.borrow().accel() != ui_state::AccelState::Running);
+                if turning_on && !runtime.config().snapshot().groups.iter().any(|g| g.enabled) {
+                    return;
+                }
+                let effects = MODEL.with(|m| {
+                    let env = m.borrow().env().clone();
+                    m.borrow_mut().toggle(env)
+                });
+                ui_state::execute(&effects, runtime);
+                self.sync_model();
+                self.refresh();
+            }
+            Action::ToggleGroup(id, enabled) => {
+                if let Err(error) = runtime.set_group_enabled(&id, enabled) {
+                    tracing::warn!(error = %format!("{error:#}"), "could not toggle the site");
+                }
+                self.refresh();
+            }
+            Action::SelectAll(enabled) => {
+                let _ = runtime.config().mutate(|config| {
+                    for group in &mut config.groups {
+                        group.enabled = enabled;
+                    }
+                    Ok(())
+                });
+                if !enabled {
+                    let effects = MODEL.with(|m| m.borrow_mut().stop());
+                    ui_state::execute(&effects, runtime);
+                }
+                self.sync_model();
+                self.refresh();
+            }
+            Action::ToggleOpen(id) => {
+                let mut set = self.ctx.expanded.borrow_mut();
+                if !set.remove(&id) {
+                    set.insert(id);
+                }
+                drop(set);
+                self.refresh();
+            }
+            Action::ProbeSelected => {
+                if self.ctx.sweep.running.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                self.refresh();
+                let sweep = self.ctx.sweep.clone();
+                let runtime = runtime.clone();
+                let tx = tx.clone();
+                self.ctx.spawner.spawn(async move {
+                    runtime.probe_sweep().await;
+                    sweep.running.store(false, Ordering::SeqCst);
+                    sweep.commit_once.store(true, Ordering::SeqCst);
+                    let _ = tx.send(Action::ProbeFinished);
+                });
+            }
+            Action::ProbeFinished => self.refresh(),
+            Action::ReapplyProxy => {
+                let runtime = runtime.clone();
+                std::thread::spawn(move || {
+                    if let Err(error) = runtime.apply_system_proxy() {
+                        eprintln!("hakimi-ui: manual system proxy re-apply failed: {error:#}");
+                    }
+                });
+            }
+            Action::SaveString(key, value) => {
+                let value = value.trim().to_string();
+                let error = apply_setting_string(runtime, &key, &value);
+                let failed = error.is_some();
+                s.cfg_error.set(error.unwrap_or_default());
+                s.cfg_error_key
+                    .set(if failed { key } else { String::new() });
+                self.refresh();
+            }
+            Action::SaveBool(key, value) => {
+                let error = apply_setting_bool(runtime, &key, value);
+                let failed = error.is_some();
+                s.cfg_error.set(error.unwrap_or_default());
+                s.cfg_error_key
+                    .set(if failed { key } else { String::new() });
+                self.refresh();
+            }
+            Action::CaAction(kind) => {
+                // The buttons stay clickable while busy (the label flips to
+                // 处理中…); a second click here would spawn a concurrent
+                // install/uninstall whose outcome races this one's.
+                if s.ca_busy.get() {
+                    return;
+                }
+                s.ca_busy.set(true);
+                s.ca_action_error.set(String::new());
+                ui_state::sync_ca_status(s);
+                let runtime = runtime.clone();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let outcome = match kind {
+                        1 => ca_outcome(runtime.ca_install().map(|st| st.installed), true),
+                        2 => ca_outcome(runtime.ca_uninstall().map(|st| st.installed), false),
+                        3 => ca_outcome(runtime.ca_repair().map(|st| st.installed), true),
+                        _ => CaOutcome::Done,
+                    };
+                    let _ = tx.send(Action::CaOutcome {
+                        message: outcome.message().map(str::to_string),
+                    });
+                });
+            }
+            Action::CaOutcome { message } => {
+                s.ca_busy.set(false);
+                if let Some(message) = message {
+                    s.ca_action_error.set(message);
+                }
+                // The row and the footer must reflect the outcome now, not on
+                // the next one-second probe tick: a successful install flips
+                // the status green and re-enables the finish button at once.
+                let env = ui_state::probe_env(runtime, false);
+                let effects = MODEL.with(|m| m.borrow_mut().env_changed(env));
+                ui_state::execute(&effects, runtime);
+                self.sync_model();
+                self.refresh();
+            }
+            Action::OpenDataDir => {
+                let dir = runtime.paths().root().to_path_buf();
+                std::thread::spawn(move || {
+                    let _ = open::that(dir);
+                });
+            }
+            Action::OpenSite(url) => {
+                std::thread::spawn(move || {
+                    let _ = open::that(url);
+                });
+            }
+            Action::CheckUpdate => {
+                UPDATE_LAST_ATTEMPT.with(|slot| slot.set(Some(Instant::now())));
+                self.start_update_check();
+            }
+            Action::OpenUpdate => {
+                let url = s.release_url.get();
+                if !url.is_empty() {
+                    let _ = tx.send(Action::OpenSite(url));
+                }
+            }
+            Action::UpdateResult { status, available, url } => {
+                s_update_signals(s, false, &status, available, url);
+            }
+            Action::EnvChanged(env) => {
+                let effects = MODEL.with(|m| m.borrow_mut().env_changed(env));
+                ui_state::execute(&effects, runtime);
+                self.sync_model();
+            }
+            Action::ToggleAutoStart | Action::ToggleStartHidden => {
+                let is_auto = matches!(action, Action::ToggleAutoStart);
+                let key = if is_auto {
+                    "advanced.startup.autoStart"
+                } else {
+                    "advanced.startup.startHidden"
+                };
+                let startup = &runtime.config().snapshot().advanced.startup;
+                let enabled = if is_auto {
+                    !startup.auto_start
+                } else {
+                    !startup.start_hidden
+                };
+                let error = apply_setting_bool(runtime, key, enabled);
+                if let Some(message) = &error {
+                    tracing::warn!(error = %message, "tray startup toggle failed");
+                }
+                s.cfg_error.set(error.clone().unwrap_or_default());
+                s.cfg_error_key.set(if error.is_some() { key.to_string() } else { String::new() });
+                self.refresh();
+            }
+            Action::OpenEditor(id) => {
+                let config = runtime.config().snapshot();
+                let builtins = builtin_group_ids();
+                match config.group(&id) {
+                    Some(group) => {
+                        s.editor_is_new.set(false);
+                        s.editor_id.set(group.id.clone());
+                        s.editor_name.set(group.name.clone());
+                        s.editor_homepage
+                            .set(group.homepage.clone().unwrap_or_default());
+                        let preset = route_preset_index(&group.default_route);
+                        s.editor_default_preset.set(preset);
+                        s.editor_default_custom.set(if preset == 4 {
+                            format_route(&group.default_route)
+                        } else {
+                            String::new()
+                        });
+                        s.editor_deletable.set(!builtins.contains(&group.id));
+                        let rows: Vec<EditorRowState> =
+                            app_state::with_editor_rows(|| {
+                                group
+                                    .domains
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, rule)| {
+                                        let (preset, sni, custom) = match &rule.route {
+                                            None => (0, String::new(), String::new()),
+                                            Some(route) if route == &RoutePolicy::direct() => {
+                                                (1, String::new(), String::new())
+                                            }
+                                            Some(route) if route == &RoutePolicy::ech_shared() => {
+                                                (2, String::new(), String::new())
+                                            }
+                                            Some(route) => match domain_sni_hosts(route) {
+                                                Some(hosts) => (3, hosts.join(", "), String::new()),
+                                                None => (4, String::new(), format_route(route)),
+                                            },
+                                        };
+                                        EditorRowState::new(
+                                            i,
+                                            &rule.pattern,
+                                            preset,
+                                            &sni,
+                                            &custom,
+                                        )
+                                    })
+                                    .collect()
+                            });
+                        s.editor_rows.set(rows);
+                    }
+                    None => {
+                        s.editor_is_new.set(true);
+                        s.editor_id.set(String::new());
+                        s.editor_name.set(String::new());
+                        s.editor_rows.set(app_state::with_editor_rows(|| {
+                            vec![EditorRowState::new(0, "", 0, "", "")]
+                        }));
+                        s.editor_homepage.set(String::new());
+                        s.editor_default_preset.set(0);
+                        s.editor_default_custom.set(String::new());
+                        s.editor_deletable.set(false);
+                    }
+                }
+                s.editor_error.set(String::new());
+                s.editor_open.set(true);
+            }
+            Action::CloseEditor => {
+                s.editor_open.set(false);
+                s.editor_error.set(String::new());
+            }
+            Action::AddDomain => {
+                // The new row joins the current generation: the rows already on
+                // screen stay mounted and keep their signals, so only this one
+                // is registered.
+                let mut rows = s.editor_rows.get();
+                let index = rows.len();
+                app_state::with_new_editor_row(|| {
+                    rows.push(EditorRowState::new(index, "", 0, "", ""));
+                });
+                s.editor_rows.set(rows);
+            }
+            Action::RemoveDomain(index) => {
+                let mut rows = s.editor_rows.get();
+                if rows.len() > 1 && index < rows.len() {
+                    rows.remove(index);
+                    for (i, row) in rows.iter_mut().enumerate() {
+                        row.index = i;
+                    }
+                    s.editor_rows.set(rows);
+                }
+            }
+            Action::SaveEditor => {
+                let draft = SiteDraft {
+                    id: s.editor_id.get(),
+                    is_new: s.editor_is_new.get(),
+                    name: s.editor_name.get(),
+                    domains: s
+                        .editor_rows
+                        .get()
+                        .into_iter()
+                        .map(|row| DomainDraft {
+                            pattern: row.pattern.get(),
+                            preset: row.preset.get() as i32,
+                            sni: row.sni.get(),
+                            custom: row.custom.get(),
+                        })
+                        .collect(),
+                    homepage: s.editor_homepage.get(),
+                    default_preset: s.editor_default_preset.get(),
+                    default_custom: s.editor_default_custom.get(),
+                };
+                let config = runtime.config().snapshot();
+                let saved = build_group(&config, &draft).and_then(|group| {
+                    tracing::info!(id = %group.id, "site saved");
+                    runtime.upsert_group(group).map(|_| ())
+                });
+                match saved {
+                    Ok(()) => {
+                        s.editor_open.set(false);
+                        s.editor_error.set(String::new());
+                        self.refresh();
+                    }
+                    Err(error) => s.editor_error.set(format!("{error:#}")),
+                }
+            }
+            Action::DeleteSite(id) => {
+                match runtime.remove_group(&id) {
+                    Ok(_) => {
+                        tracing::info!(id = %id, "site removed");
+                        s.editor_open.set(false);
+                        s.editor_error.set(String::new());
+                        self.refresh();
+                    }
+                    Err(error) => s.editor_error.set(format!("{error:#}")),
+                }
+            }
+            Action::ResetCatalogUrls => {
+                let defaults = hakimi_core::config::CatalogSources::default();
+                let result = runtime.config().mutate(|config| {
+                    config.catalogs.ip = defaults.ip.clone();
+                    config.catalogs.doh = defaults.doh.clone();
+                    Ok(())
+                });
+                match result {
+                    Ok(_) => {
+                        tracing::info!("catalog URLs restored to their defaults");
+                        s.cfg_error.set(String::new());
+                        s.cfg_error_key.set(String::new());
+                        self.refresh();
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        s.cfg_error.set(message);
+                        s.cfg_error_key.set("catalogs.ip".into());
+                    }
+                }
             }
         }
-    })
+    }
+
+    /// Starts a check unless one is already in flight. All state is written to
+    /// signals on the UI thread; the tokio task only computes the result and
+    /// posts it back through the channel.
+    fn start_update_check(&self) {
+        if self.update_in_flight.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        s_update_signals(&self.signals, true, "正在检查更新…", false, String::new());
+        tracing::info!("checking for updates");
+        let tx = self.tx();
+        let in_flight = self.update_in_flight.clone();
+        self.ctx.spawner.spawn(async move {
+            let (status, available, url) = match update::check().await {
+                Ok(update::CheckOutcome::Available(release)) => (
+                    format!("发现新版本 v{}", release.version),
+                    true,
+                    release.url,
+                ),
+                Ok(update::CheckOutcome::UpToDate) => ("已是最新版本".to_string(), false, String::new()),
+                Err(error) => {
+                    tracing::info!(error = %format!("{error:#}"), "the update check failed");
+                    ("暂时无法检查更新".to_string(), false, String::new())
+                }
+            };
+            in_flight.store(false, Ordering::SeqCst);
+            let _ = tx.send(Action::UpdateResult { status, available, url });
+        });
+    }
 }
 
-/// How this process was launched. Parsed before anything else so a login
-/// launch can stay silent even when a window would otherwise be built.
+/// Write all update-related signals in one place, only on the UI thread.
+fn s_update_signals(s: &UiSignals, checking: bool, status: &str, available: bool, url: String) {
+    if s.update_checking.get() != checking { s.update_checking.set(checking); }
+    if s.update_status.get() != status { s.update_status.set(status.to_string()); }
+    if s.update_available.get() != available { s.update_available.set(available); }
+    if s.release_url.get() != url { s.release_url.set(url); }
+    let label = if available { "下载" } else if checking { "检查中…" } else { "检查" };
+    if s.update_button.get() != label { s.update_button.set(label.to_string()); }
+}
+
+fn maybe_auto_update(ui: &Ui) {
+    let due = UPDATE_LAST_ATTEMPT
+        .with(|slot| slot.get().is_none_or(|at| at.elapsed() >= UPDATE_INTERVAL));
+    if due {
+        UPDATE_LAST_ATTEMPT.with(|slot| slot.set(Some(Instant::now())));
+        ui.start_update_check();
+    }
+}
+
+// -- launch options -----------------------------------------------------------
+
 #[derive(Clone, Copy, Default)]
 struct LaunchOptions {
-    /// Started by the OS login entry: never pop a window unless `--show` is
-    /// also present.
     autostart: bool,
-    /// `--hidden`: park in the tray for this launch only.
     hidden: bool,
-    /// `--show`: force the window open despite the settings above.
     show: bool,
 }
 
@@ -2714,31 +1606,19 @@ fn launch_options(args: &[String]) -> LaunchOptions {
     }
 }
 
-/// Whether this launch builds no window. A login launch is always silent
-/// unless the entry was customized with `--show`.
 fn starts_hidden(options: LaunchOptions, config_hidden: bool) -> bool {
     (options.autostart || options.hidden || config_hidden) && !options.show
 }
 
+// -- entry point --------------------------------------------------------------
+
 fn main() -> Result<()> {
-    #[cfg(any(debug_assertions, feature = "dev-shot"))]
-    {
-        let args: Vec<String> = std::env::args().collect();
-        if let Some(index) = args.iter().position(|arg| arg == "--shot") {
-            let prefix = args
-                .get(index + 1)
-                .cloned()
-                .unwrap_or_else(|| "/tmp/hakimi-ui".into());
-            let page = args
-                .iter()
-                .position(|arg| arg == "--page")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|value| value.parse::<i32>().ok())
-                .unwrap_or(0);
-            let running = args.iter().any(|arg| arg == "--running");
-            return shot(&prefix, page, running);
-        }
-    }
+    use_light_appearance();
+
+    // Install the old light palette before any widget tree is built. windui
+    // reads `theme::current()` at construction time (spacing, default colours),
+    // and `App::theme` installs it again for every paint frame.
+    windui::theme::set_current(std::rc::Rc::new(theme::app_theme()));
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let options = launch_options(&args);
@@ -2746,68 +1626,32 @@ fn main() -> Result<()> {
     // Single instance: a second long-running app would fight over the proxy port.
     let instance_dir = match data_dir() {
         Some(dir) => dir,
-        None => hakimi_core::paths::Paths::default_location()?
-            .root()
-            .to_path_buf(),
+        None => hakimi_core::paths::Paths::default_location()?.root().to_path_buf(),
     };
+    // Hold the guard for the whole process: dropping it would release the
+    // advisory lock and let a second app fight over the proxy port.
     let _instance_lock = match InstanceLock::acquire(&instance_dir) {
         Ok(lock) => lock,
         Err(InstanceLockError::AlreadyRunning { .. }) => {
-            // A login entry racing a process the user just opened (or one
-            // they closed to the tray) must not pop a window over their work.
             if options.autostart {
                 return Ok(());
             }
-            // Visible feedback instead of a silently dead second launch.
-            let notice = AlreadyRunningWindow::new()?;
-            notice.show()?;
-            #[cfg(windows)]
-            {
-                let weak = notice.as_weak();
-                slint::Timer::single_shot(Duration::from_millis(100), move || {
-                    if let Some(notice) = weak.upgrade() {
-                        apply_light_title_bar(&notice.window());
-                    }
-                });
-            }
-            let timer = slint::Timer::default();
-            timer.start(
-                slint::TimerMode::SingleShot,
-                Duration::from_millis(2500),
-                || {
-                    let _ = slint::quit_event_loop();
-                },
-            );
-            notice.run()?;
+            // A short-lived notice window; windui has no second-window dialog
+            // primitive here, so print a clear message and exit.
+            eprintln!("hakimi 已经在运行，请使用已打开的窗口");
             return Ok(());
         }
         Err(error) => return Err(error.into()),
     };
 
-    use_light_appearance();
-
-    // The runtime lives on the UI thread: every interaction is a direct
-    // synchronous call, so a click applies within the same frame. Only the
-    // genuinely async parts (serving the proxy, waiting for shutdown) run on a
-    // dedicated tokio runtime in the background.
     let runtime = HakimiRuntime::new(data_dir())?;
-    let sweep = std::sync::Arc::new(SweepState::default());
+    let sweep = Arc::new(SweepState::default());
     let startup = runtime.config().snapshot().advanced.startup.clone();
 
-    // Reconcile the OS login entry with the config on every launch: a moved
-    // executable rewrites its own path, and an entry left behind by a manual
-    // edit is cleaned up while the switch is off.
     if let Err(error) = autostart::apply(startup.auto_start) {
-        tracing::warn!(
-            error = %format!("{error:#}"),
-            "could not update the login item"
-        );
+        tracing::warn!(error = %format!("{error:#}"), "could not update the login item");
     }
 
-    // The state machine decides the startup posture. This one synchronous
-    // probe is the only environment check on the UI thread; after this, the
-    // probe thread streams results in. The proxy effects map onto the start
-    // mode because they need the PAC URL, which only exists post-bind.
     let startup_effects = MODEL.with(|m| {
         m.borrow_mut()
             .startup(ui_state::probe_env(&runtime, false), startup.auto_connect)
@@ -2837,192 +1681,214 @@ fn main() -> Result<()> {
         })
     };
 
-    let expanded: Rc<std::cell::RefCell<HashSet<String>>> =
-        Rc::new(std::cell::RefCell::new(HashSet::new()));
+    let mut expanded = HashSet::new();
     if let Ok(id) = std::env::var("HAKIMI_UI_EXPAND") {
-        expanded.borrow_mut().insert(id);
-    }
-    if std::env::var("HAKIMI_UI_PAGE").as_deref() == Ok("1") {
-        PAGE_STATE.with(|page| page.set(1));
+        expanded.insert(id);
     }
 
-    let ctx = UiContext {
+    let ctx = AppContext {
         runtime: runtime.clone(),
         spawner: spawner.clone(),
-        expanded: expanded.clone(),
+        expanded: RefCell::new(expanded),
         sweep: sweep.clone(),
     };
 
-    // System tray: keeps the app alive with the window closed, and mirrors the
-    // window actions. The tray must be created on the main thread.
-    let tray = TrayRoot::new()?;
-    tray.on_show_main({
-        let ctx = ctx.clone();
-        move || show_main_window(&ctx)
+    // The UI is shared between the channel handler and the one-second timer.
+    // Signals are Copy handles, so all three views observe the same state.
+    let ui = std::rc::Rc::new(Ui {
+        signals: UiSignals::default(),
+        ctx,
+        tx: std::rc::Rc::new(RefCell::new(None)),
+        update_in_flight: Arc::new(AtomicBool::new(false)),
+        hidden: Arc::new(AtomicBool::new(false)),
+        quitting: Arc::new(AtomicBool::new(false)),
+        shutdown: shutdown.clone(),
+        settings_revision: std::cell::Cell::new(None),
+        reclaim_editor_rows: std::cell::Cell::new(false),
     });
-    tray.on_toggle_master({
-        let ctx = ctx.clone();
-        move || {
-            let existing = WINDOW.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .map(|shell| (shell.closing.clone(), shell.app.as_weak()))
-            });
-            if let Some((closing, weak)) = existing {
-                if !closing.get() {
-                    if let Some(app) = weak.upgrade() {
-                        app.invoke_toggle_master();
-                        return;
-                    }
-                }
-            }
-            // No window: drive the same state machine directly.
-            let runtime = ctx.runtime.clone();
-            let turning_on = MODEL.with(|m| m.borrow().accel() != ui_state::AccelState::Running);
-            if turning_on && !runtime.config().snapshot().groups.iter().any(|g| g.enabled) {
-                return;
-            }
-            let effects = MODEL.with(|m| {
-                let env = m.borrow().env().clone();
-                m.borrow_mut().toggle(env)
-            });
-            ui_state::execute(&effects, &runtime);
-            let running = runtime.is_started() && !runtime.status().paused();
-            TRAY.with(|slot| {
-                if let Some(tray) = slot.borrow().as_ref() {
-                    tray.set_running(running);
-                }
-            });
+    if std::env::var("HAKIMI_UI_PAGE").as_deref() == Ok("1") {
+        ui.signals.page.set(1);
+    }
+    if let Ok(section) = std::env::var("HAKIMI_UI_SECTION") {
+        if let Ok(section) = section.parse::<i32>() {
+            ui.signals.settings_section.set(section);
         }
-    });
-    tray.on_toggle_auto_start({
-        let runtime = runtime.clone();
-        move || {
-            let enabled = !runtime.config().snapshot().advanced.startup.auto_start;
-            let error = apply_setting_bool(&runtime, "advanced.startup.autoStart", enabled);
-            if let Some(message) = &error {
-                tracing::warn!(error = %message, "tray auto-start toggle failed");
-            }
-            // A window may be open; show the failure there when it is.
-            report_setting_error("advanced.startup.autoStart", error);
-            sync_tray_settings(&runtime);
-        }
-    });
-    tray.on_toggle_start_hidden({
-        let runtime = runtime.clone();
-        move || {
-            let enabled = !runtime.config().snapshot().advanced.startup.start_hidden;
-            let error = apply_setting_bool(&runtime, "advanced.startup.startHidden", enabled);
-            if let Some(message) = &error {
-                tracing::warn!(error = %message, "tray start-hidden toggle failed");
-            }
-            report_setting_error("advanced.startup.startHidden", error);
-            sync_tray_settings(&runtime);
-        }
-    });
-    tray.on_quit(|| {
-        // Quitting goes through the normal path below: run_event_loop returns,
-        // the background thread stops the proxy and restores the system proxy.
-        let _ = slint::quit_event_loop();
-    });
-    TRAY.with(|slot| *slot.borrow_mut() = Some(tray));
-    sync_tray_settings(&runtime);
+    }
 
-    // The environment probe is an input stream: it runs off the UI thread and
-    // posts results through the event loop. The state machine and the proxy
-    // keep working even when no window exists.
+    // Install signal values that never come from the refresh path.
+    ui.signals
+        .cfg_data_dir
+        .set(runtime.paths().root().display().to_string());
+    ui.signals
+        .cfg_version
+        .set(env!("CARGO_PKG_VERSION").to_string());
+    ui.signals
+        .cfg_core_version
+        .set(hakimi_core::VERSION.to_string());
+    ui.sync_model();
+    ui.sync_root();
+    ui.refresh();
+
+    // Create the channel first: every UI action, tray click and background
+    // result is a message handled on the UI thread by `Ui::handle`.
+    let mut app = App::new("hakimi", WINDOW_WIDTH, WINDOW_HEIGHT)
+        .icon(assets::window_icon())
+        .theme(theme::app_theme())
+        .bg(theme::WINDOW_BG)
+        // GPU (Direct2D on Windows) first, with automatic fallback to software.
+        // Software rasterising the modal's translucent scrim is far too slow.
+        .renderer(Renderer::Auto)
+        .resizable(false)
+        .hide_on_close();
+    if let Some((x, y)) = centered_position(WINDOW_WIDTH, WINDOW_HEIGHT) {
+        app = app.position(x, y);
+    }
+    let handler_ui = ui.clone();
+    let tx = app.channel::<Action>(move |_ctx, action| {
+        handler_ui.handle(action);
+        // Page/window/onboarding changes must advance the switcher's key.
+        handler_ui.sync_root();
+    });
+    *ui.tx.borrow_mut() = Some(tx.clone());
+    if std::env::var("HAKIMI_UI_EDITOR").is_ok() {
+        ui.handle(Action::OpenEditor(String::new()));
+    }
+
+    {
+        let close_ui = ui.clone();
+        app = app.on_close_request(move |_ctx| {
+            tracing::info!(
+                window_open_before = close_ui.signals.window_open.get(),
+                root_before = close_ui.signals.root.get(),
+                "DBG on_close_request: hiding"
+            );
+            set_dock_visible(false);
+            close_ui.release_view_state();
+            tracing::info!(
+                window_open_after = close_ui.signals.window_open.get(),
+                root_after = close_ui.signals.root.get(),
+                "DBG on_close_request: done"
+            );
+            true
+        });
+    }
+
+    {
+        let show_ui = ui.clone();
+        app = app.on_show(move |_ctx| {
+            // Closing parks the tree on the blank Closed page (root 0). Restore
+            // the Home subtree in the same tick the tray reveals the window —
+            // ShowMain arrives a frame later via the channel, so relying on it
+            // shows one blank frame before the content appears.
+            tracing::info!(
+                window_open_before = show_ui.signals.window_open.get(),
+                root_before = show_ui.signals.root.get(),
+                "DBG on_show: revealing"
+            );
+            set_dock_visible(true);
+            if !show_ui.signals.window_open.get() {
+                show_ui.signals.window_open.set(true);
+            }
+            show_ui.sync_root();
+            show_ui.refresh();
+            tracing::info!(root_after = show_ui.signals.root.get(), "DBG on_show: done");
+        });
+    }
+
+    {
+        let shortcut_ui = ui.clone();
+        app = app.on_shortcut(move |ctx, ev| {
+            if !ev.ctrl || ev.shift || ev.alt {
+                return false;
+            }
+            match ev.key {
+                Key::Char('w') | Key::Char('W') => {
+                    ctx.request_close();
+                    true
+                }
+                Key::Char('m') | Key::Char('M') => {
+                    minimize_window();
+                    true
+                }
+                Key::Char('q') | Key::Char('Q') => {
+                    shortcut_ui.request_quit();
+                    true
+                }
+                _ => false,
+            }
+        });
+    }
+
+    // One-second refresh: recompute the snapshot and push changed signals.
+    let timer_ui = ui.clone();
+    let title_bar_done = std::cell::Cell::new(false);
+    app = app.on_interval(Duration::from_millis(1000), move |ctx| {
+        if !title_bar_done.get() {
+            title_bar_done.set(true);
+            apply_light_title_bar();
+        }
+        // Deferred from the close handler: the rows are off the tree by now.
+        if timer_ui.reclaim_editor_rows.replace(false) {
+            app_state::release_editor_rows();
+        }
+        let visible = ctx.window_state().visible;
+        if visible && !timer_ui.signals.editor_open.get() {
+            timer_ui.refresh();
+        }
+        timer_ui.hidden.store(!visible, Ordering::Relaxed);
+        maybe_auto_update(&timer_ui);
+    });
+
+    // Tray keeps the app alive with the window closed and mirrors key actions.
+    app = app.tray(tray::build(
+        tx.clone(),
+        ui.signals.running,
+        ui.signals.cfg_auto_start,
+        ui.signals.cfg_start_hidden,
+        assets::tray_icon_rgba(),
+    ));
+
+    // A background thread streams environment probes; results are posted
+    // through the channel so the UI thread stays responsive. The daily update
+    // check is driven from the same tick, independent of window visibility.
     let probe_stop = Arc::new(AtomicBool::new(false));
     {
         let probe_stop = probe_stop.clone();
         let probe_runtime = runtime.clone();
-        let probe_spawner = spawner.clone();
+        let probe_tx = tx.clone();
+        let probe_hidden = ui.hidden.clone();
         std::thread::spawn(move || {
-            // One OS-proxy read-back every 3 s on every platform: a `scutil
-            // --proxy` run on macOS (≈5 ms) and a registry read on Windows
-            // (µs) are both negligible, and a shared cadence keeps the
-            // interrupt behavior identical everywhere.
-            let proxy_check_every: u32 = 3;
-            let mut tick: u32 = 0;
+            let mut tick = 0u32;
             while !probe_stop.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(1000));
+                let hidden = probe_hidden.load(Ordering::Relaxed);
+                std::thread::sleep(if hidden {
+                    Duration::from_secs(15)
+                } else {
+                    Duration::from_secs(1)
+                });
                 if probe_stop.load(Ordering::SeqCst) {
                     break;
                 }
                 tick = tick.wrapping_add(1);
-                let env = ui_state::probe_env(&probe_runtime, tick % proxy_check_every == 0);
-                let runtime = probe_runtime.clone();
-                let spawner = probe_spawner.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    MODEL.with(|m| {
-                        let mut model = m.borrow_mut();
-                        let effects = model.env_changed(env);
-                        ui_state::execute(&effects, &runtime);
-                    });
-                    let running = runtime.is_started() && !runtime.status().paused();
-                    let has_window = WINDOW.with(|slot| {
-                        let slot = slot.borrow();
-                        if let Some(shell) = slot.as_ref() {
-                            MODEL.with(|m| ui_state::sync_window(&m.borrow(), &shell.app));
-                            true
-                        } else {
-                            false
-                        }
-                    });
-                    if !has_window {
-                        TRAY.with(|slot| {
-                            if let Some(tray) = slot.borrow().as_ref() {
-                                tray.set_running(running);
-                            }
-                        });
-                    }
-                    // Independent of any window: a silent launch checks once
-                    // a day and shows the result when a window comes back.
-                    if maybe_auto_update(&spawner) {
-                        apply_update_to_live_window();
-                    }
-                });
+                let env = ui_state::probe_env(&probe_runtime, !hidden && tick.is_multiple_of(10));
+                let _ = probe_tx.send(Action::EnvChanged(env));
             }
         });
     }
 
-    // The initial window. `run_event_loop` keeps running while the tray icon
-    // exists; closing the window drops the component without stopping it.
-    // A login or silent launch builds no window at all: the tray keeps the
-    // event loop alive and rebuilds the component on demand.
-    let start_hidden = starts_hidden(options, startup.start_hidden);
-    if start_hidden {
+    // Attach the content tree in BOTH branches. A hidden launch still owns a
+    // hidden window that the tray reveals later; without this it would be blank.
+    let app = app.screenshot_from_args().content(view::view(ui.signals, tx.clone()));
+    macos_reopen::install();
+    if starts_hidden(options, startup.start_hidden) {
         set_dock_visible(false);
         tracing::info!("starting with only the tray icon");
+        app.start_hidden().run();
     } else {
-        let shell = build_window(&ctx)?;
         set_dock_visible(true);
-        shell.app.show()?;
-        WINDOW.with(|slot| *slot.borrow_mut() = Some(shell));
+        app.run();
     }
 
-    // A visible launch has created the backend event loop (and winit's
-    // NSApplication delegate) by now. A hidden launch has no window yet, so
-    // the delegate may not exist and `install` returns early; retry once the
-    // event loop is running. Both calls are idempotent.
-    #[cfg(target_os = "macos")]
-    {
-        macos_reopen::install({
-            let ctx = ctx.clone();
-            move || show_main_window(&ctx)
-        });
-        let ctx = ctx.clone();
-        slint::Timer::single_shot(Duration::from_millis(50), move || {
-            let ctx = ctx.clone();
-            macos_reopen::install(move || show_main_window(&ctx));
-        });
-    }
-
-    slint::run_event_loop()?;
-
-    // Quitting stops the proxy and restores the system proxy state.
-    WINDOW.with(|slot| {
-        *slot.borrow_mut() = None;
-    });
     probe_stop.store(true, Ordering::SeqCst);
     shutdown.notify_one();
     let _ = background.join();

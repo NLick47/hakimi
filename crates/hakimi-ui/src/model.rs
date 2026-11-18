@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
-use hakimi_core::config::{DomainRule, EchSource, RouteAttempt, RoutePolicy};
+use hakimi_core::config::{EchSource, RouteAttempt, RoutePolicy};
 use hakimi_core::domain::{host_from_url, normalize_hostname, DomainPattern};
 use hakimi_core::mirror::MirrorStatus;
 use hakimi_core::resolver::EffectiveEndpoint;
@@ -41,9 +41,7 @@ pub(crate) struct SiteData {
     pub(crate) enabled: bool,
     pub(crate) open: bool,
     pub(crate) first: bool,
-    pub(crate) last: bool,
     pub(crate) url: String,
-    pub(crate) custom: bool,
     pub(crate) domains: Vec<DomainData>,
 }
 
@@ -184,11 +182,14 @@ pub(crate) fn normalize_domain_host(raw: &str) -> Result<String> {
 
 /// Built-in group ids. Anything else was added by the user and may be removed
 /// from the UI.
-pub(crate) fn builtin_group_ids() -> std::collections::HashSet<String> {
-    hakimi_core::config::default_groups()
-        .into_iter()
-        .map(|group| group.id)
-        .collect()
+pub(crate) fn builtin_group_ids() -> &'static HashSet<String> {
+    static IDS: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    IDS.get_or_init(|| {
+        hakimi_core::config::default_groups()
+            .into_iter()
+            .map(|group| group.id)
+            .collect()
+    })
 }
 
 /// Muted brand-ish tiles for groups without a real favicon.
@@ -231,9 +232,11 @@ pub(crate) const TONE_DEGRADED: i32 = 2;
 pub(crate) const TONE_BROKEN: i32 = 3;
 
 /// One address row in the expanded status card: a short name, a detail line
-/// (host or the last error) and the tone-coloured verdict.
+/// (host or the last error) and the tone-coloured verdict. `key` identifies
+/// the row to the keyed list; labels can repeat (two same-named endpoints).
 #[derive(Clone, PartialEq)]
 pub(crate) struct NetEntry {
+    pub(crate) key: String,
     pub(crate) label: String,
     pub(crate) detail: String,
     pub(crate) value: String,
@@ -271,6 +274,7 @@ pub(crate) fn doh_entries(
 ) -> Vec<NetEntry> {
     if endpoints.is_empty() {
         return vec![NetEntry {
+            key: "unconfigured".into(),
             label: "未配置 DoH".into(),
             detail: "在设置中填写加密 DNS 地址".into(),
             value: "—".into(),
@@ -303,6 +307,7 @@ pub(crate) fn doh_entries(
                 ),
             };
             NetEntry {
+                key: endpoint.url.clone(),
                 label,
                 detail: short(detail),
                 value,
@@ -316,6 +321,7 @@ pub(crate) fn doh_entries(
 pub(crate) fn mirror_entries(enabled: bool, status: &[MirrorStatus]) -> Vec<NetEntry> {
     if !enabled {
         return vec![NetEntry {
+            key: "disabled".into(),
             label: "镜像未开启".into(),
             detail: "在设置中填写目录来源后启用".into(),
             value: "已关闭".into(),
@@ -324,6 +330,7 @@ pub(crate) fn mirror_entries(enabled: bool, status: &[MirrorStatus]) -> Vec<NetE
     }
     if status.is_empty() {
         return vec![NetEntry {
+            key: "fetching".into(),
             label: "镜像列表".into(),
             detail: "正在获取远程目录".into(),
             value: "更新中".into(),
@@ -350,6 +357,7 @@ pub(crate) fn mirror_entries(enabled: bool, status: &[MirrorStatus]) -> Vec<NetE
                 )
             };
             NetEntry {
+                key: row.prefix.clone(),
                 label: host_from_url(&row.prefix)
                     .unwrap_or(&row.prefix)
                     .to_string(),
@@ -423,7 +431,6 @@ pub(crate) fn build_sites(
 
     let mut sites: Vec<SiteData> = Vec::new();
     let mut selected = 0usize;
-    let builtins = builtin_group_ids();
 
     if let Some(groups) = config.get("groups").and_then(Value::as_array) {
         for group in groups {
@@ -437,29 +444,23 @@ pub(crate) fn build_sites(
                 selected += 1;
             }
 
-            let rules: Vec<DomainRule> = group
+            let patterns: Vec<String> = group
                 .get("domains")
                 .and_then(Value::as_array)
                 .map(|list| {
                     list.iter()
                         .filter_map(|value| {
                             let pattern = text(value, "pattern");
-                            if pattern.is_empty() {
-                                return None;
-                            }
-                            let route = value.get("route").and_then(|route| {
-                                serde_json::from_value::<RoutePolicy>(route.clone()).ok()
-                            });
-                            Some(DomainRule { pattern, route })
+                            (!pattern.is_empty()).then_some(pattern)
                         })
                         .collect()
                 })
                 .unwrap_or_default();
-            let domains_config: Vec<String> = rules
+            let domains_config: Vec<String> = patterns
                 .iter()
-                .filter(|rule| !rule.pattern.starts_with("*."))
+                .filter(|pattern| !pattern.starts_with("*."))
                 .take(12)
-                .map(|rule| rule.pattern.clone())
+                .cloned()
                 .collect();
 
             let mut rows: Vec<DomainData> = Vec::new();
@@ -529,9 +530,9 @@ pub(crate) fn build_sites(
                 .first()
                 .cloned()
                 .or_else(|| {
-                    rules
+                    patterns
                         .iter()
-                        .find_map(|rule| rule.pattern.strip_prefix("*.").map(ToOwned::to_owned))
+                        .find_map(|pattern| pattern.strip_prefix("*.").map(ToOwned::to_owned))
                 })
                 .unwrap_or_else(|| "example.com".into());
 
@@ -539,7 +540,6 @@ pub(crate) fn build_sites(
             let id_key = id.clone();
             let tile_hex = tile_color(&id);
             let icon_key = icon_key_for(&id);
-            let custom = !builtins.contains(&id);
             // The preset/catalog owns the canonical landing page; custom groups
             // fall back to their first exact routed domain.
             let homepage = group
@@ -564,19 +564,15 @@ pub(crate) fn build_sites(
                 enabled,
                 open: expanded.contains(&id_key),
                 first: false,
-                last: false,
                 url: homepage,
-                custom,
                 domains: rows,
             });
         }
     }
 
-    // Mark the first and last rows so the group card can draw its separators.
-    let total = sites.len();
+    // Mark the first row so the list skips its top separator.
     for (index, site) in sites.iter_mut().enumerate() {
         site.first = index == 0;
-        site.last = index + 1 == total;
     }
 
     (sites, selected)
@@ -647,6 +643,7 @@ pub(crate) fn finish_snapshot(
 
 /// Convenience wrapper used by tests and the offscreen `--shot` renderer.
 #[cfg(any(debug_assertions, feature = "dev-shot", test))]
+#[allow(dead_code)]
 pub(crate) fn build_snapshot(
     status: &Value,
     config: &Value,

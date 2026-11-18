@@ -1,9 +1,7 @@
 fn main() {
-    let config = slint_build::CompilerConfiguration::new().with_style("fluent".into());
-    slint_build::compile_with_config("ui/app.slint", config).unwrap();
-
     // Explorer, shortcuts and the taskbar fall back to the executable's
-    // resource icon before the window exists.
+    // resource icon before the window exists. windui needs no build-time code
+    // generation; its UI is plain Rust compiled by cargo.
     #[cfg(windows)]
     {
         println!("cargo:rerun-if-changed=assets/app-icon.ico");
