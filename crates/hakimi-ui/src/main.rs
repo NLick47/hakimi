@@ -23,6 +23,9 @@ use windui::prelude::*;
 mod app_state;
 mod assets;
 mod autostart;
+// Only the macOS windowed lifecycle installs the reopen hook; keep the module
+// compiled on Windows so its off-macOS test still runs.
+#[cfg_attr(windows, allow(dead_code))]
 mod macos_reopen;
 mod model;
 mod theme;
@@ -1085,11 +1088,11 @@ impl Ui {
 
     fn release_view_state(&self) {
         let s = &self.signals;
-        // Drop the whole page subtree when the window closes: switching the
-        // root to Closed rebuilds the switcher, so the Home/Settings/Fix nodes
-        // and the signals they created are reclaimed immediately instead of
-        // living as long as the hidden window. The tray re-mounts Home in
-        // prepare_show(), synchronously, before the window is shown again.
+        // On Windows the window itself is destroyed (resident mode), so the
+        // tree, its text layouts and its GPU buffers go with it. On macOS the
+        // window is only hidden: parking the switcher on the Closed page drops
+        // the page subtree and the signals it created too; prepare_show()
+        // re-mounts it before the tray reveals the window again.
         if s.window_open.get() {
             s.window_open.set(false);
         }
@@ -1103,6 +1106,11 @@ impl Ui {
         s.editor_error.set(String::new());
 
         REFRESH_CACHE.with(|cell| *cell.borrow_mut() = None);
+        // Site rows are rebuilt by the next refresh; dropping the snapshot
+        // releases every string it carried while the window is gone.
+        if !s.sites.get().is_empty() {
+            s.sites.set(Vec::new());
+        }
         if !s.doh_rows.get().is_empty() {
             s.doh_rows.set(Vec::new());
         }
@@ -1116,6 +1124,10 @@ impl Ui {
             s.mirror_open.set(false);
         }
         self.sync_root();
+
+        // Decoded logos are cached in a thread-local; the rows that used them
+        // are gone, so the cache would otherwise keep the pixmaps forever.
+        assets::clear_logo_cache();
     }
 
     fn request_quit(&self) {
@@ -1593,6 +1605,223 @@ fn starts_hidden(options: LaunchOptions, config_hidden: bool) -> bool {
     (options.autostart || options.hidden || config_hidden) && !options.show
 }
 
+/// Singleton key of the main window. On Windows the window is created on
+/// demand and destroyed on close, so this is what keeps tray clicks from
+/// opening a second one (an already-open window is focused instead).
+#[cfg_attr(not(windows), allow(dead_code))]
+const MAIN_WINDOW_KEY: &str = "main";
+
+/// Window-level shortcuts shared by the main-window and resident paths.
+fn shortcut_handler(
+    ui: std::rc::Rc<Ui>,
+) -> impl FnMut(&mut windui::event::ShortcutCtx, windui::event::KeyEvent) -> bool + 'static {
+    move |ctx, ev| {
+        if !ev.ctrl || ev.shift || ev.alt {
+            return false;
+        }
+        match ev.key {
+            Key::Char('w') | Key::Char('W') => {
+                ctx.request_close();
+                true
+            }
+            Key::Char('m') | Key::Char('M') => {
+                minimize_window();
+                true
+            }
+            Key::Char('q') | Key::Char('Q') => {
+                ui.request_quit();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Tray click / "显示主窗口": bring the UI back.
+///
+/// Windows resident mode keeps no window while closed, so this asks for a new
+/// on-demand window (`.single(main)` focuses an already-open one). macOS keeps
+/// a hidden main window: remount the page tree synchronously, then show it.
+pub(crate) fn tray_show(ctx: &mut TrayCtx, ui: &std::rc::Rc<Ui>, signals: UiSignals) {
+    set_dock_visible(true);
+    app_state::prepare_show(signals);
+    #[cfg(windows)]
+    ctx.open_window(main_window_request(ui.clone(), ui.tx()));
+    #[cfg(not(windows))]
+    {
+        ui.handle(Action::ShowMain);
+        ctx.show_window();
+    }
+}
+
+/// Build the main UI as an on-demand window (Windows resident mode).
+///
+/// Every open gets a fresh request: signals created while building the content
+/// belong to that window and are reclaimed when it is destroyed, so closing
+/// returns the whole UI — widget tree, text layouts, decoded logos and the
+/// renderer's back buffers — instead of parking it in a hidden window.
+#[cfg(windows)]
+fn main_window_request(ui: std::rc::Rc<Ui>, tx: Sender<Action>) -> WindowRequest {
+    let close_ui = ui.clone();
+    let refresh_ui = ui.clone();
+    let content_ui = ui.clone();
+    let shortcut_ui = ui.clone();
+
+    let title_bar_pending = std::cell::Cell::new(true);
+    let mut window = Window::new("hakimi", WINDOW_WIDTH, WINDOW_HEIGHT)
+        .icon(assets::window_icon())
+        .resizable(false)
+        .bg(theme::WINDOW_BG)
+        .single(MAIN_WINDOW_KEY);
+    if let Some((x, y)) = centered_position(WINDOW_WIDTH, WINDOW_HEIGHT) {
+        window = window.position(x, y);
+    }
+    window
+        .on_close_request(move |_ctx| {
+            tracing::info!("main window closing: releasing the UI");
+            close_ui.release_view_state();
+            true
+        })
+        .on_shortcut(shortcut_handler(shortcut_ui))
+        // The HWND exists only once the window is created, so the palette is
+        // applied on the first short tick rather than before the request.
+        .on_interval(Duration::from_millis(120), move |_ctx| {
+            if title_bar_pending.replace(false) {
+                apply_light_title_bar();
+            }
+        })
+        .on_interval(Duration::from_millis(1000), move |_ctx| {
+            // Deferred from the close handler: the rows are off the tree.
+            if refresh_ui.reclaim_editor_rows.replace(false) {
+                app_state::release_editor_rows();
+            }
+            if !refresh_ui.signals.editor_open.get() {
+                refresh_ui.refresh();
+            }
+        })
+        .content(move || {
+            // App-level signals outlive the window: restore the page state and
+            // refresh before building so the first frame is already right.
+            tracing::info!("main window: building content");
+            content_ui.signals.window_open.set(true);
+            content_ui.sync_root();
+            content_ui.refresh();
+            view::view(content_ui.signals, tx)
+        })
+}
+
+/// Windows: run without a main window and open the UI on demand. Closing the
+/// window destroys it, which is what actually returns its memory.
+///
+/// windui keeps its shared Direct2D/DirectWrite device chain for the process
+/// lifetime unless asked to release it. The local windui fork exposes
+/// `release_shared_device_if_idle()`; this tick calls it once the window is
+/// really gone, returning the UI's GPU/font caches (tens of MB for this UI)
+/// to the system. The next open recreates them lazily. The API itself refuses
+/// while any window is alive, so a fast reopen is safe.
+#[cfg(windows)]
+fn run_resident(mut app: App, ui: std::rc::Rc<Ui>, tx: Sender<Action>, start_hidden: bool) {
+    let tick_ui = ui.clone();
+    app = app.on_interval(Duration::from_millis(1000), move |_ctx| {
+        // Runs with zero windows too: finish the editor-scope reclaim deferred
+        // by the close handler and keep the daily update check alive.
+        if tick_ui.reclaim_editor_rows.replace(false) {
+            app_state::release_editor_rows();
+        }
+        // Only UI-originated memory: the proxy runtime is untouched. No-op
+        // while a window is open or after the chain was already released.
+        if !window_open(MAIN_WINDOW_KEY)
+            && windui::platform::release_shared_device_if_idle()
+        {
+            tracing::info!("released the shared UI device caches");
+        }
+        tick_ui
+            .hidden
+            .store(!window_open(MAIN_WINDOW_KEY), Ordering::Relaxed);
+        maybe_auto_update(&tick_ui);
+    });
+
+    if start_hidden {
+        set_dock_visible(false);
+        ui.hidden.store(true, Ordering::Relaxed);
+        tracing::info!("starting with only the tray icon");
+    } else {
+        set_dock_visible(true);
+        app = app.start_window(main_window_request(ui.clone(), tx.clone()));
+    }
+    app = app.screenshot_window(main_window_request(ui.clone(), tx)).screenshot_from_args();
+
+    if !app.run_resident() {
+        tracing::error!("resident mode could not start");
+    }
+}
+
+/// macOS: keep a hidden main window (windui's resident mode is not implemented
+/// there yet), so the page tree stays mounted and only the data is dropped.
+#[cfg(not(windows))]
+fn run_windowed(mut app: App, ui: std::rc::Rc<Ui>, tx: Sender<Action>, start_hidden: bool) {
+    {
+        let close_ui = ui.clone();
+        app = app.on_close_request(move |_ctx| {
+            set_dock_visible(false);
+            close_ui.release_view_state();
+            true
+        });
+    }
+
+    {
+        let show_ui = ui.clone();
+        app = app.on_show(move |_ctx| {
+            // The tray callback already re-mounted the page tree before the
+            // window was shown (see app_state::prepare_show). Keep the signal
+            // writes: they are idempotent and cover other reveal paths.
+            set_dock_visible(true);
+            if !show_ui.signals.window_open.get() {
+                show_ui.signals.window_open.set(true);
+            }
+            show_ui.sync_root();
+            show_ui.refresh();
+        });
+    }
+
+    app = app.on_shortcut(shortcut_handler(ui.clone()));
+
+    // One-second refresh: recompute the snapshot and push changed signals.
+    let timer_ui = ui.clone();
+    let mut title_bar_done = false;
+    app = app.on_interval(Duration::from_millis(1000), move |ctx| {
+        if !title_bar_done {
+            title_bar_done = true;
+            apply_light_title_bar();
+        }
+        // Deferred from the close handler: the rows are off the tree by now.
+        if timer_ui.reclaim_editor_rows.replace(false) {
+            app_state::release_editor_rows();
+        }
+        let visible = ctx.window_state().visible;
+        if visible && !timer_ui.signals.editor_open.get() {
+            timer_ui.refresh();
+        }
+        timer_ui.hidden.store(!visible, Ordering::Relaxed);
+        maybe_auto_update(&timer_ui);
+    });
+
+    // Attach the content tree in BOTH branches. A hidden launch still owns a
+    // hidden window that the tray reveals later; without this it would be blank.
+    let app = app
+        .screenshot_from_args()
+        .content(view::view(ui.signals, tx));
+    macos_reopen::install();
+    if start_hidden {
+        set_dock_visible(false);
+        tracing::info!("starting with only the tray icon");
+        app.start_hidden().run();
+    } else {
+        set_dock_visible(true);
+        app.run();
+    }
+}
+
 // -- entry point --------------------------------------------------------------
 
 fn main() -> Result<()> {
@@ -1714,20 +1943,39 @@ fn main() -> Result<()> {
 
     // Create the channel first: every UI action, tray click and background
     // result is a message handled on the UI thread by `Ui::handle`.
-    let mut app = App::new("hakimi", WINDOW_WIDTH, WINDOW_HEIGHT)
+    //
+    // Windows runs in resident mode: there is no main window at all and the UI
+    // is an on-demand window whose close destroys it (see `run_resident`).
+    // macOS still needs the hidden main window because windui's resident mode
+    // is not implemented there yet.
+    #[cfg(windows)]
+    let mut app = App::resident("hakimi");
+    #[cfg(not(windows))]
+    let mut app = App::new("hakimi", WINDOW_WIDTH, WINDOW_HEIGHT).hide_on_close();
+    app = app
         .icon(assets::window_icon())
         .theme(theme::app_theme())
         .bg(theme::WINDOW_BG)
         // GPU (Direct2D on Windows) first, with automatic fallback to software.
         // Software rasterising the modal's translucent scrim is far too slow.
         .renderer(Renderer::Auto)
-        .resizable(false)
-        .hide_on_close();
+        .resizable(false);
     if let Some((x, y)) = centered_position(WINDOW_WIDTH, WINDOW_HEIGHT) {
         app = app.position(x, y);
     }
     let handler_ui = ui.clone();
     let tx = app.channel::<Action>(move |_ctx, action| {
+        // With no window kept alive, "show the main window" is a creation
+        // request. `.single(main)` focuses an already-open window instead of
+        // opening a second one.
+        #[cfg(windows)]
+        if matches!(action, Action::ShowMain) {
+            set_dock_visible(true);
+            activate_app();
+            handler_ui.refresh();
+            _ctx.open_window(main_window_request(handler_ui.clone(), handler_ui.tx()));
+            return;
+        }
         handler_ui.handle(action);
         // Page/window/onboarding changes must advance the switcher's key.
         handler_ui.sync_root();
@@ -1736,91 +1984,6 @@ fn main() -> Result<()> {
     if std::env::var("HAKIMI_UI_EDITOR").is_ok() {
         ui.handle(Action::OpenEditor(String::new()));
     }
-
-    {
-        let close_ui = ui.clone();
-        app = app.on_close_request(move |_ctx| {
-            tracing::info!(
-                window_open_before = close_ui.signals.window_open.get(),
-                root_before = close_ui.signals.root.get(),
-                "DBG on_close_request: hiding"
-            );
-            set_dock_visible(false);
-            close_ui.release_view_state();
-            tracing::info!(
-                window_open_after = close_ui.signals.window_open.get(),
-                root_after = close_ui.signals.root.get(),
-                "DBG on_close_request: done"
-            );
-            true
-        });
-    }
-
-    {
-        let show_ui = ui.clone();
-        app = app.on_show(move |_ctx| {
-            // The tray callback already re-mounted the page tree before the
-            // window was shown (see app_state::prepare_show), so this handler
-            // only needs to refresh data and re-assert the Dock icon. Keep the
-            // signal writes: they are idempotent and cover other reveal paths.
-            tracing::info!(
-                window_open_before = show_ui.signals.window_open.get(),
-                root_before = show_ui.signals.root.get(),
-                "DBG on_show: revealing"
-            );
-            set_dock_visible(true);
-            if !show_ui.signals.window_open.get() {
-                show_ui.signals.window_open.set(true);
-            }
-            show_ui.sync_root();
-            show_ui.refresh();
-            tracing::info!(root_after = show_ui.signals.root.get(), "DBG on_show: done");
-        });
-    }
-
-    {
-        let shortcut_ui = ui.clone();
-        app = app.on_shortcut(move |ctx, ev| {
-            if !ev.ctrl || ev.shift || ev.alt {
-                return false;
-            }
-            match ev.key {
-                Key::Char('w') | Key::Char('W') => {
-                    ctx.request_close();
-                    true
-                }
-                Key::Char('m') | Key::Char('M') => {
-                    minimize_window();
-                    true
-                }
-                Key::Char('q') | Key::Char('Q') => {
-                    shortcut_ui.request_quit();
-                    true
-                }
-                _ => false,
-            }
-        });
-    }
-
-    // One-second refresh: recompute the snapshot and push changed signals.
-    let timer_ui = ui.clone();
-    let title_bar_done = std::cell::Cell::new(false);
-    app = app.on_interval(Duration::from_millis(1000), move |ctx| {
-        if !title_bar_done.get() {
-            title_bar_done.set(true);
-            apply_light_title_bar();
-        }
-        // Deferred from the close handler: the rows are off the tree by now.
-        if timer_ui.reclaim_editor_rows.replace(false) {
-            app_state::release_editor_rows();
-        }
-        let visible = ctx.window_state().visible;
-        if visible && !timer_ui.signals.editor_open.get() {
-            timer_ui.refresh();
-        }
-        timer_ui.hidden.store(!visible, Ordering::Relaxed);
-        maybe_auto_update(&timer_ui);
-    });
 
     // Tray keeps the app alive with the window closed and mirrors key actions.
     app = app.tray(tray::build(
@@ -1860,18 +2023,11 @@ fn main() -> Result<()> {
         });
     }
 
-    // Attach the content tree in BOTH branches. A hidden launch still owns a
-    // hidden window that the tray reveals later; without this it would be blank.
-    let app = app.screenshot_from_args().content(view::view(ui.signals, tx.clone()));
-    macos_reopen::install();
-    if starts_hidden(options, startup.start_hidden) {
-        set_dock_visible(false);
-        tracing::info!("starting with only the tray icon");
-        app.start_hidden().run();
-    } else {
-        set_dock_visible(true);
-        app.run();
-    }
+    let start_hidden = starts_hidden(options, startup.start_hidden);
+    #[cfg(windows)]
+    run_resident(app, ui.clone(), tx, start_hidden);
+    #[cfg(not(windows))]
+    run_windowed(app, ui.clone(), tx, start_hidden);
 
     probe_stop.store(true, Ordering::SeqCst);
     shutdown.notify_one();

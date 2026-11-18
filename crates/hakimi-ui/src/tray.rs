@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use windui::prelude::*;
 
-use crate::app_state::{self, Action, UiSignals};
+use crate::app_state::{Action, UiSignals};
 use crate::Ui;
 
 /// Build the tray. Menu item titles encode state (`开机自启：开/关`) because
@@ -44,24 +44,11 @@ pub fn build(
     Tray::new()
         .tooltip("hakimi")
         .icon_rgba(tray_rgba.0, tray_rgba.1, &tray_rgba.2)
-        .on_left_click(move |ctx| {
-            crate::set_dock_visible(true);
-            app_state::prepare_show(click_signals);
-            click_ui.handle(Action::ShowMain);
-            ctx.show_window();
-        })
-        .on_double_click(move |ctx| {
-            crate::set_dock_visible(true);
-            app_state::prepare_show(double_signals);
-            double_ui.handle(Action::ShowMain);
-            ctx.show_window();
-        })
+        .on_left_click(move |ctx| crate::tray_show(ctx, &click_ui, click_signals))
+        .on_double_click(move |ctx| crate::tray_show(ctx, &double_ui, double_signals))
         .menu(vec![
             TrayMenuItem::item("显示主窗口", move |ctx| {
-                crate::set_dock_visible(true);
-                app_state::prepare_show(show_signals);
-                show_ui_handle.handle(Action::ShowMain);
-                ctx.show_window();
+                crate::tray_show(ctx, &show_ui_handle, show_signals);
             }),
             TrayMenuItem::separator(),
             TrayMenuItem::item(

@@ -356,6 +356,9 @@ pub(crate) enum Action {
     FinishOnboarding,
     SetPage(i32),
     SetSection(i32),
+    /// macOS reveal path; Windows resident mode opens the window directly
+    /// from the tray callback instead.
+    #[cfg_attr(windows, allow(dead_code))]
     ShowMain,
     Quit,
     ToggleAutoStart,

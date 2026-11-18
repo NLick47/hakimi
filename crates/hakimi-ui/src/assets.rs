@@ -52,6 +52,13 @@ pub fn site_logo(key: &str) -> Option<ImageContent> {
     })
 }
 
+/// Drop every decoded logo. Called when the window closes so the decoded
+/// pixmaps do not outlive the UI that showed them; the next window re-decodes
+/// on demand (the PNGs stay embedded in the binary).
+pub fn clear_logo_cache() {
+    LOGO_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
 /// Every embedded logo key. Used by tests to keep the decode table and the
 /// id-matching table in sync.
 #[cfg(test)]
