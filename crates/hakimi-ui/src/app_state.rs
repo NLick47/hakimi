@@ -83,6 +83,46 @@ pub(crate) fn release_editor_rows() {
     })
 }
 
+/// Recompute the switcher's page-root key from the navigation signals.
+/// `root` is a plain signal because a derived map only tracks one source, so
+/// page / onboarding / window-open changes would otherwise miss the switcher.
+/// Kept here so the tray can call it synchronously before showing the window.
+pub(crate) fn sync_root(s: UiSignals) {
+    let root = if !s.window_open.get() {
+        0 // Closed
+    } else if s.show_onboarding.get() {
+        3 // Fix
+    } else if s.page.get() == 1 {
+        2 // Settings
+    } else {
+        1 // Home
+    };
+    if s.root.get() != root {
+        tracing::info!(
+            from = s.root.get(),
+            to = root,
+            window_open = s.window_open.get(),
+            show_onboarding = s.show_onboarding.get(),
+            page = s.page.get(),
+            editor_open = s.editor_open.get(),
+            "DBG sync_root: root changed"
+        );
+        s.root.set(root);
+    }
+}
+
+/// Re-mount the page subtree before the tray reveals the window. The close
+/// handler parks the switcher on the blank Closed page (and reclaims its
+/// nodes); doing this in the tray callback — which windui runs before
+/// `makeKeyAndOrderFront` — makes the first visible frame the real page rather
+/// than one blank frame followed by the content.
+pub(crate) fn prepare_show(s: UiSignals) {
+    if !s.window_open.get() {
+        s.window_open.set(true);
+    }
+    sync_root(s);
+}
+
 /// The full set of signals the view tree binds to. Created once on the UI
 /// thread and captured by value (Signals are Copy) into widget callbacks.
 #[derive(Clone, Copy)]

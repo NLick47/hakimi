@@ -20,12 +20,18 @@ pub fn view(s: UiSignals, tx: Sender<Action>) -> Element {
     let fix_tx = tx.clone();
     let editor_tx = tx;
 
-    let pages = Element::switcher(s.root, move |root| match root {
-        0 => Element::stack().fill().bg(crate::theme::WINDOW_BG), // Closed
-        1 => home::view(s, home_tx.clone()),
-        2 => settings::view(s, settings_tx.clone()),
-        3 => fix::view(s, fix_tx.clone()),
-        _ => Element::stack().fill().bg(crate::theme::WINDOW_BG),
+    let pages = Element::switcher(s.root, move |root| {
+        let page = match root {
+            0 => Element::stack().fill().bg(crate::theme::WINDOW_BG), // Closed
+            1 => home::view(s, home_tx.clone()),
+            2 => settings::view(s, settings_tx.clone()),
+            3 => fix::view(s, fix_tx.clone()),
+            _ => Element::stack().fill().bg(crate::theme::WINDOW_BG),
+        };
+        // The switcher adds a cross-fade to any page without its own presence.
+        // Reopening from the tray swaps Closed→Home; a fade there reads as a
+        // flash, so switch pages instantly.
+        page.transition(Presence::none())
     })
     .fill();
 

@@ -124,7 +124,7 @@ fn activate_app() {}
 /// Switch to an accessory app while the window is closed so the Dock icon goes
 /// away; the tray and the proxy stay alive.
 #[cfg(target_os = "macos")]
-fn set_dock_visible(visible: bool) {
+pub(crate) fn set_dock_visible(visible: bool) {
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
@@ -145,7 +145,7 @@ fn set_dock_visible(visible: bool) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn set_dock_visible(_visible: bool) {}
+pub(crate) fn set_dock_visible(_visible: bool) {}
 
 /// Top-left corner that centres a `width` x `height` window on the primary
 /// screen, in the framework's macOS convention (origin top-left, y down).
@@ -1085,11 +1085,14 @@ impl Ui {
 
     fn release_view_state(&self) {
         let s = &self.signals;
-        // Keep the page subtree mounted while the window is hidden: tearing it
-        // down switches the switcher to the blank Closed page, so the next tray
-        // reveal shows one blank frame before the content is rebuilt. The
-        // window is orderOut'd, so the retained tree is not visible anyway.
-        // window_open and root stay as-is.
+        // Drop the whole page subtree when the window closes: switching the
+        // root to Closed rebuilds the switcher, so the Home/Settings/Fix nodes
+        // and the signals they created are reclaimed immediately instead of
+        // living as long as the hidden window. The tray re-mounts Home in
+        // prepare_show(), synchronously, before the window is shown again.
+        if s.window_open.get() {
+            s.window_open.set(false);
+        }
         if s.editor_open.get() {
             s.editor_open.set(false);
         }
@@ -1112,6 +1115,7 @@ impl Ui {
         if s.mirror_open.get() {
             s.mirror_open.set(false);
         }
+        self.sync_root();
     }
 
     fn request_quit(&self) {
@@ -1148,28 +1152,7 @@ impl Ui {
     /// subtree is mounted. Must be a plain signal write: the switcher keys on
     /// the signal's version, which a derived map would not advance.
     fn sync_root(&self) {
-        let s = &self.signals;
-        let root = if !s.window_open.get() {
-            0 // Closed
-        } else if s.show_onboarding.get() {
-            3 // Fix
-        } else if s.page.get() == 1 {
-            2 // Settings
-        } else {
-            1 // Home
-        };
-        if s.root.get() != root {
-            tracing::info!(
-                from = s.root.get(),
-                to = root,
-                window_open = s.window_open.get(),
-                show_onboarding = s.show_onboarding.get(),
-                page = s.page.get(),
-                editor_open = s.editor_open.get(),
-                "DBG sync_root: root changed"
-            );
-            s.root.set(root);
-        }
+        app_state::sync_root(self.signals);
     }
 
     fn handle(&self, action: Action) {
@@ -1776,10 +1759,10 @@ fn main() -> Result<()> {
     {
         let show_ui = ui.clone();
         app = app.on_show(move |_ctx| {
-            // Closing parks the tree on the blank Closed page (root 0). Restore
-            // the Home subtree in the same tick the tray reveals the window —
-            // ShowMain arrives a frame later via the channel, so relying on it
-            // shows one blank frame before the content appears.
+            // The tray callback already re-mounted the page tree before the
+            // window was shown (see app_state::prepare_show), so this handler
+            // only needs to refresh data and re-assert the Dock icon. Keep the
+            // signal writes: they are idempotent and cover other reveal paths.
             tracing::info!(
                 window_open_before = show_ui.signals.window_open.get(),
                 root_before = show_ui.signals.root.get(),
@@ -1841,7 +1824,8 @@ fn main() -> Result<()> {
 
     // Tray keeps the app alive with the window closed and mirrors key actions.
     app = app.tray(tray::build(
-        tx.clone(),
+        ui.clone(),
+        ui.signals,
         ui.signals.running,
         ui.signals.cfg_auto_start,
         ui.signals.cfg_start_hidden,
