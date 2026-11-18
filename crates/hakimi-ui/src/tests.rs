@@ -208,7 +208,7 @@ fn icon_keys_match_whole_ids_and_slugs_only() {
 /// one that groups can reach but has no asset leaves a letter tile behind.
 #[test]
 fn bundled_logos_and_group_lookups_stay_in_sync() {
-    let assets: std::collections::HashSet<&str> = ICON_ASSETS.iter().map(|(key, _)| *key).collect();
+    let assets: std::collections::HashSet<&str> = crate::assets::logo_keys().into_iter().collect();
     for key in SITE_ICONS {
         assert!(assets.contains(key), "{key} is matched but not embedded");
     }
@@ -221,20 +221,11 @@ fn bundled_logos_and_group_lookups_stay_in_sync() {
     }
 }
 
-/// Decoding happens once at startup and failures are silent, so a broken PNG
-/// would quietly turn every tile of that site back into a letter.
+/// Decoding happens at startup and failures are silent, so a broken PNG would
+/// quietly turn every tile of that site back into a letter.
 #[test]
 fn every_bundled_logo_decodes() {
-    load_assets(1.0);
-    ASSETS.with(|assets| {
-        let images = assets.borrow();
-        for (key, _) in ICON_ASSETS {
-            let image = images
-                .get(key)
-                .unwrap_or_else(|| panic!("{key} did not decode"));
-            assert!(image.size().width > 0, "{key} decoded to an empty image");
-        }
-    });
+    assert!(crate::assets::every_logo_decodes(), "a bundled logo did not decode");
 }
 
 /// The Android shell keeps its own copy of every logo. Both trees have drifted
@@ -578,52 +569,9 @@ fn a_sweep_is_visible_while_paused() {
 
 #[test]
 fn custom_groups_are_marked_for_deletion() {
-    let config = serde_json::json!({
-        "groups": [
-            { "id": "pixiv", "name": "Pixiv", "enabled": true, "domains": domains(&["pixiv.net"]) },
-            { "id": "mine", "name": "Mine", "enabled": true, "domains": domains(&["mine.example"]) }
-        ]
-    });
-    let (sites, _) = build_snapshot(
-        &serde_json::json!({}),
-        &config,
-        &HashSet::new(),
-        true,
-        false,
-        None,
-    );
-    assert!(!sites.iter().find(|s| s.id == "pixiv").unwrap().custom);
-    assert!(sites.iter().find(|s| s.id == "mine").unwrap().custom);
-}
-
-/// One UI refresh tick: status/config JSON in, raw rows out.
-#[test]
-#[ignore = "micro benchmark"]
-fn bench_build_sites_tick() {
-    let config = serde_json::to_value(AppConfig::default()).unwrap();
-    let domains: Vec<serde_json::Value> = (0..2048)
-        .map(|index| {
-            serde_json::json!({
-                "domain": format!("host{index}.example.test"),
-                "state": "normal",
-                "latencyMs": 42
-            })
-        })
-        .collect();
-    let status = serde_json::json!({ "domains": domains });
-    let expanded = HashSet::new();
-    // Warm the lazily built helpers the way the second tick does.
-    let _ = build_sites(&status, &config, &expanded);
-    let started = std::time::Instant::now();
-    for _ in 0..200 {
-        let _ = build_sites(&status, &config, &expanded);
-    }
-    let elapsed = started.elapsed();
-    println!(
-        "{:<28} {:>10.1} ns/op   (200 rounds in {elapsed:?})",
-        "ui.build_sites",
-        elapsed.as_nanos() as f64 / 200.0
-    );
+    let builtins = builtin_group_ids();
+    assert!(builtins.contains("pixiv"), "bundled ids stay undeletable");
+    assert!(!builtins.contains("mine"), "user ids are deletable");
 }
 
 /// The settings page shows the host list as one comma-separated line, the same
@@ -903,4 +851,158 @@ fn mirror_rows_separate_off_updating_and_cooldown() {
     assert_eq!(rows[1].value, "冷却 4:52");
     assert_eq!(rows[1].tone, TONE_DEGRADED);
     assert_eq!(rows[2].tone, TONE_BROKEN);
+}
+
+#[test]
+fn adding_a_domain_keeps_the_existing_rows_alive() {
+    let mut rows = crate::app_state::with_editor_rows(|| {
+        (0..2)
+            .map(|i| crate::EditorRowState::new(i, "a.com", 0, "", ""))
+            .collect::<Vec<_>>()
+    });
+    let first_pattern = rows[0].pattern;
+
+    let index = rows.len();
+    crate::app_state::with_new_editor_row(|| {
+        rows.push(crate::EditorRowState::new(index, "", 0, "", ""));
+    });
+
+    // The row that was already mounted still reads: rotating the generation
+    // here would have disposed this slot.
+    assert_eq!(first_pattern.get(), "a.com");
+    assert!(rows[2].pattern.is_alive());
+}
+
+#[test]
+fn repeated_editor_opens_reach_a_steady_state() {
+    let build = || {
+        crate::app_state::with_editor_rows(|| {
+            (0..5)
+                .map(|i| crate::EditorRowState::new(i, "a.com", 0, "", ""))
+                .collect::<Vec<_>>()
+        })
+    };
+    // Warm up to the steady state: two generations are live by design.
+    for _ in 0..4 {
+        std::hint::black_box(build());
+    }
+    let settled = windui::signal::stats().live;
+    for _ in 0..20 {
+        std::hint::black_box(build());
+    }
+    let after = windui::signal::stats().live;
+    assert_eq!(
+        after, settled,
+        "live signal count kept growing across editor opens ({settled} -> {after}); \
+         the per-generation reclaim is not running"
+    );
+}
+
+#[test]
+fn the_mirror_source_falls_back_to_the_default_only_when_absent() {
+    let base = serde_json::to_value(AppConfig::default()).unwrap();
+
+    let mut omitted = base.clone();
+    omitted.as_object_mut().unwrap().remove("advanced");
+    assert_eq!(
+        settings_values(&omitted).mirror_source,
+        hakimi_core::config::DownloadConfig::default().mirror_source,
+        "a missing `advanced` section must not blank the mirror list"
+    );
+
+    let mut switched_off = base.clone();
+    switched_off["advanced"]["download"]["mirrorSource"] = serde_json::json!("");
+    assert_eq!(
+        settings_values(&switched_off).mirror_source,
+        "",
+        "an explicit empty string is the user switching it off"
+    );
+
+    let mut custom = base;
+    custom["advanced"]["download"]["mirrorSource"] =
+        serde_json::json!("https://example.test/mirrors.json");
+    assert_eq!(
+        settings_values(&custom).mirror_source,
+        "https://example.test/mirrors.json"
+    );
+}
+
+#[test]
+fn the_catalog_urls_fall_back_to_the_default_only_when_absent() {
+    let base = serde_json::to_value(AppConfig::default()).unwrap();
+    let defaults = hakimi_core::config::CatalogSources::default();
+
+    let mut omitted = base.clone();
+    omitted.as_object_mut().unwrap().remove("catalogs");
+    let values = settings_values(&omitted);
+    assert_eq!(values.catalog_ip, defaults.ip);
+    assert_eq!(values.catalog_doh, defaults.doh);
+
+    let mut cleared = base;
+    cleared["catalogs"]["ip"] = serde_json::json!("");
+    cleared["catalogs"]["doh"] = serde_json::json!("");
+    let values = settings_values(&cleared);
+    assert_eq!(values.catalog_ip, "", "an explicit empty string means disabled");
+    assert_eq!(values.catalog_doh, "");
+}
+
+
+#[test]
+fn footer_buttons_are_hittable_next_to_a_flex_spacer() {
+    use windui::core::Tree;
+    use windui::text::NullTextEngine;
+
+    // Same shape as the fix-page footer: [text_button][flex_spacer][button].
+    let mut tree = Tree::new();
+    let row = Element::row()
+        .width(520)
+        .height(30)
+        .child(
+            Element::row()
+                .height(30)
+                .min_width(44)
+                .clickable()
+                .on_click(|_| {})
+                .child(Element::label("暂不处理").font_size(12.5)),
+        )
+        .child(Element::flex_spacer())
+        .child(Element::button("完成").min_width(96).height(30))
+        .build(&mut tree);
+    tree.root = Some(row);
+    tree.layout_root(Size::new(560, 40), &mut NullTextEngine);
+
+    let kids = tree.get(row).unwrap().children.clone();
+    assert_eq!(kids.len(), 3, "footer row must have three children");
+    let (first, spacer, second) = (kids[0], kids[1], kids[2]);
+    let center = |id| {
+        let b = tree.abs_bounds(id);
+        windui::geometry::Point::new(b.x + b.w / 2, b.y + b.h / 2)
+    };
+    let hit_first = tree.hit_test(center(first));
+    let hit_second = tree.hit_test(center(second));
+    let in_subtree = |hit, root| {
+        let mut cur = Some(hit);
+        while let Some(id) = cur {
+            if id == root {
+                return true;
+            }
+            cur = tree.get(id).and_then(|n| n.parent);
+        }
+        false
+    };
+    assert!(
+        hit_first.is_some_and(|h| in_subtree(h, first)),
+        "first button center must resolve inside it, got {:?}",
+        hit_first
+    );
+    assert!(
+        hit_second.is_some_and(|h| in_subtree(h, second)),
+        "second button center must resolve inside it, got {:?}",
+        hit_second
+    );
+    // The spacer itself must never swallow a click aimed at either button.
+    assert!(
+        hit_first != Some(spacer) && hit_second != Some(spacer),
+        "the flex spacer must not be the hit target"
+    );
 }

@@ -699,6 +699,14 @@ impl HakimiRuntime {
         self.proxy_applied.read().unwrap_or(true)
     }
 
+    /// Whether a takeover is recorded at all: `true` covers a successful apply
+    /// and one that failed (the intent is still ours to retry); `false` means
+    /// nothing is installed — off, deferred, released or abandoned. The fix
+    /// page uses this to keep from claiming 已写入 before the first apply.
+    pub fn system_proxy_takeover_active(&self) -> bool {
+        self.proxy_applied.read().is_some()
+    }
+
     /// Read the OS back to see whether the takeover we installed is still in
     /// place. `Some(true)` means it was changed or switched off by someone
     /// else; `None` means there is nothing to check or the OS could not be
@@ -751,6 +759,14 @@ impl HakimiRuntime {
         tracing::warn!(
             "acceleration interrupted: the system proxy no longer points at this instance"
         );
+    }
+
+    /// [`Self::abandon_takeover`] on a worker thread: the proxy write runs
+    /// several OS commands and must never block the UI thread, same as
+    /// [`Self::apply_system_proxy_async`].
+    pub fn abandon_takeover_async(self: &Arc<Self>) {
+        let runtime = self.clone();
+        std::thread::spawn(move || runtime.abandon_takeover());
     }
 
     /// Disable a PAC takeover that points at this instance. Only this
@@ -1446,12 +1462,12 @@ impl HakimiRuntime {
             }
         });
 
-        // WinINet keeps serving a cached PAC until told the settings changed
+        // WinINet keeps serving a cached PAC until told the settings changed.
         let runtime = self.clone();
         let mut receiver = shutdown.subscribe();
         self.spawn(async move {
             let mut watch = PacWatch::default();
-            let mut ticker = tokio::time::interval(Duration::from_millis(200));
+            let mut ticker = tokio::time::interval(Duration::from_secs(2));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {

@@ -23,8 +23,7 @@ use std::time::{Duration, Instant};
 
 use hakimi_core::runtime::HakimiRuntime;
 
-use crate::AppWindow;
-use slint::SharedString;
+use crate::app_state::UiSignals;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EnvState {
@@ -34,6 +33,10 @@ pub struct EnvState {
     /// The takeover we installed is no longer in the OS: another program (or
     /// the user) changed the system proxy while acceleration was running.
     pub proxy_lost: bool,
+    /// Whether a takeover is recorded at all: off/deferred/released leave
+    /// nothing installed. Display state for the fix page, which must not
+    /// claim 已写入 before the first apply ever ran.
+    pub proxy_takeover: bool,
 }
 
 impl EnvState {
@@ -132,6 +135,7 @@ impl Default for AppModel {
                 ca_error: String::new(),
                 proxy_ok: true,
                 proxy_lost: false,
+                proxy_takeover: false,
             },
             fix_page_open: false,
             running_since: None,
@@ -356,27 +360,108 @@ pub fn execute(effects: &Effects, runtime: &Arc<HakimiRuntime>) {
         runtime.release_system_proxy_async();
     }
     if effects.forget_proxy {
-        runtime.abandon_takeover();
+        runtime.abandon_takeover_async();
     }
 }
 
-/// Mirror the model onto the window. The only place that writes UI state.
-pub fn sync_window(model: &AppModel, app: &AppWindow) {
+/// Mirror the model onto the UI signals. The only place that writes these
+/// environment/fix state signals; windui redraws only the bound widgets.
+pub fn sync_window(model: &AppModel, s: &UiSignals) {
     let env = model.env();
-    app.set_show_onboarding(model.fix_page());
-    app.set_fix_blocked(model.fix_blocked());
-    app.set_ca_installed(env.ca_ok);
-    app.set_ca_error(SharedString::from(env.ca_error.clone()));
-    app.set_proxy_ok(env.proxy_ok);
-    app.set_proxy_interrupted(model.proxy_lost());
-    if env.ca_ok || !env.ca_error.is_empty() {
-        // Install finished (or failed loudly): the wait-for-dialog state can go.
-        app.set_ob_installing(false);
-    }
-    if env.ca_ok && !app.get_ca_action_error().is_empty() {
+    // Guard every write: this runs on every 1 Hz probe tick, and windui
+    // re-paints on any Signal::set even when the value is unchanged.
+    let set_bool = |sig: windui::prelude::Signal<bool>, value: bool| {
+        if sig.get() != value { sig.set(value); }
+    };
+    set_bool(s.show_onboarding, model.fix_page());
+    set_bool(s.fix_blocked, model.fix_blocked());
+    let (fix_title, fix_subtitle) = if model.fix_blocked() {
+        (
+            "无法开启加速：环境检查未通过",
+            "为避免「看似加速实则无效」，已暂停开启。\n修复以下问题后将自动开启加速。",
+        )
+    } else if env.ca_ok && env.proxy_ok {
+        ("环境检查通过", "加速环境已就绪。")
+    } else {
+        ("环境检查未通过", "修复以下问题后即可正常加速。")
+    };
+    set_str(s.fix_title, fix_title);
+    set_str(s.fix_subtitle, fix_subtitle);
+    set_bool(s.ca_installed, env.ca_ok);
+    if s.ca_error.get() != env.ca_error { s.ca_error.set(env.ca_error.clone()); }
+    set_bool(s.proxy_ok, env.proxy_ok);
+    set_bool(s.env_ok, env.ca_ok && env.proxy_ok);
+    set_bool(s.proxy_interrupted, model.proxy_lost());
+    // The proxy row copy mixes the takeover flag with the write result; a
+    // windui map tracks one source, so the three states are written here.
+    let (proxy_status, proxy_status_sub, proxy_tone, proxy_reapply) = if !env.proxy_takeover {
+        ("未接管", "开启加速后自动写入系统代理", 0, false)
+    } else if env.proxy_ok {
+        ("已写入", "PAC 已写入系统；其他代理开启时可能优先生效", 1, false)
+    } else {
+        ("写入失败", "点击重新应用；其他代理开启时请先关闭", 2, true)
+    };
+    set_str(s.proxy_status, proxy_status);
+    set_str(s.proxy_status_sub, proxy_status_sub);
+    set_tone(s.proxy_status_tone, proxy_tone);
+    set_bool(s.proxy_reapply, proxy_reapply);
+    if env.ca_ok && !s.ca_action_error.get().is_empty() {
         // A later successful install clears the stale password/cancel message.
-        app.set_ca_action_error(SharedString::new());
+        s.ca_action_error.set(String::new());
     }
+    sync_ca_status(s);
+}
+
+fn set_str(sig: windui::prelude::Signal<String>, value: &str) {
+    if sig.get() != value {
+        sig.set(value.to_string());
+    }
+}
+
+fn set_tone(sig: windui::prelude::Signal<i32>, value: i32) {
+    if sig.get() != value {
+        sig.set(value);
+    }
+}
+
+/// The CA copy on the settings card and the fix row mixes `ca_busy` with
+/// `ca_installed`/`ca_error`. A windui `map` tracks only its one source
+/// signal, so these are written here instead of derived in the view; otherwise
+/// a trust change that arrives without a busy flip (external trust change, the
+/// CA's own background probe) would leave stale text behind.
+pub fn sync_ca_status(s: &UiSignals) {
+    let busy = s.ca_busy.get();
+    let installed = s.ca_installed.get();
+    let error = s.ca_error.get();
+    let status = if busy {
+        "处理中…"
+    } else if installed {
+        "已安装并受信任"
+    } else {
+        "未受信任"
+    };
+    set_str(s.ca_status, status);
+    let sub = if busy {
+        "等待系统授权，完成前不会改判状态".to_string()
+    } else if installed {
+        "ECH / SNI 修改可用".to_string()
+    } else if error.is_empty() {
+        "ECH / SNI 修改会失败".to_string()
+    } else {
+        error.clone()
+    };
+    set_str(s.ca_status_sub, &sub);
+    set_tone(s.ca_status_tone, if busy { 0 } else if installed { 1 } else { 2 });
+    set_str(
+        s.ca_button,
+        if busy {
+            "处理中…"
+        } else if installed {
+            "修复"
+        } else {
+            "安装"
+        },
+    );
 }
 
 // -- environment probing ------------------------------------------------------
@@ -396,6 +481,7 @@ pub fn probe_env(runtime: &HakimiRuntime, check_proxy_os: bool) -> EnvState {
         ca_error: ca.error.unwrap_or_default(),
         proxy_ok: runtime.system_proxy_applied(),
         proxy_lost: check_proxy_os && runtime.takeover_lost() == Some(true),
+        proxy_takeover: runtime.system_proxy_takeover_active(),
     }
 }
 
@@ -443,9 +529,7 @@ mod tests {
             enabled: true,
             open: false,
             first: false,
-            last: false,
             url: String::new(),
-            custom: false,
             domains: vec![],
         }
     }
@@ -492,6 +576,7 @@ mod tests {
             },
             proxy_ok: healthy,
             proxy_lost: false,
+            proxy_takeover: healthy,
         }
     }
 
@@ -757,6 +842,7 @@ mod tests {
             ca_error: String::new(),
             proxy_ok: false,
             proxy_lost: false,
+            proxy_takeover: true,
         };
         let effects = model.env_changed(failed);
         assert_eq!(effects, Effects::default());
@@ -775,6 +861,7 @@ mod tests {
             ca_error: String::new(),
             proxy_ok: false,
             proxy_lost: false,
+            proxy_takeover: true,
         };
         model.env_changed(failed);
         model.toggle(env(true)); // running → stopped
@@ -784,6 +871,7 @@ mod tests {
             ca_error: String::new(),
             proxy_ok: false,
             proxy_lost: false,
+            proxy_takeover: true,
         });
         assert_eq!(model.accel(), AccelState::Running);
         assert!(effects.resume);
@@ -791,6 +879,45 @@ mod tests {
             effects.apply_proxy,
             "a failed write must be retried when the user turns acceleration back on"
         );
+    }
+
+    /// The fix page must not claim 已写入 before any takeover exists: a
+    /// blocked launch defers the proxy write, so the row shows 未接管 with no
+    /// retry button until acceleration actually ran.
+    #[test]
+    fn the_fix_page_proxy_row_never_claims_applied_before_a_takeover() {
+        let mut model = AppModel::default();
+        model.startup(env(false), false);
+        let s = UiSignals::default();
+        sync_window(&model, &s);
+        assert_eq!(s.proxy_status.get(), "未接管");
+        assert_eq!(s.proxy_status_sub.get(), "开启加速后自动写入系统代理");
+        assert_eq!(s.proxy_status_tone.get(), 0);
+        assert!(!s.proxy_reapply.get(), "nothing was written, so nothing to retry");
+
+        // Running with the takeover applied: the row reports success.
+        let model = running_model();
+        let s = UiSignals::default();
+        sync_window(&model, &s);
+        assert_eq!(s.proxy_status.get(), "已写入");
+        assert_eq!(s.proxy_status_tone.get(), 1);
+        assert!(!s.proxy_reapply.get());
+
+        // A takeover recorded but its write failed: the row turns red and
+        // offers the retry.
+        let mut model = running_model();
+        model.env_changed(EnvState {
+            ca_ok: true,
+            ca_error: String::new(),
+            proxy_ok: false,
+            proxy_lost: false,
+            proxy_takeover: true,
+        });
+        let s = UiSignals::default();
+        sync_window(&model, &s);
+        assert_eq!(s.proxy_status.get(), "写入失败");
+        assert_eq!(s.proxy_status_tone.get(), 2);
+        assert!(s.proxy_reapply.get(), "a failed write offers 重新应用");
     }
 }
 
