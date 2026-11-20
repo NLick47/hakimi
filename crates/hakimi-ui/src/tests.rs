@@ -225,7 +225,10 @@ fn bundled_logos_and_group_lookups_stay_in_sync() {
 /// quietly turn every tile of that site back into a letter.
 #[test]
 fn every_bundled_logo_decodes() {
-    assert!(crate::assets::every_logo_decodes(), "a bundled logo did not decode");
+    assert!(
+        crate::assets::every_logo_decodes(),
+        "a bundled logo did not decode"
+    );
 }
 
 /// The Android shell keeps its own copy of every logo. Both trees have drifted
@@ -586,7 +589,10 @@ fn the_http1_host_list_round_trips_through_the_settings_field() {
     ];
     let json = serde_json::to_value(&config).unwrap();
     let values = crate::settings_values(&json);
-    assert_eq!(values.http1_hosts, "i.pximg.net, s.pximg.net, cdn.example.com");
+    assert_eq!(
+        values.http1_hosts,
+        "i.pximg.net, s.pximg.net, cdn.example.com"
+    );
 
     // The editor parses the same shape back: commas, arbitrary spaces, and an
     // empty entry from a trailing comma all collapse to the list.
@@ -661,14 +667,14 @@ fn startup_switches_default_to_off_and_follow_the_config() {
     assert!(values.auto_start && values.start_hidden && values.auto_connect);
 }
 
-/// The download card must show the shipped thread count even though a file
-/// whose `advanced.download` still matches the defaults omits the whole
+/// The download card must show the shipped concurrency ceiling even though a
+/// file whose `advanced.download` still matches the defaults omits the whole
 /// section.
 #[test]
 fn download_controls_show_defaults_and_follow_the_config() {
     let values = crate::settings_values(&serde_json::json!({ "advanced": {} }));
     assert!(values.download_enabled);
-    assert_eq!(values.download_segments, "6");
+    assert_eq!(values.download_segments, "12");
 
     let mut config = AppConfig::default();
     config.advanced.download.enabled = false;
@@ -678,10 +684,26 @@ fn download_controls_show_defaults_and_follow_the_config() {
     assert!(!values.download_enabled);
     assert_eq!(values.download_segments, "8");
 
-    // The runtime clamps to 2..=8; the picker must show the effective value.
+    // The runtime clamps to 2..=12; the picker must show the effective value.
     config.advanced.download.segments = 1;
     let json = serde_json::to_value(&config).unwrap();
     assert_eq!(crate::settings_values(&json).download_segments, "2");
+}
+
+/// The caption must name only the scenarios where the engine lands below the
+/// chosen ceiling: below 6 the pill already says everything, and a wrong merge
+/// condition would either lie or leak an empty line.
+#[test]
+fn the_concurrency_caption_names_only_truncated_scenarios() {
+    use crate::view::settings::concurrency_caption;
+
+    for value in [2, 3, 4, 5, 6] {
+        assert!(concurrency_caption(value).is_empty(), "{value} must stay silent");
+    }
+    assert_eq!(concurrency_caption(7), "镜像 6");
+    assert_eq!(concurrency_caption(8), "镜像 6");
+    assert_eq!(concurrency_caption(12), "小文件 8 · 镜像 6");
+    assert_eq!(concurrency_caption(64), "大文件 12 · 小文件 8 · 镜像 6");
 }
 
 /// The card must render the shipped relay without the user typing anything:
@@ -703,9 +725,18 @@ fn the_settings_card_shows_the_shipped_image_relay() {
 /// list match nothing at all.
 #[test]
 fn comma_separated_fields_split_on_both_commas() {
-    assert_eq!(split_entries("/img-original/, /img-master/"), ["/img-original/", "/img-master/"]);
-    assert_eq!(split_entries("/img-original/，/img-master/"), ["/img-original/", "/img-master/"]);
-    assert_eq!(split_entries(" i.pximg.net ， s.pximg.net ,,"), ["i.pximg.net", "s.pximg.net"]);
+    assert_eq!(
+        split_entries("/img-original/, /img-master/"),
+        ["/img-original/", "/img-master/"]
+    );
+    assert_eq!(
+        split_entries("/img-original/，/img-master/"),
+        ["/img-original/", "/img-master/"]
+    );
+    assert_eq!(
+        split_entries(" i.pximg.net ， s.pximg.net ,,"),
+        ["i.pximg.net", "s.pximg.net"]
+    );
     assert!(split_entries("   ").is_empty());
     assert_eq!(
         parse_sni_hosts("a.example.com，B.Example.com ").unwrap(),
@@ -773,7 +804,10 @@ fn doh_endpoint(name: &str, url: &str) -> EffectiveEndpoint {
 #[test]
 fn doh_rows_keep_unprobed_neutral_and_show_the_failure_detail() {
     let endpoints = vec![
-        doh_endpoint("cleanbrowsing", "https://doh.cleanbrowsing.org/doh/security-filter"),
+        doh_endpoint(
+            "cleanbrowsing",
+            "https://doh.cleanbrowsing.org/doh/security-filter",
+        ),
         doh_endpoint("fallback", "https://doh.example/query"),
     ];
 
@@ -796,13 +830,19 @@ fn doh_rows_keep_unprobed_neutral_and_show_the_failure_detail() {
         (rows[0].value.as_str(), rows[0].tone),
         ("检测中", TONE_NEUTRAL)
     );
-    assert_eq!((rows[1].value.as_str(), rows[1].tone), ("失败", TONE_BROKEN));
+    assert_eq!(
+        (rows[1].value.as_str(), rows[1].tone),
+        ("失败", TONE_BROKEN)
+    );
     assert_eq!(rows[1].detail, "TCP 超时");
 }
 
 #[test]
 fn doh_rows_format_latency_and_explain_an_empty_config() {
-    let endpoints = vec![doh_endpoint("cleanbrowsing", "https://doh.cleanbrowsing.org")];
+    let endpoints = vec![doh_endpoint(
+        "cleanbrowsing",
+        "https://doh.cleanbrowsing.org",
+    )];
     let observed = vec![DohObservation {
         url: endpoints[0].url.clone(),
         healthy: true,
@@ -824,7 +864,10 @@ fn doh_rows_format_latency_and_explain_an_empty_config() {
 fn mirror_rows_separate_off_updating_and_cooldown() {
     let off = mirror_entries(false, &[]);
     assert_eq!(off.len(), 1);
-    assert_eq!((off[0].value.as_str(), off[0].tone), ("已关闭", TONE_NEUTRAL));
+    assert_eq!(
+        (off[0].value.as_str(), off[0].tone),
+        ("已关闭", TONE_NEUTRAL)
+    );
     assert_eq!(mirror_entries(true, &[])[0].value, "更新中");
 
     let status = vec![
@@ -942,10 +985,12 @@ fn the_catalog_urls_fall_back_to_the_default_only_when_absent() {
     cleared["catalogs"]["ip"] = serde_json::json!("");
     cleared["catalogs"]["doh"] = serde_json::json!("");
     let values = settings_values(&cleared);
-    assert_eq!(values.catalog_ip, "", "an explicit empty string means disabled");
+    assert_eq!(
+        values.catalog_ip, "",
+        "an explicit empty string means disabled"
+    );
     assert_eq!(values.catalog_doh, "");
 }
-
 
 #[test]
 fn footer_buttons_are_hittable_next_to_a_flex_spacer() {

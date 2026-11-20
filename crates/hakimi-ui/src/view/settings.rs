@@ -1,4 +1,4 @@
-//! Settings page: four sections (常规 / 网络 / 下载与目录 / 数据与更新).
+//! Settings page: four sections (常规 / 网络 / 下载 / 数据与更新).
 //! Port of the `page == 1` tree in app.slint. Text fields bind to draft
 //! signals and commit through `Action::SaveString` on Enter/focus loss; the
 //! field that owns `cfg-error-key` gets the red border.
@@ -12,11 +12,11 @@ use crate::view::common::{
     self, card, choice_pill, pill_button, pill_button_danger, row_line, site_badge, toggle_row,
 };
 
-const SECTIONS: [&str; 4] = ["常规", "网络", "下载与目录", "数据与更新"];
+const SECTIONS: [&str; 4] = ["常规", "网络", "下载", "数据与更新"];
 const SECTION_SUBTITLES: [&str; 4] = [
     "管理站点、证书和启动行为",
-    "设置监听端口、加密 DNS 与中继",
-    "配置下载镜像和远程目录来源",
+    "设置监听端口、加密 DNS、中继与远程目录",
+    "GitHub 资产的镜像与并发下载",
     "打开数据目录与检查更新",
 ];
 
@@ -205,7 +205,11 @@ fn management_site_row(site: SiteData, tx: Sender<Action>) -> Element {
                     Element::label(site.name.clone())
                         .font_size(13.5)
                         .font_weight(500)
-                        .fg(if site.enabled { theme::TEXT } else { theme::TEXT_SOFT }),
+                        .fg(if site.enabled {
+                            theme::TEXT
+                        } else {
+                            theme::TEXT_SOFT
+                        }),
                 )
                 .child(
                     Element::label(site.summary.clone())
@@ -216,10 +220,7 @@ fn management_site_row(site: SiteData, tx: Sender<Action>) -> Element {
         )
         .child(common::chevron_right_icon());
     if !site.first {
-        row = Element::col()
-            .width_match()
-            .child(inset_line())
-            .child(row);
+        row = Element::col().width_match().child(inset_line()).child(row);
     }
     row
 }
@@ -297,7 +298,11 @@ fn local_ca_card(s: UiSignals, tx: Sender<Action>) -> Element {
                                     .outline()
                                     .on_click(move |_| {
                                         let install = installed_for_click.get();
-                                        let _ = main_tx.send(Action::CaAction(if install { 3 } else { 1 }));
+                                        let _ = main_tx.send(Action::CaAction(if install {
+                                            3
+                                        } else {
+                                            1
+                                        }));
                                     }),
                             ),
                     ),
@@ -322,11 +327,7 @@ fn ca_action_error_row(s: UiSignals) -> Element {
                     top: 8,
                     bottom: 8,
                 })
-                .child(
-                    Element::label_signal(error)
-                        .font_size(11.5)
-                        .fg(theme::WARN),
-                ),
+                .child(Element::label_signal(error).font_size(11.5).fg(theme::WARN)),
         )
 }
 
@@ -353,7 +354,10 @@ fn startup_card(s: UiSignals, tx: Sender<Action>) -> Element {
                 signal(String::new()),
                 s.cfg_start_hidden,
                 move |_, value| {
-                    let _ = tx2.send(Action::SaveBool("advanced.startup.startHidden".into(), value));
+                    let _ = tx2.send(Action::SaveBool(
+                        "advanced.startup.startHidden".into(),
+                        value,
+                    ));
                 },
             ))
             .child(row_line())
@@ -363,7 +367,10 @@ fn startup_card(s: UiSignals, tx: Sender<Action>) -> Element {
                 signal(String::new()),
                 s.cfg_auto_connect,
                 move |_, value| {
-                    let _ = tx3.send(Action::SaveBool("advanced.startup.autoConnect".into(), value));
+                    let _ = tx3.send(Action::SaveBool(
+                        "advanced.startup.autoConnect".into(),
+                        value,
+                    ));
                 },
             )),
     )
@@ -388,6 +395,9 @@ fn subhead(title: &'static str) -> Element {
 }
 
 fn section_network(s: UiSignals, tx: Sender<Action>) -> Element {
+    let ip_tx = tx.clone();
+    let doh_tx = tx.clone();
+    let reset_tx = tx.clone();
     Element::col()
         .width_match()
         .spacing(12)
@@ -533,80 +543,6 @@ fn section_network(s: UiSignals, tx: Sender<Action>) -> Element {
             )
             .width_match(),
         )
-}
-
-fn image_relay_toggle(
-    _s: &UiSignals,
-    label: &'static str,
-    hint: &'static str,
-    key: &'static str,
-    value: Signal<bool>,
-    tx: Sender<Action>,
-) -> Element {
-    toggle_row(label, hint, signal(String::new()), value, move |_, v| {
-        let _ = tx.send(Action::SaveBool(key.to_string(), v));
-    })
-}
-
-fn relay_toggle(
-    _s: &UiSignals,
-    label: &'static str,
-    hint: &'static str,
-    key: &'static str,
-    value: Signal<bool>,
-    tx: Sender<Action>,
-) -> Element {
-    toggle_row(label, hint, signal(String::new()), value, move |_, v| {
-        let _ = tx.send(Action::SaveBool(key.to_string(), v));
-    })
-}
-
-// -- section: 下载与目录 -----------------------------------------------------------
-
-const SEGMENT_LABELS: [&str; 7] = ["2", "3", "4", "5", "6", "7", "8"];
-
-fn threads_row(s: UiSignals, tx: Sender<Action>) -> Element {
-    let mut pills = Element::row().spacing(6);
-    for (i, label) in SEGMENT_LABELS.iter().enumerate() {
-        let n = i + 2;
-        let active = s.cfg_download_segments.map(move |v| *v == n as i32);
-        let tx_n = tx.clone();
-        pills = pills.child(
-            choice_pill(label, active)
-                .width(44)
-                .on_click(move |_| {
-                    let _ = tx_n.send(Action::SaveString(
-                        "advanced.download.segments".into(),
-                        n.to_string(),
-                    ));
-                }),
-        );
-    }
-    Element::row()
-        .width_match()
-        .height(52)
-        .padding_xy(16, 0)
-        .cross(Align::Center)
-        .spacing(12)
-        .child(
-            Element::label("下载线程")
-                .width(132)
-                .font_size(13.0)
-                .fg(theme::TEXT),
-        )
-        .child(Element::flex_spacer())
-        .child(pills)
-}
-
-fn section_downloads(s: UiSignals, tx: Sender<Action>) -> Element {
-    let mirror_tx = tx.clone();
-    let enable_tx = tx.clone();
-    let ip_tx = tx.clone();
-    let doh_tx = tx.clone();
-    let reset_tx = tx.clone();
-    Element::col()
-        .width_match()
-        .spacing(12)
         .child(subhead("远程目录"))
         .child(
             card(
@@ -638,75 +574,162 @@ fn section_downloads(s: UiSignals, tx: Sender<Action>) -> Element {
                             .padding_xy(16, 0)
                             .cross(Align::Center)
                             .child(Element::flex_spacer())
-                            .child(
-                                pill_button("还原默认地址").on_click(move |_| {
-                                    let _ = reset_tx.send(Action::ResetCatalogUrls);
-                                }),
-                            ),
+                            .child(pill_button("还原默认地址").on_click(move |_| {
+                                let _ = reset_tx.send(Action::ResetCatalogUrls);
+                            })),
                     ),
-            )
-            .width_match(),
-        )
-        .child(subhead("GitHub 镜像"))
-        .child(
-            card(
-                Element::col()
-                    .width_match()
-                    .child(toggle_row(
-                        "GitHub 镜像加速",
-                        "release 资产与源码包改走第三方镜像（仅公开仓库）",
-                        signal(String::new()),
-                        s.cfg_download_mirror,
-                        move |_, v| {
-                            let _ = mirror_tx.send(Action::SaveBool(
-                                "advanced.download.mirrorSource".into(),
-                                v,
-                            ));
-                        },
-                    ))
-                    .child(field_row_fill(
-                        &s,
-                        "镜像列表",
-                        "留空则停用",
-                        "advanced.download.mirrorSource",
-                        s.cfg_mirror_source,
-                        "https://…",
-                        tx.clone(),
-                    )),
-            )
-            .width_match(),
-        )
-        .child(subhead("分段下载"))
-        .child(
-            card(
-                Element::col()
-                    .width_match()
-                    .child(toggle_row(
-                        "启用分段下载",
-                        "大文件分块并行拉取；仅对 ≥ 2 MiB 且支持 Range 的下载生效",
-                        signal(String::new()),
-                        s.cfg_download_enabled,
-                        move |_, v| {
-                            let _ = enable_tx.send(Action::SaveBool(
-                                "advanced.download.enabled".into(),
-                                v,
-                            ));
-                        },
-                    ))
-                    .child(threads_row(s.clone(), tx.clone())),
             )
             .width_match(),
         )
 }
 
+fn image_relay_toggle(
+    _s: &UiSignals,
+    label: &'static str,
+    hint: &'static str,
+    key: &'static str,
+    value: Signal<bool>,
+    tx: Sender<Action>,
+) -> Element {
+    toggle_row(label, hint, signal(String::new()), value, move |_, v| {
+        let _ = tx.send(Action::SaveBool(key.to_string(), v));
+    })
+}
+
+fn relay_toggle(
+    _s: &UiSignals,
+    label: &'static str,
+    hint: &'static str,
+    key: &'static str,
+    value: Signal<bool>,
+    tx: Sender<Action>,
+) -> Element {
+    toggle_row(label, hint, signal(String::new()), value, move |_, v| {
+        let _ = tx.send(Action::SaveBool(key.to_string(), v));
+    })
+}
+
+// -- section: 下载 -----------------------------------------------------------
+
+const SEGMENT_LABELS: [&str; 6] = ["2", "3", "4", "6", "8", "12"];
+
+/// The engine tiers the chosen ceiling by route and size; name the scenarios
+/// where it lands lower. Values the pill already shows stay unsaid.
+pub(crate) fn concurrency_caption(value: i32) -> String {
+    let mut parts = Vec::new();
+    if value.min(12) < value {
+        parts.push(format!("大文件 {}", value.min(12)));
+    }
+    if value.min(8) < value {
+        parts.push(format!("小文件 {}", value.min(8)));
+    }
+    if value.min(6) < value {
+        parts.push(format!("镜像 {}", value.min(6)));
+    }
+    parts.join(" · ")
+}
+
+fn threads_row(s: UiSignals, tx: Sender<Action>) -> Element {
+    let mut pills = Element::row().spacing(6);
+    for label in SEGMENT_LABELS.iter() {
+        let n: i32 = label.parse().unwrap();
+        let active = s.cfg_download_segments.map(move |v| *v == n);
+        let tx_n = tx.clone();
+        pills = pills.child(choice_pill(label, active).width(44).on_click(move |_| {
+            let _ = tx_n.send(Action::SaveString(
+                "advanced.download.segments".into(),
+                n.to_string(),
+            ));
+        }));
+    }
+    let caption = s.cfg_download_segments.map(|v| concurrency_caption(*v));
+    let caption_visible = caption.map(|text| !text.is_empty());
+    Element::col()
+        .width_match()
+        .child(
+            Element::row()
+                .width_match()
+                .height(52)
+                .padding_xy(16, 0)
+                .cross(Align::Center)
+                .spacing(12)
+                .child(
+                    Element::label("下载并发")
+                        .width(132)
+                        .font_size(13.0)
+                        .fg(theme::TEXT),
+                )
+                .child(Element::flex_spacer())
+                .child(pills),
+        )
+        .child(
+            Element::col()
+                .width_match()
+                .visible_signal(caption_visible)
+                .child(
+                    Element::row()
+                        .width_match()
+                        .height(26)
+                        .padding_xy(16, 2)
+                        .cross(Align::Center)
+                        .child(Element::flex_spacer())
+                        .child(
+                            Element::label_signal(caption)
+                                .font_size(12.0)
+                                .fg(theme::TEXT_MUTED),
+                        ),
+                ),
+        )
+}
+
+fn section_downloads(s: UiSignals, tx: Sender<Action>) -> Element {
+    let mirror_tx = tx.clone();
+    let mirror_toggle_tx = mirror_tx.clone();
+    let enable_tx = tx;
+    Element::col().width_match().child(
+        card(
+            Element::col()
+                .width_match()
+                .child(toggle_row(
+                    "启用分段下载",
+                    "大文件并行拉取，失败自动回落单流",
+                    signal(String::new()),
+                    s.cfg_download_enabled,
+                    move |_, v| {
+                        let _ =
+                            enable_tx.send(Action::SaveBool("advanced.download.enabled".into(), v));
+                    },
+                ))
+                .child(row_line())
+                .child(threads_row(s.clone(), mirror_tx.clone()))
+                .child(row_line())
+                .child(toggle_row(
+                    "GitHub 镜像加速",
+                    "release 资产与源码包走第三方镜像",
+                    signal(String::new()),
+                    s.cfg_download_mirror,
+                    move |_, v| {
+                        let _ = mirror_toggle_tx
+                            .send(Action::SaveBool("advanced.download.mirrorSource".into(), v));
+                    },
+                ))
+                .child(field_row_fill(
+                    &s,
+                    "镜像列表",
+                    "留空则停用",
+                    "advanced.download.mirrorSource",
+                    s.cfg_mirror_source,
+                    "https://…",
+                    mirror_tx,
+                )),
+        )
+        .width_match(),
+    )
+}
+
 // -- section: 数据与更新 ------------------------------------------------------------
 
-fn data_row(
-    label: &'static str,
-    middle: Element,
-    button: Element,
-    button_width: i32,
-) -> Element {
+fn data_row(label: &'static str, middle: Element, button: Element, button_width: i32) -> Element {
     Element::row()
         .width_match()
         .height(52)
@@ -720,7 +743,12 @@ fn data_row(
                 .fg(theme::TEXT),
         )
         .child(middle)
-        .child(Element::col().width(button_width).cross(Align::Center).child(button))
+        .child(
+            Element::col()
+                .width(button_width)
+                .cross(Align::Center)
+                .child(button),
+        )
 }
 
 fn section_data(s: UiSignals, tx: Sender<Action>) -> Element {
@@ -738,60 +766,56 @@ fn section_data(s: UiSignals, tx: Sender<Action>) -> Element {
     card(
         Element::col()
             .width_match()
-            .child(
-                data_row(
-                    "数据目录",
-                    Element::label_signal(s.cfg_data_dir)
-                        .weight(1.0)
-                        .font_size(11.5)
-                        .font_family(theme::mono_font())
+            .child(data_row(
+                "数据目录",
+                Element::label_signal(s.cfg_data_dir)
+                    .weight(1.0)
+                    .font_size(11.5)
+                    .font_family(theme::mono_font())
+                    .fg(theme::TEXT_SOFT)
+                    .truncate(Truncate::End),
+                pill_button("打开").width(64).on_click(move |_| {
+                    let _ = open_tx.send(Action::OpenDataDir);
+                }),
+                64,
+            ))
+            .child(row_line())
+            .child(data_row(
+                "检查更新",
+                Element::col()
+                    .weight(1.0)
+                    .spacing(2)
+                    .child(
+                        Element::label_signal(s.update_status)
+                            .font_size(12.0)
+                            .fg_role_signal(status_role)
+                            .truncate(Truncate::End),
+                    )
+                    .child(
+                        Element::label(format!(
+                            "客户端版本 {} · Rust Core {}",
+                            s.cfg_version.get(),
+                            s.cfg_core_version.get()
+                        ))
+                        .font_size(10.5)
                         .fg(theme::TEXT_SOFT)
                         .truncate(Truncate::End),
-                    pill_button("打开").width(64).on_click(move |_| {
-                        let _ = open_tx.send(Action::OpenDataDir);
+                    ),
+                Element::button(s.update_button)
+                    .height(28)
+                    .min_width(64)
+                    .corner(5.0)
+                    .font_size(12.0)
+                    .outline()
+                    .on_click(move |_| {
+                        if button_state.get() {
+                            let _ = update_tx.send(Action::OpenUpdate);
+                        } else if !button_checking.get() {
+                            let _ = update_tx.send(Action::CheckUpdate);
+                        }
                     }),
-                    64,
-                ),
-            )
-            .child(row_line())
-            .child(
-                data_row(
-                    "检查更新",
-                    Element::col()
-                        .weight(1.0)
-                        .spacing(2)
-                        .child(
-                            Element::label_signal(s.update_status)
-                                .font_size(12.0)
-                                .fg_role_signal(status_role)
-                                .truncate(Truncate::End),
-                        )
-                        .child(
-                            Element::label(format!(
-                                "客户端版本 {} · Rust Core {}",
-                                s.cfg_version.get(),
-                                s.cfg_core_version.get()
-                            ))
-                            .font_size(10.5)
-                            .fg(theme::TEXT_SOFT)
-                            .truncate(Truncate::End),
-                        ),
-                    Element::button(s.update_button)
-                        .height(28)
-                        .min_width(64)
-                        .corner(5.0)
-                        .font_size(12.0)
-                        .outline()
-                        .on_click(move |_| {
-                            if button_state.get() {
-                                let _ = update_tx.send(Action::OpenUpdate);
-                            } else if !button_checking.get() {
-                                let _ = update_tx.send(Action::CheckUpdate);
-                            }
-                        }),
-                    72,
-                ),
-            ),
+                72,
+            )),
     )
     .width_match()
 }
@@ -907,17 +931,15 @@ pub fn view(s: UiSignals, tx: Sender<Action>) -> Element {
                 .spacing(18)
                 .child(section_nav(s.clone(), tx.clone()))
                 .child(
-                    Element::scroll()
-                        .weight(1.0)
-                        .child(
-                            Element::col()
-                                .width_match()
-                                .spacing(12)
-                                .child(section_title_block(s.clone()))
-                                .child(Element::leaf().height(4))
-                                .child(pages)
-                                .child(error_banner(s)),
-                        ),
+                    Element::scroll().weight(1.0).child(
+                        Element::col()
+                            .width_match()
+                            .spacing(12)
+                            .child(section_title_block(s.clone()))
+                            .child(Element::leaf().height(4))
+                            .child(pages)
+                            .child(error_banner(s)),
+                    ),
                 ),
         )
 }

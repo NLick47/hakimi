@@ -279,15 +279,11 @@ pub(crate) fn settings_values(config: &Value) -> SettingsValues {
         .and_then(|download| download.get("segments"))
         .and_then(Value::as_u64)
         .unwrap_or(download_defaults.segments as u64)
-        .clamp(2, 8);
+        .clamp(2, 12);
     let relay = config
         .get("advanced")
         .and_then(|advanced| advanced.get("relay"));
-    let relay_field = |key: &str| {
-        relay
-            .map(|value| text(value, key))
-            .unwrap_or_default()
-    };
+    let relay_field = |key: &str| relay.map(|value| text(value, key)).unwrap_or_default();
     let startup = config
         .get("advanced")
         .and_then(|advanced| advanced.get("startup"));
@@ -434,9 +430,9 @@ fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Opti
                 let segments: usize = value
                     .trim()
                     .parse()
-                    .context("下载线程需为 2–8 之间的整数")?;
-                if !(2..=8).contains(&segments) {
-                    bail!("下载线程需在 2–8 之间");
+                    .context("下载并发需为 2–12 之间的整数")?;
+                if !(2..=12).contains(&segments) {
+                    bail!("下载并发需在 2–12 之间");
                 }
                 config.advanced.download.segments = segments;
             }
@@ -462,9 +458,7 @@ fn apply_setting_string(runtime: &HakimiRuntime, key: &str, value: &str) -> Opti
             "advanced.http1Hosts" => {
                 config.advanced.http1_hosts = split_entries(value);
             }
-            "advanced.imageRelays.pixiv.base" => {
-                pixiv_image_relay(config).base = value.to_string()
-            }
+            "advanced.imageRelays.pixiv.base" => pixiv_image_relay(config).base = value.to_string(),
             "advanced.imageRelays.pixiv.hosts" => {
                 pixiv_image_relay(config).hosts = split_entries(value);
             }
@@ -978,21 +972,36 @@ impl Ui {
         // row (and re-decodes every logo) on each idle tick — the source of
         // scroll jank. A no-op tick must touch zero signals.
         let set_str = |sig: Signal<String>, value: String| {
-            if sig.get() != value { sig.set(value); }
+            if sig.get() != value {
+                sig.set(value);
+            }
         };
         let set_i32 = |sig: Signal<i32>, value: i32| {
-            if sig.get() != value { sig.set(value); }
+            if sig.get() != value {
+                sig.set(value);
+            }
         };
         let set_bool = |sig: Signal<bool>, value: bool| {
-            if sig.get() != value { sig.set(value); }
+            if sig.get() != value {
+                sig.set(value);
+            }
         };
         set_str(s.stat_sites, snap.sites.len().to_string());
-        set_str(s.stat_enabled, snap.sites.iter().filter(|site| site.enabled).count().to_string());
+        set_str(
+            s.stat_enabled,
+            snap.sites
+                .iter()
+                .filter(|site| site.enabled)
+                .count()
+                .to_string(),
+        );
         set_str(s.stat_domains, domains.to_string());
         set_str(s.stat_slow, slow.to_string());
         set_str(s.stat_bad, bad.to_string());
         let all_selected = !snap.sites.is_empty() && snap.sites.iter().all(|site| site.enabled);
-        if s.sites.get() != snap.sites { s.sites.set(snap.sites); }
+        if s.sites.get() != snap.sites {
+            s.sites.set(snap.sites);
+        }
         set_str(s.status_subtitle, snap.subtitle);
         set_str(s.sites_summary, snap.sites_summary);
         set_bool(s.running, snap.running);
@@ -1000,8 +1009,12 @@ impl Ui {
         set_i32(s.stat_doh_tone, snap.net_doh_tone);
         set_str(s.stat_mirror, snap.net_mirror);
         set_i32(s.stat_mirror_tone, snap.net_mirror_tone);
-        if s.doh_rows.get() != snap.doh_rows { s.doh_rows.set(snap.doh_rows); }
-        if s.mirror_rows.get() != snap.mirror_rows { s.mirror_rows.set(snap.mirror_rows); }
+        if s.doh_rows.get() != snap.doh_rows {
+            s.doh_rows.set(snap.doh_rows);
+        }
+        if s.mirror_rows.get() != snap.mirror_rows {
+            s.mirror_rows.set(snap.mirror_rows);
+        }
 
         // Settings fields are rewritten only when the configuration actually
         // changed. Comparing values is not enough: clearing a field makes the
@@ -1060,7 +1073,10 @@ impl Ui {
         // Windows can disable the Startup entry from Task Manager without
         // touching the file; surface it instead of claiming it will run.
         let warning = if st.auto_start {
-            autostart::login_state().problem().unwrap_or_default().to_string()
+            autostart::login_state()
+                .problem()
+                .unwrap_or_default()
+                .to_string()
         } else {
             String::new()
         };
@@ -1346,7 +1362,11 @@ impl Ui {
                     let _ = tx.send(Action::OpenSite(url));
                 }
             }
-            Action::UpdateResult { status, available, url } => {
+            Action::UpdateResult {
+                status,
+                available,
+                url,
+            } => {
                 s_update_signals(s, false, &status, available, url);
             }
             Action::EnvChanged(env) => {
@@ -1372,7 +1392,11 @@ impl Ui {
                     tracing::warn!(error = %message, "tray startup toggle failed");
                 }
                 s.cfg_error.set(error.clone().unwrap_or_default());
-                s.cfg_error_key.set(if error.is_some() { key.to_string() } else { String::new() });
+                s.cfg_error_key.set(if error.is_some() {
+                    key.to_string()
+                } else {
+                    String::new()
+                });
                 self.refresh();
             }
             Action::OpenEditor(id) => {
@@ -1393,36 +1417,29 @@ impl Ui {
                             String::new()
                         });
                         s.editor_deletable.set(!builtins.contains(&group.id));
-                        let rows: Vec<EditorRowState> =
-                            app_state::with_editor_rows(|| {
-                                group
-                                    .domains
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, rule)| {
-                                        let (preset, sni, custom) = match &rule.route {
-                                            None => (0, String::new(), String::new()),
-                                            Some(route) if route == &RoutePolicy::direct() => {
-                                                (1, String::new(), String::new())
-                                            }
-                                            Some(route) if route == &RoutePolicy::ech_shared() => {
-                                                (2, String::new(), String::new())
-                                            }
-                                            Some(route) => match domain_sni_hosts(route) {
-                                                Some(hosts) => (3, hosts.join(", "), String::new()),
-                                                None => (4, String::new(), format_route(route)),
-                                            },
-                                        };
-                                        EditorRowState::new(
-                                            i,
-                                            &rule.pattern,
-                                            preset,
-                                            &sni,
-                                            &custom,
-                                        )
-                                    })
-                                    .collect()
-                            });
+                        let rows: Vec<EditorRowState> = app_state::with_editor_rows(|| {
+                            group
+                                .domains
+                                .iter()
+                                .enumerate()
+                                .map(|(i, rule)| {
+                                    let (preset, sni, custom) = match &rule.route {
+                                        None => (0, String::new(), String::new()),
+                                        Some(route) if route == &RoutePolicy::direct() => {
+                                            (1, String::new(), String::new())
+                                        }
+                                        Some(route) if route == &RoutePolicy::ech_shared() => {
+                                            (2, String::new(), String::new())
+                                        }
+                                        Some(route) => match domain_sni_hosts(route) {
+                                            Some(hosts) => (3, hosts.join(", "), String::new()),
+                                            None => (4, String::new(), format_route(route)),
+                                        },
+                                    };
+                                    EditorRowState::new(i, &rule.pattern, preset, &sni, &custom)
+                                })
+                                .collect()
+                        });
                         s.editor_rows.set(rows);
                     }
                     None => {
@@ -1500,17 +1517,15 @@ impl Ui {
                     Err(error) => s.editor_error.set(format!("{error:#}")),
                 }
             }
-            Action::DeleteSite(id) => {
-                match runtime.remove_group(&id) {
-                    Ok(_) => {
-                        tracing::info!(id = %id, "site removed");
-                        s.editor_open.set(false);
-                        s.editor_error.set(String::new());
-                        self.refresh();
-                    }
-                    Err(error) => s.editor_error.set(format!("{error:#}")),
+            Action::DeleteSite(id) => match runtime.remove_group(&id) {
+                Ok(_) => {
+                    tracing::info!(id = %id, "site removed");
+                    s.editor_open.set(false);
+                    s.editor_error.set(String::new());
+                    self.refresh();
                 }
-            }
+                Err(error) => s.editor_error.set(format!("{error:#}")),
+            },
             Action::ResetCatalogUrls => {
                 let defaults = hakimi_core::config::CatalogSources::default();
                 let result = runtime.config().mutate(|config| {
@@ -1553,26 +1568,48 @@ impl Ui {
                     true,
                     release.url,
                 ),
-                Ok(update::CheckOutcome::UpToDate) => ("已是最新版本".to_string(), false, String::new()),
+                Ok(update::CheckOutcome::UpToDate) => {
+                    ("已是最新版本".to_string(), false, String::new())
+                }
                 Err(error) => {
                     tracing::info!(error = %format!("{error:#}"), "the update check failed");
                     ("暂时无法检查更新".to_string(), false, String::new())
                 }
             };
             in_flight.store(false, Ordering::SeqCst);
-            let _ = tx.send(Action::UpdateResult { status, available, url });
+            let _ = tx.send(Action::UpdateResult {
+                status,
+                available,
+                url,
+            });
         });
     }
 }
 
 /// Write all update-related signals in one place, only on the UI thread.
 fn s_update_signals(s: &UiSignals, checking: bool, status: &str, available: bool, url: String) {
-    if s.update_checking.get() != checking { s.update_checking.set(checking); }
-    if s.update_status.get() != status { s.update_status.set(status.to_string()); }
-    if s.update_available.get() != available { s.update_available.set(available); }
-    if s.release_url.get() != url { s.release_url.set(url); }
-    let label = if available { "下载" } else if checking { "检查中…" } else { "检查" };
-    if s.update_button.get() != label { s.update_button.set(label.to_string()); }
+    if s.update_checking.get() != checking {
+        s.update_checking.set(checking);
+    }
+    if s.update_status.get() != status {
+        s.update_status.set(status.to_string());
+    }
+    if s.update_available.get() != available {
+        s.update_available.set(available);
+    }
+    if s.release_url.get() != url {
+        s.release_url.set(url);
+    }
+    let label = if available {
+        "下载"
+    } else if checking {
+        "检查中…"
+    } else {
+        "检查"
+    };
+    if s.update_button.get() != label {
+        s.update_button.set(label.to_string());
+    }
 }
 
 fn maybe_auto_update(ui: &Ui) {
@@ -1730,9 +1767,7 @@ fn run_resident(mut app: App, ui: std::rc::Rc<Ui>, tx: Sender<Action>, start_hid
         }
         // Only UI-originated memory: the proxy runtime is untouched. No-op
         // while a window is open or after the chain was already released.
-        if !window_open(MAIN_WINDOW_KEY)
-            && windui::platform::release_shared_device_if_idle()
-        {
+        if !window_open(MAIN_WINDOW_KEY) && windui::platform::release_shared_device_if_idle() {
             tracing::info!("released the shared UI device caches");
         }
         tick_ui
@@ -1749,7 +1784,9 @@ fn run_resident(mut app: App, ui: std::rc::Rc<Ui>, tx: Sender<Action>, start_hid
         set_dock_visible(true);
         app = app.start_window(main_window_request(ui.clone(), tx.clone()));
     }
-    app = app.screenshot_window(main_window_request(ui.clone(), tx)).screenshot_from_args();
+    app = app
+        .screenshot_window(main_window_request(ui.clone(), tx))
+        .screenshot_from_args();
 
     if !app.run_resident() {
         tracing::error!("resident mode could not start");
@@ -1838,7 +1875,9 @@ fn main() -> Result<()> {
     // Single instance: a second long-running app would fight over the proxy port.
     let instance_dir = match data_dir() {
         Some(dir) => dir,
-        None => hakimi_core::paths::Paths::default_location()?.root().to_path_buf(),
+        None => hakimi_core::paths::Paths::default_location()?
+            .root()
+            .to_path_buf(),
     };
     // Hold the guard for the whole process: dropping it would release the
     // advisory lock and let a second app fight over the proxy port.
