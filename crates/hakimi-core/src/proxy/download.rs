@@ -27,6 +27,8 @@ use crate::config::AppConfig;
 use http_body_util::BodyExt;
 
 const MIB: u64 = 1024 * 1024;
+/// The eligibility floor below which a range probe costs more than it saves
+const HARD_FLOOR: u64 = 256 * 1024;
 /// Cap on finished-but-undelivered chunks; segment connections pause above it
 const BACKLOG_CHUNKS: usize = 8;
 /// Per-chunk attempt cap; a re-dial can pick a different IP
@@ -38,6 +40,18 @@ const STREAM_CHUNK: u64 = 0;
 /// The shared counter starts after [`STREAM_CHUNK`] so no other worker can
 /// claim the streaming chunk out from under the stream.
 const NEXT_AFTER_STREAM_CHUNK: u64 = STREAM_CHUNK + 1;
+/// Mirror hosts reject bursts of range requests: ghfast answers 429 at 8+
+const MIRROR_SEGMENT_CAP: usize = 6;
+/// Direct downloads below the tier line share this cap
+const DIRECT_SEGMENT_CAP: usize = 8;
+/// Large direct downloads scale to this
+const DIRECT_SEGMENT_MAX: usize = 12;
+/// Files at or above this size reach for the widest direct split
+const SEGMENT_TIER_BYTES: u64 = 8 * MIB;
+/// An auto-shrunk chunk never goes below this: header RTT would dominate
+const AUTO_CHUNK_FLOOR: u64 = 256 * 1024;
+/// A failed chunk waits this long per attempt before re-dialling
+const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 pub struct DownloadManager {
     slots: Arc<Semaphore>,
@@ -94,12 +108,15 @@ fn headers_eligible(
 /// Content-Length, advertised byte ranges and no content encoding. Returns
 /// the body length when the response qualifies.
 pub(crate) fn response_eligible<B>(response: &http::Response<B>) -> Option<u64> {
-    response_eligible_from(response, MIB)
+    response_eligible_from(response, HARD_FLOOR)
 }
 
 /// Same gate with a caller-chosen size floor. Image CDNs qualify far below the
 /// archive floor, so the shared helper cannot bake in one MiB.
-pub(crate) fn response_eligible_from<B>(response: &http::Response<B>, min_size: u64) -> Option<u64> {
+pub(crate) fn response_eligible_from<B>(
+    response: &http::Response<B>,
+    min_size: u64,
+) -> Option<u64> {
     let headers = response.headers();
     if content_encoded(headers) {
         return None;
@@ -375,7 +392,7 @@ pub(crate) fn segment_eligible(
     if !is_get || has_range {
         return false;
     }
-    // a 1 MiB hard floor rejects most traffic before the config snapshot is paid for
+    // a hard floor keeps page-sized traffic from paying for the config snapshot
     let Some(len) = response_eligible(response) else {
         return false;
     };
@@ -387,6 +404,32 @@ pub(crate) fn segment_eligible(
         return false;
     }
     candidate_uri(rule_uri)
+}
+
+/// Chunk size, chunk count and connection count for one download.
+///
+/// The config value is a ceiling: mirror downloads stay at 6, direct ones
+/// tier at 8 below the size line and 12 above
+fn plan_download(
+    total_len: u64,
+    cfg_segments: usize,
+    cfg_chunk_bytes: u64,
+    mirrored: bool,
+) -> (u64, u64, usize) {
+    let cap = if mirrored {
+        MIRROR_SEGMENT_CAP
+    } else if total_len >= SEGMENT_TIER_BYTES {
+        DIRECT_SEGMENT_MAX
+    } else {
+        DIRECT_SEGMENT_CAP
+    };
+    let seg_target = cfg_segments.clamp(2, DIRECT_SEGMENT_MAX).min(cap);
+    let chunk_len = cfg_chunk_bytes
+        .max(64 * 1024)
+        .min((total_len / ((seg_target * 2) as u64)).max(AUTO_CHUNK_FLOOR));
+    let chunks_total = total_len.div_ceil(chunk_len).max(1);
+    let segments = seg_target.min(chunks_total as usize);
+    (chunk_len, chunks_total, segments)
 }
 
 /// Single cursor: every segment claims the next chunk near the consumer, so N
@@ -698,6 +741,8 @@ impl Worker {
                         ));
                     }
                     tracing::debug!(host = %self.shared.host, index, attempts, %reason, "retrying download chunk");
+                    // a quota window outlives an immediate re-dial: give it a beat to clear
+                    tokio::time::sleep(RETRY_BACKOFF * attempts).await;
                 }
             }
         }
@@ -1149,30 +1194,15 @@ pub(crate) async fn segment(
     let sliceable = total_len > 0
         && response.status() == StatusCode::OK
         && !content_encoded(response.headers());
-    let ranges_ok = sliceable
-        && if mirrored {
-            !prefix.is_empty()
-                && mirror_range_ok(ctx, &uri, &range_headers, &response, prefix).await
-        } else {
-            // `Accept-Ranges` is only an advertisement: a server (or a proxy
-            // in front of it) can answer a range request with the whole body,
-            // and the first such reply aborted the download after chunk 0 was
-            // already on the wire. Probe while the original response is still
-            // unread; a failure falls back to that response as a single stream
-            // below instead of killing it.
-            //
-            // Images pay this probe too. It costs one handshake, but a false
-            // positive would fail the whole image once the segmented path
-            // started, and a broken image is worse than a slow one.
-            probe_range_support(ctx, &uri, &range_headers, &response, None).await
-        };
-    if !ranges_ok {
+    let (chunk_len, chunks_total, segments) =
+        plan_download(total_len, download.segments, download.chunk_bytes, mirrored);
+    if !sliceable || chunks_total < 2 {
         tracing::info!(
             host = uri.host().unwrap_or(""),
-            reason = if mirrored {
-                "mirror does not support ranges or the body is not sliceable"
+            reason = if !sliceable {
+                "the body is not sliceable"
             } else {
-                "the body is not sliceable or the origin did not honour a range probe"
+                "the file cannot split into two chunks"
             },
             "falling back to a single stream"
         );
@@ -1183,10 +1213,38 @@ pub(crate) async fn segment(
             ProxyBody::upstream(body, uri, StatusCode::OK, ctx.upstream.clone(), None),
         );
     }
-
-    let chunk_len = download.chunk_bytes.max(64 * 1024);
-    let chunks_total = total_len.div_ceil(chunk_len).max(1);
-    let segments = download.segments.clamp(2, 8).min(chunks_total as usize);
+    let ranges_ok = if mirrored {
+        !prefix.is_empty() && mirror_range_ok(ctx, &uri, &range_headers, &response, prefix).await
+    } else {
+        // `Accept-Ranges` is only an advertisement: a server (or a proxy
+        // in front of it) can answer a range request with the whole body,
+        // and the first such reply aborted the download after chunk 0 was
+        // already on the wire. Probe while the original response is still
+        // unread; a failure falls back to that response as a single stream
+        // below instead of killing it.
+        //
+        // Images pay this probe too. It costs one handshake, but a false
+        // positive would fail the whole image once the segmented path
+        // started, and a broken image is worse than a slow one.
+        probe_range_support(ctx, &uri, &range_headers, &response, None).await
+    };
+    if !ranges_ok {
+        tracing::info!(
+            host = uri.host().unwrap_or(""),
+            reason = if mirrored {
+                "the mirror does not support ranges"
+            } else {
+                "the origin did not honour a range probe"
+            },
+            "falling back to a single stream"
+        );
+        let (mut parts, body) = response.into_parts();
+        super::upstream::sanitize_response_headers(&mut parts.headers, false);
+        return Response::from_parts(
+            parts,
+            ProxyBody::upstream(body, uri, StatusCode::OK, ctx.upstream.clone(), None),
+        );
+    }
 
     let (mut parts, body) = response.into_parts();
     super::upstream::sanitize_response_headers(&mut parts.headers, false);
@@ -1310,8 +1368,9 @@ mod tests {
     use super::{
         candidate_uri, claim, content_encoded, credential_headers, expected_chunk_len,
         github_artifact_entry, headers_eligible, host_header, mirror_candidate, mirror_origins,
-        parse_content_range, range_request_headers, response_eligible, response_eligible_from,
-        run_merger, signed_url, Shared, Source, Worker, MIB, NEXT_AFTER_STREAM_CHUNK,
+        parse_content_range, plan_download, range_request_headers, response_eligible,
+        response_eligible_from, run_merger, signed_url, Shared, Source, Worker, MIB,
+        NEXT_AFTER_STREAM_CHUNK,
     };
     use crate::cache::{CacheManager, LastGoodEntry};
     use crate::catalog::RemoteIpProvider;
@@ -1329,12 +1388,12 @@ mod tests {
     use http_body_util::Full;
     use hyper::body::Incoming;
     use hyper_util::rt::TokioIo;
+    use parking_lot::Mutex;
     use std::future::Future;
     use std::net::IpAddr;
     use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::sync::Arc;
     use std::task::{Context, Poll};
-    use parking_lot::Mutex;
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -1376,9 +1435,10 @@ mod tests {
         assert!(mirror_origins(&config, &mirrors, &Method::GET, &page).is_none());
     }
 
-    /// The shared header gate defaults to one MiB. If the image branch used it,
-    /// every artwork would be rejected before the lower image floor was even
-    /// consulted — which is exactly what happened on the first attempt.
+    /// The shared header gate floor dropped to 256 KiB: the route experiment
+    /// measured a 1.9 MiB asset at 86 s single-stream against 8.5 s split, so
+    /// sub-megabyte release assets belong on the segmented path too. A
+    /// caller-chosen floor still rules wherever one is passed.
     #[test]
     fn the_header_gate_accepts_an_artwork_sized_body() {
         let build = |len: &str| {
@@ -1393,14 +1453,15 @@ mod tests {
             response
         };
         let artwork = 441_990u64;
-        assert!(
-            response_eligible(&build(&artwork.to_string())).is_none(),
-            "the archive floor must still reject a 442 KiB body"
+        assert_eq!(
+            response_eligible(&build(&artwork.to_string())),
+            Some(artwork),
+            "the 256 KiB hard floor must admit a 442 KiB body"
         );
         assert_eq!(
-            response_eligible_from(&build(&artwork.to_string()), 256 * 1024),
-            Some(artwork),
-            "the image floor must let the same body through"
+            response_eligible_from(&build(&artwork.to_string()), MIB),
+            None,
+            "a caller raising the floor must still be honoured"
         );
     }
 
@@ -1643,9 +1704,11 @@ mod tests {
         assert!(headers_eligible(StatusCode::OK, Some("1024"), Some("bytes"), MIB).is_none());
         assert!(headers_eligible(StatusCode::OK, Some("1048576"), Some("none"), MIB).is_none());
         assert!(headers_eligible(StatusCode::OK, Some("abc"), Some("bytes"), MIB).is_none());
-        // below the configured threshold but above the 1 MiB floor: the caller
+        // below the configured threshold but above the hard floor: the caller
         // applies the config on top
-        assert!(headers_eligible(StatusCode::OK, Some("2097152"), Some("bytes"), 4 * MIB).is_none());
+        assert!(
+            headers_eligible(StatusCode::OK, Some("2097152"), Some("bytes"), 4 * MIB).is_none()
+        );
     }
 
     /// The mirror failover hands its candidate straight to `segment()`; a
@@ -1653,26 +1716,27 @@ mod tests {
     /// would end up empty while the merger waits for chunks that never come.
     #[test]
     fn response_eligible_requires_a_sliceable_body() {
-        let build = |status: StatusCode, len: Option<&str>, ranges: Option<&str>, encoding: &str| {
-            let mut response = Response::new(Full::new(Bytes::new()));
-            *response.status_mut() = status;
-            if let Some(len) = len {
+        let build =
+            |status: StatusCode, len: Option<&str>, ranges: Option<&str>, encoding: &str| {
+                let mut response = Response::new(Full::new(Bytes::new()));
+                *response.status_mut() = status;
+                if let Some(len) = len {
+                    response
+                        .headers_mut()
+                        .insert(header::CONTENT_LENGTH, len.parse().unwrap());
+                }
+                if let Some(ranges) = ranges {
+                    response
+                        .headers_mut()
+                        .insert(header::ACCEPT_RANGES, ranges.parse().unwrap());
+                }
+                if !encoding.is_empty() {
+                    response
+                        .headers_mut()
+                        .insert(header::CONTENT_ENCODING, encoding.parse().unwrap());
+                }
                 response
-                    .headers_mut()
-                    .insert(header::CONTENT_LENGTH, len.parse().unwrap());
-            }
-            if let Some(ranges) = ranges {
-                response
-                    .headers_mut()
-                    .insert(header::ACCEPT_RANGES, ranges.parse().unwrap());
-            }
-            if !encoding.is_empty() {
-                response
-                    .headers_mut()
-                    .insert(header::CONTENT_ENCODING, encoding.parse().unwrap());
-            }
-            response
-        };
+            };
         let ok = build(StatusCode::OK, Some("1048576"), Some("bytes"), "");
         assert_eq!(response_eligible(&ok), Some(1048576));
         // A mirror that answers without Content-Length (or with a redirect or
@@ -1682,11 +1746,21 @@ mod tests {
             None
         );
         assert_eq!(
-            response_eligible(&build(StatusCode::MOVED_PERMANENTLY, Some("1048576"), Some("bytes"), "")),
+            response_eligible(&build(
+                StatusCode::MOVED_PERMANENTLY,
+                Some("1048576"),
+                Some("bytes"),
+                ""
+            )),
             None
         );
         assert_eq!(
-            response_eligible(&build(StatusCode::OK, Some("1048576"), Some("bytes"), "gzip")),
+            response_eligible(&build(
+                StatusCode::OK,
+                Some("1048576"),
+                Some("bytes"),
+                "gzip"
+            )),
             None
         );
     }
@@ -1776,6 +1850,53 @@ mod tests {
         assert_eq!(sum, total);
         assert_eq!(expected_chunk_len(4, chunks_total, chunk_len, total), 1);
         assert_eq!(expected_chunk_len(0, chunks_total, chunk_len, total), 2);
+    }
+
+    /// Every branch is a shape the route experiment actually measured: 8
+    /// connections won near the floor, 12 won on large direct downloads, and
+    /// ghfast refused 8+ connections outright while serving 6 at record pace.
+    #[test]
+    fn the_plan_tiers_by_size_and_mirror() {
+        let plan = plan_download(2 * MIB, 12, 512 * 1024, false);
+        assert_eq!(plan, (256 * 1024, 8, 8));
+
+        let plan = plan_download(13_065_800, 12, 512 * 1024, false);
+        assert_eq!(plan, (512 * 1024, 25, 12));
+
+        let plan = plan_download(13_065_800, 12, 512 * 1024, true);
+        assert_eq!(plan, (512 * 1024, 25, 6));
+
+        let plan = plan_download(7 * MIB, 12, 512 * 1024, false);
+        assert_eq!(plan, (458_752, 16, 8));
+
+        let plan = plan_download(MIB, 12, 512 * 1024, false);
+        assert_eq!(plan, (256 * 1024, 4, 4));
+
+        // below two chunk floors the split degenerates to one chunk: the
+        // caller must skip the probe and stream instead
+        let plan = plan_download(256 * 1024, 12, 512 * 1024, false);
+        assert_eq!(plan, (256 * 1024, 1, 1));
+
+        let plan = plan_download(300 * 1024, 12, 512 * 1024, false);
+        assert_eq!(plan, (256 * 1024, 2, 2));
+    }
+
+    /// The config value is a ceiling, not a promise: a user-pinned 4 is
+    /// honoured, an explicit chunk size wins over the auto-shrink floor, and
+    /// a count of one folds to the parallelism floor.
+    #[test]
+    fn the_config_value_is_a_ceiling_not_a_promise() {
+        let plan = plan_download(13_065_800, 4, 512 * 1024, true);
+        assert_eq!(plan, (512 * 1024, 25, 4));
+
+        let plan = plan_download(13_065_800, 12, 128 * 1024, false);
+        assert_eq!(plan, (128 * 1024, 100, 12));
+
+        let plan = plan_download(13_065_800, 1, 512 * 1024, false);
+        assert_eq!(plan, (512 * 1024, 25, 2));
+
+        let plan = plan_download(1024 * MIB, 12, 512 * 1024, false);
+        assert_eq!(plan, (512 * 1024, 2048, 12));
     }
 
     #[test]
@@ -1943,7 +2064,10 @@ mod tests {
             .await
             .expect("chunk 0 must be delivered");
         let acquired = tokio::time::timeout(Duration::from_secs(5), worker.wait_backlog()).await;
-        assert!(matches!(acquired, Ok(true)), "a delivered slot must free a worker");
+        assert!(
+            matches!(acquired, Ok(true)),
+            "a delivered slot must free a worker"
+        );
         assert_eq!(backlog.available_permits(), 0);
 
         shared.set_fatal("stop test merger");

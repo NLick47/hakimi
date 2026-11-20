@@ -376,7 +376,7 @@ pub struct DownloadConfig {
     pub enabled: bool,
     /// Responses below this size stay on one connection
     pub min_size_bytes: u64,
-    /// Segment connections, clamped to 2..=8 at use
+    /// Segment connections, clamped to 2..=12 at use
     pub segments: usize,
     /// Dynamic chunk size: a slow connection simply claims fewer chunks
     pub chunk_bytes: u64,
@@ -396,13 +396,12 @@ impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            // a few MB on a slow link takes minutes on one connection
-            min_size_bytes: 2 * 1024 * 1024,
-            // The first chunk streams single-connection for about one chunk
-            // duration, so a smaller chunk shortens the 1x phase; a larger one
-            // makes completion arrive in sparse bursts and the progress bar
-            // oscillates between 0 and a jump.
-            segments: 6,
+            // below two chunk floors a split degenerates to one stream, so the
+            // floor keeps the range probe off files that cannot be split
+            min_size_bytes: 512 * 1024,
+            // The engine tiers this ceiling by route and size: mirrors stay at
+            // 6, small direct downloads at 8, large direct ones reach 12
+            segments: 12,
             // Each chunk is one HTTP request. At 128 KiB a 10 MB asset paid
             // ~80 round trips, so on a 300–450 ms link the request latency
             // dominated and six connections could not fill the pipe. 512 KiB
@@ -1043,14 +1042,14 @@ impl AppConfig {
         }
         // Rebuild the group index. A duplicated id keeps the first group, the
         // same one a linear scan would have found.
-        self.group_index = self
-            .groups
-            .iter()
-            .enumerate()
-            .fold(HashMap::new(), |mut index, (position, group)| {
-                index.entry(group.id.clone()).or_insert(position);
-                index
-            });
+        self.group_index =
+            self.groups
+                .iter()
+                .enumerate()
+                .fold(HashMap::new(), |mut index, (position, group)| {
+                    index.entry(group.id.clone()).or_insert(position);
+                    index
+                });
     }
 
     /// Image relays are hand-editable, so every rule is checked here instead of
@@ -1059,7 +1058,8 @@ impl AppConfig {
         if self.advanced.image_relays.len() > 8 {
             bail!("advanced.imageRelays supports at most 8 rules");
         }
-        let mut mapped: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut mapped: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for rule in &self.advanced.image_relays {
             let id = rule.id.trim();
@@ -1085,9 +1085,7 @@ impl AppConfig {
                 let pattern = DomainPattern::parse(host).with_context(|| {
                     format!("invalid advanced.imageRelays.{id}.hosts entry `{host}`")
                 })?;
-                if let Some(previous) =
-                    mapped.insert(pattern.as_str().to_owned(), id.to_owned())
-                {
+                if let Some(previous) = mapped.insert(pattern.as_str().to_owned(), id.to_owned()) {
                     bail!("host `{host}` is mapped by both `{previous}` and `{id}`");
                 }
             }
@@ -2370,17 +2368,18 @@ mod tests {
             "originals and the page previews are relayed, thumbnails are not"
         );
         assert_eq!(rule.base, ImageRelayRule::pixiv_default().base);
-        assert!(rule.fallback_direct, "a dead relay must not blank the image");
+        assert!(
+            rule.fallback_direct,
+            "a dead relay must not blank the image"
+        );
 
         // Defaults are re-applied on load, so they never reach the file: an
         // install that never touches this card keeps a config without it.
         let persisted = sanitized_persisted_value(&config);
-        assert!(
-            persisted
-                .get("advanced")
-                .and_then(|advanced| advanced.get("imageRelays"))
-                .is_none()
-        );
+        assert!(persisted
+            .get("advanced")
+            .and_then(|advanced| advanced.get("imageRelays"))
+            .is_none());
     }
 
     #[test]
@@ -2412,18 +2411,13 @@ mod tests {
         let mut config = AppConfig::default();
         let mut second = image_relay("https://other.example/pximg");
         second.id = "pixiv-2".into();
-        config.advanced.image_relays = vec![
-            image_relay("https://relay.example/pximg"),
-            second,
-        ];
+        config.advanced.image_relays = vec![image_relay("https://relay.example/pximg"), second];
         assert!(config.validate().is_err());
 
         let mut duplicate_id = image_relay("https://other.example/pximg");
         duplicate_id.hosts = vec!["s.pximg.net".into()];
-        config.advanced.image_relays = vec![
-            image_relay("https://relay.example/pximg"),
-            duplicate_id,
-        ];
+        config.advanced.image_relays =
+            vec![image_relay("https://relay.example/pximg"), duplicate_id];
         assert!(config.validate().is_err());
     }
 
@@ -2435,16 +2429,21 @@ mod tests {
         )
         .expect("hand-written rules must parse");
         let rule = &advanced.image_relays[0];
-        assert!(rule.enabled, "a rule that exists is on unless it says otherwise");
-        assert!(rule.fallback_direct, "falling back is what keeps images loading");
+        assert!(
+            rule.enabled,
+            "a rule that exists is on unless it says otherwise"
+        );
+        assert!(
+            rule.fallback_direct,
+            "falling back is what keeps images loading"
+        );
         assert!(rule.referer.is_none());
 
         let mut config = AppConfig::default();
         config.advanced.image_relays = vec![rule.clone()];
         config.canonicalize();
         assert_eq!(
-            config.advanced.image_relays[0].base,
-            "https://relay.example/pximg",
+            config.advanced.image_relays[0].base, "https://relay.example/pximg",
             "a trailing slash would produce `//path`"
         );
     }
@@ -2452,7 +2451,8 @@ mod tests {
     /// One rung per filter class, and no duplicates. The ladder is also what
     /// the plan cache validates against, so the two must be the same list.
     #[test]
-    fn the_global_sni_ladder_covers_each_class_exactly_once() {        let configured = vec!["www.bing.com".to_string()];
+    fn the_global_sni_ladder_covers_each_class_exactly_once() {
+        let configured = vec!["www.bing.com".to_string()];
         assert_eq!(
             global_sni_ladder("Example.COM", &configured),
             vec![
@@ -2949,9 +2949,7 @@ mod tests {
         let base = now();
         for offset in -2i64..=2 {
             let stamp = (base + chrono::Duration::seconds(offset)).format("%Y%m%d-%H%M%S");
-            let _ = std::fs::create_dir(
-                paths.root().join(format!("config.invalid-{stamp}.json")),
-            );
+            let _ = std::fs::create_dir(paths.root().join(format!("config.invalid-{stamp}.json")));
         }
 
         let result = ConfigManager::load_or_create(&paths);
