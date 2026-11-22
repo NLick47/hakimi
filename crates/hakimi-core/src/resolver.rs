@@ -14,6 +14,7 @@ use crate::cache::{CacheManager, CachedAnswer, CachedEch};
 use crate::catalog::CatalogManager;
 use crate::config::{AppConfig, ConfigManager, DohEndpoint};
 use crate::dns::{self, ResolvedAnswer, TYPE_A, TYPE_AAAA, TYPE_HTTPS};
+use crate::domain::normalize_hostname_cow;
 use crate::strategy::DohSource;
 use crate::util::{now, redact_url};
 
@@ -527,108 +528,31 @@ impl Resolver {
         values
     }
 
-    /// Merge every fresh cached A/AAAA answer into one resolution.
-    ///
-    /// The two record types have independent TTLs. Returning the first family
-    /// that happened to be fresh dropped the other one: a dual-stack host lost
-    /// its IPv6 candidate for the whole A TTL, and once the shorter-lived A
-    /// answer expired the resolver served the still-fresh AAAA alone without
-    /// ever re-querying A.
-    fn fresh_ip_resolution(
+    /// Read both families' cached answers once. The merge tiers used to call
+    /// `doh_answer` up to six times per resolution, deep-cloning the
+    /// addresses on every probe; every tier now works on this snapshot.
+    fn cached_families(
         &self,
         domain: &str,
         now: chrono::DateTime<chrono::Utc>,
-    ) -> Option<DohResolution> {
-        let mut ips = Vec::new();
-        let mut ttl = u32::MAX;
-        for qtype in [TYPE_A, TYPE_AAAA] {
+    ) -> [Option<CachedFamily>; 2] {
+        let mut families = [None, None];
+        for (slot, qtype) in families.iter_mut().zip([TYPE_A, TYPE_AAAA]) {
             let Some(answer) = self.cache.doh_answer(domain, qtype) else {
                 continue;
             };
-            if !answer.is_fresh(now) || answer.ips.is_empty() {
-                continue;
-            }
-            ttl = ttl.min(remaining_ttl(&answer, now));
-            for ip in answer.ips {
-                if !ips.contains(&ip) {
-                    ips.push(ip);
-                }
-            }
+            let fresh = answer.is_fresh(now);
+            let remaining_ttl = remaining_ttl(&answer, now);
+            *slot = Some(CachedFamily {
+                now,
+                ips: answer.ips,
+                fresh,
+                remaining_ttl,
+                ttl_secs: answer.ttl_secs,
+                fetched_at: answer.fetched_at,
+            });
         }
-        if ips.is_empty() {
-            return None;
-        }
-        Some(DohResolution {
-            ips,
-            source: DohSource::Cache,
-            endpoint: "cache".to_string(),
-            stale: false,
-            ttl: if ttl == u32::MAX { 0 } else { ttl },
-            fallback_used: false,
-        })
-    }
-
-    /// Select cached IP answers without waiting for DoH. `extra_secs` bounds
-    /// how far past the DNS TTL the answers may be served in the background
-    /// refresh path; `None` is the last-resort fallback used after a live
-    /// failure. Both address families are merged for the same reason as in
-    /// [`Self::fresh_ip_resolution`].
-    fn stale_ip_resolution(
-        &self,
-        domain: &str,
-        at: chrono::DateTime<chrono::Utc>,
-        extra_secs: Option<i64>,
-    ) -> Option<DohResolution> {
-        let mut ips = Vec::new();
-        for qtype in [TYPE_A, TYPE_AAAA] {
-            let Some(answer) = self.cache.doh_answer(domain, qtype) else {
-                continue;
-            };
-            if answer.ips.is_empty() || answer.is_fresh(at) {
-                continue;
-            }
-            if let Some(extra) = extra_secs {
-                if answer.ttl_secs == 0 {
-                    continue;
-                }
-                let age = at.signed_duration_since(answer.fetched_at).num_seconds();
-                if age > answer.ttl_secs as i64 + extra {
-                    continue;
-                }
-            }
-            for ip in answer.ips {
-                if !ips.contains(&ip) {
-                    ips.push(ip);
-                }
-            }
-        }
-        if ips.is_empty() {
-            return None;
-        }
-        Some(DohResolution {
-            ips,
-            source: DohSource::Cache,
-            endpoint: "stale-cache".to_string(),
-            stale: true,
-            ttl: 0,
-            fallback_used: false,
-        })
-    }
-
-    /// True when one of the cached A/AAAA answers has expired.
-    ///
-    /// A fresh answer from one family must not keep the other family's expired
-    /// answer out of the refresh path: the two TTLs are independent, so
-    /// returning early on the fresh one would leave the expired family
-    /// unqueried for up to the longer TTL. Only an entry that actually had
-    /// addresses counts, so an IPv4-only domain (which never caches AAAA) does
-    /// not trigger a background lookup every few seconds.
-    fn cached_family_expired(&self, domain: &str, at: chrono::DateTime<chrono::Utc>) -> bool {
-        [TYPE_A, TYPE_AAAA].into_iter().any(|qtype| {
-            self.cache
-                .doh_answer(domain, qtype)
-                .is_some_and(|answer| !answer.ips.is_empty() && !answer.is_fresh(at))
-        })
+        families
     }
 
     /// Serve the cached answer for `domain`, merging both address families and
@@ -638,10 +562,11 @@ impl Resolver {
         domain: &str,
         at: chrono::DateTime<chrono::Utc>,
     ) -> Option<DohResolution> {
-        let fresh = self.fresh_ip_resolution(domain, at);
-        let stale = self.stale_ip_resolution(domain, at, Some(STALE_WHILE_REVALIDATE_SECS));
+        let families = self.cached_families(domain, at);
+        let fresh = fresh_resolution_from(&families);
+        let stale = stale_resolution_from(&families, Some(STALE_WHILE_REVALIDATE_SECS));
         let resolution = merge_cached_resolutions(fresh, stale)?;
-        if resolution.stale || self.cached_family_expired(domain, at) {
+        if resolution.stale || any_family_expired(&families) {
             self.spawn_ip_refresh(domain.to_owned());
         }
         Some(resolution)
@@ -654,7 +579,8 @@ impl Resolver {
     /// first fresh family here would leave the expired one unqueried until the
     /// fresh family expires as well.
     fn ip_cache_needs_refresh(&self, domain: &str, at: chrono::DateTime<chrono::Utc>) -> bool {
-        self.fresh_ip_resolution(domain, at).is_none() || self.cached_family_expired(domain, at)
+        let families = self.cached_families(domain, at);
+        fresh_resolution_from(&families).is_none() || any_family_expired(&families)
     }
 
     fn fresh_ech(&self, domain: &str) -> Result<Option<EchOutcome>> {
@@ -731,7 +657,10 @@ impl Resolver {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let domain = normalize_query_name(&domain);
+        let Ok(domain) = normalize_hostname_cow(&domain) else {
+            return;
+        };
+        let domain = domain.into_owned();
         // A burst of asset connections can all hit the same stale answer.
         // Without a per-domain gate, each request would spawn another full
         // DoH attempt after the previous one failed, amplifying an outage.
@@ -774,7 +703,10 @@ impl Resolver {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let domain = normalize_query_name(&domain);
+        let Ok(domain) = normalize_hostname_cow(&domain) else {
+            return;
+        };
+        let domain = domain.into_owned();
         let key = format!("ech|{domain}");
         {
             let at = Instant::now();
@@ -812,7 +744,7 @@ impl Resolver {
     /// queried together so a dual-stack host gets IPv6 candidates even when
     /// IPv4 answers (the better default path) exist.
     pub async fn resolve_ips(&self, domain: &str) -> Result<DohResolution> {
-        let domain = normalize_query_name(domain);
+        let domain = normalize_hostname_cow(domain)?;
         let at = now();
 
         // Cached answers from both families are merged. A just-expired answer
@@ -932,12 +864,13 @@ impl Resolver {
 
         // Another request may have completed a refresh while this query was
         // running; prefer that answer over the last-resort stale entry.
-        if let Some(mut resolution) = self.fresh_ip_resolution(domain, now()) {
+        let families = self.cached_families(domain, now());
+        if let Some(mut resolution) = fresh_resolution_from(&families) {
             resolution.fallback_used = fallback_used;
             return Ok(resolution);
         }
 
-        if let Some(mut resolution) = self.stale_ip_resolution(domain, now(), None) {
+        if let Some(mut resolution) = stale_resolution_from(&families, None) {
             resolution.fallback_used = fallback_used;
             return Ok(resolution);
         }
@@ -992,7 +925,7 @@ impl Resolver {
     /// Cloudflare's shared `cloudflare-ech.com` config (the approach used by the Piku
     /// project for Pixiv). This only works for Cloudflare-fronted hostnames.
     pub async fn ech_config(&self, domain: &str, allow_shared: bool) -> Result<EchOutcome> {
-        let domain = normalize_query_name(domain);
+        let domain = normalize_hostname_cow(domain)?;
         if let Some(outcome) = self.fresh_ech(&domain)? {
             return Ok(outcome);
         }
@@ -1000,7 +933,7 @@ impl Resolver {
         // refreshes it in the background. This keeps an expiry off the
         // handshake's critical path instead of blocking on a live query.
         if let Some(outcome) = self.stale_ech(&domain) {
-            self.spawn_ech_refresh(domain.clone(), allow_shared);
+            self.spawn_ech_refresh(domain.to_string(), allow_shared);
             return Ok(outcome);
         }
         let _guard = self.query_lock(format!("ech|{domain}")).await;
@@ -1915,8 +1848,110 @@ fn cooldown_delay(failures: u32) -> Duration {
     (ENDPOINT_COOLDOWN_BASE * 2u32.pow(steps)).min(ENDPOINT_COOLDOWN_MAX)
 }
 
-fn normalize_query_name(domain: &str) -> String {
-    domain.trim().trim_end_matches('.').to_ascii_lowercase()
+/// One family's cached answer, reduced to what the merge tiers need. All
+/// freshness fields are evaluated against one `now`, so the fresh, stale and
+/// expired checks cannot disagree with each other.
+struct CachedFamily {
+    now: chrono::DateTime<chrono::Utc>,
+    ips: Vec<std::net::IpAddr>,
+    fresh: bool,
+    remaining_ttl: u32,
+    ttl_secs: u32,
+    fetched_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Merge every fresh cached A/AAAA answer into one resolution.
+///
+/// The two record types have independent TTLs. Returning the first family
+/// that happened to be fresh dropped the other one: a dual-stack host lost
+/// its IPv6 candidate for the whole A TTL, and once the shorter-lived A
+/// answer expired the resolver served the still-fresh AAAA alone without
+/// ever re-querying A.
+fn fresh_resolution_from(families: &[Option<CachedFamily>; 2]) -> Option<DohResolution> {
+    let mut ips = Vec::new();
+    let mut ttl = u32::MAX;
+    for family in families.iter().flatten() {
+        if !family.fresh || family.ips.is_empty() {
+            continue;
+        }
+        ttl = ttl.min(family.remaining_ttl);
+        for ip in &family.ips {
+            if !ips.contains(ip) {
+                ips.push(*ip);
+            }
+        }
+    }
+    if ips.is_empty() {
+        return None;
+    }
+    Some(DohResolution {
+        ips,
+        source: DohSource::Cache,
+        endpoint: "cache".to_string(),
+        stale: false,
+        ttl: if ttl == u32::MAX { 0 } else { ttl },
+        fallback_used: false,
+    })
+}
+
+/// Select cached IP answers without waiting for DoH. `extra_secs` bounds how
+/// far past the DNS TTL the answers may be served in the background refresh
+/// path; `None` is the last-resort fallback used after a live failure. Both
+/// address families are merged for the same reason as in
+/// [`fresh_resolution_from`].
+fn stale_resolution_from(
+    families: &[Option<CachedFamily>; 2],
+    extra_secs: Option<i64>,
+) -> Option<DohResolution> {
+    let mut ips = Vec::new();
+    for family in families.iter().flatten() {
+        if family.ips.is_empty() || family.fresh {
+            continue;
+        }
+        if let Some(extra) = extra_secs {
+            if family.ttl_secs == 0 {
+                continue;
+            }
+            let age = family
+                .now
+                .signed_duration_since(family.fetched_at)
+                .num_seconds();
+            if age > family.ttl_secs as i64 + extra {
+                continue;
+            }
+        }
+        for ip in &family.ips {
+            if !ips.contains(ip) {
+                ips.push(*ip);
+            }
+        }
+    }
+    if ips.is_empty() {
+        return None;
+    }
+    Some(DohResolution {
+        ips,
+        source: DohSource::Cache,
+        endpoint: "stale-cache".to_string(),
+        stale: true,
+        ttl: 0,
+        fallback_used: false,
+    })
+}
+
+/// True when one of the cached A/AAAA answers has expired.
+///
+/// A fresh answer from one family must not keep the other family's expired
+/// answer out of the refresh path: the two TTLs are independent, so
+/// returning early on the fresh one would leave the expired family
+/// unqueried for up to the longer TTL. Only an entry that actually had
+/// addresses counts, so an IPv4-only domain (which never caches AAAA) does
+/// not trigger a background lookup every few seconds.
+fn any_family_expired(families: &[Option<CachedFamily>; 2]) -> bool {
+    families
+        .iter()
+        .flatten()
+        .any(|family| !family.ips.is_empty() && !family.fresh)
 }
 
 /// Combine a fresh cached answer with a just-expired one. The fresh answer
@@ -1976,6 +2011,7 @@ fn format_ips(ips: &[std::net::IpAddr]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::cache::CacheManager;
     use crate::catalog::CatalogManager;
     use crate::config::ConfigManager;
@@ -2236,8 +2272,9 @@ mod tests {
             vec![v4, v6],
             "the expired IPv4 fallback must survive while AAAA is fresh"
         );
+        let families = resolver.cached_families("github.com", now());
         assert!(
-            resolver.cached_family_expired("github.com", now()),
+            any_family_expired(&families),
             "the expired family has to be refreshed in the background"
         );
         // Let the background refresh observe the closed endpoint and exit.
@@ -2419,23 +2456,20 @@ mod tests {
         });
 
         let at = now();
-        let stale = resolver
-            .stale_ip_resolution("github.com", at, Some(STALE_WHILE_REVALIDATE_SECS))
+        let families = resolver.cached_families("github.com", at);
+        let stale = stale_resolution_from(&families, Some(STALE_WHILE_REVALIDATE_SECS))
             .expect("an expired answer within the grace window must be usable");
         assert!(stale.stale);
         assert_eq!(stale.ips.len(), 1);
 
         let beyond_grace = now() + chrono::Duration::seconds(90);
+        let families = resolver.cached_families("github.com", beyond_grace);
         assert!(
-            resolver
-                .stale_ip_resolution("github.com", beyond_grace, Some(60))
-                .is_none(),
+            stale_resolution_from(&families, Some(60)).is_none(),
             "the stale-while-revalidate path must not serve arbitrarily old answers"
         );
         assert!(
-            resolver
-                .stale_ip_resolution("github.com", beyond_grace, None)
-                .is_some(),
+            stale_resolution_from(&families, None).is_some(),
             "the last-resort path may still use the usable answer"
         );
     }
