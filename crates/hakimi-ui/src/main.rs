@@ -768,7 +768,7 @@ fn network_status(runtime: &HakimiRuntime, settings: &SettingsValues) -> NetStat
     let health = resolver.health_snapshot();
     let (doh, doh_tone) = doh_summary(
         endpoints.len(),
-        health.len(),
+        health.iter().filter(|entry| entry.observed).count(),
         health.iter().filter(|entry| entry.healthy).count(),
     );
     let observations: Vec<DohObservation> = health
@@ -776,6 +776,7 @@ fn network_status(runtime: &HakimiRuntime, settings: &SettingsValues) -> NetStat
         .map(|row| DohObservation {
             url: row.url.clone(),
             healthy: row.healthy,
+            observed: row.observed,
             latency_ms: row.latency_ms,
             last_error: row.last_error.clone(),
         })

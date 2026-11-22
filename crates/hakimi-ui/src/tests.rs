@@ -744,12 +744,12 @@ fn comma_separated_fields_split_on_both_commas() {
     );
 }
 
-/// The status card counts, it does not judge: an endpoint nobody has queried
+/// The status card counts, it does not judge: an endpoint nobody has observed
 /// yet is neutral, never a failure — otherwise the panel flashes red every
 /// time the window opens.
 #[test]
 fn doh_summary_separates_unprobed_from_failed() {
-    assert_eq!(doh_summary(2, 0, 0), ("检测中".to_string(), TONE_NEUTRAL));
+    assert_eq!(doh_summary(2, 0, 0), ("未检测".to_string(), TONE_NEUTRAL));
     assert_eq!(doh_summary(2, 2, 2), ("2/2 可用".to_string(), TONE_OK));
     assert_eq!(
         doh_summary(4, 4, 3),
@@ -799,8 +799,9 @@ fn doh_endpoint(name: &str, url: &str) -> EffectiveEndpoint {
 }
 
 /// A health record is keyed by URL. Matching by name would leave the failed
-/// endpoint reading "检测中" forever, which is exactly what a half-configured
-/// fallback looks like in the panel.
+/// endpoint reading "未检测" forever, which is exactly what a half-configured
+/// fallback looks like in the panel. A synthesized entry (observed=false)
+/// reads the same neutral "未检测" as a missing one.
 #[test]
 fn doh_rows_keep_unprobed_neutral_and_show_the_failure_detail() {
     let endpoints = vec![
@@ -815,20 +816,21 @@ fn doh_rows_keep_unprobed_neutral_and_show_the_failure_detail() {
     assert_eq!(unprobed.len(), 2);
     assert_eq!(
         (unprobed[0].value.as_str(), unprobed[0].tone),
-        ("检测中", TONE_NEUTRAL)
+        ("未检测", TONE_NEUTRAL)
     );
     assert_eq!(unprobed[0].detail, "doh.cleanbrowsing.org");
 
     let observed = vec![DohObservation {
         url: endpoints[1].url.clone(),
         healthy: false,
+        observed: true,
         latency_ms: None,
         last_error: Some("TCP 超时".into()),
     }];
     let rows = doh_entries(&endpoints, &observed);
     assert_eq!(
         (rows[0].value.as_str(), rows[0].tone),
-        ("检测中", TONE_NEUTRAL)
+        ("未检测", TONE_NEUTRAL)
     );
     assert_eq!(
         (rows[1].value.as_str(), rows[1].tone),
@@ -846,6 +848,7 @@ fn doh_rows_format_latency_and_explain_an_empty_config() {
     let observed = vec![DohObservation {
         url: endpoints[0].url.clone(),
         healthy: true,
+        observed: true,
         latency_ms: Some(28),
         last_error: None,
     }];

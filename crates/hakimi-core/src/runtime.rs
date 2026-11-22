@@ -138,6 +138,7 @@ impl StatusProvider {
             "ca": ca,
             "catalogs": catalogs,
             "dohHealth": self.resolver.health_snapshot(),
+            "dohStats": self.resolver.stats_snapshot(),
             "upstream": self.upstream.stats_json(),
             "cache": cache,
             "logDropped": crate::logging::dropped_events(),

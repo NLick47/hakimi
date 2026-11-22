@@ -23,7 +23,7 @@ mod query;
 
 pub use ech::EchOutcome;
 pub use endpoints::EffectiveEndpoint;
-pub use health::DohHealth;
+pub use health::{DohHealth, DohStatsSnapshot};
 pub(crate) use query::doh_lookup_budget;
 
 #[derive(Debug, Clone)]
@@ -71,6 +71,9 @@ pub struct Resolver {
     catalogs: Arc<CatalogManager>,
     clients: Arc<RwLock<HashMap<String, CachedDohClient>>>,
     health: Arc<RwLock<HashMap<String, DohHealth>>>,
+    /// Per-endpoint counters since process start; see
+    /// [`health::DohEndpointStats`] and [`Self::stats_snapshot`].
+    stats: Arc<parking_lot::Mutex<HashMap<String, health::DohEndpointStats>>>,
     query_locks: Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// One stale-answer refresh attempt per domain per window. The map is
     /// bounded like the query locks; entries are cheap and expire quickly.
@@ -94,6 +97,7 @@ impl Resolver {
             catalogs,
             clients: Arc::new(RwLock::new(HashMap::new())),
             health: Arc::new(RwLock::new(HashMap::new())),
+            stats: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             query_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             stale_refresh_after: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             endpoint_cache: Arc::new(RwLock::new(None)),

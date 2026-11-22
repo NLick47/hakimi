@@ -1243,18 +1243,35 @@ pub(crate) fn diagnostics_error_page(
         suggestions.push_str("</ul>");
     }
     let health = ctx.resolver.health_snapshot();
+    let stats_rows = ctx.resolver.stats_snapshot();
+    let stats: std::collections::HashMap<&str, &crate::resolver::DohStatsSnapshot> = stats_rows
+        .iter()
+        .map(|row| (row.url.as_str(), row))
+        .collect();
     let mut doh_health = String::new();
     if !health.is_empty() {
-        doh_health.push_str("<h2>DoH health</h2><table><tr><th>Endpoint</th><th>Source</th><th>Healthy</th><th>Latency</th><th>Last error</th></tr>");
+        doh_health.push_str("<h2>DoH health</h2><table><tr><th>Endpoint</th><th>Source</th><th>Healthy</th><th>Latency</th><th>Answered</th><th>Failed</th><th>Last error</th></tr>");
         for item in &health {
+            let (answered, failed) = stats
+                .get(item.url.as_str())
+                .map(|row| (row.answered.to_string(), row.failed.to_string()))
+                .unwrap_or_else(|| ("-".into(), "-".into()));
             doh_health.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 escape_html(&item.name),
                 item.source,
-                if item.healthy { "yes" } else { "no" },
+                if !item.observed {
+                    "?"
+                } else if item.healthy {
+                    "yes"
+                } else {
+                    "no"
+                },
                 item.latency_ms
                     .map(|ms| format!("{ms} ms"))
                     .unwrap_or_else(|| "-".into()),
+                answered,
+                failed,
                 escape_html(item.last_error.as_deref().unwrap_or("")),
             ));
         }

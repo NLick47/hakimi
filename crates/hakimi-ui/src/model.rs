@@ -262,12 +262,15 @@ fn short(text: String) -> String {
 pub(crate) struct DohObservation {
     pub(crate) url: String,
     pub(crate) healthy: bool,
+    /// False for a synthesized entry: the endpoint is configured but nothing
+    /// has observed it yet, which reads "未检测" instead of a fake verdict.
+    pub(crate) observed: bool,
     pub(crate) latency_ms: Option<u64>,
     pub(crate) last_error: Option<String>,
 }
 
-/// An endpoint with no health record has not been queried yet: that is
-/// "检测中", not a failure. A failed one shows the error instead of its URL.
+/// An endpoint with no observation yet is "未检测", not a failure. A failed
+/// one shows the error instead of its URL.
 pub(crate) fn doh_entries(
     endpoints: &[EffectiveEndpoint],
     health: &[DohObservation],
@@ -293,7 +296,8 @@ pub(crate) fn doh_entries(
                 .unwrap_or(&endpoint.url)
                 .to_string();
             let (detail, value, tone) = match health.iter().find(|row| row.url == endpoint.url) {
-                None => (host.clone(), "检测中".to_string(), TONE_NEUTRAL),
+                None => (host.clone(), "未检测".to_string(), TONE_NEUTRAL),
+                Some(row) if !row.observed => (host.clone(), "未检测".to_string(), TONE_NEUTRAL),
                 Some(row) if row.healthy => (
                     host.clone(),
                     row.latency_ms
@@ -369,19 +373,19 @@ pub(crate) fn mirror_entries(enabled: bool, status: &[MirrorStatus]) -> Vec<NetE
         .collect()
 }
 
-/// DoH endpoints as `healthy/total 可用`. An endpoint nobody has queried yet
-/// is neither a pass nor a failure, so a partially probed resolver stays
+/// DoH endpoints as `healthy/total 可用`. An endpoint nobody has observed yet
+/// is neither a pass nor a failure, so a partially observed resolver stays
 /// neutral instead of flashing red the moment the window opens.
-pub(crate) fn doh_summary(total: usize, probed: usize, healthy: usize) -> (String, i32) {
+pub(crate) fn doh_summary(total: usize, observed: usize, healthy: usize) -> (String, i32) {
     if total == 0 {
         return ("未配置".into(), TONE_BROKEN);
     }
-    if probed == 0 {
-        return ("检测中".into(), TONE_NEUTRAL);
+    if observed == 0 {
+        return ("未检测".into(), TONE_NEUTRAL);
     }
     let value = format!("{healthy}/{total} 可用");
-    if probed < total {
-        // The rest are still in flight: a partial count is not a verdict.
+    if observed < total {
+        // The rest have not been observed yet: a partial count is not a verdict.
         return (value, TONE_NEUTRAL);
     }
     if healthy == total {
