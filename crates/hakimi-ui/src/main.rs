@@ -33,6 +33,8 @@ mod tray;
 mod ui_state;
 mod update;
 mod view;
+#[cfg(windows)]
+mod window_placement;
 
 pub(crate) use app_state::{Action, AppContext, EditorRowState, UiSignals};
 #[cfg(test)]
@@ -1710,12 +1712,16 @@ fn main_window_request(ui: std::rc::Rc<Ui>, tx: Sender<Action>) -> WindowRequest
         .resizable(false)
         .bg(theme::WINDOW_BG)
         .single(MAIN_WINDOW_KEY);
-    if let Some((x, y)) = centered_position(WINDOW_WIDTH, WINDOW_HEIGHT) {
-        window = window.position(x, y);
-    }
+    // Reopen where the user left it; a first open (or a frame stranded on an
+    // unplugged monitor) falls back to windui's monitor-aware centering.
+    window = match window_placement::restore() {
+        Some((x, y)) => window.position(x, y),
+        None => window.centered(true),
+    };
     window
         .on_close_request(move |_ctx| {
             tracing::info!("main window closing: releasing the UI");
+            window_placement::remember_current();
             close_ui.release_view_state();
             true
         })
