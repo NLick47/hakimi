@@ -103,7 +103,7 @@ hdiutil create \
     -volname "hakimi ${VERSION}" \
     -srcfolder "$STAGE" \
     -ov \
-    -format UDZO \
+    -format ULMO \
     "$DMG"
 
 rm -rf "$STAGE"
