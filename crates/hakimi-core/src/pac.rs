@@ -3,6 +3,35 @@ use std::net::SocketAddr;
 
 use crate::config::AppConfig;
 
+/// Short cache-buster for the PAC URL: six hex chars. Chromium keys its
+/// in-memory PAC cache on the URL, so a changed script must change the URL
+/// the browser is configured with.
+pub fn cache_token(script: &str) -> String {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in script.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("{:06x}", hash & 0x00ff_ffff)
+}
+
+/// The PAC URL identity: the version suffix is invisible to [`same_url`].
+pub fn base_url(proxy: SocketAddr) -> String {
+    format!("http://{proxy}/proxy.pac")
+}
+
+/// The PAC URL as written into the OS settings: a changed script changes the
+/// URL, which makes every browser re-fetch the script.
+pub fn versioned_url(proxy: SocketAddr, script: &str) -> String {
+    format!("{}?v={}", base_url(proxy), cache_token(script))
+}
+
+/// Compare two PAC URLs ignoring the cache-buster version, so a stored
+/// `?v=` value still matches its own base form.
+pub fn same_url(a: &str, b: &str) -> bool {
+    a.split('?').next() == b.split('?').next()
+}
+
 /// Generate the PAC script. Only enabled groups are intercepted; everything else is DIRECT.
 /// A paused runtime (global switch off) returns a DIRECT-only script.
 ///
@@ -94,6 +123,28 @@ fn escape_js(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_token_is_short_deterministic_and_sensitive() {
+        let script = "function FindProxyForURL(url, host) { return \"DIRECT\"; }";
+        let token = cache_token(script);
+        assert_eq!(token.len(), 6);
+        assert_eq!(cache_token(script), token);
+        assert_ne!(cache_token(&format!("{script}x")), token);
+    }
+
+    #[test]
+    fn versioned_url_matches_its_own_base_and_nothing_else() {
+        let script = "x";
+        let url = versioned_url("127.0.0.1:8443".parse().unwrap(), script);
+        assert!(url.starts_with("http://127.0.0.1:8443/proxy.pac?v="));
+        assert!(same_url(&url, "http://127.0.0.1:8443/proxy.pac"));
+        assert!(same_url(
+            &url,
+            &versioned_url("127.0.0.1:8443".parse().unwrap(), "y")
+        ));
+        assert!(!same_url(&url, "http://127.0.0.1:9999/proxy.pac"));
+    }
 
     #[test]
     fn intercepts_only_enabled_groups() {

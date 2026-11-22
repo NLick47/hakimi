@@ -798,7 +798,11 @@ impl HakimiRuntime {
             .status(Some(ProxyMode::Pac), Some(url.clone()))
             .map(|status| status.applied)
             .unwrap_or(false)
-            || self.system_proxy.legacy_pac_url().as_deref() == Some(url.as_str());
+            || self
+                .system_proxy
+                .legacy_pac_url()
+                .as_deref()
+                .is_some_and(|stored| crate::pac::same_url(stored, &url));
         if ours {
             tracing::info!("stale PAC takeover found; switching it off");
             self.system_proxy.pac_disable();
@@ -939,9 +943,11 @@ impl HakimiRuntime {
             return self.system_proxy.status(Some(config.proxy.mode), None);
         };
         let result = match config.proxy.mode {
-            ProxyMode::Pac => self
-                .system_proxy
-                .apply_pac(&format!("http://{listen}/proxy.pac")),
+            ProxyMode::Pac => {
+                let script = crate::pac::generate(&config, listen, self.status.paused());
+                self.system_proxy
+                    .apply_pac(&crate::pac::versioned_url(listen, &script))
+            }
             ProxyMode::Http => self.system_proxy.apply_http(listen),
             ProxyMode::Off => unreachable!(),
         };
@@ -1462,9 +1468,13 @@ impl HakimiRuntime {
             }
         });
 
-        // WinINet keeps serving a cached PAC until told the settings changed.
+        // WinINet keeps serving a cached PAC until told the settings changed,
+        // and Chromium keys its in-memory PAC cache on the URL. A changed
+        // script therefore changes the configured URL, and the re-apply makes
+        // every browser re-fetch it.
         let runtime = self.clone();
         let mut receiver = shutdown.subscribe();
+        let mut revision_rx = runtime.config.revision_watch();
         self.spawn(async move {
             let mut watch = PacWatch::default();
             let mut ticker = tokio::time::interval(Duration::from_secs(2));
@@ -1472,14 +1482,15 @@ impl HakimiRuntime {
             loop {
                 tokio::select! {
                     _ = receiver.changed() => break,
-                    _ = ticker.tick() => {}
+                    _ = ticker.tick() => {},
+                    Ok(_) = revision_rx.changed() => {},
                 }
                 let revision = runtime.config.revision();
                 let paused = runtime.status.paused();
                 let script = || runtime.pac_script();
                 let eligible = || runtime.pac_refresh_eligible();
                 if watch.poll(revision, paused, script, eligible) {
-                    runtime.system_proxy.refresh_pac_cache();
+                    runtime.apply_system_proxy_async();
                 }
             }
         });

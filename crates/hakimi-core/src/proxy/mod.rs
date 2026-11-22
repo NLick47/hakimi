@@ -316,15 +316,10 @@ impl ProxyContext {
             .unwrap_or_else(|| SocketAddr::new(config.proxy.bind, config.proxy.port));
         crate::pac::generate(&config, addr, self.status.paused())
     }
-
-    pub fn pac_url(&self) -> String {
-        format!("http://{}/proxy.pac", self.proxy_addr())
-    }
 }
 
 pub struct ProxyHandle {
     pub local_addr: SocketAddr,
-    pub pac_url: String,
     shutdown: watch::Sender<bool>,
     task: JoinHandle<()>,
 }
@@ -342,7 +337,6 @@ pub async fn start(ctx: Arc<ProxyContext>, bind: SocketAddr) -> Result<ProxyHand
         .with_context(|| format!("binding local proxy on {bind}"))?;
     let local_addr = listener.local_addr()?;
     let _ = ctx.proxy_addr.set(local_addr);
-    let pac_url = format!("http://{local_addr}/proxy.pac");
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let gate = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     let task = tokio::spawn(async move {
@@ -395,7 +389,6 @@ pub async fn start(ctx: Arc<ProxyContext>, bind: SocketAddr) -> Result<ProxyHand
     });
     Ok(ProxyHandle {
         local_addr,
-        pac_url,
         shutdown: shutdown_tx,
         task,
     })

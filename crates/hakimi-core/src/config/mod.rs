@@ -1484,6 +1484,9 @@ pub struct ConfigManager {
     /// write lock across a `sync_all` stalled all of them for the whole flush.
     write_gate: Mutex<()>,
     revision: AtomicU64,
+    /// Publishes every new revision, so watchers (the PAC script rebuilder)
+    /// react to a mutation at once instead of polling.
+    revision_watch: tokio::sync::watch::Sender<u64>,
 }
 
 struct Inner {
@@ -1691,6 +1694,7 @@ impl ConfigManager {
             }),
             write_gate: Mutex::new(()),
             revision: AtomicU64::new(1),
+            revision_watch: tokio::sync::watch::channel(1).0,
         })
     }
 
@@ -1698,6 +1702,11 @@ impl ConfigManager {
     /// re-reading the configuration when nothing changed.
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Relaxed)
+    }
+
+    /// Fires whenever [`Self::revision`] increases.
+    pub fn revision_watch(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revision_watch.subscribe()
     }
 
     pub fn path(&self) -> &Path {
@@ -1746,6 +1755,8 @@ impl ConfigManager {
         // `snapshot_with_revision` can never pair a new config with an old
         // revision (or vice versa).
         self.revision.fetch_add(1, Ordering::Relaxed);
+        self.revision_watch
+            .send_replace(self.revision.load(Ordering::Relaxed));
         drop(guard);
         Ok(())
     }
@@ -1771,6 +1782,8 @@ impl ConfigManager {
             guard.config = Arc::new(config.clone());
             guard.matcher = matcher;
             self.revision.fetch_add(1, Ordering::Relaxed);
+            self.revision_watch
+                .send_replace(self.revision.load(Ordering::Relaxed));
         }
         Ok(config)
     }
@@ -2167,6 +2180,22 @@ mod tests {
             group.route_for("trailing.example"),
             &RoutePolicy::direct(),
             "the hand-written rule must keep the route the user gave it"
+        );
+    }
+
+    #[test]
+    fn mutations_publish_the_revision_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager =
+            ConfigManager::new(dir.path().join("config.json"), AppConfig::default()).unwrap();
+        let mut watch = manager.revision_watch();
+        assert!(!watch.has_changed().unwrap());
+        manager
+            .set_group_enabled("github", false)
+            .expect("the built-in group exists");
+        assert!(
+            watch.has_changed().unwrap(),
+            "a mutation must wake the watchers at once"
         );
     }
 

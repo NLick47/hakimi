@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::ProxyMode;
+use crate::pac::same_url;
 use crate::util::{atomic_write_json, now, read_json};
 
 #[derive(Debug, Clone, Serialize)]
@@ -250,15 +251,6 @@ impl SystemProxyManager {
         Ok(status)
     }
 
-    /// Invalidate the cached PAC script without rewriting the proxy settings.
-    pub fn refresh_pac_cache(&self) {
-        #[cfg(windows)]
-        {
-            notify_proxy_changed();
-            tracing::debug!("PAC cache invalidated after a rule change");
-        }
-    }
-
     /// The PAC URL still present in the readable registry mirror, if any.
     ///
     /// Browsers that read the registry directly (Chromium) use this value even
@@ -386,7 +378,11 @@ impl SystemProxyManager {
         if let Some(own) = own_pac {
             // Windows keeps the same value in the registry; clearing it keeps a
             // killed run's PAC out of the "original" state there too.
-            if state.auto_config_url.as_deref() == Some(own) {
+            if state
+                .auto_config_url
+                .as_deref()
+                .is_some_and(|stored| same_url(stored, own))
+            {
                 state.auto_config_url = None;
             }
             // The per-connection blob can also carry a killed run's PAC. Drop
@@ -396,14 +392,18 @@ impl SystemProxyManager {
                 let Some(mut blob) = ConnectionBlob::parse(&connection.bytes) else {
                     continue;
                 };
-                if blob.pac_url().as_deref() == Some(own) {
+                if blob
+                    .pac_url()
+                    .as_deref()
+                    .is_some_and(|stored| same_url(stored, own))
+                {
                     blob.set_flags(blob.flags() & !WIN_PROXY_TYPE_AUTO_PROXY_URL);
                     blob.set_pac_url(None);
                     connection.bytes = blob.to_bytes();
                 }
             }
             for pac in &mut state.mac_pac {
-                if pac.url.as_deref() == Some(own) {
+                if pac.url.as_deref().is_some_and(|stored| same_url(stored, own)) {
                     pac.enabled = false;
                     pac.url = None;
                 }
@@ -451,6 +451,10 @@ fn mode_name(mode: ProxyMode) -> &'static str {
 /// becomes `::1:8443`, while `SocketAddr::to_string()` keeps the IPv6 brackets
 /// (`[::1]:8443`). Accept either spelling.
 fn proxy_setting_matches(current: &str, expected: &str) -> bool {
+    // A versioned PAC URL only ever matches itself, never an older or newer
+    // write of the same script base, so the cache-buster is stripped first.
+    let current = current.split('?').next().unwrap_or(current);
+    let expected = expected.split('?').next().unwrap_or(expected);
     if current.contains(expected) {
         return true;
     }
@@ -935,7 +939,11 @@ fn connection_blob_matches(
         return false;
     }
     if let Some(url) = pac_url {
-        if blob.pac_url().as_deref() != Some(url) {
+        if blob
+            .pac_url()
+            .as_deref()
+            .is_none_or(|stored| !same_url(stored, url))
+        {
             return false;
         }
     }
