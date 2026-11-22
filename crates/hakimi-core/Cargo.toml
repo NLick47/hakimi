@@ -44,7 +44,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 webpki-roots.workspace = true
-x509-parser = "0.16"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 dirs.workspace = true
@@ -59,4 +58,6 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile.workspace = true
+# The CA parser is cross-validated against x509-parser in tests only.
+x509-parser = "0.16"
 tokio = { workspace = true, features = ["rt", "macros", "net", "time", "io-util"] }

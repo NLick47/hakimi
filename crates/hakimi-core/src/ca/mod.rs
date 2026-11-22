@@ -27,6 +27,7 @@ use self::trust::{
 pub use self::trust::set_android_ca_trusted;
 
 mod material;
+mod minider;
 mod trust;
 
 #[cfg(test)]

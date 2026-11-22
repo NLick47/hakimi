@@ -31,9 +31,9 @@ pub(super) struct CaMaterial {
 /// Subject from the actual certificate, not a hardcoded preset: the Android
 /// probe ships a pre-generated CA whose CN differs from the desktop default.
 fn parse_subject(der: &[u8]) -> Result<String> {
-    let (_, certificate) = x509_parser::parse_x509_certificate(der)
-        .map_err(|error| anyhow::anyhow!("parsing CA subject: {error}"))?;
-    Ok(certificate.subject().to_string())
+    super::minider::parse_ca_fields(der)
+        .map(|fields| fields.subject)
+        .context("parsing CA subject")
 }
 
 pub(super) fn build_leaf_config(
@@ -115,16 +115,12 @@ pub(super) fn load_material(
     let key = KeyPair::from_pem(&key_pem)
         .with_context(|| format!("parsing CA key {}", key_path.display()))?;
     let original_der = pem_to_der(&pem)?;
-    let (_, certificate) = x509_parser::parse_x509_certificate(&original_der)
-        .map_err(|error| anyhow::anyhow!("parsing CA certificate: {error}"))?;
-    let subject = parse_subject(&original_der)?;
-    let params = issuer_params_from(&certificate)?;
+    let fields = super::minider::parse_ca_fields(&original_der).context("parsing CA certificate")?;
+    let params = issuer_params_from(&fields)?;
     // `self_signed` 用同一把 CA 私钥重签解析出的参数，得到签名 leaf 时的 issuer 模板
     let issuer = params
         .self_signed(&key)
         .context("reconstructing CA issuer parameters")?;
-    let not_before = certificate.validity().not_before.to_datetime().to_string();
-    let not_after = certificate.validity().not_after.to_datetime().to_string();
     Ok(CaMaterial {
         issuer,
         key,
@@ -132,23 +128,22 @@ pub(super) fn load_material(
         fingerprint_sha256: sha256_hex(&original_der),
         der: original_der,
         pem,
-        subject,
-        not_before,
-        not_after,
+        subject: fields.subject,
+        not_before: fields.not_before.to_string(),
+        not_after: fields.not_after.to_string(),
     })
 }
 
 /// 从解析出的 CA 证书重建自签参数
 /// hakimi 签发的 CA 只含 CN，重建时同样只取 CN，有效期沿用原证书
-fn issuer_params_from(
-    certificate: &x509_parser::certificate::X509Certificate<'_>,
-) -> Result<CertificateParams> {
+fn issuer_params_from(fields: &super::minider::CaFields) -> Result<CertificateParams> {
     let mut params = CertificateParams::default();
     let mut cn_count = 0;
-    for attr in certificate.subject().iter_common_name() {
-        let value = attr
-            .attr_value()
-            .as_str()
+    for attr in &fields.subject_attrs {
+        if attr.oid != super::minider::OID_COMMON_NAME {
+            continue;
+        }
+        let value = super::minider::utf8_string(attr.tag, &attr.value)
             .context("CA subject CN is not a string")?;
         params.distinguished_name.push(DnType::CommonName, value);
         cn_count += 1;
@@ -167,46 +162,12 @@ fn issuer_params_from(
     // CA we load here was made by openssl with a SHA-1 key id. Clients compare
     // the two byte for byte before they try the signature, so the leaf has to
     // carry the certificate's own id or the chain never builds.
-    if let Some(key_id) = subject_key_identifier(certificate) {
-        params.key_identifier_method = KeyIdMethod::PreSpecified(key_id);
+    if let Some(key_id) = &fields.ski {
+        params.key_identifier_method = KeyIdMethod::PreSpecified(key_id.clone());
     }
-    params.not_before = certificate.validity().not_before.to_datetime();
-    params.not_after = certificate.validity().not_after.to_datetime();
+    params.not_before = fields.not_before;
+    params.not_after = fields.not_after;
     Ok(params)
-}
-
-/// The CA's own key identifier, so a leaf can repeat it as its AKI.
-fn subject_key_identifier(
-    certificate: &x509_parser::certificate::X509Certificate<'_>,
-) -> Option<Vec<u8>> {
-    const SKI_OID: &str = "2.5.29.14";
-    let extension = certificate
-        .extensions()
-        .iter()
-        .find(|extension| extension.oid.to_id_string() == SKI_OID)?;
-    // extnValue wraps the key identifier in one OCTET STRING.
-    octet_string(extension.value).map(<[u8]>::to_vec)
-}
-
-fn octet_string(bytes: &[u8]) -> Option<&[u8]> {
-    if *bytes.first()? != 0x04 {
-        return None;
-    }
-    let (length, start) = match *bytes.get(1)? {
-        short if short < 0x80 => (short as usize, 2),
-        long => {
-            let count = (long & 0x7f) as usize;
-            if count == 0 || count > 2 {
-                return None;
-            }
-            let mut length = 0usize;
-            for byte in bytes.get(2..2 + count)? {
-                length = (length << 8) | *byte as usize;
-            }
-            (length, 2 + count)
-        }
-    };
-    bytes.get(start..start + length)
 }
 
 fn material_from_parts(issuer: Certificate, key: KeyPair) -> CaMaterial {

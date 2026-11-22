@@ -483,3 +483,204 @@ fn an_operation_in_flight_never_triggers_a_background_probe() {
     drop(_guard);
     assert!(!stale.installed, "a temp CA is never trusted");
 }
+
+#[cfg(test)]
+mod minider_crosscheck {
+    use super::*;
+
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+    use time::{Date, Month, Time};
+    use x509_parser::der_parser::asn1_rs::{FromDer, GeneralizedTime, UtcTime};
+    use x509_parser::parse_x509_certificate;
+
+    fn utc_date(year: i32, month: u8, day: u8) -> OffsetDateTime {
+        Date::from_calendar_date(year, Month::try_from(month).unwrap(), day)
+            .unwrap()
+            .with_time(Time::MIDNIGHT)
+            .assume_utc()
+    }
+
+    fn rcgen_ca(
+        not_before: OffsetDateTime,
+        not_after: OffsetDateTime,
+        dn: impl FnOnce(&mut CertificateParams),
+    ) -> String {
+        let mut params = CertificateParams::default();
+        dn(&mut params);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.use_authority_key_identifier_extension = true;
+        params.not_before = not_before;
+        params.not_after = not_after;
+        let key = KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().pem()
+    }
+
+    /// Both parsers must agree on every field hakimi consumes.
+    fn crosscheck(pem: &str) {
+        let der = material::pem_to_der(pem).unwrap();
+        let (_, cert) = parse_x509_certificate(&der).unwrap();
+        let fields = minider::parse_ca_fields(&der).unwrap();
+
+        assert_eq!(fields.subject, cert.subject().to_string(), "subject display");
+
+        let old_ski = cert
+            .extensions()
+            .iter()
+            .find_map(|ext| match ext.parsed_extension() {
+                x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(key_id) => {
+                    Some(key_id.0.to_vec())
+                }
+                _ => None,
+            });
+        assert_eq!(fields.ski, old_ski, "subject key identifier");
+
+        let old_cns: Vec<String> = cert
+            .subject()
+            .iter_common_name()
+            .map(|attr| attr.attr_value().as_str().unwrap().to_string())
+            .collect();
+        let new_cns: Vec<String> = fields
+            .subject_attrs
+            .iter()
+            .filter(|attr| attr.oid == minider::OID_COMMON_NAME)
+            .map(|attr| minider::utf8_string(attr.tag, &attr.value).unwrap().to_string())
+            .collect();
+        assert_eq!(new_cns, old_cns, "common names");
+
+        assert_eq!(fields.not_before, cert.validity().not_before.to_datetime());
+        assert_eq!(fields.not_after, cert.validity().not_after.to_datetime());
+    }
+
+    #[test]
+    fn shipped_android_probe_ca_matches_x509_parser() {
+        let pem = include_str!("../../../../android/probe/assets/ca/ca.pem");
+        let fields = minider::parse_ca_fields(&material::pem_to_der(pem).unwrap()).unwrap();
+        assert_eq!(fields.subject, "CN=Hakimi Android Probe CA");
+        assert_eq!(
+            fields.ski.unwrap(),
+            [
+                0xE4, 0x0C, 0x9D, 0x4D, 0xA9, 0x35, 0xD1, 0x15, 0x67, 0xD7, 0x14, 0xED, 0xF8,
+                0xA7, 0x31, 0xA8, 0x47, 0x92, 0x70, 0x49
+            ]
+        );
+        crosscheck(pem);
+    }
+
+    #[test]
+    fn rcgen_generated_ca_matches_x509_parser() {
+        let pem = rcgen_ca(utc_date(2026, 1, 1), utc_date(2036, 1, 1), |params| {
+            params
+                .distinguished_name
+                .push(DnType::CommonName, "Hakimi Cross Check CA");
+        });
+        crosscheck(&pem);
+    }
+
+    #[test]
+    fn multi_rdn_subject_matches_x509_parser() {
+        let pem = rcgen_ca(utc_date(2026, 1, 1), utc_date(2036, 1, 1), |params| {
+            params.distinguished_name.push(DnType::CountryName, "US");
+            params
+                .distinguished_name
+                .push(DnType::OrganizationName, "Hakimi Test Org");
+            params
+                .distinguished_name
+                .push(DnType::OrganizationalUnitName, "QA");
+            params
+                .distinguished_name
+                .push(DnType::CommonName, "Cross Check CA");
+        });
+        crosscheck(&pem);
+    }
+
+    #[test]
+    fn validity_across_2050_boundary_matches_x509_parser() {
+        // not_before lands in UTCTime range, not_after past 2050 in
+        // GeneralizedTime: one certificate exercises both encodings.
+        let pem = rcgen_ca(utc_date(2049, 12, 31), utc_date(2051, 1, 1), |params| {
+            params
+                .distinguished_name
+                .push(DnType::CommonName, "Boundary CA");
+        });
+        let fields =
+            minider::parse_ca_fields(&material::pem_to_der(&pem).unwrap()).unwrap();
+        assert_eq!(fields.not_before.year(), 2049);
+        assert_eq!(fields.not_after.year(), 2051);
+        crosscheck(&pem);
+    }
+
+    fn tlv_bytes(tag: u8, content: &str) -> Vec<u8> {
+        let mut bytes = vec![tag, content.len() as u8];
+        bytes.extend_from_slice(content.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn time_shapes_match_asn1_rs() {
+        let cases: Vec<(u8, &str)> = vec![
+            (0x17, "260102030405Z"),
+            (0x17, "490101000000Z"),
+            (0x17, "500101000000Z"),
+            (0x17, "2601010000Z"),
+            (0x17, "260101000000+0530"),
+            (0x17, "260101000000-0530"),
+            (0x18, "20501231235959Z"),
+            (0x18, "20510101000000Z"),
+            (0x18, "20510101000000.500Z"),
+            (0x18, "20510101000000,5Z"),
+            (0x18, "205101010000Z"),
+        ];
+        for (tag, content) in cases {
+            let bytes = tlv_bytes(tag, content);
+            let parsed = minider::parse_time(tag, content.as_bytes());
+            let reference = match tag {
+                0x17 => UtcTime::from_der(&bytes)
+                    .map(|(_, t)| t.utc_adjusted_datetime()),
+                _ => GeneralizedTime::from_der(&bytes)
+                    .map(|(_, t)| t.utc_datetime()),
+            };
+            match reference {
+                Ok(Ok(expected)) => assert_eq!(parsed.unwrap(), expected, "shape {content}"),
+                _ => assert!(parsed.is_err(), "shape {content} must also be rejected"),
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_times_error_like_the_old_parser() {
+        let cases: Vec<(u8, &str)> = vec![
+            (0x17, "260101000"),
+            (0x17, "2601010000"),
+            (0x17, "260101000000"),
+            (0x17, "2601010000+0530"),
+            (0x17, "261301000000Z"),
+            (0x17, "260132000000Z"),
+            (0x18, "20510101000000.500"),
+            (0x18, "20510101000000,5Z"),
+            (0x18, "20a101000000Z"),
+            (0x13, "260101000000Z"),
+        ];
+        for (tag, content) in cases {
+            assert!(
+                minider::parse_time(tag, content.as_bytes()).is_err(),
+                "expected {content:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn garbage_certificates_are_rejected() {
+        let der = material::pem_to_der(include_str!(
+            "../../../../android/probe/assets/ca/ca.pem"
+        ))
+        .unwrap();
+        for cut in [0, 1, 4, 16, der.len() / 2, der.len() - 1] {
+            assert!(
+                minider::parse_ca_fields(&der[..cut]).is_err(),
+                "truncation at {cut} must be rejected"
+            );
+        }
+        assert!(minider::parse_ca_fields(&[0x02, 0x01, 0x00]).is_err());
+        assert!(minider::parse_ca_fields(&[0x30, 0x03, 0x02, 0x01, 0x00]).is_err());
+    }
+}
