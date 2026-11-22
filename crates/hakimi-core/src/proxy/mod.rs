@@ -259,6 +259,11 @@ pub struct ProxyContext {
     /// Raised by `/hakimi/stop`. Only the owner of the runtime knows what a
     /// shutdown involves, so the endpoint signals instead of shutting down.
     pub on_stop: Arc<dyn Fn() + Send + Sync>,
+    /// Raised by `/hakimi/pause` and `/hakimi/resume`. The runtime owns the
+    /// pause semantics — the system takeover is restored on pause and
+    /// re-applied on resume, not just the flag flipped.
+    pub on_pause: Arc<dyn Fn() + Send + Sync>,
+    pub on_resume: Arc<dyn Fn() + Send + Sync>,
     proxy_addr: OnceLock<SocketAddr>,
 }
 
@@ -277,6 +282,8 @@ impl ProxyContext {
         mirrors: Arc<crate::mirror::MirrorList>,
         status_json: Arc<dyn Fn(bool) -> serde_json::Value + Send + Sync>,
         on_stop: Arc<dyn Fn() + Send + Sync>,
+        on_pause: Arc<dyn Fn() + Send + Sync>,
+        on_resume: Arc<dyn Fn() + Send + Sync>,
     ) -> Arc<Self> {
         let snapshot = config.snapshot();
         let download = Arc::new(download::DownloadManager::new(&snapshot, mirrors));
@@ -294,6 +301,8 @@ impl ProxyContext {
             relay_health: Arc::new(relay::Health::default()),
             status_json,
             on_stop,
+            on_pause,
+            on_resume,
             proxy_addr: OnceLock::new(),
         })
     }
@@ -521,16 +530,13 @@ async fn local_response(req: &Request<Incoming>, ctx: &Arc<ProxyContext>) -> Res
             }
         }
         "/hakimi/pause" => {
-            ctx.status.set_paused(true);
+            // Same semantics as the UI's pause: the runtime restores the
+            // system takeover, not just the flag.
+            (ctx.on_pause)();
             json_response(serde_json::json!({ "paused": true }))
         }
         "/hakimi/resume" => {
-            ctx.status.set_paused(false);
-            // Same contract as runtime.resume(): sockets pooled before
-            // the pause are commonly dead once traffic is intercepted
-            // again, so the first requests after the resume must not
-            // touch them.
-            ctx.upstream.retire_pools();
+            (ctx.on_resume)();
             json_response(serde_json::json!({ "paused": false }))
         }
         "/hakimi/stop" => {

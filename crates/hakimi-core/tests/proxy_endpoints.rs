@@ -65,6 +65,16 @@ async fn serves_pac_and_status_endpoints() {
         Arc::new(move || {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }),
+        // The endpoints delegate the whole pause to the callbacks, so the
+        // stubs mirror what runtime.pause()/resume() do to the status store.
+        {
+            let store = store.clone();
+            Arc::new(move || store.set_paused(true))
+        },
+        {
+            let store = store.clone();
+            Arc::new(move || store.set_paused(false))
+        },
     );
     let handle = proxy::start(ctx, "127.0.0.1:0".parse().unwrap())
         .await

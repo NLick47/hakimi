@@ -66,13 +66,15 @@ pub async fn run(runtime: &Arc<HakimiRuntime>, args: ServeArgs) -> Result<()> {
     // the product there and the user decides who points at it.
     let takeover_unsupported = runtime.config().snapshot().proxy.takeover
         && !hakimi_core::system_proxy::takeover_supported();
+    // Pause before the start: a paused serve leaves the system proxy
+    // untouched instead of applying and immediately restoring a takeover.
+    if args.paused {
+        runtime.pause();
+    }
     if args.no_takeover || takeover_unsupported {
         runtime.start_without_takeover().await?;
     } else {
         runtime.start().await?;
-    }
-    if args.paused {
-        runtime.pause();
     }
     banner(runtime, args.paused);
     notes(runtime, takeover_unsupported);

@@ -526,6 +526,14 @@ impl HakimiRuntime {
                     let _ = shutdown.send(true);
                 }) as Arc<dyn Fn() + Send + Sync>
             };
+            let on_pause = {
+                let runtime = Arc::clone(self);
+                Arc::new(move || runtime.pause()) as Arc<dyn Fn() + Send + Sync>
+            };
+            let on_resume = {
+                let runtime = Arc::clone(self);
+                Arc::new(move || runtime.resume()) as Arc<dyn Fn() + Send + Sync>
+            };
             let ctx = ProxyContext::new(
                 self.engine.clone(),
                 self.ca.clone(),
@@ -539,6 +547,8 @@ impl HakimiRuntime {
                 self.mirrors.clone(),
                 status_json,
                 on_stop,
+                on_pause,
+                on_resume,
             );
             let bind = SocketAddr::new(config.proxy.bind, config.proxy.port);
             let handle = proxy::start(ctx, bind)
@@ -573,7 +583,12 @@ impl HakimiRuntime {
                     *self.proxy_applied.write() = None;
                 }
                 StartPolicy::Apply => {
-                    if config.proxy.takeover {
+                    if self.status.paused() {
+                        // Started paused: the system proxy stays untouched
+                        // until the user resumes.
+                        tracing::info!("started paused; the system proxy stays untouched");
+                        *self.proxy_applied.write() = None;
+                    } else if config.proxy.takeover {
                         // The apply records `proxy_applied`/`proxy_error` itself.
                         // It spawns child processes and polls their exit with a
                         // 20 ms sleep, so it belongs on the blocking pool —
@@ -751,7 +766,7 @@ impl HakimiRuntime {
         self.proxy_intent.load(Ordering::SeqCst) > seq
     }
 
-    pub fn abandon_takeover(&self) {
+    pub fn abandon_takeover(self: &Arc<Self>) {
         self.pause();
         self.disable_system_proxy_inner(self.proxy_write_seq());
         self.system_proxy.forget();
@@ -916,6 +931,19 @@ impl HakimiRuntime {
         result
     }
 
+    /// Restore for the paused state. The user's original settings come back
+    /// instead of a DIRECT-only script, so coexisting tools (fixed-proxy
+    /// setups like v2rayN) keep working while acceleration is paused. A newer
+    /// intent wins: if the user resumed while this restore was in flight, the
+    /// stale restore aborts and the re-apply owns the outcome.
+    pub fn restore_system_proxy_if_current(&self, seq: u64) -> Result<bool> {
+        let _write = self.proxy_write.lock();
+        if self.proxy_write_stale(seq) {
+            return Ok(false);
+        }
+        self.restore_system_proxy_unlocked()
+    }
+
     fn apply_system_proxy_inner(&self, seq: u64) -> Result<SystemProxyStatus> {
         let _write = self.proxy_write.lock();
         if self.proxy_write_stale(seq) {
@@ -988,21 +1016,42 @@ impl HakimiRuntime {
         result
     }
 
-    pub fn pause(&self) {
+    pub fn pause(self: &Arc<Self>) {
         self.status.set_paused(true);
+        // Pausing hands the system proxy back: the user's original settings
+        // are restored instead of a DIRECT-only script staying applied, so
+        // coexisting setups (fixed proxies like v2rayN) keep working while
+        // paused. Resume re-applies the takeover.
+        if *self.proxy_applied.read() == Some(true) {
+            let seq = self.proxy_write_seq();
+            let this = Arc::clone(self);
+            // The restore runs OS child processes; keep it off the caller's
+            // thread and let a newer intent (resume) win via the seq guard.
+            std::thread::spawn(move || match this.restore_system_proxy_if_current(seq) {
+                Ok(true) => tracing::info!("system proxy restored for the paused state"),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(error = %error, "failed to restore the system proxy on pause")
+                }
+            });
+        }
         tracing::info!("hakimi paused");
     }
 
-    pub fn resume(&self) {
+    pub fn resume(self: &Arc<Self>) {
         self.status.set_paused(false);
         // Connections pooled before the pause usually die while traffic is
         // not being intercepted; the first requests after the resume would
         // fail on them. Swap the pools so everything reopens fresh.
         self.upstream.retire_pools();
+        let config = self.config.snapshot();
+        if self.is_started() && config.proxy.takeover && config.proxy.mode != ProxyMode::Off {
+            Arc::clone(self).apply_system_proxy_async();
+        }
         tracing::info!("hakimi resumed");
     }
 
-    pub fn set_paused(&self, paused: bool) {
+    pub fn set_paused(self: &Arc<Self>, paused: bool) {
         if paused {
             self.pause();
         } else {
@@ -1472,17 +1521,22 @@ impl HakimiRuntime {
         // and Chromium keys its in-memory PAC cache on the URL. A changed
         // script therefore changes the configured URL, and the re-apply makes
         // every browser re-fetch it.
+        let mut watch = PacWatch::default();
+        // Record the baseline at once: the first event must measure against
+        // the applied state, not become the baseline itself.
+        watch.poll(
+            self.config.revision(),
+            self.status.paused(),
+            || self.pac_script(),
+            || self.pac_refresh_eligible(),
+        );
         let runtime = self.clone();
         let mut receiver = shutdown.subscribe();
         let mut revision_rx = runtime.config.revision_watch();
         self.spawn(async move {
-            let mut watch = PacWatch::default();
-            let mut ticker = tokio::time::interval(Duration::from_secs(2));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = receiver.changed() => break,
-                    _ = ticker.tick() => {},
                     Ok(_) = revision_rx.changed() => {},
                 }
                 let revision = runtime.config.revision();

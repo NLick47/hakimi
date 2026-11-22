@@ -333,7 +333,7 @@ pub fn start_mode(effects: &Effects) -> StartMode {
 
 /// Execute the startup transition: pause/resume run now; the proxy effects are
 /// mapped onto the [`StartMode`] the runtime starts with.
-pub fn execute_startup(effects: &Effects, runtime: &HakimiRuntime) -> StartMode {
+pub fn execute_startup(effects: &Effects, runtime: &Arc<HakimiRuntime>) -> StartMode {
     if effects.resume {
         runtime.resume();
     }

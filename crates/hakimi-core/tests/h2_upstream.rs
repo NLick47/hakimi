@@ -189,6 +189,8 @@ async fn spawn_proxy(
         Arc::new(hakimi_core::mirror::MirrorList::load(None)),
         status_json,
         Arc::new(|| {}),
+        Arc::new(|| {}),
+        Arc::new(|| {}),
     );
     let handle = proxy::start(ctx, "127.0.0.1:0".parse().unwrap())
         .await

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 use crate::config::AppConfig;
 use crate::strategy::{CacheStatus, DohSource, FailureReason, IpSource, TlsMode};
@@ -166,6 +167,9 @@ pub struct StatusStore {
     /// counters separate lets pollers read them without scanning all domains.
     counts: RwLock<StatusCounts>,
     paused: AtomicBool,
+    /// Publishes every real pause/resume flip, so the PAC script rebuilder
+    /// reacts at once instead of polling.
+    paused_watch: watch::Sender<bool>,
     /// Bumped whenever a domain record or the pause flag changes. Pollers
     /// compare it to skip rebuilding a snapshot that cannot have changed.
     revision: AtomicU64,
@@ -184,6 +188,7 @@ impl StatusStore {
             domains: RwLock::new(HashMap::new()),
             counts: RwLock::new(StatusCounts::default()),
             paused: AtomicBool::new(false),
+            paused_watch: watch::channel(false).0,
             revision: AtomicU64::new(0),
             started_at: now(),
         }
@@ -202,11 +207,17 @@ impl StatusStore {
     pub fn set_paused(&self, paused: bool) {
         if self.paused.swap(paused, Ordering::SeqCst) != paused {
             self.revision.fetch_add(1, Ordering::SeqCst);
+            self.paused_watch.send_replace(paused);
         }
     }
 
     pub fn paused(&self) -> bool {
         self.paused.load(Ordering::SeqCst)
+    }
+
+    /// Fires whenever [`Self::paused`] flips.
+    pub fn paused_watch(&self) -> watch::Receiver<bool> {
+        self.paused_watch.subscribe()
     }
 
     pub fn get(&self, domain: &str) -> Option<Arc<DomainDiagnostics>> {
@@ -780,14 +791,25 @@ mod tests {
     fn revision_moves_only_when_the_published_state_changes() {
         let store = StatusStore::new();
         let start = store.revision();
+        let mut paused_watch = store.paused_watch();
+        assert!(!paused_watch.has_changed().unwrap());
 
         store.set_paused(true);
         let paused = store.revision();
         assert!(paused > start, "a pause flip must publish");
+        assert!(
+            paused_watch.has_changed().unwrap(),
+            "a pause flip must wake the watchers at once"
+        );
+        assert_eq!(*paused_watch.borrow_and_update(), true);
 
         // Setting the same value again is not a change.
         store.set_paused(true);
         assert_eq!(store.revision(), paused);
+        assert!(
+            !paused_watch.has_changed().unwrap(),
+            "a redundant pause must stay silent"
+        );
 
         store.record(report("github.com", State::Normal));
         assert!(store.revision() > paused, "a domain record must publish");

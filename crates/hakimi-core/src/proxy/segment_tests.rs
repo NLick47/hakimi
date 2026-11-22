@@ -269,6 +269,8 @@ fn build_context(dir: &Path) -> Arc<ProxyContext> {
         Arc::new(MirrorList::load(None)),
         Arc::new(|_every| json!({"app": "hakimi", "test": true})),
         Arc::new(|| {}),
+        Arc::new(|| {}),
+        Arc::new(|| {}),
     )
 }
 
