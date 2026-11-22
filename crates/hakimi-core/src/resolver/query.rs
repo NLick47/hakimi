@@ -41,10 +41,14 @@ const FALLBACK_WAVES: u32 = 2;
 const ENDPOINT_WINDOW: Duration = Duration::from_secs(4);
 
 /// How long the first endpoint gets before the second is dialled as well. The
-/// second is a hedge, not a second racer: a healthy endpoint answers in a few
-/// hundred milliseconds, and racing both from t=0 sent every queried name to
-/// two providers on every cache miss.
-const PRIMARY_HEDGE: Duration = Duration::from_millis(250);
+/// second is a hedge, not a second racer: racing both from t=0 sent every
+/// queried name to two providers on every cache miss. 400 ms sits above the
+/// real-world DoH RTT band (150-400 ms), so a healthy-but-slow primary is not
+/// hedged on every cold domain; the measured matrix (2026-11-22) halved the
+/// POST count for a 350 ms primary with no latency change, and the dead-primary
+/// path is unchanged — its wall clock is dominated by the client timeout, not
+/// the hedge.
+const PRIMARY_HEDGE: Duration = Duration::from_millis(400);
 
 /// Distinct addresses an A/AAAA answer must carry before the query stops
 /// collecting. One address is a single point of failure — and exactly what a
