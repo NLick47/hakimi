@@ -1318,52 +1318,17 @@ impl HakimiRuntime {
     }
 
     fn spawn_background_tasks(self: &Arc<Self>, shutdown: watch::Sender<bool>) {
-        // DoH health and the initial group probes.
+        // Boot sequence: refresh the catalogs, then probe DoH health and warm
+        // the groups. The order matters and is why this is one linear task:
+        // the health pass lists the effective endpoints, which the remote DoH
+        // catalog extends, so probing before the refresh lands would leave the
+        // catalog endpoints without any observation — the UI showed them as
+        // checking forever. A failed fetch keeps the cached copy, so an
+        // offline start still uses the last known good catalog.
         let runtime = self.clone();
         let mut receiver = shutdown.subscribe();
         self.spawn(async move {
-            let health = {
-                let runtime = runtime.clone();
-                tokio::spawn(async move { runtime.resolver.health_check().await })
-            };
-            // A fresh data directory has no cached IP catalog. Warming up
-            // before the initial refresh records false failures for every
-            // catalog-backed domain, and the status then flips Failed -> Normal
-            // seconds later. Wait briefly for that first refresh instead.
-            let catalog_configured = {
-                let config = runtime.config.snapshot();
-                !config.catalogs.ip.trim().is_empty() || !config.catalogs.ip_mirrors.is_empty()
-            };
-            if catalog_configured && !runtime.catalogs.has_ip_catalog() {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while !runtime.catalogs.has_ip_catalog() && Instant::now() < deadline {
-                    tokio::select! {
-                        _ = receiver.changed() => return,
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                    }
-                }
-            }
-            // Warm-up runs resolves and connects; a shutdown that lands
-            // mid-warm must not hold stop() for the full per-task timeout.
-            tokio::select! {
-                _ = receiver.changed() => return,
-                _ = runtime.warm_groups() => {}
-            }
-            tokio::select! {
-                _ = receiver.changed() => {}
-                _ = health => {}
-            }
-        });
-
-        // Catalog refresh: once per launch. A failed fetch keeps the cached copy,
-        // so an offline start still uses the last known good catalog.
-        let runtime = self.clone();
-        let mut receiver = shutdown.subscribe();
-        self.spawn(async move {
-            tokio::select! {
-                _ = receiver.changed() => return,
-                _ = tokio::time::sleep(Duration::from_millis(300)) => {}
-            }
+            let started = Instant::now();
             // An upgrade re-reads the catalog once even when the server would
             // answer 304: the new binary's built-in groups and defaults expect
             // a catalog published for that version.
@@ -1388,6 +1353,33 @@ impl HakimiRuntime {
                     ),
                     Err(error) => tracing::warn!(error = %error, "catalog refresh failed"),
                 }
+            }
+            // With the catalogs in place the endpoint list is complete: probe
+            // every DoH endpoint and warm the groups in parallel. Warm-up runs
+            // resolves and connects; a shutdown that lands mid-warm must not
+            // hold stop() for the full per-task timeout.
+            let health = {
+                let runtime = runtime.clone();
+                tokio::spawn(async move { runtime.resolver.health_check().await })
+            };
+            tokio::select! {
+                _ = receiver.changed() => return,
+                _ = runtime.warm_groups() => {}
+            }
+            let health = tokio::select! {
+                _ = receiver.changed() => None,
+                // The child only ever returns the probe results; a JoinError
+                // would mean it panicked, which is a bug worth surfacing.
+                health = health => Some(health.expect("the DoH health task panicked")),
+            };
+            if let Some(health) = &health {
+                let failed = health.iter().filter(|entry| !entry.healthy).count();
+                tracing::info!(
+                    endpoints = health.len(),
+                    failed,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "boot finished: catalogs refreshed, DoH endpoints probed, groups warmed"
+                );
             }
         });
 
