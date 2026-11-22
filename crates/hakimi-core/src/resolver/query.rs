@@ -59,7 +59,19 @@ const MAX_ANSWER_SOURCES: usize = 3;
 /// does not exist. One endpoint saying "no records" can be a filter; two are
 /// not. Without this, every IPv4-only host walked the whole catalog for its
 /// (always empty) AAAA query — a query storm on the most common case.
+///
+/// This is the threshold for the terminal families: a missing A record means
+/// no IPv4 candidates at all, and a missing HTTPS record means no ECH — a
+/// lying endpoint would break or degrade the connection, so two votes are
+/// required. AAAA is exempt (see [`AAAA_EMPTY_CONFIRMATIONS`]).
 const EMPTY_CONFIRMATIONS: usize = 2;
+/// AAAA NODATA needs a single vote. IPv6 is additive: the connection rides on
+/// the A answer, so a lying endpoint can only hide candidates the connection
+/// does not need — and the negative TTL bounds that window. Demanding the
+/// second vote cost one POST on every IPv4-only domain — the most common case
+/// — and the measured matrix (2026-11-22, `doh_traffic` probe + lying-endpoint
+/// scenario) showed no latency change from dropping it.
+const AAAA_EMPTY_CONFIRMATIONS: usize = 1;
 
 /// The upper bound of one live `doh_ips` call, excluding the single-flight
 /// queue wait: one endpoint window plus the serial fallback waves. Callers
@@ -100,6 +112,9 @@ pub struct TypeQuery {
 /// endpoint returned threw away exactly the address that would have worked.
 struct MergedAnswers {
     address_query: bool,
+    /// Empty votes required before this query concludes NODATA: two for the
+    /// terminal families (A, HTTPS), one for AAAA.
+    empty_confirmations: usize,
     ips: Vec<IpAddr>,
     ech: Option<Vec<u8>>,
     ttl: u32,
@@ -120,9 +135,10 @@ struct MergedAnswers {
 }
 
 impl MergedAnswers {
-    fn new(address_query: bool) -> Self {
+    fn new(address_query: bool, empty_confirmations: usize) -> Self {
         Self {
             address_query,
+            empty_confirmations,
             ips: Vec::new(),
             ech: None,
             ttl: u32::MAX,
@@ -173,9 +189,10 @@ impl MergedAnswers {
 
     /// Whether this query has collected enough to stop.
     fn complete(&self) -> bool {
-        // An empty answer needs as many confirmations as an ECH lookup: the
-        // first NODATA may be a filter, the second makes it a conclusion.
-        let confirmed_empty = self.ips.is_empty() && self.answered >= EMPTY_CONFIRMATIONS;
+        // An empty answer needs enough votes to outvote a lying endpoint: two
+        // for the terminal families (A, HTTPS), one for AAAA — hiding IPv6
+        // candidates costs nothing the connection needs.
+        let confirmed_empty = self.ips.is_empty() && self.answered >= self.empty_confirmations;
         if self.address_query {
             // Two addresses give the engine a real choice; one is a single
             // point of failure. A peer repeating that one address has nothing
@@ -187,7 +204,7 @@ impl MergedAnswers {
         } else {
             // ECH is a single domain-level value: the first copy is the whole
             // answer. Without it, a second independent NODATA is required.
-            self.ech.is_some() || self.answered >= EMPTY_CONFIRMATIONS
+            self.ech.is_some() || self.answered >= self.empty_confirmations
         }
     }
 
@@ -224,7 +241,14 @@ impl Resolver {
         // user's configured order is kept among equals.
         let order = self.endpoint_order(&endpoints);
         let primary = order[0];
-        let mut merged = MergedAnswers::new(address_query);
+        let mut merged = MergedAnswers::new(
+            address_query,
+            if address_query && qtype == TYPE_AAAA {
+                AAAA_EMPTY_CONFIRMATIONS
+            } else {
+                EMPTY_CONFIRMATIONS
+            },
+        );
         let mut attempts: Vec<DohAttemptError> = Vec::new();
         // Per-endpoint outcome of this query: None until the endpoint produced
         // a result. The authoritative-NODATA decision reads it.

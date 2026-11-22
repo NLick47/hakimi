@@ -162,6 +162,9 @@ enum DohMode {
     Fail,
     /// Read the query, then never answer: the client has to give up.
     Stall,
+    /// Two A records immediately, but an AAAA query is read and never
+    /// answered: the client has to give up on this endpoint's AAAA alone.
+    StallAAAA,
 }
 
 /// A DoH server that answers every query with one A record, answers with an
@@ -244,6 +247,14 @@ impl DohServer {
                             }
                             // Echo the id and the question of the query.
                             let qtype = qtype_from_query(&query);
+                            if matches!(&mode, DohMode::StallAAAA) && qtype == TYPE_AAAA {
+                                // Hold the AAAA query open without answering;
+                                // the A record still leaves immediately.
+                                let never: std::future::Pending<
+                                    Result<hyper::Response<Full<Bytes>>, Infallible>,
+                                > = std::future::pending();
+                                return never.await;
+                            }
                             let mut response = Vec::new();
                             response.extend_from_slice(&query[0..2]);
                             response.extend_from_slice(&0x8180u16.to_be_bytes());
@@ -252,7 +263,7 @@ impl DohServer {
                                 DohMode::Answer(_) | DohMode::HttpsEch(_) => 1,
                                 DohMode::Wide | DohMode::SlowWide(_)
                                     if matches!(qtype, TYPE_A | TYPE_AAAA) => 2,
-                                DohMode::V4Only if qtype == TYPE_A => 2,
+                                DohMode::V4Only | DohMode::StallAAAA if qtype == TYPE_A => 2,
                                 _ => 0,
                             };
                             response.extend_from_slice(&answers.to_be_bytes());
@@ -281,7 +292,7 @@ impl DohServer {
                                         _ => {}
                                     }
                                 }
-                                DohMode::V4Only => {
+                                DohMode::V4Only | DohMode::StallAAAA => {
                                     if qtype == TYPE_A {
                                         let name = name_from_query(&query);
                                         for ip in WIDE_V4 {
@@ -362,14 +373,15 @@ async fn a_thin_primary_answer_is_widened_and_cached() {
         "the union keeps the primary's answer first"
     );
     assert!(resolution.fallback_used, "a second endpoint was involved");
-    // A: primary + widened fallback. AAAA: neither has a record, and the
-    // second NODATA confirms the first.
+    // A: primary + widened fallback. AAAA: neither has a record, and one
+    // NODATA concludes the family — hiding IPv6 candidates costs nothing the
+    // connection needs.
     let primary_requests = primary.requests.load(Ordering::Relaxed);
     let fallback_requests = fallback.requests.load(Ordering::Relaxed);
     assert_eq!(primary_requests, 2, "one query per record type");
     assert_eq!(
-        fallback_requests, 2,
-        "the thin A answer and the empty AAAA answer each need a peer"
+        fallback_requests, 1,
+        "the thin A answer needs a peer; the empty AAAA concludes on one vote"
     );
 
     // The second query is answered from the cache, union included.
@@ -445,11 +457,11 @@ async fn an_empty_primary_answer_falls_back_to_a_real_address() {
     assert_eq!(resolution.source, DohSource::Fallback);
     assert!(resolution.fallback_used);
 
-    // Both endpoints are queried once per record type (A and AAAA): the empty
-    // answer is not retried and the winner is the fallback, not a second lookup
-    // against the primary.
+    // The primary is dialled once per record type; only the A query reaches
+    // the fallback — the empty AAAA concludes on the primary's own vote, and
+    // the winner is the fallback, not a second lookup against the primary.
     assert_eq!(primary.requests.load(Ordering::Relaxed), 2);
-    assert_eq!(fallback.requests.load(Ordering::Relaxed), 2);
+    assert_eq!(fallback.requests.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1230,8 +1242,8 @@ async fn a_total_nodata_is_negative_cached_and_not_requeried() {
         .map(|server| server.requests.load(Ordering::Relaxed))
         .sum();
     assert_eq!(
-        requests, 4,
-        "A and AAAA each need the pair to confirm the silence"
+        requests, 3,
+        "the A family needs the pair to confirm the silence; AAAA concludes on one vote"
     );
 
     let second = resolver.resolve_ips("example.com").await;
@@ -1271,8 +1283,8 @@ async fn an_ipv4_only_domain_does_not_walk_the_catalog() {
     );
     assert_eq!(
         servers[1].requests.load(Ordering::Relaxed),
-        1,
-        "one confirmation is enough to conclude the AAAA is absent"
+        0,
+        "the primary's own NODATA concludes the empty AAAA"
     );
     assert_eq!(
         servers[2].requests.load(Ordering::Relaxed),
@@ -1302,7 +1314,11 @@ async fn identical_answers_stop_after_the_second_endpoint() {
         "the repeated answer is the only candidate"
     );
     assert_eq!(servers[0].requests.load(Ordering::Relaxed), 2);
-    assert_eq!(servers[1].requests.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        servers[1].requests.load(Ordering::Relaxed),
+        1,
+        "the thin A answer is widened once; the empty AAAA needs no peer"
+    );
     assert_eq!(
         servers[2].requests.load(Ordering::Relaxed),
         0,
@@ -1319,8 +1335,12 @@ async fn a_slow_hedged_peer_is_not_discarded_before_the_window_ends() {
         resolver_with_timeout(&[DohMode::Empty, DohMode::SlowWide(1750)], 4).await;
 
     let resolution = resolver.resolve_ips("example.com").await.unwrap();
-    assert_eq!(resolution.ips.len(), 4, "A and AAAA from the slow peer");
-    assert_eq!(servers[1].requests.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        resolution.ips.len(),
+        2,
+        "the slow peer's A answer is waited for; AAAA concluded on the primary's vote"
+    );
+    assert_eq!(servers[1].requests.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1368,7 +1388,11 @@ async fn a_slow_hedge_wins_before_empty_catalog_endpoints() {
     .await;
 
     let resolution = resolver.resolve_ips("example.com").await.unwrap();
-    assert_eq!(resolution.ips.len(), 4, "A and AAAA from the slow peer");
+    assert_eq!(
+        resolution.ips.len(),
+        2,
+        "the slow peer's A answer is waited for; AAAA concluded on one vote"
+    );
     assert_eq!(
         servers[2].requests.load(Ordering::Relaxed),
         0,
@@ -1387,8 +1411,12 @@ async fn a_slow_foreign_endpoint_gets_its_full_window() {
         resolver_with_timeout(&[DohMode::Empty, DohMode::SlowWide(3200)], 6).await;
 
     let resolution = resolver.resolve_ips("example.com").await.unwrap();
-    assert_eq!(resolution.ips.len(), 4, "A and AAAA from the slow endpoint");
-    assert_eq!(servers[1].requests.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        resolution.ips.len(),
+        2,
+        "the slow endpoint's A answer is waited for"
+    );
+    assert_eq!(servers[1].requests.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1418,10 +1446,11 @@ async fn a_stalled_hedge_does_not_block_the_catalog() {
 async fn a_slow_aaaa_does_not_hold_the_ipv4_answer() {
     install_logs();
     let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    // A is complete in milliseconds; the AAAA confirmation never arrives. The
-    // resolution must return the IPv4 candidates after the short window
+    // A is complete in milliseconds; the primary never answers its AAAA. The
+    // resolution must return the IPv4 candidates after the short grace window
     // instead of waiting out the endpoint window.
-    let (resolver, servers) = resolver_with_timeout(&[DohMode::V4Only, DohMode::Stall], 8).await;
+    let (resolver, servers) =
+        resolver_with_timeout(&[DohMode::StallAAAA, DohMode::Stall], 8).await;
 
     let started = std::time::Instant::now();
     let resolution = resolver.resolve_ips("example.com").await.unwrap();
@@ -1433,7 +1462,7 @@ async fn a_slow_aaaa_does_not_hold_the_ipv4_answer() {
         "the AAAA query must get its short window, took {elapsed:?}"
     );
     assert!(
-        elapsed < std::time::Duration::from_millis(2_000),
+        elapsed < std::time::Duration::from_millis(2_500),
         "the AAAA confirmation must not hold the resolution, took {elapsed:?}"
     );
     assert!(
@@ -1449,7 +1478,7 @@ async fn a_slow_aaaa_answer_is_cached_after_the_short_window() {
     // The IPv6 answer arrives after the short window. It must not be lost: the
     // query continues in the background, so the next resolution has it.
     let (resolver, _servers) =
-        resolver_with_timeout(&[DohMode::V4Only, DohMode::SlowWide(2000)], 8).await;
+        resolver_with_timeout(&[DohMode::StallAAAA, DohMode::SlowWide(2000)], 8).await;
 
     let first = resolver.resolve_ips("example.com").await.unwrap();
     assert_eq!(first.ips.len(), 2, "IPv4 answers first");
