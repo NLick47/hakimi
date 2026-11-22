@@ -128,7 +128,7 @@ fn section_nav(s: UiSignals, tx: Sender<Action>) -> Element {
 // -- section: 常规 ---------------------------------------------------------------
 
 fn site_management_row(s: UiSignals, tx: Sender<Action>) -> Element {
-    let s = s.clone();
+    let s = s;
     let head_tx = tx.clone();
     let add_tx = tx.clone();
     let open = s.sites_expanded;
@@ -380,8 +380,8 @@ fn section_general(s: UiSignals, tx: Sender<Action>) -> Element {
     Element::col()
         .width_match()
         .spacing(8)
-        .child(card(site_management_row(s.clone(), tx.clone())))
-        .child(local_ca_card(s.clone(), tx.clone()))
+        .child(card(site_management_row(s, tx.clone())))
+        .child(local_ca_card(s, tx.clone()))
         .child(startup_card(s, tx))
 }
 
@@ -701,7 +701,7 @@ fn section_downloads(s: UiSignals, tx: Sender<Action>) -> Element {
                     },
                 ))
                 .child(row_line())
-                .child(threads_row(s.clone(), mirror_tx.clone()))
+                .child(threads_row(s, mirror_tx.clone()))
                 .child(row_line())
                 .child(toggle_row(
                     "GitHub 镜像加速",
@@ -904,10 +904,10 @@ pub fn view(s: UiSignals, tx: Sender<Action>) -> Element {
     let sec3 = section;
     let pages = Element::stack()
         .fill()
-        .child(section_general(s.clone(), tx.clone()).visible_when(move || sec0.get() == 0))
-        .child(section_network(s.clone(), tx.clone()).visible_when(move || sec1.get() == 1))
-        .child(section_downloads(s.clone(), tx.clone()).visible_when(move || sec2.get() == 2))
-        .child(section_data(s.clone(), tx.clone()).visible_when(move || sec3.get() == 3));
+        .child(section_general(s, tx.clone()).visible_when(move || sec0.get() == 0))
+        .child(section_network(s, tx.clone()).visible_when(move || sec1.get() == 1))
+        .child(section_downloads(s, tx.clone()).visible_when(move || sec2.get() == 2))
+        .child(section_data(s, tx.clone()).visible_when(move || sec3.get() == 3));
 
     Element::col()
         .fill()
@@ -929,13 +929,13 @@ pub fn view(s: UiSignals, tx: Sender<Action>) -> Element {
                     bottom: 14,
                 })
                 .spacing(18)
-                .child(section_nav(s.clone(), tx.clone()))
+                .child(section_nav(s, tx.clone()))
                 .child(
                     Element::scroll().weight(1.0).child(
                         Element::col()
                             .width_match()
                             .spacing(12)
-                            .child(section_title_block(s.clone()))
+                            .child(section_title_block(s))
                             .child(Element::leaf().height(4))
                             .child(pages)
                             .child(error_banner(s)),

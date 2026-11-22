@@ -175,9 +175,9 @@ pub fn view(s: UiSignals, tx: Sender<Action>) -> Element {
                             ),
                     )
                     .child(hairline())
-                    .child(ca_row(s.clone(), tx.clone()))
+                    .child(ca_row(s, tx.clone()))
                     .child(hairline())
-                    .child(proxy_row(s.clone(), tx.clone()))
+                    .child(proxy_row(s, tx.clone()))
                     .child(hairline())
                     .child(
                         Element::row()

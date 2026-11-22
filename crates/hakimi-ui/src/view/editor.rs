@@ -68,7 +68,7 @@ fn domain_row(row: EditorRowState, removable: bool, tx: Sender<Action>) -> Eleme
     let remove_tx = tx.clone();
 
     // Blur / Enter normalises a pasted URL into a bare host; save repeats it.
-    let norm_pattern = row.pattern.clone();
+    let norm_pattern = row.pattern;
     let input = Element::text_input(row.pattern, "example.com 或 *.example.com")
         .weight(1.0)
         .height(38)

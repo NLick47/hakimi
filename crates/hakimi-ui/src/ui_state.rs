@@ -1046,7 +1046,7 @@ pub fn apply_settle(sites: &mut [crate::SiteData], phase: SettlePhase) {
                         }
                         None => false,
                     };
-                    settle_display(entry, &site.summary, &site.summary_hex, stable)
+                    settle_display(entry, &site.summary, site.summary_hex, stable)
                 }
             };
             site.summary = summary;
