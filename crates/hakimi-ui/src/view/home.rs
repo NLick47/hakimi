@@ -4,20 +4,21 @@
 use windui::prelude::*;
 
 use crate::app_state::{Action, UiSignals};
-use crate::fx;
 use crate::model::{NetEntry, SiteData};
 use crate::theme;
 use crate::view::common::{self, card, chevron, site_badge, stat_row, status_row, text_button};
 
 // -- sidebar ------------------------------------------------------------------
 
-/// The master switch as a dark hero card; the FX night sky fades in behind
-/// the content while acceleration runs.
+/// The master switch as a dark hero card. Two exclusive switch stacks (glass
+/// track when paused, green gradient when running) mirror the old button pair;
+/// each closure reads only its single source signal.
 fn master_card(s: UiSignals, tx: Sender<Action>) -> Element {
+    let off_tx = tx.clone();
+    let on_tx = tx;
     let running = s.running;
-    Element::stack()
+    Element::col()
         .width_match()
-        .height(56)
         .corner(10.0)
         .bg_gradient(Gradient::linear(
             (0.0, 0.0),
@@ -25,19 +26,28 @@ fn master_card(s: UiSignals, tx: Sender<Action>) -> Element {
             vec![(0.0, theme::HERO_BG_TOP), (1.0, theme::HERO_BG_BOTTOM)],
         ))
         .shadow(Shadow::new(0.0, 5.0, 16.0, theme::HERO_SHADOW))
-        .child(fx::sky_layer(s))
-        .child(fx::galaxy_layer(s))
-        .child(fx::twinkle_layer(s))
-        .child(fx::aurora_layer(s))
-        .child(fx::meteor_layer(s))
         .child(
             Element::row()
                 .width_match()
-                .height_match()
+                .height(56)
                 .padding_xy(14, 0)
                 .cross(Align::Center)
                 .spacing(9)
-                .child(fx::dot(s.fx_dot))
+                .child(
+                    Element::leaf()
+                        .size(8, 8)
+                        .corner(4.0)
+                        .bg(theme::HERO_DOT_PAUSED)
+                        .visible_when(move || !running.get()),
+                )
+                .child(
+                    Element::leaf()
+                        .size(8, 8)
+                        .corner(4.0)
+                        .bg(theme::HERO_DOT_RUN)
+                        .shadow(Shadow::new(0.0, 0.0, 8.0, theme::HERO_DOT_GLOW))
+                        .visible_when(move || running.get()),
+                )
                 .child(
                     Element::col()
                         .weight(1.0)
@@ -67,7 +77,64 @@ fn master_card(s: UiSignals, tx: Sender<Action>) -> Element {
                             .visible_when(move || running.get()),
                         ),
                 )
-                .child(fx::switch(s, tx)),
+                .child(hero_switch_off(off_tx).visible_when(move || !running.get()))
+                .child(hero_switch_on(on_tx).visible_when(move || running.get())),
+        )
+}
+
+/// Master switch when paused: glass track on the dark card, knob left.
+fn hero_switch_off(tx: Sender<Action>) -> Element {
+    Element::stack()
+        .size(40, 24)
+        .clickable()
+        .on_click(move |_| {
+            let _ = tx.send(Action::ToggleMaster);
+        })
+        .child(
+            Element::leaf()
+                .fill()
+                .corner(12.0)
+                .bg(theme::SWITCH_OFF_TRACK)
+                .border(theme::SWITCH_OFF_BORDER, 1),
+        )
+        .child(
+            Element::leaf()
+                .size(18, 18)
+                .corner(9.0)
+                .bg(theme::CARD_BG)
+                .shadow(Shadow::new(0.0, 1.0, 3.0, theme::KNOB_SHADOW))
+                .align_xy(Align::Start, Align::Center)
+                .margin_xy(3, 0),
+        )
+}
+
+/// Master switch while running: green gradient track with a glow, knob right.
+fn hero_switch_on(tx: Sender<Action>) -> Element {
+    Element::stack()
+        .size(40, 24)
+        .clickable()
+        .on_click(move |_| {
+            let _ = tx.send(Action::ToggleMaster);
+        })
+        .child(
+            Element::leaf()
+                .fill()
+                .corner(12.0)
+                .bg_gradient(Gradient::linear(
+                    (0.0, 0.0),
+                    (0.0, 1.0),
+                    vec![(0.0, theme::SWITCH_ON_TOP), (1.0, theme::SWITCH_ON_BOTTOM)],
+                ))
+                .shadow(Shadow::new(0.0, 2.0, 8.0, theme::SWITCH_ON_GLOW)),
+        )
+        .child(
+            Element::leaf()
+                .size(18, 18)
+                .corner(9.0)
+                .bg(theme::CARD_BG)
+                .shadow(Shadow::new(0.0, 1.0, 3.0, theme::KNOB_SHADOW))
+                .align_xy(Align::End, Align::Center)
+                .margin_xy(3, 0),
         )
 }
 
@@ -235,12 +302,12 @@ fn sidebar(s: UiSignals, tx: Sender<Action>) -> Element {
                         .width_match()
                         .padding(16)
                         .spacing(14)
-                        .child(master_card(s, tx.clone()))
-                        .child(warn_banner(s, tx.clone()).visible_signal(warn_visible))
+                        .child(master_card(s.clone(), tx.clone()))
+                        .child(warn_banner(s.clone(), tx.clone()).visible_signal(warn_visible))
                         .child(
                             interrupt_banner(tx.clone()).visible_signal(s.proxy_interrupted),
                         )
-                        .child(overview_card(s))
+                        .child(overview_card(s.clone()))
                         .child(Element::leaf().height(0)),
                 ),
         )
@@ -481,21 +548,21 @@ pub fn view(s: UiSignals, tx: Sender<Action>) -> Element {
         .child(
             Element::col()
                 .width_match()
-                .child(toolbar(s, tx.clone()))
+                .child(toolbar(s.clone(), tx.clone()))
                 .child(Element::leaf().height(1).bg(theme::BORDER)),
         )
         .child(
             Element::row()
                 .weight(1.0)
                 .height_match()
-                .child(sidebar(s, tx.clone()))
+                .child(sidebar(s.clone(), tx.clone()))
                 .child(
                     Element::col()
                         .weight(1.0)
                         .height_match()
                         .padding(18)
                         .spacing(12)
-                        .child(sites_header(s, tx.clone()))
+                        .child(sites_header(s.clone(), tx.clone()))
                         .child(
                             Element::scroll()
                                 .weight(1.0)

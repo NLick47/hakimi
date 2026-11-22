@@ -79,8 +79,8 @@ pub const DANGER_TILE: Color = Color::hex(0xC05B5B);
 pub const DOT_NEUTRAL: Color = Color::hex(0xA0A8B0);
 
 // Dark hero card (the master switch): the only dark surface in the window, so
-// the primary control reads at a glance. Slate gradient; the running-state
-// night sky and switch colors live in fx.rs.
+// the primary control reads at a glance. Slate gradient + a green glow while
+// running; the glass switch track and knob sit on top.
 pub const HERO_BG_TOP: Color = Color::hex(0x2B3850);
 pub const HERO_BG_BOTTOM: Color = Color::hex(0x1D2736);
 pub const HERO_SHADOW: Color = Color::rgba(23, 32, 46, 82);
@@ -89,9 +89,14 @@ pub const HERO_TEXT: Color = Color::hex(0xF2F5F9);
 pub const HERO_TEXT_SUB: Color = Color::rgba(242, 245, 249, 158);
 pub const HERO_DOT_PAUSED: Color = Color::hex(0x7C8BA1);
 pub const HERO_DOT_RUN: Color = Color::hex(0x3DDC97);
+pub const HERO_DOT_GLOW: Color = Color::rgba(61, 220, 151, 166);
+pub const SWITCH_ON_TOP: Color = Color::hex(0x34D292);
+pub const SWITCH_ON_BOTTOM: Color = Color::hex(0x22B87A);
+pub const SWITCH_ON_GLOW: Color = Color::rgba(34, 184, 122, 102);
 /// Glass track: white 16% fill over a white 14% hairline.
 pub const SWITCH_OFF_TRACK: Color = Color::rgba(255, 255, 255, 41);
 pub const SWITCH_OFF_BORDER: Color = Color::rgba(255, 255, 255, 36);
+pub const KNOB_SHADOW: Color = Color::rgba(0, 0, 0, 89);
 
 // Hover fills used by rows, nav items and inputs.
 #[allow(dead_code)]

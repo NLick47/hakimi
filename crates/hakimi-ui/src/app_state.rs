@@ -242,13 +242,6 @@ pub(crate) struct UiSignals {
     pub editor_deletable: Signal<bool>,
     pub editor_error: Signal<String>,
     pub editor_rows: Signal<Vec<EditorRowState>>,
-    // -- hero-card fx (crate::fx writes, the view rebuilds from them) --
-    pub fx_switch: Signal<Vec<crate::fx::SwitchFx>>,
-    pub fx_dot: Signal<Vec<crate::fx::DotFx>>,
-    pub fx_meteors: Signal<Vec<crate::fx::Meteor>>,
-    pub fx_veil: Signal<Vec<crate::fx::VeilFx>>,
-    pub fx_twinkle: Signal<Vec<crate::fx::TwinkleFx>>,
-    pub fx_aurora: Signal<Vec<crate::fx::AuroraFx>>,
 }
 
 impl Default for UiSignals {
@@ -340,24 +333,6 @@ impl Default for UiSignals {
             editor_deletable: signal(false),
             editor_error: signal(String::new()),
             editor_rows: signal(Vec::new()),
-            fx_switch: signal(vec![crate::fx::SwitchFx {
-                knob_x: 3,
-                blend: 0,
-                star: 0,
-                wisp: 0,
-            }]),
-            fx_dot: signal(vec![crate::fx::DotFx {
-                on: false,
-                spread: 0,
-                alpha: 0,
-            }]),
-            fx_meteors: signal(Vec::new()),
-            fx_veil: signal(vec![crate::fx::VeilFx { alpha: 0 }]),
-            fx_twinkle: signal(vec![crate::fx::TwinkleFx { phase: 0 }]),
-            fx_aurora: signal(vec![crate::fx::AuroraFx {
-                phase: 0,
-                sway: 0,
-            }]),
         }
     }
 }
