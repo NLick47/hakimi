@@ -23,6 +23,7 @@ use windui::prelude::*;
 mod app_state;
 mod assets;
 mod autostart;
+mod fx;
 // Only the macOS windowed lifecycle installs the reopen hook; keep the module
 // compiled on Windows so its off-macOS test still runs.
 #[cfg_attr(windows, allow(dead_code))]
@@ -605,7 +606,7 @@ fn domain_sni_hosts(route: &RoutePolicy) -> Option<Vec<String>> {
 }
 
 fn split_entries(raw: &str) -> Vec<String> {
-    raw.split(|c| c == ',' || c == '，')
+    raw.split([',', '，'])
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
         .map(str::to_string)
@@ -942,6 +943,7 @@ struct Ui {
     /// their `visible_signal`s during that frame's layout. One tick later the
     /// nodes are gone and the slots are safe to dispose.
     reclaim_editor_rows: std::cell::Cell<bool>,
+    fx: RefCell<fx::Engine>,
 }
 
 impl Ui {
@@ -1004,7 +1006,8 @@ impl Ui {
         }
         set_str(s.status_subtitle, snap.subtitle);
         set_str(s.sites_summary, snap.sites_summary);
-        set_bool(s.running, snap.running);
+        let shot_running = std::env::var("HAKIMI_UI_RUNNING").is_ok();
+        set_bool(s.running, snap.running || shot_running);
         set_str(s.stat_doh, snap.net_doh);
         set_i32(s.stat_doh_tone, snap.net_doh_tone);
         set_str(s.stat_mirror, snap.net_mirror);
@@ -1100,6 +1103,11 @@ impl Ui {
     fn refresh(&self) {
         let snap = refresh_snapshot(&self.ctx);
         self.apply_snapshot(snap);
+    }
+
+    fn fx_tick(&self) {
+        let running = self.signals.running.get();
+        self.fx.borrow_mut().tick(running, &self.signals);
     }
 
     fn release_view_state(&self) {
@@ -1703,6 +1711,7 @@ fn main_window_request(ui: std::rc::Rc<Ui>, tx: Sender<Action>) -> WindowRequest
     let refresh_ui = ui.clone();
     let content_ui = ui.clone();
     let shortcut_ui = ui.clone();
+    let fx_ui = ui.clone();
 
     let title_bar_pending = std::cell::Cell::new(true);
     let mut window = Window::new("hakimi", WINDOW_WIDTH, WINDOW_HEIGHT)
@@ -1725,6 +1734,11 @@ fn main_window_request(ui: std::rc::Rc<Ui>, tx: Sender<Action>) -> WindowRequest
         .on_interval(Duration::from_millis(120), move |_ctx| {
             if title_bar_pending.replace(false) {
                 apply_light_title_bar();
+            }
+        })
+        .on_interval(Duration::from_millis(50), move |ctx| {
+            if ctx.window_state().visible {
+                fx_ui.fx_tick();
             }
         })
         .on_interval(Duration::from_millis(1000), move |_ctx| {
@@ -1825,6 +1839,7 @@ fn run_windowed(mut app: App, ui: std::rc::Rc<Ui>, tx: Sender<Action>, start_hid
 
     // One-second refresh: recompute the snapshot and push changed signals.
     let timer_ui = ui.clone();
+    let fx_ui = ui.clone();
     let mut title_bar_done = false;
     app = app.on_interval(Duration::from_millis(1000), move |ctx| {
         if !title_bar_done {
@@ -1841,6 +1856,12 @@ fn run_windowed(mut app: App, ui: std::rc::Rc<Ui>, tx: Sender<Action>, start_hid
         }
         timer_ui.hidden.store(!visible, Ordering::Relaxed);
         maybe_auto_update(&timer_ui);
+    });
+
+    app = app.on_interval(Duration::from_millis(50), move |ctx| {
+        if ctx.window_state().visible {
+            fx_ui.fx_tick();
+        }
     });
 
     // Attach the content tree in BOTH branches. A hidden launch still owns a
@@ -1956,6 +1977,7 @@ fn main() -> Result<()> {
         shutdown: shutdown.clone(),
         settings_revision: std::cell::Cell::new(None),
         reclaim_editor_rows: std::cell::Cell::new(false),
+        fx: RefCell::new(fx::Engine::new()),
     });
     if std::env::var("HAKIMI_UI_PAGE").as_deref() == Ok("1") {
         ui.signals.page.set(1);
@@ -1979,6 +2001,12 @@ fn main() -> Result<()> {
     ui.sync_model();
     ui.sync_root();
     ui.refresh();
+
+    if std::env::var("HAKIMI_UI_RUNNING").is_ok() {
+        ui.fx.borrow_mut().spawn_shot_meteor();
+        ui.fx.borrow_mut().shot_running(&ui.signals);
+        ui.signals.running.set(true);
+    }
 
     // Create the channel first: every UI action, tray click and background
     // result is a message handled on the UI thread by `Ui::handle`.
