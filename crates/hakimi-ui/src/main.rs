@@ -1347,12 +1347,12 @@ impl Ui {
             Action::OpenDataDir => {
                 let dir = runtime.paths().root().to_path_buf();
                 std::thread::spawn(move || {
-                    let _ = open::that(dir);
+                    open_external(&dir);
                 });
             }
             Action::OpenSite(url) => {
                 std::thread::spawn(move || {
-                    let _ = open::that(url);
+                    open_external(&url);
                 });
             }
             Action::CheckUpdate => {
@@ -1867,6 +1867,29 @@ fn run_windowed(mut app: App, ui: std::rc::Rc<Ui>, tx: Sender<Action>, start_hid
 }
 
 // -- entry point --------------------------------------------------------------
+
+#[cfg(windows)]
+fn open_external(target: impl AsRef<std::ffi::OsStr>) {
+    use windows::core::{w, HSTRING, PCWSTR};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let target = HSTRING::from(target.as_ref().to_string_lossy().as_ref());
+    unsafe {
+        let _ = ShellExecuteW(
+            None,
+            w!("open"),
+            &target,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn open_external(target: impl AsRef<std::ffi::OsStr>) {
+    let _ = open::that(target);
+}
 
 fn main() -> Result<()> {
     use_light_appearance();
