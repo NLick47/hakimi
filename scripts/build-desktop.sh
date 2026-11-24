@@ -14,10 +14,20 @@ cd "$(dirname "$0")/.."
 profile="desktop-release"
 target="${HAKIMI_TARGET:-}"
 
-args=(build --profile "$profile" -p hakimi-ui)
+args=(
+    +nightly
+    build
+    -Z build-std=std,panic_abort
+    -Z build-std-features=optimize_for_size
+    --profile "$profile"
+    -p hakimi-ui
+)
 if [[ -n "$target" ]]; then
     args+=(--target "$target")
 fi
+
+root="$(git rev-parse --show-toplevel)"
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$root/=src/"
 
 cargo "${args[@]}"
 
