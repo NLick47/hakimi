@@ -213,6 +213,60 @@ jobs:
           path: dist/hakimi-*-macos-arm64.dmg
           if-no-files-found: error
 
+  macos-intel:
+    name: macOS x64
+    needs: prepare
+    runs-on: macos-15-intel
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify Intel runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(uname -m)" != "x86_64" ]]; then
+            echo "::error::macos-15-intel is expected to be an Intel runner, got $(uname -m)"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-x64-desktop
+
+      - name: Set desktop version
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.desktop_version }}
+        run: python3 scripts/ci/version.py --apply "$VERSION"
+
+      - name: Build desktop UI
+        shell: bash
+        env:
+          HAKIMI_TARGET: x86_64-apple-darwin
+        run: bash ./scripts/build-desktop.sh
+
+      - name: Package dmg
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.desktop_version }}
+          VERSION_CODE: ${{ needs.prepare.outputs.desktop_version_code }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci/package-macos.sh "$VERSION" "$VERSION_CODE" target/desktop/hakimi-ui dist
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hakimi-${{ needs.prepare.outputs.desktop_version }}-macos-x64
+          path: dist/hakimi-*-macos-x64.dmg
+          if-no-files-found: error
+
   android:
     name: Android arm64 + armv7
     needs: prepare
@@ -394,7 +448,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [prepare, windows, macos, android]
+    needs: [prepare, windows, macos, macos-intel, android]
     if: needs.prepare.outputs.is_release == 'true'
     runs-on: ubuntu-24.04
     permissions:
@@ -428,6 +482,7 @@ jobs:
           for file in \
             "dist/hakimi-${DESKTOP_VERSION}-windows-x64.zip" \
             "dist/hakimi-${DESKTOP_VERSION}-macos-arm64.dmg" \
+            "dist/hakimi-${DESKTOP_VERSION}-macos-x64.dmg" \
             "dist/hakimi-${ANDROID_VERSION}-android.apk" \
             "dist/hakimi-${ANDROID_VERSION}-armv7.apk"
           do
@@ -453,6 +508,7 @@ jobs:
             --desktop-version "$DESKTOP_VERSION" \
             --desktop-windows-asset "hakimi-${DESKTOP_VERSION}-windows-x64.zip" \
             --desktop-macos-asset "hakimi-${DESKTOP_VERSION}-macos-arm64.dmg" \
+            --desktop-macos-intel-asset "hakimi-${DESKTOP_VERSION}-macos-x64.dmg" \
             --android-version "$ANDROID_VERSION" \
             --android-apk-asset "hakimi-${ANDROID_VERSION}-android.apk" \
             --android-apk-armv7-asset "hakimi-${ANDROID_VERSION}-armv7.apk"

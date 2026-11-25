@@ -8,7 +8,6 @@
 #   BINARY  = target/desktop/hakimi-ui
 #   OUT_DIR = dist
 #
-# The resulting app is Apple Silicon only (arm64), matching the release job.
 set -euo pipefail
 
 VERSION="${1:?usage: package-macos.sh VERSION VERSION_CODE [BINARY] [OUT_DIR]}"
@@ -32,14 +31,18 @@ if [[ ! -f "$ICON" ]]; then
 fi
 
 ARCHS="$(lipo -archs "$BIN")"
-if [[ "$ARCHS" != "arm64" ]]; then
-    echo "error: expected an arm64 binary, got: $ARCHS" >&2
-    exit 1
-fi
+case "$ARCHS" in
+    arm64) DMG_ARCH="arm64" ;;
+    x86_64) DMG_ARCH="x64" ;;
+    *)
+        echo "error: expected an arm64 or x86_64 binary, got: $ARCHS" >&2
+        exit 1
+        ;;
+esac
 
 APP="$OUT_DIR/hakimi.app"
 STAGE="$OUT_DIR/dmg-stage"
-DMG="$OUT_DIR/hakimi-${VERSION}-macos-arm64.dmg"
+DMG="$OUT_DIR/hakimi-${VERSION}-macos-${DMG_ARCH}.dmg"
 
 rm -rf "$APP" "$STAGE"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
