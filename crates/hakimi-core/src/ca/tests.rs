@@ -552,15 +552,15 @@ mod minider_crosscheck {
     }
 
     #[test]
-    fn shipped_android_probe_ca_matches_x509_parser() {
-        let pem = include_str!("../../../../android/probe/assets/ca/ca.pem");
+    fn openssl_recipe_probe_ca_matches_x509_parser() {
+        let pem = include_str!("testdata/probe-ca.pem");
         let fields = minider::parse_ca_fields(&material::pem_to_der(pem).unwrap()).unwrap();
         assert_eq!(fields.subject, "CN=Hakimi Android Probe CA");
         assert_eq!(
             fields.ski.unwrap(),
             [
-                0xE4, 0x0C, 0x9D, 0x4D, 0xA9, 0x35, 0xD1, 0x15, 0x67, 0xD7, 0x14, 0xED, 0xF8,
-                0xA7, 0x31, 0xA8, 0x47, 0x92, 0x70, 0x49
+                0x1F, 0x61, 0x67, 0xCE, 0x11, 0x19, 0xA9, 0x3B, 0x83, 0x21, 0xC0, 0xC1, 0xFA,
+                0x5A, 0x4D, 0x01, 0x7A, 0x96, 0xCA, 0x03
             ]
         );
         crosscheck(pem);
@@ -670,10 +670,7 @@ mod minider_crosscheck {
 
     #[test]
     fn garbage_certificates_are_rejected() {
-        let der = material::pem_to_der(include_str!(
-            "../../../../android/probe/assets/ca/ca.pem"
-        ))
-        .unwrap();
+        let der = material::pem_to_der(include_str!("testdata/probe-ca.pem")).unwrap();
         for cut in [0, 1, 4, 16, der.len() / 2, der.len() - 1] {
             assert!(
                 minider::parse_ca_fields(&der[..cut]).is_err(),
