@@ -39,6 +39,9 @@ pub(crate) struct SiteData {
     pub(crate) summary: String,
     pub(crate) summary_hex: &'static str,
     pub(crate) enabled: bool,
+    pub(crate) hidden: bool,
+    /// Shipped groups cannot be edited or removed; user groups can.
+    pub(crate) shipped: bool,
     pub(crate) open: bool,
     pub(crate) first: bool,
     pub(crate) url: String,
@@ -199,16 +202,10 @@ pub(crate) fn normalize_domain_host(raw: &str) -> Result<String> {
     Ok(host)
 }
 
-/// Built-in group ids. Anything else was added by the user and may be removed
-/// from the UI.
-pub(crate) fn builtin_group_ids() -> &'static HashSet<String> {
-    static IDS: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
-    IDS.get_or_init(|| {
-        hakimi_core::config::default_groups()
-            .into_iter()
-            .map(|group| group.id)
-            .collect()
-    })
+/// Whether a group is shipped with the build. A shipped group's definition is
+/// not user-editable and cannot be removed; a user group is both.
+pub(crate) fn is_shipped(site: &SiteData) -> bool {
+    site.shipped
 }
 
 /// Muted brand-ish tiles for groups without a real favicon.
@@ -463,6 +460,11 @@ pub(crate) fn build_sites(
                 .get("enabled")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let hidden = group
+                .get("hidden")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let shipped = hakimi_core::config::is_builtin_group(&id);
             if enabled {
                 selected += 1;
             }
@@ -585,6 +587,8 @@ pub(crate) fn build_sites(
                 summary,
                 summary_hex,
                 enabled,
+                hidden,
+                shipped,
                 open: expanded.contains(&id_key),
                 first: false,
                 url: homepage,

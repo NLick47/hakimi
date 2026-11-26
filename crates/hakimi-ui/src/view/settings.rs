@@ -174,22 +174,129 @@ fn site_management_row(s: UiSignals, tx: Sender<Action>) -> Element {
             s.sites,
             |site| site.id.clone(),
             move |site| management_site_row(site, head_tx.clone()),
-        ));
+        ))
+        .child(hidden_sites_section(s, tx));
     Element::col().width_match().child(head).child(expanded)
 }
 
-fn management_site_row(site: SiteData, tx: Sender<Action>) -> Element {
+/// The collapsed block of hidden sites under the visible list. The toggle is
+/// an Action so the refresh path stays the single source of the list state.
+fn hidden_sites_section(s: UiSignals, tx: Sender<Action>) -> Element {
+    let count_signal = s.sites_hidden_count;
+    let shown = s.sites_hidden_shown;
+    let checkbox = s.sites_hidden_shown;
+    let list_tx = tx.clone();
+    let toggle_tx = tx;
+    let head = Element::row()
+        .width_match()
+        .height(40)
+        .padding_xy(16, 0)
+        .cross(Align::Center)
+        .spacing(8)
+        .visible_when(move || count_signal.get() > 0)
+        .child(
+            Element::label("已隐藏（未加速）")
+                .font_size(12.5)
+                .fg(theme::TEXT_MUTED)
+                .weight(1.0),
+        )
+        .child(Element::label("显示").font_size(12.0).fg(theme::TEXT_SOFT))
+        .child(Element::checkbox("", checkbox).on_toggle(move |_| {
+            let _ = toggle_tx.send(Action::ToggleShowHidden);
+        }));
+    let list = Element::col()
+        .width_match()
+        .visible_when(move || shown.get() && count_signal.get() > 0)
+        .child(inset_line())
+        .child(Element::list_signal(
+            s.sites_hidden,
+            |site| site.id.clone(),
+            move |site| hidden_site_row(site, list_tx.clone()),
+        ));
+    Element::col().width_match().child(head).child(list)
+}
+
+/// A hidden site row: muted, opens the editor unless builtin, right-click
+/// offers unhide.
+fn hidden_site_row(site: SiteData, tx: Sender<Action>) -> Element {
     let id = site.id.clone();
     let row_tx = tx.clone();
+    let menu_tx = tx.clone();
+    let menu_id = site.id.clone();
+    let menu_builtin = crate::model::is_shipped(&site);
     let mut row = Element::row()
         .width_match()
         .height(48)
         .padding_xy(16, 0)
         .cross(Align::Center)
-        .spacing(10)
-        .clickable()
-        .on_click(move |_| {
+        .spacing(10);
+    if !menu_builtin {
+        row = row.clickable().on_click(move |_| {
             let _ = row_tx.send(Action::OpenEditor(id.clone()));
+        });
+    }
+    let mut row = row
+        .on_context_menu(move || {
+            super::site_menu(menu_tx.clone(), menu_id.clone(), menu_builtin, true, false)
+        })
+        .child(site_badge(
+            crate::assets::site_logo(&site.icon_key),
+            signal(site.initial.clone()),
+            theme::from_hex(site.tile_hex),
+        ))
+        .child(
+            Element::col()
+                .weight(1.0)
+                .cross(Align::Start)
+                .spacing(1)
+                .child(
+                    Element::label(site.name.clone())
+                        .font_size(13.5)
+                        .font_weight(500)
+                        .fg(theme::TEXT_SOFT),
+                )
+                .child(
+                    Element::label(site.summary.clone())
+                        .font_size(11.5)
+                        .fg(theme::TEXT_MUTED)
+                        .truncate(Truncate::End),
+                ),
+        );
+    if !menu_builtin {
+        row = row.child(common::chevron_right_icon());
+    }
+    let line = inset_line();
+    Element::col().width_match().child(line).child(row)
+}
+
+fn management_site_row(site: SiteData, tx: Sender<Action>) -> Element {
+    let id = site.id.clone();
+    let row_tx = tx.clone();
+    let menu_tx = tx.clone();
+    let menu_id = site.id.clone();
+    let menu_builtin = crate::model::is_shipped(&site);
+    let menu_hidden = site.hidden;
+    let menu_enabled = site.enabled;
+    let mut row = Element::row()
+        .width_match()
+        .height(48)
+        .padding_xy(16, 0)
+        .cross(Align::Center)
+        .spacing(10);
+    if !menu_builtin {
+        row = row.clickable().on_click(move |_| {
+            let _ = row_tx.send(Action::OpenEditor(id.clone()));
+        });
+    }
+    let mut row = row
+        .on_context_menu(move || {
+            super::site_menu(
+                menu_tx.clone(),
+                menu_id.clone(),
+                menu_builtin,
+                menu_hidden,
+                menu_enabled,
+            )
         })
         .child(site_badge(
             crate::assets::site_logo(&site.icon_key),
@@ -217,10 +324,13 @@ fn management_site_row(site: SiteData, tx: Sender<Action>) -> Element {
                         .fg(theme::from_hex(site.summary_hex))
                         .truncate(Truncate::End),
                 ),
-        )
-        .child(common::chevron_right_icon());
+        );
+    if !menu_builtin {
+        row = row.child(common::chevron_right_icon());
+    }
     if !site.first {
-        row = Element::col().width_match().child(inset_line()).child(row);
+        let line = inset_line();
+        return Element::col().width_match().child(line).child(row);
     }
     row
 }

@@ -1166,6 +1166,10 @@ impl HakimiRuntime {
         self.config.set_group_enabled(id, enabled)
     }
 
+    pub fn set_group_hidden(&self, id: &str, hidden: bool) -> Result<AppConfig> {
+        self.config.set_group_hidden(id, hidden)
+    }
+
     pub fn set_group_default_route(&self, id: &str, route: RoutePolicy) -> Result<AppConfig> {
         self.config.set_group_default_route(id, route)
     }
@@ -1608,10 +1612,7 @@ impl HakimiRuntime {
 
     fn note_warm_failure(&self, domain: &str) {
         let mut map = self.warm_backoff.lock();
-        let consecutive = map
-            .get(domain)
-            .map_or(0, |(n, _)| *n)
-            .saturating_add(1);
+        let consecutive = map.get(domain).map_or(0, |(n, _)| *n).saturating_add(1);
         let delay = 300u64.saturating_mul(1u64 << consecutive.saturating_sub(1).min(4));
         let next = Instant::now() + Duration::from_secs(delay.min(Self::WARM_BACKOFF_MAX_SECS));
         map.insert(domain.to_string(), (consecutive, next));
@@ -2154,6 +2155,73 @@ mod status_snapshot_tests {
         );
     }
 
+    /// A hidden site is disabled, and the warm-up must not dial it: it would
+    /// open TLS connections to a site the user explicitly stopped. The
+    /// walled addresses make "was it dialed" observable through the failure
+    /// table, which only records a warm attempt that actually ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warm_groups_skips_hidden_and_disabled_sites() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = HakimiRuntime::new(Some(dir.path().to_path_buf())).unwrap();
+        runtime
+            .config
+            .mutate(|config| {
+                config.groups.retain(|group| group.id == "github");
+                for (id, hidden, enabled) in [
+                    ("visible", false, true),
+                    ("hiddenone", true, false),
+                    ("offone", false, false),
+                ] {
+                    config.groups.push(GroupConfig {
+                        id: id.into(),
+                        name: id.into(),
+                        domains: vec![DomainRule::new(format!("{id}.test"))],
+                        enabled,
+                        homepage: None,
+                        default_route: RoutePolicy::direct(),
+                        verify: VerifyMode::Real,
+                        hidden,
+                    });
+                }
+                config.advanced.ip_timeout_ms = 500;
+                Ok(())
+            })
+            .unwrap();
+        // Every candidate address black-holes, so any domain the warm-up
+        // dials ends up in the failure table.
+        for id in ["visible", "hiddenone", "offone"] {
+            runtime.cache.put_last_good(LastGoodEntry {
+                domain: format!("{id}.test"),
+                ip: "192.0.2.1".parse().unwrap(),
+                source: crate::strategy::IpSource::Cache,
+                saved_at: crate::util::now(),
+                catalog_version: 0,
+            });
+        }
+
+        runtime.warm_groups().await;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if runtime.warm_backoff.lock().contains_key("visible.test") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the enabled site must be warmed, or the test proves nothing"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let tried = runtime.warm_backoff.lock().clone();
+        assert!(
+            !tried.contains_key("hiddenone.test"),
+            "a hidden site must not be warmed after a restart"
+        );
+        assert!(
+            !tried.contains_key("offone.test"),
+            "a disabled site must not be warmed after a restart"
+        );
+    }
+
     /// Stop must not queue behind a background fetch that ignores the
     /// shutdown signal. The mirror refresh holds its HTTP timeout for ten
     /// seconds against a stalled source, and stop() gives each task two
@@ -2260,7 +2328,10 @@ mod status_snapshot_tests {
             .unwrap();
 
         runtime.start().await.unwrap();
-        assert!(runtime.relay.read().is_none(), "no relay handle when disabled");
+        assert!(
+            runtime.relay.read().is_none(),
+            "no relay handle when disabled"
+        );
         // Nothing may be listening on the reserved port.
         assert!(
             std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
@@ -2341,15 +2412,21 @@ mod status_snapshot_tests {
             "the first poll only seeds the baseline"
         );
         assert!(
-            !watch.poll(2, false, || baseline.clone(), || {
-                panic!("an unchanged script must not check eligibility")
-            }),
+            !watch.poll(
+                2,
+                false,
+                || baseline.clone(),
+                || { panic!("an unchanged script must not check eligibility") }
+            ),
             "an edit that leaves the PAC alone must not nudge"
         );
         assert!(
-            !watch.poll(2, false, || panic!("an idle tick must not rebuild the PAC"), || {
-                panic!("an idle tick must not check eligibility")
-            }),
+            !watch.poll(
+                2,
+                false,
+                || panic!("an idle tick must not rebuild the PAC"),
+                || { panic!("an idle tick must not check eligibility") }
+            ),
             "an idle tick must not nudge"
         );
         assert!(
@@ -2369,9 +2446,12 @@ mod status_snapshot_tests {
             "a resume without takeover must not nudge"
         );
         assert!(
-            !watch.poll(4, false, || with_site.clone(), || {
-                panic!("an unchanged script must not check eligibility")
-            }),
+            !watch.poll(
+                4,
+                false,
+                || with_site.clone(),
+                || { panic!("an unchanged script must not check eligibility") }
+            ),
             "a revision bump with an unchanged script must not nudge"
         );
         assert!(

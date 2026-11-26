@@ -183,6 +183,9 @@ pub(crate) struct UiSignals {
     pub stat_mirror_tone: Signal<i32>,
     // -- sites / network rows --
     pub sites: Signal<Vec<SiteData>>,
+    /// Hidden sites (always disabled); rendered only in the site management
+    /// section, never on the home list.
+    pub sites_hidden: Signal<Vec<SiteData>>,
     pub doh_rows: Signal<Vec<NetEntry>>,
     pub mirror_rows: Signal<Vec<NetEntry>>,
     pub doh_open: Signal<bool>,
@@ -245,6 +248,10 @@ pub(crate) struct UiSignals {
     pub editor_deletable: Signal<bool>,
     pub editor_error: Signal<String>,
     pub editor_rows: Signal<Vec<EditorRowState>>,
+    /// Hidden sites shown in the management section, session-scoped.
+    pub sites_hidden_shown: Signal<bool>,
+    /// Number of hidden sites, written in `apply_snapshot` next to the lists.
+    pub sites_hidden_count: Signal<i32>,
 }
 
 impl Default for UiSignals {
@@ -286,6 +293,7 @@ impl Default for UiSignals {
             stat_mirror: signal(String::new()),
             stat_mirror_tone: signal(0),
             sites: signal(Vec::new()),
+            sites_hidden: signal(Vec::new()),
             doh_rows: signal(Vec::new()),
             mirror_rows: signal(Vec::new()),
             doh_open: signal(false),
@@ -339,6 +347,8 @@ impl Default for UiSignals {
             editor_deletable: signal(false),
             editor_error: signal(String::new()),
             editor_rows: signal(Vec::new()),
+            sites_hidden_shown: signal(false),
+            sites_hidden_count: signal(0),
         }
     }
 }
@@ -376,6 +386,10 @@ pub(crate) enum Action {
     ToggleOpen(String),
     ProbeSelected,
     ReapplyProxy,
+    // hiding
+    HideSite(String),
+    UnhideSite(String),
+    ToggleShowHidden,
     // settings
     SaveString(String, String),
     SaveBool(String, bool),
@@ -409,6 +423,7 @@ pub(crate) enum Action {
 /// keeps half-typed fields (their signals are only written when changed).
 pub(crate) struct UiSnapshot {
     pub sites: Vec<SiteData>,
+    pub sites_hidden: Vec<SiteData>,
     pub subtitle: String,
     pub sites_summary: String,
     pub running: bool,

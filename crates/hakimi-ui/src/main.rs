@@ -42,7 +42,7 @@ pub(crate) use model::build_snapshot;
 #[cfg(test)]
 pub(crate) use model::icon_key_for;
 pub(crate) use model::{
-    build_sites, builtin_group_ids, doh_entries, doh_summary, finish_snapshot, format_route,
+    build_sites, doh_entries, doh_summary, finish_snapshot, format_route,
     mirror_entries, mirror_summary, normalize_domain_host, parse_route, route_from_preset,
     route_preset_index, text, DohObservation, NetStatus, SiteData, SweepState,
 };
@@ -904,14 +904,22 @@ fn refresh_snapshot(ctx: &AppContext) -> app_state::UiSnapshot {
 
     let (sites, subtitle) = finish_snapshot(raw_sites, selected, running, starting, Some(phase));
     let net = network_status(runtime, &settings);
+    // Hidden sites never render on the home list: every proxied site stays
+    // visible, so a site disappearing means it no longer routes traffic.
+    let (mut visible, hidden_sites): (Vec<SiteData>, Vec<SiteData>) =
+        sites.into_iter().partition(|site| !site.hidden);
+    for (index, site) in visible.iter_mut().enumerate() {
+        site.first = index == 0;
+    }
     let sites_summary = format!(
         "{} 个 · 已启用 {}",
-        sites.len(),
-        sites.iter().filter(|site| site.enabled).count()
+        visible.len(),
+        visible.iter().filter(|site| site.enabled).count()
     );
 
     app_state::UiSnapshot {
-        sites,
+        sites: visible,
+        sites_hidden: hidden_sites,
         subtitle,
         sites_summary,
         running,
@@ -1008,6 +1016,13 @@ impl Ui {
         if s.sites.get() != snap.sites {
             s.sites.set(snap.sites);
         }
+        if s.sites_hidden.get() != snap.sites_hidden {
+            s.sites_hidden.set(snap.sites_hidden.clone());
+        }
+        set_i32(
+            s.sites_hidden_count,
+            snap.sites_hidden.len().try_into().unwrap_or(i32::MAX),
+        );
         set_str(s.status_subtitle, snap.subtitle);
         set_str(s.sites_summary, snap.sites_summary);
         set_bool(s.running, snap.running);
@@ -1246,9 +1261,31 @@ impl Ui {
                 }
                 self.refresh();
             }
+            Action::HideSite(id) => {
+                if let Err(error) = runtime.set_group_hidden(&id, true) {
+                    tracing::warn!(error = %format!("{error:#}"), "could not hide the site");
+                }
+                self.refresh();
+            }
+            Action::UnhideSite(id) => {
+                if let Err(error) = runtime.set_group_hidden(&id, false) {
+                    tracing::warn!(error = %format!("{error:#}"), "could not unhide the site");
+                }
+                self.refresh();
+            }
+            Action::ToggleShowHidden => {
+                let shown = !s.sites_hidden_shown.get();
+                s.sites_hidden_shown.set(shown);
+                self.refresh();
+            }
             Action::SelectAll(enabled) => {
                 let _ = runtime.config().mutate(|config| {
                     for group in &mut config.groups {
+                        // A hidden site must never start routing traffic from
+                        // a bulk toggle: proxied sites stay visible.
+                        if enabled && group.hidden {
+                            continue;
+                        }
                         group.enabled = enabled;
                     }
                     Ok(())
@@ -1407,7 +1444,6 @@ impl Ui {
             }
             Action::OpenEditor(id) => {
                 let config = runtime.config().snapshot();
-                let builtins = builtin_group_ids();
                 match config.group(&id) {
                     Some(group) => {
                         s.editor_is_new.set(false);
@@ -1432,7 +1468,8 @@ impl Ui {
                         s.editor_verify
                             .set(model::verify_preset_index(group.verify) as usize);
                         s.editor_off_armed.set(false);
-                        s.editor_deletable.set(!builtins.contains(&group.id));
+                        s.editor_deletable
+                            .set(!hakimi_core::config::is_builtin_group(&group.id));
                         let rows: Vec<EditorRowState> = app_state::with_editor_rows(|| {
                             group
                                 .domains

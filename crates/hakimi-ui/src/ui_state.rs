@@ -451,7 +451,16 @@ pub fn sync_ca_status(s: &UiSignals) {
         error.clone()
     };
     set_str(s.ca_status_sub, &sub);
-    set_tone(s.ca_status_tone, if busy { 0 } else if installed { 1 } else { 2 });
+    set_tone(
+        s.ca_status_tone,
+        if busy {
+            0
+        } else if installed {
+            1
+        } else {
+            2
+        },
+    );
     set_str(
         s.ca_button,
         if busy {
@@ -527,6 +536,8 @@ mod tests {
             summary: summary.into(),
             summary_hex: IDLE_COLOR,
             enabled: true,
+            hidden: false,
+            shipped: false,
             open: false,
             first: false,
             url: String::new(),
@@ -893,7 +904,10 @@ mod tests {
         assert_eq!(s.proxy_status.get(), "未接管");
         assert_eq!(s.proxy_status_sub.get(), "开启加速后自动写入系统代理");
         assert_eq!(s.proxy_status_tone.get(), 0);
-        assert!(!s.proxy_reapply.get(), "nothing was written, so nothing to retry");
+        assert!(
+            !s.proxy_reapply.get(),
+            "nothing was written, so nothing to retry"
+        );
 
         // Running with the takeover applied: the row reports success.
         let model = running_model();

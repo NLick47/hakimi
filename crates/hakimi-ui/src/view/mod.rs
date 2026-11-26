@@ -10,6 +10,58 @@ use windui::prelude::*;
 
 use crate::app_state::{Action, UiSignals};
 
+/// Right-click menu shared by every site row (home list + management list).
+/// Built fresh on each right-click: `builtin` decides whether the row can be
+/// edited at all, `hidden` picks hide vs unhide, and an enabled site says out
+/// loud that hiding stops it. Deletion lives in the editor, where it takes an
+/// extra click to reach.
+pub(crate) fn site_menu(
+    tx: Sender<Action>,
+    id: String,
+    builtin: bool,
+    hidden: bool,
+    enabled: bool,
+) -> Vec<MenuItem> {
+    let mut menu = Vec::new();
+    if !builtin {
+        let edit_tx = tx.clone();
+        let edit_id = id.clone();
+        menu.push(MenuItem::run(
+            "编辑",
+            move |_| {
+                let _ = edit_tx.send(Action::OpenEditor(edit_id.clone()));
+            },
+            false,
+        ));
+    }
+    if hidden {
+        let unhide_tx = tx.clone();
+        let unhide_id = id.clone();
+        menu.push(MenuItem::run(
+            "取消隐藏（不会自动加速）",
+            move |_| {
+                let _ = unhide_tx.send(Action::UnhideSite(unhide_id.clone()));
+            },
+            false,
+        ));
+    } else {
+        let hide_tx = tx.clone();
+        let hide_id = id.clone();
+        menu.push(MenuItem::run(
+            if enabled {
+                "隐藏并停止加速"
+            } else {
+                "隐藏"
+            },
+            move |_| {
+                let _ = hide_tx.send(Action::HideSite(hide_id.clone()));
+            },
+            false,
+        ));
+    }
+    menu
+}
+
 /// The full UI tree. `s.root` is written explicitly after every action so the
 /// switcher sees the change: a derived signal's version only tracks one source,
 /// so a map over window_open/page/show_onboarding would miss page changes.

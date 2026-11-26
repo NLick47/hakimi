@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{SITE_ICONS, TONE_BROKEN, TONE_DEGRADED, TONE_NEUTRAL, TONE_OK};
+use crate::model::{is_shipped, SITE_ICONS, TONE_BROKEN, TONE_DEGRADED, TONE_NEUTRAL, TONE_OK};
 use crate::ui_state::{BAD_COLOR, IDLE_COLOR, OK_COLOR, SLOW_COLOR};
 use hakimi_core::config::{DomainRule, GroupConfig, RouteAttempt, RoutePolicy, VerifyMode};
 use hakimi_core::mirror::MirrorStatus;
@@ -102,6 +102,43 @@ fn editing_a_site_keeps_its_verify_mode() {
     site.verify = 2;
     let group = build_group(&config, &site).unwrap();
     assert_eq!(group.verify, VerifyMode::Off);
+}
+
+#[test]
+fn editing_a_hidden_site_keeps_it_hidden() {
+    let mut config = AppConfig::default();
+    config.groups.push(GroupConfig {
+        id: "kept".into(),
+        name: "Kept".into(),
+        domains: vec![DomainRule::new("a.example")],
+        enabled: false,
+        homepage: None,
+        default_route: RoutePolicy::auto(),
+        verify: VerifyMode::Real,
+        hidden: true,
+    });
+    let site = draft_with("kept", false, vec![row("a.example", 0)], 0);
+    let group = build_group(&config, &site).unwrap();
+    assert!(group.hidden, "saving the editor must not unhide the site");
+    assert!(!group.enabled);
+}
+
+#[test]
+fn hidden_sites_are_marked_in_the_site_rows() {
+    let config = serde_json::json!({
+        "groups": [
+            { "id": "github", "name": "GitHub", "enabled": true, "domains": domains(&["github.com"]) },
+            { "id": "custom", "name": "Custom", "enabled": false, "hidden": true, "domains": domains(&["custom.example"]) }
+        ]
+    });
+    let status = serde_json::json!({ "domains": [] });
+    let (sites, selected) = build_sites(&status, &config, &HashSet::new());
+    assert_eq!(sites.len(), 2);
+    let github = sites.iter().find(|site| site.id == "github").unwrap();
+    let custom = sites.iter().find(|site| site.id == "custom").unwrap();
+    assert!(!github.hidden);
+    assert!(custom.hidden);
+    assert_eq!(selected, 1, "hidden sites are disabled and not counted");
 }
 
 #[test]
@@ -243,6 +280,8 @@ fn icon_keys_match_whole_ids_and_slugs_only() {
     assert_eq!(icon_key_for("mehta-com"), "");
     // Sites that ship their own logo match by id.
     assert_eq!(icon_key_for("google"), "google");
+    assert_eq!(icon_key_for("gmail"), "gmail");
+    assert_eq!(icon_key_for("chrome-web-store"), "chrome-web-store");
     assert_eq!(icon_key_for("hanime"), "hanime");
     assert_eq!(icon_key_for("nhentai"), "nhentai");
     // The catalog id and the homepage slug must reach the same logo.
@@ -620,9 +659,20 @@ fn a_sweep_is_visible_while_paused() {
 
 #[test]
 fn custom_groups_are_marked_for_deletion() {
-    let builtins = builtin_group_ids();
-    assert!(builtins.contains("pixiv"), "bundled ids stay undeletable");
-    assert!(!builtins.contains("mine"), "user ids are deletable");
+    let config = serde_json::json!({
+        "groups": [
+            { "id": "pixiv", "name": "Pixiv", "enabled": true,
+              "domains": domains(&["pixiv.net"]) },
+            { "id": "mine", "name": "Mine", "enabled": true,
+              "domains": domains(&["mine.example"]) }
+        ]
+    });
+    let status = serde_json::json!({ "domains": [] });
+    let (sites, _) = build_sites(&status, &config, &HashSet::new());
+    let shipped = sites.iter().find(|site| site.id == "pixiv").unwrap();
+    let mine = sites.iter().find(|site| site.id == "mine").unwrap();
+    assert!(is_shipped(shipped), "bundled groups stay undeletable");
+    assert!(!is_shipped(mine), "user groups are deletable");
 }
 
 /// The settings page shows the host list as one comma-separated line, the same
@@ -746,7 +796,10 @@ fn the_concurrency_caption_names_only_truncated_scenarios() {
     use crate::view::settings::concurrency_caption;
 
     for value in [2, 3, 4, 5, 6] {
-        assert!(concurrency_caption(value).is_empty(), "{value} must stay silent");
+        assert!(
+            concurrency_caption(value).is_empty(),
+            "{value} must stay silent"
+        );
     }
     assert_eq!(concurrency_caption(7), "镜像 6");
     assert_eq!(concurrency_caption(8), "镜像 6");
