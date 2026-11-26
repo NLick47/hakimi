@@ -148,6 +148,48 @@ fn only_safe_empty_requests_are_replayed() {
         !retry_eligible(&declared_body, false),
         "a declared body must be respected even when the body stream is empty"
     );
+
+    assert!(
+        !body_is_replayable(&streaming_body(b"payload")),
+        "a body whose frames are still in flight must not be replayed: the \
+         replay would ship an empty body"
+    );
+    assert!(
+        body_is_replayable(&streaming_body(b"")),
+        "a body that already ended is safe to replay"
+    );
+}
+
+/// A body that reports an unknown length and has not ended, like an h2 request
+/// whose DATA frames have not arrived yet.
+struct PendingBody {
+    data: Option<Bytes>,
+}
+
+impl Body for PendingBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        Poll::Ready(self.data.take().map(|data| Ok(Frame::data(data))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_none()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+fn streaming_body(payload: &[u8]) -> PendingBody {
+    PendingBody {
+        data: (!payload.is_empty()).then(|| Bytes::copy_from_slice(payload)),
+    }
 }
 
 #[test]
@@ -1556,7 +1598,7 @@ async fn concurrent_cold_connections_share_one_discovery() {
         port,
         mode: TlsMode::Direct,
         sni: None,
-        verify: VerifyMode::Real,
+        verify: Default::default(),
         ech_config: None,
         tls: true,
         source: IpSource::Cache,
@@ -1688,7 +1730,7 @@ async fn concurrent_recovery_requests_share_one_race() {
         port,
         mode: TlsMode::Direct,
         sni: None,
-        verify: VerifyMode::Real,
+        verify: Default::default(),
         ech_config: None,
         tls: true,
         source: IpSource::Cache,

@@ -193,13 +193,29 @@ const WARM_TIMEOUT: Duration = Duration::from_secs(12);
 /// would otherwise surface as a broken image even though a fresh connection
 /// succeeds immediately.
 fn retry_eligible(request: &Request<UpstreamBody>, upgrade: bool) -> bool {
-    !upgrade
-        && (request.method() == Method::GET || request.method() == Method::HEAD)
-        && request.body().is_end_stream()
-        && request
-            .headers()
-            .get(http::header::CONTENT_LENGTH)
-            .is_none_or(|value| value.as_bytes() == b"0")
+    if upgrade || (request.method() != Method::GET && request.method() != Method::HEAD) {
+        return false;
+    }
+    if request
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .is_some_and(|value| value.as_bytes() != b"0")
+        || request.headers().contains_key(http::header::TRANSFER_ENCODING)
+    {
+        return false;
+    }
+    let body = request.body();
+    body_is_replayable(body)
+}
+
+/// Whether a body is provably empty.
+///
+/// `is_end_stream()` alone is not enough for a streamed body: the frames may
+/// still be in flight, and the replay is rebuilt with an empty body. Only a
+/// body that has already ended, or one whose exact length is zero, can be sent
+/// twice without losing data.
+fn body_is_replayable<B: Body>(body: &B) -> bool {
+    body.is_end_stream() || body.size_hint().exact() == Some(0)
 }
 
 /// Rebuild a replayed request: replayable requests carry no body, so the

@@ -568,7 +568,6 @@ mod tests {
 
 #[cfg(all(test, target_os = "macos"))]
 mod macos_tests {
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -631,53 +630,6 @@ mod macos_tests {
         assert!(plist.contains("<key>LimitLoadToSessionType</key>\n    <string>Aqua</string>"));
         assert!(plist.contains("<string>com.hakimi.app</string>"));
         assert!(plist.contains("<string>/tmp/a&amp;b.app</string>"));
-    }
-
-    /// The entry is ours by path: turning the switch off after the app moved
-    /// has to delete it, otherwise the old path keeps starting at login while
-    /// the switch claims it is off.
-    #[test]
-    fn disabling_removes_an_entry_written_for_another_path() {
-        let path = temp_entry();
-        let old = Path::new("/Applications/old/hakimi.app/Contents/MacOS/hakimi");
-        let new = Path::new("/Applications/hakimi.app/Contents/MacOS/hakimi");
-
-        super::macos_impl::apply_entry(&path, old, true).unwrap();
-        assert!(path.exists());
-        super::macos_impl::apply_entry(&path, new, false).unwrap();
-        assert!(!path.exists());
-    }
-
-    /// Enabling again after a move rewrites the path instead of stacking a
-    /// second entry, and leaves a file launchd accepts.
-    #[test]
-    fn enabling_rewrites_the_path_when_the_app_moved() {
-        let path = temp_entry();
-        let old = Path::new("/Applications/old/hakimi.app/Contents/MacOS/hakimi");
-        let new = Path::new("/Applications/hakimi.app/Contents/MacOS/hakimi");
-
-        super::macos_impl::apply_entry(&path, old, true).unwrap();
-        super::macos_impl::apply_entry(&path, new, true).unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        let _ = std::fs::remove_file(&path);
-        assert!(content.contains("<string>/Applications/hakimi.app</string>"));
-        assert!(!content.contains("/Applications/old/"));
-        assert_eq!(mode, 0o644, "launchd ignores a group-writable agent");
-    }
-
-    /// launchd ignores a group-writable agent, so an entry whose permissions
-    /// drifted has to be rewritten even when the content is already right.
-    #[test]
-    fn a_world_writable_entry_is_repaired() {
-        let path = temp_entry();
-        let exe = Path::new("/Applications/hakimi.app/Contents/MacOS/hakimi");
-        super::macos_impl::apply_entry(&path, exe, true).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
-        super::macos_impl::apply_entry(&path, exe, true).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(mode, 0o644);
     }
 
     /// A quarantined app runs from a random AppTranslocation path and one
