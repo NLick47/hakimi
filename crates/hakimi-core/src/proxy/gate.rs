@@ -139,6 +139,7 @@ mod tests {
             port: 443,
             mode: TlsMode::FakeSni,
             sni: Some(sni.into()),
+            verify: Default::default(),
             ech_config: None,
             tls: true,
             source: IpSource::Remote,

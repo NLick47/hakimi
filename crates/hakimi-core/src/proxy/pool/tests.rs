@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 use crate::ca::CertificateAuthority;
 use crate::cache::{CacheManager, LastGoodEntry};
 use crate::catalog::CatalogManager;
-use crate::config::{ConfigManager, DomainRule, GroupConfig, RoutePolicy};
+use crate::config::{ConfigManager, DomainRule, GroupConfig, RoutePolicy, VerifyMode};
 use crate::decision::DecisionEngine;
 use crate::paths::Paths;
 use crate::resolver::{DohResolution, EchOutcome, IpResolver, Resolver};
@@ -89,6 +89,7 @@ fn engine_for_with_resolver(
                 enabled: true,
                 homepage: None,
                 default_route: RoutePolicy::direct(),
+                verify: VerifyMode::Real,
             });
             Ok(())
         })
@@ -1555,6 +1556,7 @@ async fn concurrent_cold_connections_share_one_discovery() {
         port,
         mode: TlsMode::Direct,
         sni: None,
+        verify: VerifyMode::Real,
         ech_config: None,
         tls: true,
         source: IpSource::Cache,
@@ -1686,6 +1688,7 @@ async fn concurrent_recovery_requests_share_one_race() {
         port,
         mode: TlsMode::Direct,
         sni: None,
+        verify: VerifyMode::Real,
         ech_config: None,
         tls: true,
         source: IpSource::Cache,

@@ -22,7 +22,7 @@ use tokio::net::{TcpListener, TcpStream};
 use hakimi_core::ca::CertificateAuthority;
 use hakimi_core::cache::CacheManager;
 use hakimi_core::catalog::CatalogManager;
-use hakimi_core::config::{ConfigManager, DomainRule, GroupConfig, RoutePolicy};
+use hakimi_core::config::{ConfigManager, DomainRule, GroupConfig, RoutePolicy, VerifyMode};
 use hakimi_core::decision::DecisionEngine;
 use hakimi_core::ip_tester::TlsContext;
 use hakimi_core::paths::Paths;
@@ -145,6 +145,7 @@ async fn spawn_proxy(
                 enabled: true,
                 homepage: None,
                 default_route: RoutePolicy::auto(),
+                verify: VerifyMode::Real,
             });
             // The DoH endpoints point at a closed port: the cursor always
             // asks for a DoH expansion once the catalog candidates run out,

@@ -226,6 +226,38 @@ fn ghost_button(label: &'static str, tx: Sender<Action>) -> Element {
         )
 }
 
+fn verify_section(s: &UiSignals) -> Element {
+    let labels = ["真实域名", "跟随 SNI", "关闭校验"];
+    let mut pills = Element::row().width_match().spacing(6);
+    for (index, label) in labels.iter().enumerate() {
+        let active = s.editor_verify.map(move |value| *value == index);
+        let set = s.editor_verify;
+        let armed = s.editor_off_armed;
+        pills = pills.child(
+            choice_pill(label, active)
+                .weight(1.0)
+                .on_click(move |_| {
+                    set.set(index);
+                    armed.set(false);
+                }),
+        );
+    }
+
+    Element::col()
+        .width_match()
+        .spacing(6)
+        .child(Element::leaf().height(1).bg(theme::BORDER_SOFT))
+        .child(section_heading("证书校验"))
+        .child(pills)
+        .child(
+            Element::label("关闭校验会接受任意上游证书。")
+                .font_size(11.5)
+                .fg(theme::DANGER)
+                .visible_signal(s.editor_verify.map(|value| *value == 2)),
+        )
+        .child(caption("只对使用 SNI 的线路生效；直连/ECH 不受影响。"))
+}
+
 pub fn view(s: UiSignals, tx: Sender<Action>) -> Element {
     let add_tx = tx.clone();
     let cancel_tx = tx.clone();
@@ -321,6 +353,17 @@ pub fn view(s: UiSignals, tx: Sender<Action>) -> Element {
         .child(
             Element::col()
                 .width_match()
+                .spacing(4)
+                .visible_signal(s.editor_default_preset.map(|preset| *preset == 3))
+                .child(caption("默认伪装 SNI 主机"))
+                .child(form_input_small(
+                    s.editor_default_sni,
+                    "留空使用默认候选；例如 g.cn",
+                )),
+        )
+        .child(
+            Element::col()
+                .width_match()
                 .spacing(6)
                 .visible_signal(custom_visible)
                 .child(
@@ -332,7 +375,8 @@ pub fn view(s: UiSignals, tx: Sender<Action>) -> Element {
                     s.editor_default_custom,
                     "例如 ech+direct 或 sni:www.baidu.com+direct",
                 )),
-        );
+        )
+        .child(verify_section(&s));
 
     let error = s.editor_error;
     let error_present = s.editor_error;

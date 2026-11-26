@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tokio::net::TcpStream;
 
+use crate::config::VerifyMode;
 use crate::ip_tester::{ConnectError, ProbeSuccess, TlsContext};
 use crate::status::DomainDiagnostics;
 use crate::strategy::{IpSource, TlsMode};
@@ -18,6 +19,7 @@ pub struct ConnectPlan {
     pub mode: TlsMode,
     /// Fake SNI used for upstream TLS. `None` means no SNI (or not applicable).
     pub sni: Option<String>,
+    pub verify: VerifyMode,
     /// Raw ECHConfigList for `TlsMode::Ech`.
     pub ech_config: Option<Vec<u8>>,
     /// Whether this plan terminates TLS (false only for plaintext HTTP forwarding).
@@ -48,6 +50,7 @@ impl ConnectPlan {
         self.ip.hash(&mut hasher);
         self.mode.hash(&mut hasher);
         self.sni.as_deref().unwrap_or("").hash(&mut hasher);
+        self.verify.hash(&mut hasher);
         self.ech_config.hash(&mut hasher);
         hasher.finish()
     }
@@ -75,6 +78,7 @@ pub trait Prober: Send + Sync {
         mode: TlsMode,
         sni: Option<&str>,
         ech: Option<&[u8]>,
+        verify: VerifyMode,
         timeout: Duration,
     ) -> std::result::Result<ProbeSuccess, ConnectError>;
 
@@ -96,9 +100,11 @@ impl Prober for TlsContext {
         mode: TlsMode,
         sni: Option<&str>,
         ech: Option<&[u8]>,
+        verify: VerifyMode,
         timeout: Duration,
     ) -> std::result::Result<ProbeSuccess, ConnectError> {
-        TlsContext::probe(self, ip, port, domain, mode, sni, ech, timeout).await
+        TlsContext::probe_with_verify(self, ip, port, domain, mode, sni, ech, verify, timeout)
+            .await
     }
 
     async fn probe_tcp(

@@ -247,7 +247,7 @@ fn find_unknown(value: &Value, schema: &Value, path: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{assign, first_unknown_key, lookup, merge};
-    use hakimi_core::config::AppConfig;
+    use hakimi_core::config::{AppConfig, VerifyMode};
     use serde_json::json;
 
     fn check_unknown(merged: &serde_json::Value) -> Option<String> {
@@ -344,5 +344,16 @@ mod tests {
         // A typo must not silently add a field the deserializer would ignore.
         assert!(assign(&mut root, "proxy.prot", json!(1)).is_err());
         assert!(assign(&mut root, "nope.port", json!(1)).is_err());
+    }
+
+    #[test]
+    fn verify_is_addressable_by_dotted_path() {
+        let mut root = serde_json::to_value(AppConfig::default()).unwrap();
+        assert_eq!(root["groups"][0]["verify"], "real");
+        assign(&mut root, "groups.0.verify", json!("off")).unwrap();
+        assert_eq!(root["groups"][0]["verify"], "off");
+
+        let config: AppConfig = serde_json::from_value(root).unwrap();
+        assert_eq!(config.groups[0].verify, VerifyMode::Off);
     }
 }

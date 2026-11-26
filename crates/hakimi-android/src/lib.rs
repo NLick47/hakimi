@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use hakimi_core::config::{AppConfig, DomainRule, GroupConfig, ProxyMode, RoutePolicy};
+use hakimi_core::config::{AppConfig, DomainRule, GroupConfig, ProxyMode, RoutePolicy, VerifyMode};
 use hakimi_core::runtime::HakimiRuntime;
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jstring, JNI_FALSE, JNI_TRUE};
@@ -74,6 +74,7 @@ fn initialize(data_dir: &str) -> Result<()> {
             enabled: true,
             homepage: Some("https://crypto.cloudflare.com/cdn-cgi/trace".to_string()),
             default_route: RoutePolicy::ech_shared(),
+            verify: VerifyMode::Real,
         });
     }
     runtime

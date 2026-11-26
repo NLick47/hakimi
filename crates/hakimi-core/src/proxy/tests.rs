@@ -7,7 +7,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::cache::{CacheManager, LastGoodEntry};
 use crate::catalog::RemoteIpProvider;
-use crate::config::{ConfigManager, DomainRule, GroupConfig, RoutePolicy};
+use crate::config::{ConfigManager, DomainRule, GroupConfig, RoutePolicy, VerifyMode};
 use crate::decision::{DecisionEngine, Route};
 use crate::ip_tester::TlsContext;
 use crate::paths::Paths;
@@ -283,6 +283,7 @@ fn engine_for_test(
             enabled: true,
             homepage: None,
             default_route: route,
+            verify: VerifyMode::Real,
         })
         .unwrap();
     let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
@@ -461,6 +462,7 @@ async fn raw_cached_plan_releases_hedge_after_refusal() {
         port,
         mode: TlsMode::Direct,
         sni: None,
+        verify: Default::default(),
         ech_config: None,
         tls: true,
         source: IpSource::Cache,

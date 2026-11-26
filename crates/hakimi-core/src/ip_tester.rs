@@ -15,6 +15,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+use crate::config::VerifyMode;
 use crate::strategy::{FailureReason, TlsMode};
 
 pub const ALPN_H2: &[u8] = b"h2";
@@ -94,6 +95,31 @@ impl TlsContext {
         ech: Option<&[u8]>,
         timeout: Duration,
     ) -> Result<ProbeSuccess, ConnectError> {
+        self.probe_with_verify(
+            ip,
+            port,
+            domain,
+            mode,
+            sni,
+            ech,
+            VerifyMode::Real,
+            timeout,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn probe_with_verify(
+        &self,
+        ip: IpAddr,
+        port: u16,
+        domain: &str,
+        mode: TlsMode,
+        sni: Option<&str>,
+        ech: Option<&[u8]>,
+        verify: VerifyMode,
+        timeout: Duration,
+    ) -> Result<ProbeSuccess, ConnectError> {
         let started = Instant::now();
         // The two legs are timed and classified separately, exactly like the
         // pooled connector. Collapsing both into one deadline reported a
@@ -102,7 +128,7 @@ impl TlsContext {
         let tcp = Self::open_tcp_with(ip, port, tcp_phase_budget(timeout)).await?;
         let stream = tokio::time::timeout(
             tls_phase_budget(timeout, started.elapsed()),
-            self.handshake(tcp, domain, mode, sni, ech, false),
+            self.handshake_with_verify(tcp, domain, mode, sni, ech, verify, false),
         )
         .await
         .map_err(|_| ConnectError::TlsTimeout)??;
@@ -133,7 +159,32 @@ impl TlsContext {
         sni: Option<&str>,
         ech: Option<&[u8]>,
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ConnectError> {
-        self.connect_alpn(ip, port, domain, mode, sni, ech, &[ALPN_H2, ALPN_HTTP11])
+        self.connect_with_verify(
+            ip,
+            port,
+            domain,
+            mode,
+            sni,
+            ech,
+            VerifyMode::Real,
+            &[ALPN_H2, ALPN_HTTP11],
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_with_verify(
+        &self,
+        ip: IpAddr,
+        port: u16,
+        domain: &str,
+        mode: TlsMode,
+        sni: Option<&str>,
+        ech: Option<&[u8]>,
+        verify: VerifyMode,
+        alpn: &[&[u8]],
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ConnectError> {
+        self.connect_alpn(ip, port, domain, mode, sni, ech, verify, alpn)
             .await
     }
 
@@ -148,8 +199,17 @@ impl TlsContext {
         sni: Option<&str>,
         ech: Option<&[u8]>,
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ConnectError> {
-        self.connect_alpn(ip, port, domain, mode, sni, ech, &[ALPN_HTTP11])
-            .await
+        self.connect_alpn(
+            ip,
+            port,
+            domain,
+            mode,
+            sni,
+            ech,
+            VerifyMode::Real,
+            &[ALPN_HTTP11],
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -161,10 +221,11 @@ impl TlsContext {
         mode: TlsMode,
         sni: Option<&str>,
         ech: Option<&[u8]>,
+        verify: VerifyMode,
         alpn: &[&[u8]],
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ConnectError> {
         let tcp = Self::open_tcp_with(ip, port, TCP_OPEN_TIMEOUT).await?;
-        self.handshake_alpn(tcp, domain, mode, sni, ech, alpn)
+        self.handshake_alpn(tcp, domain, mode, sni, ech, verify, alpn)
             .await
     }
 
@@ -206,12 +267,35 @@ impl TlsContext {
         ech: Option<&[u8]>,
         http1_only: bool,
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ConnectError> {
+        self.handshake_with_verify(
+            tcp,
+            domain,
+            mode,
+            sni,
+            ech,
+            VerifyMode::Real,
+            http1_only,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handshake_with_verify(
+        &self,
+        tcp: TcpStream,
+        domain: &str,
+        mode: TlsMode,
+        sni: Option<&str>,
+        ech: Option<&[u8]>,
+        verify: VerifyMode,
+        http1_only: bool,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ConnectError> {
         let alpn: &[&[u8]] = if http1_only {
             &[ALPN_HTTP11]
         } else {
             &[ALPN_H2, ALPN_HTTP11]
         };
-        self.handshake_alpn(tcp, domain, mode, sni, ech, alpn)
+        self.handshake_alpn(tcp, domain, mode, sni, ech, verify, alpn)
             .await
     }
 
@@ -223,9 +307,10 @@ impl TlsContext {
         mode: TlsMode,
         sni: Option<&str>,
         ech: Option<&[u8]>,
+        verify: VerifyMode,
         alpn: &[&[u8]],
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ConnectError> {
-        let config = self.client_config_with_alpn(domain, mode, sni, ech, alpn)?;
+        let config = self.client_config_with_alpn(domain, mode, sni, ech, verify, alpn)?;
         let server_name = match mode {
             TlsMode::Direct | TlsMode::Ech => dns_name(domain)?,
             TlsMode::FakeSni => match sni {
@@ -248,7 +333,14 @@ impl TlsContext {
         sni: Option<&str>,
         ech: Option<&[u8]>,
     ) -> Result<Arc<ClientConfig>, ConnectError> {
-        self.client_config_with_alpn(domain, mode, sni, ech, &[ALPN_H2, ALPN_HTTP11])
+        self.client_config_with_alpn(
+            domain,
+            mode,
+            sni,
+            ech,
+            VerifyMode::Real,
+            &[ALPN_H2, ALPN_HTTP11],
+        )
     }
 
     fn client_config_with_alpn(
@@ -257,9 +349,10 @@ impl TlsContext {
         mode: TlsMode,
         sni: Option<&str>,
         ech: Option<&[u8]>,
+        verify: VerifyMode,
         alpn: &[&[u8]],
     ) -> Result<Arc<ClientConfig>, ConnectError> {
-        let key = config_cache_key(domain, mode, sni, ech, alpn);
+        let key = config_cache_key(domain, mode, sni, ech, verify, alpn);
         if let Some(config) = self.configs.read().get(&key) {
             return Ok(config.clone());
         }
@@ -292,10 +385,25 @@ impl TlsContext {
                     WebPkiServerVerifier::builder_with_provider(self.roots.clone(), provider)
                         .build()
                         .map_err(|error| ConnectError::Tls(format!("{error:?}")))?;
+                let verifier: Arc<dyn ServerCertVerifier> = match verify {
+                    VerifyMode::Real => Arc::new(RealDomainVerifier {
+                        inner,
+                        real,
+                        alt: None,
+                    }),
+                    VerifyMode::Sni => {
+                        let alt = match sni {
+                            Some(name) if !name.is_empty() => Some(dns_name(name)?),
+                            _ => None,
+                        };
+                        Arc::new(RealDomainVerifier { inner, real, alt })
+                    }
+                    VerifyMode::Off => Arc::new(NoCertVerifier { inner }),
+                };
                 base.with_safe_default_protocol_versions()
                     .map_err(|error| ConnectError::Tls(error.to_string()))?
                     .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(RealDomainVerifier { inner, real }))
+                    .with_custom_certificate_verifier(verifier)
                     .with_no_client_auth()
             }
         };
@@ -326,12 +434,14 @@ fn config_cache_key(
     mode: TlsMode,
     sni: Option<&str>,
     ech: Option<&[u8]>,
+    verify: VerifyMode,
     alpn: &[&[u8]],
 ) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     alpn.hash(&mut hasher);
     ech.hash(&mut hasher);
+    verify.hash(&mut hasher);
     let ech = hasher.finish();
     match mode {
         TlsMode::Direct => format!("direct|{}|{ech}", alpn_name(alpn)),
@@ -363,12 +473,14 @@ pub struct ProbeSuccess {
 struct RealDomainVerifier {
     inner: Arc<WebPkiServerVerifier>,
     real: ServerName<'static>,
+    alt: Option<ServerName<'static>>,
 }
 
 impl fmt::Debug for RealDomainVerifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RealDomainVerifier")
             .field("real", &self.real)
+            .field("alt", &self.alt)
             .finish_non_exhaustive()
     }
 }
@@ -382,8 +494,66 @@ impl ServerCertVerifier for RealDomainVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        self.inner
-            .verify_server_cert(end_entity, intermediates, &self.real, ocsp_response, now)
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            &self.real,
+            ocsp_response,
+            now,
+        ) {
+            Ok(verified) => Ok(verified),
+            Err(error) => match &self.alt {
+                Some(alt) => self
+                    .inner
+                    .verify_server_cert(end_entity, intermediates, alt, ocsp_response, now),
+                None => Err(error),
+            },
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+struct NoCertVerifier {
+    inner: Arc<WebPkiServerVerifier>,
+}
+
+impl fmt::Debug for NoCertVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NoCertVerifier").finish_non_exhaustive()
+    }
+}
+
+impl ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -671,5 +841,107 @@ mod tests {
             hello.windows(15).any(|w| w == b"huggingface.co."),
             "SNI must keep the trailing root label"
         );
+    }
+
+    #[tokio::test]
+    async fn verify_modes_decide_by_real_name_fake_sni_or_off() {
+        use rcgen::{
+            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+            KeyUsagePurpose,
+        };
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use std::io::Write;
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let _root_guard = crate::hooks::extra_root_guard().await;
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let mut leaf_params = CertificateParams::new(vec!["fake.test".to_string()]).unwrap();
+        leaf_params.is_ca = IsCa::NoCa;
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let root_file = tempfile::NamedTempFile::new().unwrap();
+        root_file
+            .as_file()
+            .write_all(ca_cert.pem().as_bytes())
+            .unwrap();
+        std::env::set_var("HAKIMI_EXTRA_ROOT_CA", root_file.path());
+
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            leaf_key.serialize_der(),
+        ));
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![leaf.der().clone(), ca_cert.der().clone()], key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = acceptor.accept(stream).await;
+                });
+            }
+        });
+
+        let context = TlsContext::new().unwrap();
+        let real = context
+            .connect_with_verify(
+                address.ip(),
+                address.port(),
+                "real.test",
+                TlsMode::FakeSni,
+                Some("fake.test"),
+                None,
+                VerifyMode::Real,
+                &[ALPN_H2, ALPN_HTTP11],
+            )
+            .await;
+        assert!(real.is_err(), "real-name verification must reject the cert");
+
+        let sni = context
+            .connect_with_verify(
+                address.ip(),
+                address.port(),
+                "real.test",
+                TlsMode::FakeSni,
+                Some("fake.test"),
+                None,
+                VerifyMode::Sni,
+                &[ALPN_H2, ALPN_HTTP11],
+            )
+            .await;
+        assert!(sni.is_ok(), "fake-SNI verification must accept the cert");
+
+        let off = context
+            .connect_with_verify(
+                address.ip(),
+                address.port(),
+                "real.test",
+                TlsMode::FakeSni,
+                Some("fake.test"),
+                None,
+                VerifyMode::Off,
+                &[ALPN_H2, ALPN_HTTP11],
+            )
+            .await;
+        assert!(off.is_ok(), "off must accept the local certificate");
+
+        std::env::remove_var("HAKIMI_EXTRA_ROOT_CA");
+        server_task.abort();
     }
 }

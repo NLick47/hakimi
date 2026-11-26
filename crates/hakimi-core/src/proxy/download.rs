@@ -1374,7 +1374,7 @@ mod tests {
     };
     use crate::cache::{CacheManager, LastGoodEntry};
     use crate::catalog::RemoteIpProvider;
-    use crate::config::{ConfigManager, DomainRule, DownloadConfig, GroupConfig, RoutePolicy};
+    use crate::config::{ConfigManager, DomainRule, DownloadConfig, GroupConfig, RoutePolicy, VerifyMode};
     use crate::decision::DecisionEngine;
     use crate::ip_tester::TlsContext;
     use crate::mirror::{MirrorList, BUILTIN_MIRRORS};
@@ -2130,6 +2130,7 @@ mod tests {
                 enabled: true,
                 homepage: None,
                 default_route: RoutePolicy::direct(),
+                verify: VerifyMode::Real,
             })
             .unwrap();
         let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());

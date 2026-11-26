@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 
 use crate::cache::{CacheManager, LastGoodEntry};
 use crate::catalog::RemoteIpProvider;
-use crate::config::{ConfigManager, DomainRule, GroupConfig, RouteAttempt, RoutePolicy};
+use crate::config::{ConfigManager, DomainRule, GroupConfig, RouteAttempt, RoutePolicy, VerifyMode};
 use crate::ip_tester::{ConnectError, ProbeSuccess};
 use crate::paths::Paths;
 use crate::resolver::{DohResolution, EchOutcome, IpResolver};
@@ -86,6 +86,7 @@ impl Prober for FakeProber {
         mode: TlsMode,
         sni: Option<&str>,
         _ech: Option<&[u8]>,
+        _verify: crate::config::VerifyMode,
         _timeout: Duration,
     ) -> std::result::Result<ProbeSuccess, ConnectError> {
         self.calls
@@ -340,6 +341,7 @@ fn harness(group_domains: &[&str], default_route: RoutePolicy) -> Harness {
             enabled: true,
             homepage: None,
             default_route,
+            verify: VerifyMode::Real,
         })
         .unwrap();
     let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());
@@ -564,6 +566,65 @@ async fn cached_plan_is_invalidated_when_route_changes() {
         .is_none());
 }
 
+#[tokio::test]
+async fn a_plan_is_not_reused_after_the_rule_changes_its_verify_mode() {
+    let harness = harness(&["example.com"], RoutePolicy::sni(vec!["fake.test".into()]));
+    *harness.remote.catalog.lock() = true;
+    *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let plan = cursor.next_plan().await.expect("a fake-SNI plan");
+    assert_eq!(plan.verify, VerifyMode::Real);
+    cursor.note_success(Arc::new(plan), 7);
+    assert!(harness
+        .engine
+        .cached_plan("example.com", 443, true)
+        .is_some());
+
+    // Turning verification off changes what the same handshake proves, so the
+    // remembered plan must not be reused with the old mode.
+    let config = harness.engine.config.snapshot();
+    let mut group = config.group("test").unwrap().clone();
+    group.verify = VerifyMode::Off;
+    harness.engine.config.upsert_group(group).unwrap();
+
+    assert!(harness
+        .engine
+        .cached_plan("example.com", 443, true)
+        .is_none());
+}
+
+#[tokio::test]
+async fn an_unverified_fake_sni_is_not_remembered() {
+    let harness = harness(&["example.com"], RoutePolicy::sni(vec!["fake.test".into()]));
+    *harness.remote.catalog.lock() = true;
+    *harness.remote.ips.lock() = Some(vec!["1.1.1.1".parse().unwrap()]);
+    let mut cursor = match harness.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let plan = cursor.next_plan().await.expect("a fake-SNI plan");
+    let plan = ConnectPlan {
+        verify: VerifyMode::Off,
+        ..plan
+    };
+    let sni = plan.sni.clone();
+    cursor.note_success(Arc::new(plan), 7);
+
+    let network = network_id();
+    assert!(
+        harness
+            .engine
+            .cache
+            .sni("test", "example.com", &network)
+            .is_none(),
+        "a name that was never verified must not become the learned route \
+         (it was {sni:?})"
+    );
+}
+
 fn test_plan(mode: TlsMode, sni: Option<&str>) -> ConnectPlan {
     ConnectPlan {
         domain: "example.com".into(),
@@ -572,6 +633,7 @@ fn test_plan(mode: TlsMode, sni: Option<&str>) -> ConnectPlan {
         port: 443,
         mode,
         sni: sni.map(ToOwned::to_owned),
+        verify: Default::default(),
         ech_config: None,
         tls: true,
         source: IpSource::Remote,

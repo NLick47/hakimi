@@ -350,6 +350,7 @@ impl DecisionEngine {
                                 plan.mode,
                                 plan.sni.as_deref(),
                                 plan.ech_config.as_deref(),
+                                plan.verify,
                                 timeout,
                             )
                             .await
@@ -557,6 +558,9 @@ impl DecisionEngine {
             // the rule index resolves the same route as `route_for` did while
             // avoiding a scan over every domain in the group on every reused
             // cold plan.
+            if group.verify != plan.verify {
+                return None;
+            }
             let route = group.route_at(rule_index);
             if !route.contains_mode(plan.mode) {
                 return None;
@@ -1392,6 +1396,7 @@ impl DecisionEngine {
                     plan.mode,
                     plan.sni.as_deref(),
                     plan.ech_config.as_deref(),
+                    plan.verify,
                     timeout,
                 )
                 .await;
@@ -1404,6 +1409,7 @@ impl DecisionEngine {
                     plan.mode,
                     plan.sni.as_deref(),
                     plan.ech_config.as_deref(),
+                    plan.verify,
                     timeout,
                 )
                 .await;

@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use hakimi_core::config::{
-    validate_group_id, DomainRule, EchSource, GroupConfig, RouteAttempt, RoutePolicy,
+    validate_group_id, DomainRule, EchSource, GroupConfig, RouteAttempt, RoutePolicy, VerifyMode,
 };
 use hakimi_core::runtime::HakimiRuntime;
 
@@ -304,6 +304,7 @@ fn add(
         default_route: route
             .map(RoutePolicy::from)
             .unwrap_or_else(RoutePolicy::auto),
+        verify: VerifyMode::Real,
     };
     runtime.upsert_group(group)?;
     Ok(())

@@ -93,6 +93,11 @@ private fun infoRow(context: Context, label: String, value: String, onClick: (()
 
 private val ROW_ROUTE_PRESETS = listOf("继承默认", "直连", "ECH", "SNI 伪装", "自定义")
 
+private val VERIFY_MODES = listOf("real", "sni", "off")
+private val VERIFY_LABELS = listOf("真实域名", "跟随 SNI", "关闭校验")
+
+private fun verifyIndex(mode: String): Int = VERIFY_MODES.indexOf(mode)
+
 private fun EditText.watchText(action: (String) -> Unit) {
     addTextChangedListener(object : TextWatcher {
         override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
@@ -291,6 +296,59 @@ class SiteEditorSheet(
         }
         updateChips()
 
+        val initialVerify = site?.verify?.let(::verifyIndex) ?: 0
+        var selectedVerify = if (initialVerify < 0) 0 else initialVerify
+        var offArmed = false
+
+        val verifyChips = ArrayList<TextView>()
+        val verifyRow = context.row()
+        val verifyHint = context.text("", 11f, Palette.RED).apply {
+            visibility = View.GONE
+            setPadding(context.dp(2f), context.dp(8f), 0, 0)
+        }
+
+        fun updateVerifyChips() {
+            verifyChips.forEachIndexed { index, chip ->
+                val active = index == selectedVerify
+                chip.setTextColor(if (active) Palette.DARK_TEXT else Palette.TEXT_2)
+                chip.background = if (active) {
+                    context.rounded(Palette.ACCENT, 12f)
+                } else {
+                    context.ripple(Palette.SURFACE, 12f, 0x150EA5E9, Palette.BORDER, 1f)
+                }
+            }
+            val text = if (selectedVerify == 2) "关闭校验会接受任意上游证书" else ""
+            verifyHint.text = text
+            verifyHint.visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
+        }
+
+        VERIFY_LABELS.forEachIndexed { index, label ->
+            val chip = context.text(label, 11f, Palette.TEXT_2, medium = true).apply {
+                gravity = Gravity.CENTER
+                setPadding(context.dp(6f), context.dp(10f), context.dp(6f), context.dp(10f))
+                clickOnce {
+                    selectedVerify = index
+                    offArmed = false
+                    updateVerifyChips()
+                }
+            }
+            verifyChips += chip
+            verifyRow.addView(chip, LinearLayout.LayoutParams(0, context.dp(40f), 1f).apply {
+                if (index > 0) marginStart = context.dp(6f)
+            })
+        }
+        updateVerifyChips()
+
+        val verifyBlock = context.column().apply {
+            setPadding(0, context.dp(14f), 0, 0)
+            addView(fieldLabel(context, "证书校验"))
+            addView(verifyRow)
+            addView(verifyHint)
+            addView(context.text("只对使用 SNI 的线路生效；直连/ECH 不受影响", 10.5f, Palette.MUTED).apply {
+                setPadding(context.dp(2f), context.dp(8f), 0, 0)
+            })
+        }
+
         val error = context.text("", 11f, Palette.RED).apply {
             visibility = View.GONE
             setPadding(0, context.dp(10f), 0, 0)
@@ -305,11 +363,16 @@ class SiteEditorSheet(
             addView(chipRow)
         })
         sheet.add(customBlock)
+        sheet.add(verifyBlock)
         sheet.add(error)
 
         sheet.buttons("保存", {
             val nameText = name.text.toString().trim()
             runCatching {
+                if (selectedVerify == 2 && !offArmed) {
+                    offArmed = true
+                    throw IllegalArgumentException("关闭校验会接受任意上游证书；再点一次保存确认")
+                }
                 val rules = buildRules(drafts)
                 val defaultSpec = if (selectedPreset == 4) {
                     val text = custom.text.toString().trim()
@@ -337,6 +400,7 @@ class SiteEditorSheet(
                     put("name", nameText.ifEmpty { primary })
                     put("domains", domainRulesJson(rules))
                     put("defaultRoute", defaultRoute)
+                    put("verify", VERIFY_MODES[selectedVerify])
                     put("enabled", site?.enabled ?: true)
                     put("homepage", homepageText)
                 }

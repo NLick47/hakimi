@@ -35,6 +35,7 @@ data class SiteInfo(
     val rawDomainCount: Int,
     val domainRules: List<DomainRuleInfo>,
     val defaultRoute: String,
+    val verify: String,
     val routeDetail: String,
     val summary: String,
     val summaryColor: Int,
@@ -248,6 +249,7 @@ object CoreParser {
             val rawDomains = rules.map { it.pattern }
             val exactDomains = rawDomains.filter { !it.startsWith("*.") }
             val defaultRoute = routeSpec(group.optJSONObject("defaultRoute"))
+            val verify = group.str("verify").ifEmpty { "real" }
             val (_, routeDetail) = groupRouteSummary(defaultRoute, rules)
             val displayDomains = exactDomains.take(24).map { host ->
                 domainInfo(host, diagnostics[host], enabled)
@@ -327,6 +329,7 @@ object CoreParser {
                 rawDomainCount = rawDomains.size,
                 domainRules = rules,
                 defaultRoute = defaultRoute,
+                verify = verify,
                 routeDetail = routeDetail,
                 summary = summary,
                 summaryColor = summaryColor,

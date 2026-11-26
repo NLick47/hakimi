@@ -648,6 +648,7 @@ impl RouteCursor {
             port: self.port,
             mode,
             sni,
+            verify: self.group().verify,
             ech_config: ech,
             tls: self.tls,
             source: candidate.source,
@@ -764,13 +765,18 @@ impl RouteCursor {
         if plan.mode == TlsMode::FakeSni {
             self.engine
                 .clear_sni_rejection(&plan.domain, plan.sni.as_deref());
-            self.engine.cache.put_sni(crate::cache::CachedSni {
-                group: self.group().id.clone(),
-                domain: self.domain.clone(),
-                network_id: self.network.to_string(),
-                sni: plan.sni.clone(),
-                saved_at: now(),
-            });
+            // A name that was not verified is not a proven route: remembering
+            // it would lead the next `real` connection with a handshake that
+            // is expected to fail.
+            if plan.verify == crate::config::VerifyMode::Real {
+                self.engine.cache.put_sni(crate::cache::CachedSni {
+                    group: self.group().id.clone(),
+                    domain: self.domain.clone(),
+                    network_id: self.network.to_string(),
+                    sni: plan.sni.clone(),
+                    saved_at: now(),
+                });
+            }
         }
         self.finished = true;
         self.succeeded = true;

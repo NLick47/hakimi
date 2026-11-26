@@ -369,7 +369,7 @@ pub fn lookup_domain_map<'a, V>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DomainRule, GroupConfig};
+    use crate::config::{DomainRule, GroupConfig, VerifyMode};
 
     fn group(id: &str, domains: &[&str]) -> GroupConfig {
         GroupConfig {
@@ -382,6 +382,7 @@ mod tests {
             enabled: true,
             homepage: None,
             default_route: crate::config::RoutePolicy::direct(),
+            verify: VerifyMode::Real,
         }
     }
 

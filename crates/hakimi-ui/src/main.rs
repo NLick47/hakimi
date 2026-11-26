@@ -596,6 +596,8 @@ struct SiteDraft {
     homepage: String,
     default_preset: i32,
     default_custom: String,
+    default_sni: String,
+    verify: i32,
 }
 
 fn domain_sni_hosts(route: &RoutePolicy) -> Option<Vec<String>> {
@@ -626,6 +628,11 @@ fn parse_sni_hosts(raw: &str) -> Result<Vec<String>> {
 }
 
 fn build_group(config: &AppConfig, draft: &SiteDraft) -> Result<GroupConfig> {
+    let existing = if draft.is_new {
+        None
+    } else {
+        config.group(&draft.id).cloned()
+    };
     let mut domains: Vec<DomainRule> = Vec::new();
     for row in &draft.domains {
         let pattern = normalize_domain_host(&row.pattern)?;
@@ -661,10 +668,10 @@ fn build_group(config: &AppConfig, draft: &SiteDraft) -> Result<GroupConfig> {
             bail!("域名 {} 已属于站点「{}」", conflict.pattern, other.name);
         }
     }
-    let default_route = if draft.default_preset == 4 {
-        parse_route(&draft.default_custom)?
-    } else {
-        route_from_preset(draft.default_preset).unwrap_or_default()
+    let default_route = match draft.default_preset {
+        3 => RoutePolicy::sni(parse_sni_hosts(&draft.default_sni)?),
+        4 => parse_route(&draft.default_custom)?,
+        _ => route_from_preset(draft.default_preset).unwrap_or_default(),
     };
     let name = if draft.name.trim().is_empty() {
         domains[0].pattern.clone()
@@ -685,11 +692,6 @@ fn build_group(config: &AppConfig, draft: &SiteDraft) -> Result<GroupConfig> {
         }
     };
 
-    let existing = if draft.is_new {
-        None
-    } else {
-        config.group(&draft.id).cloned()
-    };
     let mut group = existing.unwrap_or_default();
     group.id = if draft.is_new {
         unique_group_id(config, &domains[0].pattern)
@@ -700,6 +702,7 @@ fn build_group(config: &AppConfig, draft: &SiteDraft) -> Result<GroupConfig> {
     group.domains = domains;
     group.homepage = homepage;
     group.default_route = default_route;
+    group.verify = model::verify_from_preset(draft.verify);
     if draft.is_new {
         group.enabled = true;
     }
@@ -1419,6 +1422,16 @@ impl Ui {
                         } else {
                             String::new()
                         });
+                        s.editor_default_sni.set(if preset == 3 {
+                            domain_sni_hosts(&group.default_route)
+                                .map(|hosts| hosts.join(", "))
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        });
+                        s.editor_verify
+                            .set(model::verify_preset_index(group.verify) as usize);
+                        s.editor_off_armed.set(false);
                         s.editor_deletable.set(!builtins.contains(&group.id));
                         let rows: Vec<EditorRowState> = app_state::with_editor_rows(|| {
                             group
@@ -1455,6 +1468,9 @@ impl Ui {
                         s.editor_homepage.set(String::new());
                         s.editor_default_preset.set(0);
                         s.editor_default_custom.set(String::new());
+                        s.editor_default_sni.set(String::new());
+                        s.editor_verify.set(0);
+                        s.editor_off_armed.set(false);
                         s.editor_deletable.set(false);
                     }
                 }
@@ -1463,6 +1479,7 @@ impl Ui {
             }
             Action::CloseEditor => {
                 s.editor_open.set(false);
+                s.editor_off_armed.set(false);
                 s.editor_error.set(String::new());
             }
             Action::AddDomain => {
@@ -1487,6 +1504,12 @@ impl Ui {
                 }
             }
             Action::SaveEditor => {
+                if s.editor_verify.get() == 2 && !s.editor_off_armed.get() {
+                    s.editor_off_armed.set(true);
+                    s.editor_error
+                        .set("关闭校验会接受任意上游证书；再点一次保存确认。".into());
+                    return;
+                }
                 let draft = SiteDraft {
                     id: s.editor_id.get(),
                     is_new: s.editor_is_new.get(),
@@ -1505,6 +1528,8 @@ impl Ui {
                     homepage: s.editor_homepage.get(),
                     default_preset: s.editor_default_preset.get(),
                     default_custom: s.editor_default_custom.get(),
+                    default_sni: s.editor_default_sni.get(),
+                    verify: s.editor_verify.get() as i32,
                 };
                 let config = runtime.config().snapshot();
                 let saved = build_group(&config, &draft).and_then(|group| {
@@ -1514,6 +1539,7 @@ impl Ui {
                 match saved {
                     Ok(()) => {
                         s.editor_open.set(false);
+                        s.editor_off_armed.set(false);
                         s.editor_error.set(String::new());
                         self.refresh();
                     }

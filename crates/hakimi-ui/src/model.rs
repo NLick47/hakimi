@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
-use hakimi_core::config::{EchSource, RouteAttempt, RoutePolicy};
+use hakimi_core::config::{EchSource, RouteAttempt, RoutePolicy, VerifyMode};
 use hakimi_core::domain::{host_from_url, normalize_hostname, DomainPattern};
 use hakimi_core::mirror::MirrorStatus;
 use hakimi_core::resolver::EffectiveEndpoint;
@@ -53,10 +53,29 @@ pub(crate) fn route_preset_index(route: &RoutePolicy) -> i32 {
         1
     } else if route == &RoutePolicy::ech_shared() {
         2
-    } else if route == &RoutePolicy::sni(Vec::new()) {
+    } else if matches!(
+        route.attempts.as_slice(),
+        [RouteAttempt::Sni { .. }] | [RouteAttempt::Sni { .. }, RouteAttempt::Direct]
+    ) {
         3
     } else {
         4
+    }
+}
+
+pub(crate) fn verify_preset_index(mode: VerifyMode) -> i32 {
+    match mode {
+        VerifyMode::Real => 0,
+        VerifyMode::Sni => 1,
+        VerifyMode::Off => 2,
+    }
+}
+
+pub(crate) fn verify_from_preset(index: i32) -> VerifyMode {
+    match index {
+        1 => VerifyMode::Sni,
+        2 => VerifyMode::Off,
+        _ => VerifyMode::Real,
     }
 }
 

@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use crate::ca::{CaStatus, CertificateAuthority};
 use crate::cache::CacheManager;
 use crate::catalog::{CatalogManager, RefreshReport};
-use crate::config::{AppConfig, ConfigManager, GroupConfig, ProxyMode, RoutePolicy};
+use crate::config::{AppConfig, ConfigManager, GroupConfig, ProxyMode, RoutePolicy, VerifyMode};
 use crate::decision::DecisionEngine;
 use crate::ip_tester::TlsContext;
 use crate::logging;
@@ -244,6 +244,21 @@ pub struct HakimiRuntime {
     sweep_epoch: AtomicU64,
     sweep_done: AtomicU64,
     started_at: DateTime<Utc>,
+}
+
+/// Whether any domain rule changed its certificate verification mode.
+///
+/// Only `verify` matters here: a rename or a homepage edit must not drop every
+/// warm upstream connection in the process.
+fn verify_modes_changed(current: &AppConfig, next: &AppConfig) -> bool {
+    fn modes(config: &AppConfig) -> std::collections::HashMap<&str, VerifyMode> {
+        config
+            .groups
+            .iter()
+            .map(|group| (group.id.as_str(), group.verify))
+            .collect()
+    }
+    modes(current) != modes(next)
 }
 
 impl Drop for HakimiRuntime {
@@ -1156,7 +1171,9 @@ impl HakimiRuntime {
     }
 
     pub fn upsert_group(&self, group: GroupConfig) -> Result<AppConfig> {
-        self.config.upsert_group(group)
+        let saved = self.config.upsert_group(group)?;
+        self.upstream.retire_pools();
+        Ok(saved)
     }
 
     pub fn remove_group(&self, id: &str) -> Result<AppConfig> {
@@ -1209,6 +1226,11 @@ impl HakimiRuntime {
         let mirror_source_changed =
             current.advanced.download.mirror_source != config.advanced.download.mirror_source;
         let http1_hosts_changed = current.advanced.http1_hosts != config.advanced.http1_hosts;
+        // A pooled socket carries the verification mode it was opened with.
+        // Switching a rule to `real` must not keep serving requests over a
+        // connection whose certificate was never checked, so the pools are
+        // retired like `upsert_group` does.
+        let verify_changed = verify_modes_changed(&current, &config);
         let result = self.config.update(config);
         if result.is_ok() {
             self.engine.clear_route_rejections();
@@ -1219,6 +1241,9 @@ impl HakimiRuntime {
                 // Apply an edited host list to the running pool: the list is
                 // the user's own, so an edit should not need a restart.
                 self.apply_http1_hosts();
+            }
+            if verify_changed {
+                self.upstream.retire_pools();
             }
         }
         result
@@ -1878,6 +1903,7 @@ mod status_snapshot_tests {
                     enabled: true,
                     homepage: None,
                     default_route: RoutePolicy::auto(),
+                    verify: VerifyMode::Real,
                 });
                 Ok(())
             })
@@ -1945,6 +1971,7 @@ mod status_snapshot_tests {
                         enabled: true,
                         homepage: None,
                         default_route: RoutePolicy::auto(),
+                        verify: VerifyMode::Real,
                     });
                 }
                 Ok(())
@@ -2068,6 +2095,7 @@ mod status_snapshot_tests {
                     enabled: true,
                     homepage: None,
                     default_route: RoutePolicy::direct(),
+                    verify: VerifyMode::Real,
                 });
                 config.advanced.ip_timeout_ms = 500;
                 Ok(())
@@ -2296,6 +2324,7 @@ mod status_snapshot_tests {
             enabled: true,
             homepage: None,
             default_route: RoutePolicy::auto(),
+            verify: VerifyMode::Real,
         });
         let with_site = crate::pac::generate(&config, addr, false);
         let paused = crate::pac::generate(&config, addr, true);
@@ -2344,6 +2373,32 @@ mod status_snapshot_tests {
         assert!(
             watch.poll(5, false, || baseline.clone(), || true),
             "removing a site must nudge"
+        );
+    }
+
+    #[test]
+    fn only_a_verify_change_retires_the_pools() {
+        let base = AppConfig::default();
+        let mut renamed = base.clone();
+        renamed.groups[0].name.push_str(" renamed");
+        renamed.groups[0].homepage = Some("https://example.com/".into());
+        assert!(
+            !verify_modes_changed(&base, &renamed),
+            "a rename or a homepage edit must keep every warm connection"
+        );
+
+        let mut flipped = base.clone();
+        flipped.groups[0].verify = VerifyMode::Off;
+        assert!(
+            verify_modes_changed(&base, &flipped),
+            "turning verification off must force fresh connections"
+        );
+
+        let mut reordered = base.clone();
+        reordered.groups.reverse();
+        assert!(
+            !verify_modes_changed(&base, &reordered),
+            "reordering groups does not change any rule's mode"
         );
     }
 }

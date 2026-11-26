@@ -580,8 +580,17 @@ impl Default for RoutePolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VerifyMode {
+    #[default]
+    Real,
+    Sni,
+    Off,
+}
+
 /// A domain pattern plus an optional override of the site's default route.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DomainRule {
     pub pattern: String,
@@ -621,6 +630,9 @@ pub struct GroupConfig {
     /// Route used by domain rules without an explicit route.
     #[serde(default = "RoutePolicy::auto")]
     pub default_route: RoutePolicy,
+    /// Certificate verification for every domain of this group.
+    #[serde(default)]
+    pub verify: VerifyMode,
 }
 
 impl Default for GroupConfig {
@@ -632,6 +644,7 @@ impl Default for GroupConfig {
             enabled: true,
             homepage: None,
             default_route: RoutePolicy::auto(),
+            verify: VerifyMode::Real,
         }
     }
 }
@@ -795,6 +808,7 @@ pub fn default_groups() -> Vec<GroupConfig> {
             enabled,
             homepage: Some(homepage.to_string()),
             default_route,
+            verify: VerifyMode::Real,
         }
     }
 
@@ -1917,6 +1931,7 @@ mod tests {
                 enabled: true,
                 homepage: None,
                 default_route: RoutePolicy::direct(),
+                verify: VerifyMode::Real,
             }
         });
         config.canonicalize();
@@ -1953,6 +1968,7 @@ mod tests {
                 enabled: true,
                 homepage: None,
                 default_route: RoutePolicy::direct(),
+                verify: VerifyMode::Real,
             });
         }
         wide.canonicalize();
@@ -2082,6 +2098,7 @@ mod tests {
             enabled: true,
             homepage: None,
             default_route: default_route.clone(),
+            verify: VerifyMode::Real,
         };
         let config = AppConfig {
             groups: vec![group.clone()],
@@ -2139,6 +2156,7 @@ mod tests {
                 enabled: true,
                 homepage: None,
                 default_route: default_route.clone(),
+                verify: VerifyMode::Real,
             }],
             ..AppConfig::default()
         };
@@ -2211,6 +2229,7 @@ mod tests {
                 enabled: true,
                 homepage: None,
                 default_route: RoutePolicy::direct(),
+                verify: VerifyMode::Real,
             }],
             ..AppConfig::default()
         };

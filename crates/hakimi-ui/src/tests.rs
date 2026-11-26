@@ -1,7 +1,7 @@
 use super::*;
 use crate::model::{SITE_ICONS, TONE_BROKEN, TONE_DEGRADED, TONE_NEUTRAL, TONE_OK};
 use crate::ui_state::{BAD_COLOR, IDLE_COLOR, OK_COLOR, SLOW_COLOR};
-use hakimi_core::config::{DomainRule, RouteAttempt, RoutePolicy};
+use hakimi_core::config::{DomainRule, GroupConfig, RouteAttempt, RoutePolicy, VerifyMode};
 use hakimi_core::mirror::MirrorStatus;
 use hakimi_core::resolver::EffectiveEndpoint;
 use hakimi_core::strategy::DohSource;
@@ -42,6 +42,8 @@ fn draft(rows: Vec<DomainDraft>, preset: i32) -> SiteDraft {
         homepage: String::new(),
         default_preset: preset,
         default_custom: String::new(),
+        default_sni: String::new(),
+        verify: 0,
     }
 }
 
@@ -56,6 +58,49 @@ fn new_site_gets_a_config_safe_id() {
     assert_eq!(group.domains.len(), 1);
     assert_eq!(group.domains[0].pattern, "www.example.com");
     assert!(group.domains[0].route.is_none());
+}
+
+#[test]
+fn default_sni_hosts_round_trip_through_the_editor() {
+    let config = AppConfig::default();
+    let mut site = draft(vec![row("www.example.com", 0)], 3);
+    site.default_sni = "g.cn".into();
+    let group = build_group(&config, &site).unwrap();
+    assert_eq!(
+        group.default_route,
+        RoutePolicy::sni(vec!["g.cn".to_string()])
+    );
+    assert_eq!(route_preset_index(&group.default_route), 3);
+}
+
+#[test]
+fn the_site_verify_mode_is_stored_on_the_group() {
+    let config = AppConfig::default();
+    let mut site = draft(
+        vec![row("www.example.com", 0), row("*.cdn.example.com", 3)],
+        0,
+    );
+    site.verify = 1;
+    let group = build_group(&config, &site).unwrap();
+    assert_eq!(group.verify, VerifyMode::Sni);
+}
+
+#[test]
+fn editing_a_site_keeps_its_verify_mode() {
+    let mut config = AppConfig::default();
+    config.groups.push(GroupConfig {
+        id: "kept".into(),
+        name: "Kept".into(),
+        domains: vec![DomainRule::new("a.example")],
+        enabled: true,
+        homepage: None,
+        default_route: RoutePolicy::auto(),
+        verify: VerifyMode::Off,
+    });
+    let mut site = draft_with("kept", false, vec![row("a.example", 0)], 0);
+    site.verify = 2;
+    let group = build_group(&config, &site).unwrap();
+    assert_eq!(group.verify, VerifyMode::Off);
 }
 
 #[test]
@@ -265,6 +310,8 @@ fn draft_with(id: &str, is_new: bool, rows: Vec<DomainDraft>, preset: i32) -> Si
         homepage: String::new(),
         default_preset: preset,
         default_custom: String::new(),
+        default_sni: String::new(),
+        verify: 0,
     }
 }
 

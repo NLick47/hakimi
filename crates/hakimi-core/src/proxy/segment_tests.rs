@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 use crate::ca::CertificateAuthority;
 use crate::cache::{CacheManager, LastGoodEntry};
 use crate::catalog::CatalogManager;
-use crate::config::{ConfigManager, DomainRule, GroupConfig, RoutePolicy};
+use crate::config::{ConfigManager, DomainRule, GroupConfig, RoutePolicy, VerifyMode};
 use crate::decision::DecisionEngine;
 use crate::ip_tester::TlsContext;
 use crate::mirror::MirrorList;
@@ -232,6 +232,7 @@ fn build_context(dir: &Path) -> Arc<ProxyContext> {
             enabled: true,
             homepage: None,
             default_route: RoutePolicy::direct(),
+            verify: VerifyMode::Real,
         })
         .unwrap();
     let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());

@@ -1846,12 +1846,13 @@ impl RouteConnector {
         let remaining = tls_phase_budget(timeout, started.elapsed());
         let result = tokio::time::timeout(
             remaining,
-            self.tls.handshake(
+            self.tls.handshake_with_verify(
                 tcp,
                 plan.domain.as_str(),
                 plan.mode,
                 plan.sni.as_deref(),
                 plan.ech_config.as_deref(),
+                plan.verify,
                 self.http1_only || force_http1,
             ),
         )
