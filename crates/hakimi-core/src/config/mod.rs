@@ -1031,6 +1031,18 @@ pub fn default_groups() -> Vec<GroupConfig> {
                     "*.googleusercontent.com",
                     RoutePolicy::sni(vec!["g.cn".to_string()]),
                 ),
+                DomainRule::routed(
+                    "workspace.google.com",
+                    RoutePolicy::sni(vec!["g.cn".to_string()]),
+                ),
+                DomainRule::routed(
+                    "contacts.google.com",
+                    RoutePolicy::sni(vec!["g.cn".to_string()]),
+                ),
+                DomainRule::routed(
+                    "calendar.google.com",
+                    RoutePolicy::sni(vec!["g.cn".to_string()]),
+                ),
             ],
             RoutePolicy::sni(vec!["g.cn".to_string()]),
             true,
@@ -1051,6 +1063,10 @@ pub fn default_groups() -> Vec<GroupConfig> {
                 // Extension downloads; the install button needs it.
                 DomainRule::routed(
                     "clients2.google.com",
+                    RoutePolicy::sni(vec!["g.cn".to_string()]),
+                ),
+                DomainRule::routed(
+                    "clients6.google.com",
                     RoutePolicy::sni(vec!["g.cn".to_string()]),
                 ),
             ],
