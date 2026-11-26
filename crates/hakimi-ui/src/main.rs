@@ -1780,15 +1780,10 @@ fn main_window_request(ui: std::rc::Rc<Ui>, tx: Sender<Action>) -> WindowRequest
         })
 }
 
-/// Windows: run without a main window and open the UI on demand. Closing the
-/// window destroys it, which is what actually returns its memory.
+/// Windows: run without a main window and open the UI on demand.
 ///
-/// windui keeps its shared Direct2D/DirectWrite device chain for the process
-/// lifetime unless asked to release it. The local windui fork exposes
-/// `release_shared_device_if_idle()`; this tick calls it once the window is
-/// really gone, returning the UI's GPU/font caches (tens of MB for this UI)
-/// to the system. The next open recreates them lazily. The API itself refuses
-/// while any window is alive, so a fast reopen is safe.
+/// Once the window is gone the tick releases windui's shared D2D/DWrite
+/// device chain; the next open rebuilds it lazily.
 #[cfg(windows)]
 fn run_resident(mut app: App, ui: std::rc::Rc<Ui>, tx: Sender<Action>, start_hidden: bool) {
     let tick_ui = ui.clone();
@@ -1798,8 +1793,6 @@ fn run_resident(mut app: App, ui: std::rc::Rc<Ui>, tx: Sender<Action>, start_hid
         if tick_ui.reclaim_editor_rows.replace(false) {
             app_state::release_editor_rows();
         }
-        // Only UI-originated memory: the proxy runtime is untouched. No-op
-        // while a window is open or after the chain was already released.
         if !window_open(MAIN_WINDOW_KEY) && windui::platform::release_shared_device_if_idle() {
             tracing::info!("released the shared UI device caches");
         }
