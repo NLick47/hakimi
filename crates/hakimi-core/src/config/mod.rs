@@ -633,6 +633,10 @@ pub struct GroupConfig {
     /// Certificate verification for every domain of this group.
     #[serde(default)]
     pub verify: VerifyMode,
+    /// Hidden sites stay disabled and are left out of the site list; they can
+    /// be restored from the site management section. Implies `enabled: false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
 }
 
 impl Default for GroupConfig {
@@ -645,6 +649,7 @@ impl Default for GroupConfig {
             homepage: None,
             default_route: RoutePolicy::auto(),
             verify: VerifyMode::Real,
+            hidden: false,
         }
     }
 }
@@ -809,13 +814,14 @@ pub fn default_groups() -> Vec<GroupConfig> {
             homepage: Some(homepage.to_string()),
             default_route,
             verify: VerifyMode::Real,
+            hidden: false,
         }
     }
 
     let plain = |pattern: &str| DomainRule::new(pattern);
     let ech = |pattern: &str| DomainRule::routed(pattern, RoutePolicy::ech_shared());
 
-    vec![
+    let mut groups = vec![
         group(
             "github",
             "GitHub",
@@ -1000,6 +1006,13 @@ pub fn default_groups() -> Vec<GroupConfig> {
                     "www.google.com.hk",
                     RoutePolicy::sni(vec!["www.google.com.hk.".to_string()]),
                 ),
+                // Google's account service is shared by Search, YouTube and
+                // Gmail; the root-dot SNI is the only way through with a
+                // real certificate for the login session.
+                DomainRule::routed(
+                    "accounts.google.com",
+                    RoutePolicy::sni(vec!["accounts.google.com.".to_string()]),
+                ),
             ],
             RoutePolicy::sni(vec![
                 "www.google.com.".to_string(),
@@ -1008,7 +1021,56 @@ pub fn default_groups() -> Vec<GroupConfig> {
             true,
             "https://www.google.com.hk/",
         ),
-    ]
+        group(
+            "gmail",
+            "Gmail",
+            vec![
+                DomainRule::routed(
+                    "mail.google.com",
+                    RoutePolicy::sni(vec!["mail.google.com.".to_string()]),
+                ),
+                DomainRule::routed("*.gstatic.com", RoutePolicy::sni(vec!["g.cn".to_string()])),
+                DomainRule::routed(
+                    "*.googleusercontent.com",
+                    RoutePolicy::sni(vec!["g.cn".to_string()]),
+                ),
+            ],
+            RoutePolicy::sni(vec!["g.cn".to_string()]),
+            true,
+            "https://mail.google.com/",
+        ),
+        group(
+            "chrome-web-store",
+            "Chrome Web Store",
+            vec![
+                DomainRule::routed(
+                    "chromewebstore.google.com",
+                    RoutePolicy::sni(vec!["g.cn".to_string()]),
+                ),
+                DomainRule::routed(
+                    "chrome.google.com",
+                    RoutePolicy::sni(vec!["g.cn".to_string()]),
+                ),
+                // Extension downloads are served from this host; without it
+                // the install button downloads through the blocked default route.
+                DomainRule::routed(
+                    "clients2.google.com",
+                    RoutePolicy::sni(vec!["g.cn".to_string()]),
+                ),
+            ],
+            RoutePolicy::sni(vec!["g.cn".to_string()]),
+            true,
+            "https://chromewebstore.google.com/",
+        ),
+    ];
+    // Both groups route via a fake `g.cn` SNI, so certificate verification
+    // must follow the SNI rather than the real hostname.
+    for id in ["gmail", "chrome-web-store"] {
+        if let Some(group) = groups.iter_mut().find(|group| group.id == id) {
+            group.verify = VerifyMode::Sni;
+        }
+    }
+    groups
 }
 
 impl AppConfig {
@@ -1924,15 +1986,13 @@ mod tests {
         // linear scan would have found the first.
         config.groups.push(GroupConfig {
             id: "pixiv".into(),
-            ..GroupConfig {
-                id: "pixiv".into(),
-                name: "duplicate".into(),
-                domains: Vec::new(),
-                enabled: true,
-                homepage: None,
-                default_route: RoutePolicy::direct(),
-                verify: VerifyMode::Real,
-            }
+            name: "duplicate".into(),
+            domains: Vec::new(),
+            enabled: true,
+            homepage: None,
+            default_route: RoutePolicy::direct(),
+            verify: VerifyMode::Real,
+            hidden: false,
         });
         config.canonicalize();
         assert_eq!(config.group_index_of("pixiv").unwrap(), first);
@@ -1969,6 +2029,7 @@ mod tests {
                 homepage: None,
                 default_route: RoutePolicy::direct(),
                 verify: VerifyMode::Real,
+                hidden: false,
             });
         }
         wide.canonicalize();
@@ -1985,7 +2046,7 @@ mod tests {
     fn defaults_validate_and_match_document() {
         let config = AppConfig::default();
         config.validate().unwrap();
-        assert_eq!(config.groups.len(), 11);
+        assert_eq!(config.groups.len(), 13);
         let x = config.group("x-com").unwrap();
         assert!(x.enabled);
         assert!(x.domains.iter().any(|rule| rule.pattern == "*.twimg.com"));
@@ -2099,6 +2160,7 @@ mod tests {
             homepage: None,
             default_route: default_route.clone(),
             verify: VerifyMode::Real,
+            hidden: false,
         };
         let config = AppConfig {
             groups: vec![group.clone()],
@@ -2157,6 +2219,7 @@ mod tests {
                 homepage: None,
                 default_route: default_route.clone(),
                 verify: VerifyMode::Real,
+                hidden: false,
             }],
             ..AppConfig::default()
         };
@@ -2230,6 +2293,7 @@ mod tests {
                 homepage: None,
                 default_route: RoutePolicy::direct(),
                 verify: VerifyMode::Real,
+                hidden: false,
             }],
             ..AppConfig::default()
         };

@@ -383,6 +383,7 @@ mod tests {
             homepage: None,
             default_route: crate::config::RoutePolicy::direct(),
             verify: VerifyMode::Real,
+            hidden: false,
         }
     }
 

@@ -280,6 +280,8 @@ private val SITE_ICONS = mapOf(
     "huggingface" to R.drawable.site_hf,
     "x" to R.drawable.site_x,
     "google" to R.drawable.site_google,
+    "gmail" to R.drawable.site_gmail,
+    "chrome-web-store" to R.drawable.site_chrome_web_store,
 )
 
 fun siteIconRes(id: String): Int {

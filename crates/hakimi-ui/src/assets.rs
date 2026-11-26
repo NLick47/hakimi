@@ -21,6 +21,11 @@ const HF_LOGO: &[u8] = include_bytes!("../assets/hf.png");
 /// The site logos, keyed by the `icon_key` derived in `model.rs`.
 const SITE_LOGOS: &[(&str, &[u8])] = &[
     ("google", include_bytes!("../assets/google.png")),
+    ("gmail", include_bytes!("../assets/gmail.png")),
+    (
+        "chrome-web-store",
+        include_bytes!("../assets/chrome-web-store.png"),
+    ),
     ("pixiv", include_bytes!("../assets/pixiv.png")),
     ("hitomi", include_bytes!("../assets/hitomi.png")),
     ("poipiku", include_bytes!("../assets/poipiku.png")),

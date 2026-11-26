@@ -284,6 +284,7 @@ fn engine_for_test(
             homepage: None,
             default_route: route,
             verify: VerifyMode::Real,
+            hidden: false,
         })
         .unwrap();
     let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());

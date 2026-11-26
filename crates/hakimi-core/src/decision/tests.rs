@@ -342,6 +342,7 @@ fn harness(group_domains: &[&str], default_route: RoutePolicy) -> Harness {
             homepage: None,
             default_route,
             verify: VerifyMode::Real,
+            hidden: false,
         })
         .unwrap();
     let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());

@@ -90,6 +90,7 @@ fn engine_for_with_resolver(
                 homepage: None,
                 default_route: RoutePolicy::direct(),
                 verify: VerifyMode::Real,
+                hidden: false,
             });
             Ok(())
         })

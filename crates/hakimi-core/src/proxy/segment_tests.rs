@@ -233,6 +233,7 @@ fn build_context(dir: &Path) -> Arc<ProxyContext> {
             homepage: None,
             default_route: RoutePolicy::direct(),
             verify: VerifyMode::Real,
+            hidden: false,
         })
         .unwrap();
     let cache = Arc::new(CacheManager::load(paths.state_file()).unwrap());

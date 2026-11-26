@@ -1904,6 +1904,7 @@ mod status_snapshot_tests {
                     homepage: None,
                     default_route: RoutePolicy::auto(),
                     verify: VerifyMode::Real,
+                    hidden: false,
                 });
                 Ok(())
             })
@@ -1972,6 +1973,7 @@ mod status_snapshot_tests {
                         homepage: None,
                         default_route: RoutePolicy::auto(),
                         verify: VerifyMode::Real,
+                        hidden: false,
                     });
                 }
                 Ok(())
@@ -2096,6 +2098,7 @@ mod status_snapshot_tests {
                     homepage: None,
                     default_route: RoutePolicy::direct(),
                     verify: VerifyMode::Real,
+                    hidden: false,
                 });
                 config.advanced.ip_timeout_ms = 500;
                 Ok(())
@@ -2325,6 +2328,7 @@ mod status_snapshot_tests {
             homepage: None,
             default_route: RoutePolicy::auto(),
             verify: VerifyMode::Real,
+            hidden: false,
         });
         let with_site = crate::pac::generate(&config, addr, false);
         let paused = crate::pac::generate(&config, addr, true);

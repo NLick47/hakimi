@@ -305,6 +305,7 @@ fn add(
             .map(RoutePolicy::from)
             .unwrap_or_else(RoutePolicy::auto),
         verify: VerifyMode::Real,
+        hidden: false,
     };
     runtime.upsert_group(group)?;
     Ok(())

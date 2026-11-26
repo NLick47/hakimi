@@ -96,6 +96,7 @@ fn editing_a_site_keeps_its_verify_mode() {
         homepage: None,
         default_route: RoutePolicy::auto(),
         verify: VerifyMode::Off,
+        hidden: false,
     });
     let mut site = draft_with("kept", false, vec![row("a.example", 0)], 0);
     site.verify = 2;

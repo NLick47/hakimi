@@ -146,6 +146,7 @@ async fn spawn_proxy(
                 homepage: None,
                 default_route: RoutePolicy::auto(),
                 verify: VerifyMode::Real,
+                hidden: false,
             });
             // The DoH endpoints point at a closed port: the cursor always
             // asks for a DoH expansion once the catalog candidates run out,

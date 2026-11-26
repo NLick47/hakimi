@@ -75,6 +75,7 @@ fn initialize(data_dir: &str) -> Result<()> {
             homepage: Some("https://crypto.cloudflare.com/cdn-cgi/trace".to_string()),
             default_route: RoutePolicy::ech_shared(),
             verify: VerifyMode::Real,
+            hidden: false,
         });
     }
     runtime
