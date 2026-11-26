@@ -17,7 +17,7 @@ dev-shot = []
 # Lightweight cross-platform GUI: tiny-skia rendering + native windows/text.
 # Default features off (PNG site logos, no SVG); `d2d` adds the Direct2D GPU
 # renderer that `Renderer::Auto` tries first before falling back to software.
-windui = { version = "=0.37.0", default-features = false, features = ["d2d"] }
+windui = { git = "https://github.com/NLick47/wind-ui-rust.git", branch = "main", default-features = false, features = ["d2d"] }
 hakimi-core = { path = "../hakimi-core" }
 anyhow.workspace = true
 serde_json.workspace = true
