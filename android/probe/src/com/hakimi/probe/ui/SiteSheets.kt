@@ -36,6 +36,7 @@ private fun inputField(
     hint: String,
     multiline: Boolean = false,
     numeric: Boolean = false,
+    readOnly: Boolean = false,
 ): EditText = EditText(context).apply {
     setText(value)
     this.hint = hint
@@ -59,6 +60,10 @@ private fun inputField(
         gravity = Gravity.CENTER_VERTICAL or Gravity.START
     }
     setSelection(text.length)
+    if (readOnly) {
+        isEnabled = false
+        setTextColor(Palette.TEXT_2)
+    }
 }
 
 private fun fieldBlock(context: Context, label: String, field: View, top: Float = 12f): LinearLayout =
@@ -129,16 +134,22 @@ class SiteEditorSheet(
     private var routePopup: PopupWindow? = null
 
     fun show() {
+        val readOnly = site != null && !site.custom
         val sheet = Sheet(
             context,
-            if (site == null) "添加站点" else "编辑站点",
+            when {
+                site == null -> "添加站点"
+                readOnly -> "查看站点"
+                else -> "编辑站点"
+            },
             site?.name
         )
-        val name = inputField(context, site?.name.orEmpty(), "例如 Pixiv")
+        val name = inputField(context, site?.name.orEmpty(), "例如 Pixiv", readOnly = readOnly)
         val homepage = inputField(
             context,
             site?.homepage.orEmpty(),
-            "https://example.com"
+            "https://example.com",
+            readOnly = readOnly
         )
 
         val drafts = site?.domainRules
@@ -154,8 +165,13 @@ class SiteEditorSheet(
                 if (index > 0) block.setPadding(0, context.dp(10f), 0, 0)
 
                 val line = context.row()
-                val pattern = inputField(context, draft.pattern, "例如 www.pixiv.net")
-                pattern.watchText { draft.pattern = it }
+                val pattern = inputField(
+                    context,
+                    draft.pattern,
+                    "例如 www.pixiv.net",
+                    readOnly = readOnly
+                )
+                if (!readOnly) pattern.watchText { draft.pattern = it }
                 line.addView(pattern, LinearLayout.LayoutParams(
                     0,
                     LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -177,14 +193,16 @@ class SiteEditorSheet(
                         Palette.BORDER,
                         1f
                     )
-                    isClickable = true
-                    isFocusable = true
+                    isClickable = !readOnly
+                    isFocusable = !readOnly
                     contentDescription = "线路：${ROW_ROUTE_PRESETS[draft.preset]}"
                 }
-                route.clickOnce {
-                    openRouteMenu(route, draft.preset) { preset ->
-                        draft.preset = preset
-                        renderRows()
+                if (!readOnly) {
+                    route.clickOnce {
+                        openRouteMenu(route, draft.preset) { preset ->
+                            draft.preset = preset
+                            renderRows()
+                        }
                     }
                 }
                 line.addView(route, LinearLayout.LayoutParams(
@@ -192,7 +210,7 @@ class SiteEditorSheet(
                     LinearLayout.LayoutParams.WRAP_CONTENT
                 ).apply { marginStart = context.dp(6f) })
 
-                if (drafts.size > 1) {
+                if (drafts.size > 1 && !readOnly) {
                     val remove = context.text("移除", 12f, Palette.TEXT_2, medium = true).apply {
                         gravity = Gravity.CENTER
                         setPadding(context.dp(6f), context.dp(10f), context.dp(6f), context.dp(10f))
@@ -216,9 +234,10 @@ class SiteEditorSheet(
                     val sni = inputField(
                         context,
                         draft.sni,
-                        "多个用逗号分隔"
+                        "多个用逗号分隔",
+                        readOnly = readOnly
                     )
-                    sni.watchText { draft.sni = it }
+                    if (!readOnly) sni.watchText { draft.sni = it }
                     block.addView(sni, LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.MATCH_PARENT,
                         LinearLayout.LayoutParams.WRAP_CONTENT
@@ -226,8 +245,13 @@ class SiteEditorSheet(
                 }
                 if (draft.preset == 4) {
                     block.addView(subFieldLabel(context, "自定义线路"))
-                    val custom = inputField(context, draft.custom, "例如 ech+direct")
-                    custom.watchText { draft.custom = it }
+                    val custom = inputField(
+                        context,
+                        draft.custom,
+                        "例如 ech+direct",
+                        readOnly = readOnly
+                    )
+                    if (!readOnly) custom.watchText { draft.custom = it }
                     block.addView(custom, LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.MATCH_PARENT,
                         LinearLayout.LayoutParams.WRAP_CONTENT
@@ -246,9 +270,12 @@ class SiteEditorSheet(
             isClickable = true
             isFocusable = true
         }
-        addDomain.clickOnce {
-            drafts.add(RowDraft())
-            renderRows()
+        if (readOnly) addDomain.visibility = View.GONE
+        if (!readOnly) {
+            addDomain.clickOnce {
+                drafts.add(RowDraft())
+                renderRows()
+            }
         }
 
         val domainSection = context.column()
@@ -263,7 +290,8 @@ class SiteEditorSheet(
         val custom = inputField(
             context,
             if (selectedPreset == 4) site?.defaultRoute.orEmpty() else "",
-            "例如 ech+direct"
+            "例如 ech+direct",
+            readOnly = readOnly
         )
         val customBlock = fieldBlock(context, "自定义线路", custom)
 
@@ -284,9 +312,11 @@ class SiteEditorSheet(
             val chip = context.text(label, 11f, Palette.TEXT_2, medium = true).apply {
                 gravity = Gravity.CENTER
                 setPadding(context.dp(6f), context.dp(10f), context.dp(6f), context.dp(10f))
-                clickOnce {
-                    selectedPreset = index
-                    updateChips()
+                if (!readOnly) {
+                    clickOnce {
+                        selectedPreset = index
+                        updateChips()
+                    }
                 }
             }
             chips += chip
@@ -326,10 +356,12 @@ class SiteEditorSheet(
             val chip = context.text(label, 11f, Palette.TEXT_2, medium = true).apply {
                 gravity = Gravity.CENTER
                 setPadding(context.dp(6f), context.dp(10f), context.dp(6f), context.dp(10f))
-                clickOnce {
-                    selectedVerify = index
-                    offArmed = false
-                    updateVerifyChips()
+                if (!readOnly) {
+                    clickOnce {
+                        selectedVerify = index
+                        offArmed = false
+                        updateVerifyChips()
+                    }
                 }
             }
             verifyChips += chip
@@ -365,6 +397,16 @@ class SiteEditorSheet(
         sheet.add(customBlock)
         sheet.add(verifyBlock)
         sheet.add(error)
+
+        if (readOnly) {
+            sheet.add(context.text("内置站点随版本更新，不可修改", 11f, Palette.MUTED).apply {
+                setPadding(0, context.dp(14f), 0, 0)
+            })
+            sheet.buttons("关闭", { sheet.dismiss() })
+            sheet.setOnDismissListener { routePopup?.dismiss() }
+            sheet.show()
+            return
+        }
 
         sheet.buttons("保存", {
             val nameText = name.text.toString().trim()
@@ -771,19 +813,15 @@ class SiteDetailSheet(
         info.addView(infoRow(context, "站点 ID", site.id))
         sheet.add(info)
 
-        if (site.custom) {
-            sheet.buttons(
-                "编辑站点",
-                {
-                    sheet.dismiss()
-                    host.openEditor(site)
-                },
-                "关闭",
-                { sheet.dismiss() },
-            )
-        } else {
-            sheet.buttons("关闭", { sheet.dismiss() })
-        }
+        sheet.buttons(
+            if (site.custom) "编辑站点" else "查看配置",
+            {
+                sheet.dismiss()
+                host.openEditor(site)
+            },
+            "关闭",
+            { sheet.dismiss() },
+        )
         sheet.show()
     }
 
