@@ -40,7 +40,6 @@ pub(crate) struct SiteData {
     pub(crate) summary_hex: &'static str,
     pub(crate) enabled: bool,
     pub(crate) hidden: bool,
-    /// Shipped groups cannot be edited or removed; user groups can.
     pub(crate) shipped: bool,
     pub(crate) open: bool,
     pub(crate) first: bool,
@@ -202,8 +201,7 @@ pub(crate) fn normalize_domain_host(raw: &str) -> Result<String> {
     Ok(host)
 }
 
-/// Whether a group is shipped with the build. A shipped group's definition is
-/// not user-editable and cannot be removed; a user group is both.
+/// A shipped group cannot be edited or removed.
 pub(crate) fn is_shipped(site: &SiteData) -> bool {
     site.shipped
 }

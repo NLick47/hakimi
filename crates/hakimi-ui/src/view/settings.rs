@@ -179,8 +179,7 @@ fn site_management_row(s: UiSignals, tx: Sender<Action>) -> Element {
     Element::col().width_match().child(head).child(expanded)
 }
 
-/// The collapsed block of hidden sites under the visible list. The toggle is
-/// an Action so the refresh path stays the single source of the list state.
+/// The collapsed block of hidden sites under the visible list.
 fn hidden_sites_section(s: UiSignals, tx: Sender<Action>) -> Element {
     let count_signal = s.sites_hidden_count;
     let shown = s.sites_hidden_shown;
@@ -216,26 +215,23 @@ fn hidden_sites_section(s: UiSignals, tx: Sender<Action>) -> Element {
     Element::col().width_match().child(head).child(list)
 }
 
-/// A hidden site row: muted, opens the editor unless builtin, right-click
-/// offers unhide.
+/// A hidden site row: muted, opens the editor, right-click offers unhide.
 fn hidden_site_row(site: SiteData, tx: Sender<Action>) -> Element {
     let id = site.id.clone();
     let row_tx = tx.clone();
     let menu_tx = tx.clone();
     let menu_id = site.id.clone();
     let menu_builtin = crate::model::is_shipped(&site);
-    let mut row = Element::row()
+    let row = Element::row()
         .width_match()
         .height(48)
         .padding_xy(16, 0)
         .cross(Align::Center)
-        .spacing(10);
-    if !menu_builtin {
-        row = row.clickable().on_click(move |_| {
+        .spacing(10)
+        .clickable()
+        .on_click(move |_| {
             let _ = row_tx.send(Action::OpenEditor(id.clone()));
-        });
-    }
-    let mut row = row
+        })
         .on_context_menu(move || {
             super::site_menu(menu_tx.clone(), menu_id.clone(), menu_builtin, true, false)
         })
@@ -261,10 +257,8 @@ fn hidden_site_row(site: SiteData, tx: Sender<Action>) -> Element {
                         .fg(theme::TEXT_MUTED)
                         .truncate(Truncate::End),
                 ),
-        );
-    if !menu_builtin {
-        row = row.child(common::chevron_right_icon());
-    }
+        )
+        .child(common::chevron_right_icon());
     let line = inset_line();
     Element::col().width_match().child(line).child(row)
 }
@@ -277,18 +271,16 @@ fn management_site_row(site: SiteData, tx: Sender<Action>) -> Element {
     let menu_builtin = crate::model::is_shipped(&site);
     let menu_hidden = site.hidden;
     let menu_enabled = site.enabled;
-    let mut row = Element::row()
+    let row = Element::row()
         .width_match()
         .height(48)
         .padding_xy(16, 0)
         .cross(Align::Center)
-        .spacing(10);
-    if !menu_builtin {
-        row = row.clickable().on_click(move |_| {
+        .spacing(10)
+        .clickable()
+        .on_click(move |_| {
             let _ = row_tx.send(Action::OpenEditor(id.clone()));
-        });
-    }
-    let mut row = row
+        })
         .on_context_menu(move || {
             super::site_menu(
                 menu_tx.clone(),
@@ -324,10 +316,8 @@ fn management_site_row(site: SiteData, tx: Sender<Action>) -> Element {
                         .fg(theme::from_hex(site.summary_hex))
                         .truncate(Truncate::End),
                 ),
-        );
-    if !menu_builtin {
-        row = row.child(common::chevron_right_icon());
-    }
+        )
+        .child(common::chevron_right_icon());
     if !site.first {
         let line = inset_line();
         return Element::col().width_match().child(line).child(row);

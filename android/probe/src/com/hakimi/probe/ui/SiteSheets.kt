@@ -782,8 +782,6 @@ class SiteDetailSheet(
                 { sheet.dismiss() },
             )
         } else {
-            // Builtins are not editable: an edit overwrites domains and routes
-            // that only a version upgrade ships again, with no way back.
             sheet.buttons("关闭", { sheet.dismiss() })
         }
         sheet.show()

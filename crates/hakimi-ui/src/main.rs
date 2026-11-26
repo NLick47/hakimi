@@ -904,8 +904,6 @@ fn refresh_snapshot(ctx: &AppContext) -> app_state::UiSnapshot {
 
     let (sites, subtitle) = finish_snapshot(raw_sites, selected, running, starting, Some(phase));
     let net = network_status(runtime, &settings);
-    // Hidden sites never render on the home list: every proxied site stays
-    // visible, so a site disappearing means it no longer routes traffic.
     let (mut visible, hidden_sites): (Vec<SiteData>, Vec<SiteData>) =
         sites.into_iter().partition(|site| !site.hidden);
     for (index, site) in visible.iter_mut().enumerate() {
@@ -1281,8 +1279,6 @@ impl Ui {
             Action::SelectAll(enabled) => {
                 let _ = runtime.config().mutate(|config| {
                     for group in &mut config.groups {
-                        // A hidden site must never start routing traffic from
-                        // a bulk toggle: proxied sites stay visible.
                         if enabled && group.hidden {
                             continue;
                         }
@@ -1470,6 +1466,8 @@ impl Ui {
                         s.editor_off_armed.set(false);
                         s.editor_deletable
                             .set(!hakimi_core::config::is_builtin_group(&group.id));
+                        s.editor_read_only
+                            .set(hakimi_core::config::is_builtin_group(&group.id));
                         let rows: Vec<EditorRowState> = app_state::with_editor_rows(|| {
                             group
                                 .domains
@@ -1509,6 +1507,7 @@ impl Ui {
                         s.editor_verify.set(0);
                         s.editor_off_armed.set(false);
                         s.editor_deletable.set(false);
+                        s.editor_read_only.set(false);
                     }
                 }
                 s.editor_error.set(String::new());
@@ -1541,6 +1540,9 @@ impl Ui {
                 }
             }
             Action::SaveEditor => {
+                if s.editor_read_only.get() {
+                    return;
+                }
                 if s.editor_verify.get() == 2 && !s.editor_off_armed.get() {
                     s.editor_off_armed.set(true);
                     s.editor_error
@@ -2106,8 +2108,8 @@ fn main() -> Result<()> {
         handler_ui.sync_root();
     });
     *ui.tx.borrow_mut() = Some(tx.clone());
-    if std::env::var("HAKIMI_UI_EDITOR").is_ok() {
-        ui.handle(Action::OpenEditor(String::new()));
+    if let Ok(id) = std::env::var("HAKIMI_UI_EDITOR") {
+        ui.handle(Action::OpenEditor(id));
     }
 
     // Tray keeps the app alive with the window closed and mirrors key actions.

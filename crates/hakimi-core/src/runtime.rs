@@ -2155,10 +2155,6 @@ mod status_snapshot_tests {
         );
     }
 
-    /// A hidden site is disabled, and the warm-up must not dial it: it would
-    /// open TLS connections to a site the user explicitly stopped. The
-    /// walled addresses make "was it dialed" observable through the failure
-    /// table, which only records a warm attempt that actually ran.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn warm_groups_skips_hidden_and_disabled_sites() {
         let dir = tempfile::tempdir().unwrap();
@@ -2187,8 +2183,6 @@ mod status_snapshot_tests {
                 Ok(())
             })
             .unwrap();
-        // Every candidate address black-holes, so any domain the warm-up
-        // dials ends up in the failure table.
         for id in ["visible", "hiddenone", "offone"] {
             runtime.cache.put_last_good(LastGoodEntry {
                 domain: format!("{id}.test"),

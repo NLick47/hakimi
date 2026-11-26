@@ -295,6 +295,7 @@ pub fn view(s: UiSignals, tx: Sender<Action>) -> Element {
 
     let delete_id = s.editor_id;
     let delete_visible = s.editor_deletable;
+    let read_only = s.editor_read_only;
     let custom_visible = s.editor_default_preset.map(|p| *p == 4);
 
     let body = Element::col()
@@ -411,8 +412,17 @@ pub fn view(s: UiSignals, tx: Sender<Action>) -> Element {
                         }),
                 )
                 .child(Element::flex_spacer())
-                .child(ghost_button("取消", cancel_tx))
-                .child(save_button(save_tx)),
+                .child(
+                    Element::label("内置站点随版本更新，不可修改")
+                        .font_size(11.5)
+                        .fg(theme::TEXT_MUTED)
+                        .visible_signal(read_only),
+                )
+                .child(ghost_button("关闭", cancel_tx))
+                .child(
+                    save_button(save_tx)
+                        .visible_signal(read_only.map(|only| !*only)),
+                ),
         );
 
     let panel = Element::col()

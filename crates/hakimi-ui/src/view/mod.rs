@@ -10,11 +10,7 @@ use windui::prelude::*;
 
 use crate::app_state::{Action, UiSignals};
 
-/// Right-click menu shared by every site row (home list + management list).
-/// Built fresh on each right-click: `builtin` decides whether the row can be
-/// edited at all, `hidden` picks hide vs unhide, and an enabled site says out
-/// loud that hiding stops it. Deletion lives in the editor, where it takes an
-/// extra click to reach.
+/// Right-click menu for a site row, rebuilt on every right-click.
 pub(crate) fn site_menu(
     tx: Sender<Action>,
     id: String,
@@ -22,18 +18,15 @@ pub(crate) fn site_menu(
     hidden: bool,
     enabled: bool,
 ) -> Vec<MenuItem> {
-    let mut menu = Vec::new();
-    if !builtin {
-        let edit_tx = tx.clone();
-        let edit_id = id.clone();
-        menu.push(MenuItem::run(
-            "编辑",
-            move |_| {
-                let _ = edit_tx.send(Action::OpenEditor(edit_id.clone()));
-            },
-            false,
-        ));
-    }
+    let open_tx = tx.clone();
+    let open_id = id.clone();
+    let mut menu = vec![MenuItem::run(
+        if builtin { "查看" } else { "编辑" },
+        move |_| {
+            let _ = open_tx.send(Action::OpenEditor(open_id.clone()));
+        },
+        false,
+    )];
     if hidden {
         let unhide_tx = tx.clone();
         let unhide_id = id.clone();

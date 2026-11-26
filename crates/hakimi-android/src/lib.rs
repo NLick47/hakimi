@@ -175,8 +175,7 @@ fn set_group_enabled(id: &str, enabled: bool) -> Result<()> {
 fn upsert_group(raw: &str) -> Result<()> {
     let host = host()?;
     let mut group: GroupConfig = serde_json::from_str(raw).context("parsing group JSON")?;
-    // The editor sends no `hidden` key, so it deserializes as false; keep the
-    // stored value or a save would silently unhide the site.
+    // The editor omits `hidden`; keep the stored value.
     if let Some(existing) = host.runtime.config().snapshot().group(&group.id) {
         group.hidden = existing.hidden;
     }

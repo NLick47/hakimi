@@ -384,12 +384,25 @@ fn site_row(site: SiteData, tx: Sender<Action>) -> Element {
 
     let row_tx = tx.clone();
     let row_id = site.id.clone();
+    let menu_tx = tx.clone();
+    let menu_id = site.id.clone();
+    let menu_builtin = crate::model::is_shipped(&site);
+    let menu_hidden = site.hidden;
     let mut row = Element::col()
         .width_match()
         .bg(if open { theme::TOOLBAR_BG } else { theme::CARD_BG })
         .clickable()
         .on_click(move |_| {
             let _ = row_tx.send(Action::ToggleOpen(row_id.clone()));
+        })
+        .on_context_menu(move || {
+            super::site_menu(
+                menu_tx.clone(),
+                menu_id.clone(),
+                menu_builtin,
+                menu_hidden,
+                enabled,
+            )
         })
         .child(header);
 

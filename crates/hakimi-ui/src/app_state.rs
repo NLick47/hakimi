@@ -183,8 +183,7 @@ pub(crate) struct UiSignals {
     pub stat_mirror_tone: Signal<i32>,
     // -- sites / network rows --
     pub sites: Signal<Vec<SiteData>>,
-    /// Hidden sites (always disabled); rendered only in the site management
-    /// section, never on the home list.
+    /// Rendered only in the site management section.
     pub sites_hidden: Signal<Vec<SiteData>>,
     pub doh_rows: Signal<Vec<NetEntry>>,
     pub mirror_rows: Signal<Vec<NetEntry>>,
@@ -246,11 +245,12 @@ pub(crate) struct UiSignals {
     pub editor_off_armed: Signal<bool>,
     pub editor_is_new: Signal<bool>,
     pub editor_deletable: Signal<bool>,
+    /// A shipped site opens the editor read-only.
+    pub editor_read_only: Signal<bool>,
     pub editor_error: Signal<String>,
     pub editor_rows: Signal<Vec<EditorRowState>>,
-    /// Hidden sites shown in the management section, session-scoped.
+    /// Session-scoped.
     pub sites_hidden_shown: Signal<bool>,
-    /// Number of hidden sites, written in `apply_snapshot` next to the lists.
     pub sites_hidden_count: Signal<i32>,
 }
 
@@ -345,6 +345,7 @@ impl Default for UiSignals {
             editor_off_armed: signal(false),
             editor_is_new: signal(true),
             editor_deletable: signal(false),
+            editor_read_only: signal(false),
             editor_error: signal(String::new()),
             editor_rows: signal(Vec::new()),
             sites_hidden_shown: signal(false),
@@ -386,7 +387,6 @@ pub(crate) enum Action {
     ToggleOpen(String),
     ProbeSelected,
     ReapplyProxy,
-    // hiding
     HideSite(String),
     UnhideSite(String),
     ToggleShowHidden,
