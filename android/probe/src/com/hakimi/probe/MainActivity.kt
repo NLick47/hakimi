@@ -258,22 +258,24 @@ class MainActivity : Activity(), Host {
             0,
             1f
         ))
-        root.addView(column, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT,
-            FrameLayout.LayoutParams.MATCH_PARENT
-        ))
 
         nav = BottomNav(this)
         nav.onSelected = { setTab(it) }
+        // A sibling of the screen host, not an overlay: overlaid, the gesture
+        // strip below the bar showed the screen scrolling underneath.
         val navWrap = FrameLayout(this).apply {
+            setBackgroundColor(Palette.SURFACE)
             padBottomForSystemBars()
         }
         navWrap.addView(nav, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
-            dp(72f),
-            Gravity.BOTTOM
+            dp(72f)
         ))
-        root.addView(navWrap, FrameLayout.LayoutParams(
+        column.addView(navWrap, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        root.addView(column, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
         ))

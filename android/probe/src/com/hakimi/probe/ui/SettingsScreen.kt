@@ -22,7 +22,7 @@ class SettingsScreen(private val context: Context, private val host: Host) {
 
     private val content = LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(0, context.dp(12f), 0, context.dp(104f))
+        setPadding(0, context.dp(12f), 0, context.dp(24f))
     }
 
     private lateinit var envRow: SettingRow
