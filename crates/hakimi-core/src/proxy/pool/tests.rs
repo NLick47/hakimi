@@ -1890,7 +1890,6 @@ fn bench_slow_host_lookup() {
     );
 }
 
-
 /// A late response behind other traffic is queueing, not a dead route.
 #[test]
 fn a_slow_response_with_concurrent_traffic_does_not_blame_the_route() {
@@ -1902,8 +1901,14 @@ fn a_slow_response_with_concurrent_traffic_does_not_blame_the_route() {
 /// marker exists for.
 #[test]
 fn a_slow_response_alone_blames_the_route() {
-    assert!(blames_route(1), "one in flight: nothing else explains the delay");
-    assert!(blames_route(0), "no counter entry must not disable the marker");
+    assert!(
+        blames_route(1),
+        "one in flight: nothing else explains the delay"
+    );
+    assert!(
+        blames_route(0),
+        "no counter entry must not disable the marker"
+    );
 }
 
 /// The counter tracks send-to-body-end: every guard drop must return the
@@ -1911,11 +1916,19 @@ fn a_slow_response_alone_blames_the_route() {
 #[test]
 fn inflight_guards_are_balanced() {
     let counter = Arc::new(AtomicUsize::new(0));
-    let first = InflightGuard { counter: counter.clone() };
-    assert_eq!(counter.load(Ordering::Acquire), 0, "the guard does not count by itself");
+    let first = InflightGuard {
+        counter: counter.clone(),
+    };
+    assert_eq!(
+        counter.load(Ordering::Acquire),
+        0,
+        "the guard does not count by itself"
+    );
     // The pool increments before handing out the guard; simulate that here.
     counter.fetch_add(1, Ordering::AcqRel);
-    let second = InflightGuard { counter: counter.clone() };
+    let second = InflightGuard {
+        counter: counter.clone(),
+    };
     counter.fetch_add(1, Ordering::AcqRel);
     assert_eq!(counter.load(Ordering::Acquire), 2);
     drop(second);

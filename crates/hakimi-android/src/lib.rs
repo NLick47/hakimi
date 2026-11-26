@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use hakimi_core::config::{AppConfig, DomainRule, GroupConfig, ProxyMode, RoutePolicy, VerifyMode};
+use hakimi_core::config::{
+    AppConfig, DomainRule, GroupConfig, ProxyMode, RoutePolicy, VerifyMode,
+};
 use hakimi_core::runtime::HakimiRuntime;
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jstring, JNI_FALSE, JNI_TRUE};
@@ -156,8 +158,7 @@ fn default_catalog_urls() -> String {
 
 /// The shipped rule, so the UI can rebuild it without copying the defaults.
 fn default_image_relay() -> String {
-    serde_json::to_string(&hakimi_core::config::ImageRelayRule::pixiv_default())
-        .unwrap_or_default()
+    serde_json::to_string(&hakimi_core::config::ImageRelayRule::pixiv_default()).unwrap_or_default()
 }
 
 fn apply_config(raw: &str) -> Result<()> {
@@ -173,7 +174,12 @@ fn set_group_enabled(id: &str, enabled: bool) -> Result<()> {
 
 fn upsert_group(raw: &str) -> Result<()> {
     let host = host()?;
-    let group: GroupConfig = serde_json::from_str(raw).context("parsing group JSON")?;
+    let mut group: GroupConfig = serde_json::from_str(raw).context("parsing group JSON")?;
+    // The editor sends no `hidden` key, so it deserializes as false; keep the
+    // stored value or a save would silently unhide the site.
+    if let Some(existing) = host.runtime.config().snapshot().group(&group.id) {
+        group.hidden = existing.hidden;
+    }
     host.runtime.upsert_group(group)?;
     Ok(())
 }

@@ -1,7 +1,8 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use hakimi_core::config::{
-    validate_group_id, DomainRule, EchSource, GroupConfig, RouteAttempt, RoutePolicy, VerifyMode,
+    validate_group_id, DomainRule, EchSource, GroupConfig, RouteAttempt, RoutePolicy,
+    VerifyMode,
 };
 use hakimi_core::runtime::HakimiRuntime;
 

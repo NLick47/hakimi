@@ -247,19 +247,13 @@ async fn non_primary_ech_lookup_does_not_hold_the_next_plan() {
     // The lookup still runs in the background and fills the cache for the
     // next cold connection.
     for _ in 0..50 {
-        if resolver
-            .ech_calls
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0
-        {
+        if resolver.ech_calls.load(std::sync::atomic::Ordering::SeqCst) > 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     assert_eq!(
-        resolver
-            .ech_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
+        resolver.ech_calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "the deferred ECH lookup must still start"
     );
@@ -721,4 +715,3 @@ fn every_control_endpoint_is_listed() {
         assert!(!super::is_control_endpoint(path), "{path} is read-only");
     }
 }
-
