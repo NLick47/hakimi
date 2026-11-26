@@ -29,18 +29,6 @@ static MIGRATIONS: &[Migration] = &[
         apply: migrate_http1_hosts,
     },
     Migration {
-        version: "0.1.2",
-        describe: "poipiku auto route folds to direct",
-        applies_below: Some(2),
-        apply: migrate_poipiku_auto,
-    },
-    Migration {
-        version: "0.1.3",
-        describe: "poipiku apex adopts the no-SNI attempt",
-        applies_below: Some(2),
-        apply: migrate_poipiku_apex,
-    },
-    Migration {
         version: "0.1.8",
         describe: "http1Hosts gain the Pixiv asset CDN",
         applies_below: Some(3),
@@ -108,22 +96,6 @@ fn fold_default<T: PartialEq + Clone>(field: &mut T, old_default: &T, current_de
     }
 }
 
-/// Give the rule matching `pattern` a route unless it already has one.
-fn adopt_route(group: &mut GroupConfig, pattern: &str, route: RoutePolicy) -> bool {
-    group
-        .domains
-        .iter_mut()
-        .find(|rule| rule.pattern == pattern)
-        .is_some_and(|rule| {
-            if rule.route.is_none() {
-                rule.route = Some(route);
-                true
-            } else {
-                false
-            }
-        })
-}
-
 fn migrate_http1_hosts(config: &mut AppConfig) -> bool {
     let old = vec![
         "*.pximg.net".to_string(),
@@ -181,26 +153,6 @@ fn migrate_download_min_size_default(config: &mut AppConfig) -> bool {
         &(2 * 1024 * 1024),
         &current,
     )
-}
-
-fn migrate_poipiku_auto(config: &mut AppConfig) -> bool {
-    let group = match config.groups.iter_mut().find(|group| group.id == "poipiku") {
-        Some(group) => group,
-        None => return false,
-    };
-    fold_default(
-        &mut group.default_route,
-        &RoutePolicy::auto(),
-        &RoutePolicy::direct(),
-    )
-}
-
-fn migrate_poipiku_apex(config: &mut AppConfig) -> bool {
-    let group = match config.groups.iter_mut().find(|group| group.id == "poipiku") {
-        Some(group) => group,
-        None => return false,
-    };
-    adopt_route(group, "poipiku.com", RoutePolicy::sni(vec![String::new()]))
 }
 
 /// An earlier build created the `pixiv` rule the moment the settings card was
@@ -268,25 +220,6 @@ mod tests {
             &vec!["c".to_string()]
         ));
         assert_eq!(value, vec!["b".to_string()]);
-    }
-
-    #[test]
-    fn adopt_route_leaves_customized_rules_alone() {
-        let mut config = legacy_config();
-        config
-            .group_mut("poipiku")
-            .unwrap()
-            .domains
-            .retain(|rule| rule.pattern == "poipiku.com");
-        config.group_mut("poipiku").unwrap().domains[0].route = Some(RoutePolicy::direct());
-        assert!(!migrate_poipiku_apex(&mut config));
-
-        config.group_mut("poipiku").unwrap().domains[0].route = None;
-        assert!(migrate_poipiku_apex(&mut config));
-        assert_eq!(
-            config.group("poipiku").unwrap().domains[0].route,
-            Some(RoutePolicy::sni(vec![String::new()]))
-        );
     }
 
     #[test]

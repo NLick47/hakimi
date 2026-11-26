@@ -1619,40 +1619,46 @@ pub fn global_sni_allowed(domain: &str, sni: Option<&str>, configured: &[String]
 
 /// Whether `id` is one of the built-in groups.
 ///
-/// [`merge_missing_builtin_groups`] re-adds every built-in id on load, so a
-/// removal that "succeeded" would quietly undo itself at the next start.
+/// A shipped group is re-added on load, so a removal that "succeeded" would
+/// quietly undo itself at the next start.
 pub fn is_builtin_group(id: &str) -> bool {
     default_groups().iter().any(|group| group.id == id)
 }
 
-/// `groups` is persisted as one whole array, so builtin sites added in a new
-/// version never reach an existing install — clearing the data was the only
-/// way to see them. Append the builtin groups that are missing here.
+/// Replace every shipped group with the definition this build carries.
 ///
-/// Only missing ids are appended: a group the user edited, disabled, or
-/// re-added by hand is kept as-is. Builtin groups cannot be removed in the
-/// UI, so no tombstones are needed.
+/// `groups` is persisted as one whole array, so a shipped site added in a new
+/// version never reaches an older install without this. A shipped group's
+/// name, domains, homepage, route and verification belong to the build, so
+/// the whole definition is replaced; only the two switches the user owns
+/// (`enabled`, `hidden`) are carried over.
 fn merge_missing_builtin_groups(config: &mut AppConfig) {
-    let present: std::collections::HashSet<String> =
-        config.groups.iter().map(|group| group.id.clone()).collect();
-    for group in default_groups() {
-        if !present.contains(group.id.as_str()) {
-            config.groups.push(group);
+    for mut shipped in default_groups() {
+        match config
+            .groups
+            .iter_mut()
+            .find(|group| group.id == shipped.id)
+        {
+            None => config.groups.push(shipped),
+            Some(group) => {
+                shipped.hidden = group.hidden;
+                shipped.enabled = group.enabled && !group.hidden;
+                *group = shipped;
+            }
         }
     }
 }
 
 /// The persisted file keeps only values the user changed.
 /// `advanced` fields equal to the current defaults are left out so new
-/// defaults reach existing installs. Builtin groups follow the same rule:
-/// one that still matches its default is not persisted (the load path
-/// appends missing builtins), while a group the user edited, disabled or
-/// created is kept verbatim.
+/// defaults reach existing installs. A shipped group that still matches its
+/// shipped definition is left out for the same reason; one that differs (the
+/// user flipped a switch) is written, and the load path merges it back.
 fn sanitized_persisted_value(config: &AppConfig) -> serde_json::Value {
     let mut value = serde_json::to_value(config).unwrap_or(serde_json::Value::Null);
     let defaults =
         serde_json::to_value(AdvancedConfig::default()).unwrap_or(serde_json::Value::Null);
-    let default_groups: std::collections::HashMap<String, serde_json::Value> =
+    let shipped: std::collections::HashMap<String, serde_json::Value> =
         serde_json::to_value(default_groups())
             .ok()
             .and_then(|value| value.as_array().cloned())
@@ -1673,11 +1679,11 @@ fn sanitized_persisted_value(config: &AppConfig) -> serde_json::Value {
         {
             groups.retain(|group| {
                 let id = group.get("id").and_then(|value| value.as_str());
-                match id.and_then(|id| default_groups.get(id)) {
-                    // A builtin group that still matches its default is a
+                match id.and_then(|id| shipped.get(id)) {
+                    // A shipped group that still matches its definition is a
                     // default value: keep it out of the file so future
-                    // defaults propagate.
-                    Some(builtin) => builtin != group,
+                    // versions propagate.
+                    Some(default) => default != group,
                     // A user-created group: always persisted.
                     None => true,
                 }
@@ -1750,14 +1756,23 @@ impl ConfigManager {
         merge_missing_builtin_groups(&mut config);
         config.canonicalize();
         config.validate()?;
-        if !applied.is_empty() {
-            // Persist the migrated shape so the next load starts clean. A
-            // failure only costs one repeated (idempotent) pass at startup.
-            if let Err(error) = atomic_write_json(&path, &sanitized_persisted_value(&config)) {
+        // Rewrite only when the merged config would persist differently from
+        // what is already there: a migration, a shipped group replaced by this
+        // build's definition, or a newly shipped group appended. The file is
+        // read back as raw JSON and compared against the same sanitized form
+        // written below — comparing against the deserialized config would
+        // differ on every start, because deserializing fills in every
+        // `serde(default)` field the file left out.
+        let persisted = sanitized_persisted_value(&config);
+        let on_disk = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        if on_disk.as_ref() != Some(&persisted) || !applied.is_empty() {
+            if let Err(error) = atomic_write_json(&path, &persisted) {
                 tracing::warn!(
                     error = %error,
                     path = %path.display(),
-                    "migrated config could not be written back"
+                    "config could not be written back after load"
                 );
             }
         }
@@ -1874,6 +1889,21 @@ impl ConfigManager {
         })
     }
 
+    /// Hiding implies disabling so the invariant "every proxied site is
+    /// visible" holds; unhiding keeps the site disabled and restores nothing.
+    pub fn set_group_hidden(&self, id: &str, hidden: bool) -> Result<AppConfig> {
+        self.mutate(|config| {
+            let group = config
+                .group_mut(id)
+                .with_context(|| format!("unknown group `{id}`"))?;
+            group.hidden = hidden;
+            if hidden {
+                group.enabled = false;
+            }
+            Ok(())
+        })
+    }
+
     pub fn set_group_default_route(&self, id: &str, route: RoutePolicy) -> Result<AppConfig> {
         self.mutate(|config| {
             let group = config
@@ -1886,17 +1916,16 @@ impl ConfigManager {
 
     pub fn upsert_group(&self, group: GroupConfig) -> Result<AppConfig> {
         self.mutate(|config| {
-            if let Some(existing) = config.group_mut(&group.id) {
-                *existing = group;
-            } else {
-                config.groups.push(group);
+            match config.group_mut(&group.id) {
+                Some(existing) => *existing = group,
+                None => config.groups.push(group),
             }
             Ok(())
         })
     }
 
     pub fn remove_group(&self, id: &str) -> Result<AppConfig> {
-        // Refusing is the only outcome that survives the next load: the built-in
+        // Refusing is the only outcome that survives the next load: the shipped
         // merge re-adds this id, so reporting success would mean the group
         // silently comes back after a restart.
         if is_builtin_group(id) {
@@ -2676,22 +2705,26 @@ mod tests {
             "new builtin sites must reach existing installs without clearing data"
         );
         assert!(snapshot.group("pixiv").is_some());
-        // The user's own github entry stays as written.
-        assert!(snapshot
-            .group("github")
-            .unwrap()
+        // The github entry is the shipped one, not the one on disk.
+        let github = snapshot.group("github").unwrap();
+        assert!(github
             .domains
             .iter()
-            .all(|rule| rule.pattern == "github.com"));
+            .any(|rule| rule.pattern == "github.com"));
+        assert!(github
+            .domains
+            .iter()
+            .any(|rule| rule.pattern == "api.github.com"));
     }
 
+    /// A builtin group's definition is shipped, not user data: an old copy on
+    /// disk is replaced wholesale, while the two switches the user owns carry
+    /// over. The extra domain a previous version merged in must not survive.
     #[test]
-    fn user_modified_builtin_groups_survive_the_merge() {
+    fn builtin_groups_are_replaced_by_the_shipped_definition() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path());
         std::fs::create_dir_all(dir.path()).unwrap();
-        // The user disabled hf and added a domain: the merge must not
-        // overwrite it.
         std::fs::write(
             paths.config_file(),
             br#"{"groups":[
@@ -2704,15 +2737,25 @@ mod tests {
         let manager = ConfigManager::load_or_create(&paths).unwrap();
         let snapshot = manager.snapshot();
         let hf = snapshot.group("hf").unwrap();
-        assert!(!hf.enabled);
+        assert!(!hf.enabled, "the user's switch must survive the upgrade");
+        assert!(
+            !hf.domains
+                .iter()
+                .any(|rule| rule.pattern == "extra.example"),
+            "a builtin's domain list comes from the shipped definition"
+        );
         assert!(hf
             .domains
             .iter()
-            .any(|rule| rule.pattern == "extra.example"));
-        assert!(
-            hf.domains.len() == 2,
-            "user domains must not be re-defaulted"
-        );
+            .any(|rule| rule.pattern == "huggingface.co"));
+        let shipped = default_groups()
+            .into_iter()
+            .find(|group| group.id == "hf")
+            .unwrap();
+        assert_eq!(hf.domains, shipped.domains);
+        assert_eq!(hf.name, shipped.name);
+        assert_eq!(hf.default_route, shipped.default_route);
+        assert_eq!(hf.verify, shipped.verify);
     }
 
     #[test]
@@ -2744,6 +2787,276 @@ mod tests {
             "default-identical groups stay out of the file so future defaults propagate"
         );
         assert!(ids.contains(&"hf"), "user-modified groups are persisted");
+    }
+
+    #[test]
+    fn hidden_builtin_group_is_persisted_and_survives_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        manager.set_group_hidden("hf", true).unwrap();
+        let snapshot = manager.snapshot();
+        let hf = snapshot.group("hf").unwrap();
+        assert!(hf.hidden);
+        assert!(!hf.enabled, "hiding implies disabling");
+
+        let reloaded = ConfigManager::load_or_create(&paths).unwrap();
+        let snapshot = reloaded.snapshot();
+        let hf = snapshot.group("hf").unwrap();
+        assert!(
+            hf.hidden,
+            "the builtin merge must not resurrect a hidden group"
+        );
+        assert!(!hf.enabled);
+    }
+
+    #[test]
+    fn unhidden_builtin_group_stays_persisted_as_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        manager.set_group_hidden("hf", true).unwrap();
+        manager.set_group_hidden("hf", false).unwrap();
+        let snapshot = manager.snapshot();
+        let hf = snapshot.group("hf").unwrap();
+        assert!(!hf.hidden);
+        assert!(!hf.enabled);
+
+        // The group differs from its default only by `enabled: false`; that
+        // choice must survive a restart, so the entry stays in the file.
+        let value = sanitized_persisted_value(&snapshot);
+        let groups = value.get("groups").and_then(|v| v.as_array()).unwrap();
+        let ids: Vec<&str> = groups
+            .iter()
+            .filter_map(|group| group.get("id").and_then(|v| v.as_str()))
+            .collect();
+        assert!(ids.contains(&"hf"), "the user-disabled state is persisted");
+
+        // Re-enabling it by hand restores default equality: the entry may
+        // leave the file again so future defaults propagate.
+        manager.set_group_enabled("hf", true).unwrap();
+        let value = sanitized_persisted_value(&manager.snapshot());
+        let groups = value.get("groups").and_then(|v| v.as_array()).unwrap();
+        let ids: Vec<&str> = groups
+            .iter()
+            .filter_map(|group| group.get("id").and_then(|v| v.as_str()))
+            .collect();
+        assert!(!ids.contains(&"hf"));
+    }
+
+    #[test]
+    fn unhiding_keeps_the_group_disabled() {
+        let mut config = AppConfig::default();
+        if let Some(hf) = config.groups.iter_mut().find(|group| group.id == "hf") {
+            hf.enabled = true;
+        }
+        let paths = Paths::new(tempfile::tempdir().unwrap().path());
+        std::fs::create_dir_all(paths.config_file().parent().unwrap()).unwrap();
+        std::fs::write(paths.config_file(), serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        manager.set_group_hidden("hf", true).unwrap();
+        manager.set_group_hidden("hf", false).unwrap();
+        let snapshot = manager.snapshot();
+        let hf = snapshot.group("hf").unwrap();
+        assert!(!hf.hidden);
+        assert!(
+            !hf.enabled,
+            "unhiding must not silently re-enable a proxied site"
+        );
+    }
+
+    #[test]
+    fn old_config_without_hidden_field_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            br#"{"groups":[{"id":"github","name":"GitHub","enabled":true,"domains":[{"pattern":"github.com"}]}]}"#,
+        )
+        .unwrap();
+
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        assert!(manager.snapshot().group("github").is_some());
+        assert!(!manager.snapshot().group("github").unwrap().hidden);
+    }
+
+    #[test]
+    fn set_group_hidden_rejects_unknown_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        assert!(manager.set_group_hidden("nope", true).is_err());
+    }
+
+    /// A config written by a build that let the user create a group under an
+    /// id this build ships keeps working, but the group now belongs to the
+    /// build: that is the price of the id being reserved.
+    #[test]
+    fn a_user_group_under_a_shipped_id_is_taken_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            br#"{"groups":[{"id":"gmail","name":"Mine","enabled":false,
+                "domains":[{"pattern":"mail.google.com"}]}]}"#,
+        )
+        .unwrap();
+
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        let gmail = manager.snapshot().group("gmail").cloned().unwrap();
+        assert!(!gmail.enabled, "the user's switch is carried over");
+        assert_eq!(
+            gmail.domains,
+            default_groups()
+                .into_iter()
+                .find(|group| group.id == "gmail")
+                .unwrap()
+                .domains
+        );
+    }
+
+    /// A user group whose id the build does not ship survives every load
+    /// unchanged and stays removable.
+    #[test]
+    fn a_user_group_is_untouched_and_removable() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            br#"{"groups":[{"id":"mine","name":"Mine","enabled":true,
+                "domains":[{"pattern":"mine.example"}]}]}"#,
+        )
+        .unwrap();
+
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        let mine = manager.snapshot().group("mine").cloned().unwrap();
+        assert_eq!(mine.domains.len(), 1);
+        manager.remove_group("mine").unwrap();
+        let reloaded = ConfigManager::load_or_create(&paths).unwrap();
+        assert!(reloaded.snapshot().group("mine").is_none());
+    }
+
+    /// A user group must reach the file: the retain rule may only drop shipped
+    /// groups that still match their definition.
+    #[test]
+    fn a_user_group_is_written_to_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        manager
+            .upsert_group(GroupConfig {
+                id: "mine".into(),
+                name: "Mine".into(),
+                domains: vec![DomainRule::new("mine.example")],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let ids: Vec<&str> = parsed["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|group| group.get("id").and_then(|id| id.as_str()))
+            .collect();
+        assert!(ids.contains(&"mine"), "a user group must be persisted");
+    }
+
+    /// A shipped group the user disabled is persisted so the switch survives a
+    /// restart; one that still matches its definition is not.
+    #[test]
+    fn only_a_changed_shipped_group_reaches_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        manager.set_group_enabled("hf", false).unwrap();
+
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let ids: Vec<&str> = parsed["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|group| group.get("id").and_then(|id| id.as_str()))
+            .collect();
+        assert!(ids.contains(&"hf"), "the user's switch must be persisted");
+        assert!(
+            !ids.contains(&"github"),
+            "an untouched shipped group stays out of the file"
+        );
+    }
+
+    /// An upgrade has to rewrite the file: the merged definition only lives in
+    /// memory otherwise, and the next start would read the stale copy again.
+    #[test]
+    fn an_upgrade_writes_the_merged_definition_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            br#"{"groups":[{"id":"hf","name":"Old Name","enabled":false,
+                "domains":[{"pattern":"stale.example"}]}]}"#,
+        )
+        .unwrap();
+
+        let manager = ConfigManager::load_or_create(&paths).unwrap();
+        assert_eq!(manager.snapshot().group("hf").unwrap().name, "Hugging Face");
+
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(
+            !text.contains("Old Name") && !text.contains("stale.example"),
+            "the file still carries the pre-upgrade definition: {text}"
+        );
+        assert!(
+            text.contains("\"enabled\": false") || text.contains("\"enabled\":false"),
+            "the user's switch must still be recorded"
+        );
+    }
+
+    /// A start that changes nothing must not touch the file: a config that is
+    /// rewritten on every launch defeats mtime-based sync and makes "did an
+    /// upgrade happen" impossible to answer from the file alone.
+    #[test]
+    fn a_start_that_changes_nothing_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        // A minimal file: every omitted `serde(default)` field reads as the
+        // default and the shipped groups are re-added, so the merged config
+        // differs from the parsed one while the persisted form is identical.
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            br#"{"groups":[{"id":"hf","name":"Hugging Face","enabled":false,
+                "domains":[{"pattern":"huggingface.co"}]}]}"#,
+        )
+        .unwrap();
+        let _first = ConfigManager::load_or_create(&paths).unwrap();
+        drop(_first);
+
+        let stamp = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .unwrap()
+        };
+        let before = stamp(&paths.config_file());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _second = ConfigManager::load_or_create(&paths).unwrap();
+        assert_eq!(
+            before,
+            stamp(&paths.config_file()),
+            "a no-op start must not rewrite the config"
+        );
     }
 
     #[test]
@@ -2905,117 +3218,6 @@ mod tests {
         manager.update(manager.snapshot().as_ref().clone()).unwrap();
         let text = std::fs::read_to_string(paths.config_file()).unwrap();
         assert!(text.contains("\"http1Hosts\""));
-    }
-
-    #[test]
-    fn legacy_materialized_poipiku_route_adopts_direct_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::new(dir.path());
-        let mut legacy = AppConfig::default();
-        legacy.schema_version = 0;
-        legacy
-            .groups
-            .iter_mut()
-            .find(|group| group.id == "poipiku")
-            .unwrap()
-            .default_route = RoutePolicy::auto();
-        std::fs::write(paths.config_file(), serde_json::to_string(&legacy).unwrap()).unwrap();
-
-        let manager = ConfigManager::load(paths.config_file()).unwrap();
-        assert_eq!(
-            manager.snapshot().group("poipiku").unwrap().default_route,
-            RoutePolicy::direct()
-        );
-    }
-
-    #[test]
-    fn customized_poipiku_route_survives_upgrade() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::new(dir.path());
-        let mut custom = AppConfig::default();
-        custom.schema_version = 0;
-        let route = RoutePolicy::sni(vec!["www.example.com".to_string()]);
-        custom
-            .groups
-            .iter_mut()
-            .find(|group| group.id == "poipiku")
-            .unwrap()
-            .default_route = route.clone();
-        std::fs::write(paths.config_file(), serde_json::to_string(&custom).unwrap()).unwrap();
-
-        let manager = ConfigManager::load(paths.config_file()).unwrap();
-        assert_eq!(
-            manager.snapshot().group("poipiku").unwrap().default_route,
-            route
-        );
-    }
-
-    #[test]
-    fn legacy_poipiku_apex_adopts_no_sni() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::new(dir.path());
-        let mut legacy = AppConfig::default();
-        legacy.schema_version = 0;
-        // an old template: the bare-domain rule has no route of its own
-        legacy
-            .group_mut("poipiku")
-            .unwrap()
-            .domains
-            .iter_mut()
-            .find(|rule| rule.pattern == "poipiku.com")
-            .unwrap()
-            .route = None;
-        std::fs::write(paths.config_file(), serde_json::to_string(&legacy).unwrap()).unwrap();
-
-        let manager = ConfigManager::load(paths.config_file()).unwrap();
-        let snapshot = manager.snapshot();
-        assert_eq!(
-            snapshot
-                .group("poipiku")
-                .unwrap()
-                .domain("poipiku.com")
-                .unwrap()
-                .route,
-            Some(RoutePolicy::sni(vec![String::new()]))
-        );
-        assert_eq!(snapshot.schema_version, SCHEMA_VERSION);
-        // the migration result is written back
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(paths.config_file()).unwrap()).unwrap();
-        assert_eq!(
-            parsed.get("schemaVersion"),
-            Some(&serde_json::json!(SCHEMA_VERSION))
-        );
-    }
-
-    #[test]
-    fn customized_poipiku_apex_route_survives_upgrade() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::new(dir.path());
-        let mut custom = AppConfig::default();
-        custom.schema_version = 0;
-        let route = RoutePolicy::sni(vec!["www.example.com".to_string()]);
-        custom
-            .group_mut("poipiku")
-            .unwrap()
-            .domains
-            .iter_mut()
-            .find(|rule| rule.pattern == "poipiku.com")
-            .unwrap()
-            .route = Some(route.clone());
-        std::fs::write(paths.config_file(), serde_json::to_string(&custom).unwrap()).unwrap();
-
-        let manager = ConfigManager::load(paths.config_file()).unwrap();
-        assert_eq!(
-            manager
-                .snapshot()
-                .group("poipiku")
-                .unwrap()
-                .domain("poipiku.com")
-                .unwrap()
-                .route,
-            Some(route)
-        );
     }
 
     #[test]
