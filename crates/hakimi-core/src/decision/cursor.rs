@@ -739,7 +739,9 @@ impl RouteCursor {
             detail: Some(detail),
             latency_ms: None,
         });
-        self.engine.record_ip(&plan.domain, plan.ip, None, true);
+        if reason.is_ip_level() {
+            self.engine.record_ip(&plan.domain, plan.ip, None, true);
+        }
         // A certificate that cannot cover the domain is a verdict about the
         // name, not the address: drop it for this domain so the next cold
         // connection does not spend another handshake on it.

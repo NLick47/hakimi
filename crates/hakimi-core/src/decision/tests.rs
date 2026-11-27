@@ -292,6 +292,137 @@ async fn a_timed_out_candidate_sinks_behind_an_untested_one() {
     );
 }
 
+#[tokio::test]
+async fn measured_latency_reorders_the_catalog() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    *h.remote.catalog.lock() = true;
+    let slow: IpAddr = "203.0.113.10".parse().unwrap();
+    let medium: IpAddr = "203.0.113.11".parse().unwrap();
+    let fast: IpAddr = "203.0.113.12".parse().unwrap();
+    // The catalog deliberately puts the slowest address first: only a real
+    // quality sort can make the fastest one lead.
+    *h.remote.ips.lock() = Some(vec![slow, medium, fast]);
+    h.engine.record_ip("example.com", slow, Some(100), false);
+    h.engine.record_ip("example.com", medium, Some(50), false);
+    h.engine.record_ip("example.com", fast, Some(10), false);
+
+    let mut cursor = match h.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let mut ordered = Vec::new();
+    for _ in 0..3 {
+        ordered.push(cursor.next_plan().await.expect("a direct plan").ip);
+    }
+    assert_eq!(
+        ordered,
+        vec![fast, medium, slow],
+        "candidate order must follow measured latency, not the catalog"
+    );
+}
+
+#[tokio::test]
+async fn ewma_smooths_a_slow_sample_before_ranking() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    *h.remote.catalog.lock() = true;
+    let fluctuated: IpAddr = "203.0.113.10".parse().unwrap();
+    let steady: IpAddr = "203.0.113.11".parse().unwrap();
+    // The catalog puts the steady address first, so only the EWMA rank —
+    // not the insertion order — can put the fluctuated one ahead.
+    *h.remote.ips.lock() = Some(vec![steady, fluctuated]);
+    h.engine.record_ip("example.com", fluctuated, Some(10), false);
+    h.engine.record_ip("example.com", fluctuated, Some(1000), false);
+    // Two samples put the EWMA at 307ms, still under this 500ms address;
+    // ranking on the raw sample instead would flip the order.
+    h.engine.record_ip("example.com", steady, Some(500), false);
+
+    let mut cursor = match h.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let mut ordered = Vec::new();
+    for _ in 0..2 {
+        ordered.push(cursor.next_plan().await.expect("a direct plan").ip);
+    }
+    assert_eq!(
+        ordered,
+        vec![fluctuated, steady],
+        "a single slow sample must not outweigh the established average"
+    );
+}
+
+#[tokio::test]
+async fn failure_history_sinks_an_ip_below_a_slower_clean_one() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    *h.remote.catalog.lock() = true;
+    let flaky: IpAddr = "203.0.113.10".parse().unwrap();
+    let clean: IpAddr = "203.0.113.11".parse().unwrap();
+    // Catalog order puts the faster-but-flaky address first; the failure
+    // penalty must reverse it.
+    *h.remote.ips.lock() = Some(vec![flaky, clean]);
+    h.engine.record_ip("example.com", flaky, Some(50), false);
+    h.engine.record_ip("example.com", flaky, None, true);
+    h.engine.record_ip("example.com", clean, Some(100), false);
+
+    let mut cursor = match h.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    let mut ordered = Vec::new();
+    for _ in 0..2 {
+        ordered.push(cursor.next_plan().await.expect("a direct plan").ip);
+    }
+    assert_eq!(
+        ordered,
+        vec![clean, flaky],
+        "a failure penalty must sink an otherwise-faster ip"
+    );
+}
+
+#[tokio::test]
+async fn variant_failure_does_not_punish_the_ip() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let ip: IpAddr = "203.0.113.10".parse().unwrap();
+    // Record a baseline success so the score is a real measurement, not UNSEEN.
+    h.engine.record_ip("example.com", ip, Some(50), false);
+    let before = h.engine.score_ip("example.com", ip);
+
+    let mut plan = test_plan(TlsMode::Direct, None);
+    plan.ip = ip;
+    let mut cursor = match h.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    cursor.note_failure(&plan, FailureReason::TlsReset, "reset".into());
+
+    assert_eq!(
+        h.engine.score_ip("example.com", ip),
+        before,
+        "a TLS reset is a variant verdict, not an IP failure"
+    );
+}
+
+#[tokio::test]
+async fn tcp_failure_still_punishes_the_ip() {
+    let h = harness(&["example.com"], RoutePolicy::direct());
+    let ip: IpAddr = "203.0.113.10".parse().unwrap();
+    h.engine.record_ip("example.com", ip, Some(50), false);
+    let before = h.engine.score_ip("example.com", ip);
+
+    let mut plan = test_plan(TlsMode::Direct, None);
+    plan.ip = ip;
+    let mut cursor = match h.engine.route("example.com", 443, true) {
+        Route::Group(cursor) => cursor,
+        _ => panic!("expected a group route"),
+    };
+    cursor.note_failure(&plan, FailureReason::TcpTimeout, "timed out".into());
+
+    assert!(
+        h.engine.score_ip("example.com", ip) > before,
+        "a TCP timeout is a real address failure and must still raise the rank"
+    );
+}
+
 #[test]
 fn ip_score_overflow_keeps_known_good_ips() {
     let h = harness(&["example.com"], RoutePolicy::auto());
