@@ -294,6 +294,13 @@ class SiteEditorSheet(
             readOnly = readOnly
         )
         val customBlock = fieldBlock(context, "自定义线路", custom)
+        val defaultSni = inputField(
+            context,
+            if (selectedPreset == 3) sniHosts(site?.defaultRoute.orEmpty()).joinToString(", ") else "",
+            "多个用逗号分隔，留空使用默认候选",
+            readOnly = readOnly
+        )
+        val defaultSniBlock = fieldBlock(context, "默认伪装主机", defaultSni)
 
         fun updateChips() {
             chips.forEachIndexed { index, chip ->
@@ -306,6 +313,7 @@ class SiteEditorSheet(
                 }
             }
             customBlock.visibility = if (selectedPreset == 4) View.VISIBLE else View.GONE
+            defaultSniBlock.visibility = if (selectedPreset == 3) View.VISIBLE else View.GONE
         }
 
         presetNames.forEachIndexed { index, label ->
@@ -395,6 +403,7 @@ class SiteEditorSheet(
             addView(chipRow)
         })
         sheet.add(customBlock)
+        sheet.add(defaultSniBlock)
         sheet.add(verifyBlock)
         sheet.add(error)
 
@@ -422,6 +431,8 @@ class SiteEditorSheet(
                         throw IllegalArgumentException("请填写自定义默认线路")
                     }
                     text
+                } else if (selectedPreset == 3) {
+                    sniHostSpec(defaultSni.text.toString())
                 } else {
                     routePresetSpec(selectedPreset)
                 }
@@ -579,35 +590,10 @@ class SiteEditorSheet(
         else -> 4
     }
 
-    private fun isSniSpec(spec: String): Boolean {
-        val parts = spec.split('+').map { it.trim() }.filter { it.isNotEmpty() }
-        if (parts.isEmpty() || parts.size > 2) return false
-        val head = parts.first()
-        if (head != "sni" && !head.startsWith("sni:")) return false
-        return parts.drop(1).all { it == "direct" }
-    }
-
-    private fun sniHosts(spec: String): List<String> =
-        spec.split('+')
-            .map { it.trim() }
-            .firstOrNull { it.startsWith("sni:") }
-            ?.substringAfter(':')
-            ?.split(',')
-            ?.map { it.trim() }
-            ?.filter { it.isNotEmpty() }
-            .orEmpty()
-
     private fun rowRouteSpec(draft: RowDraft): String = when (draft.preset) {
         1 -> "direct"
         2 -> "ech+direct"
-        3 -> {
-            val hosts = draft.sni
-                .split(',', '，', ';', '；', ' ', '\n', '\t')
-                .map { it.trim().lowercase() }
-                .filter { it.isNotEmpty() }
-                .distinct()
-            if (hosts.isEmpty()) "sni+direct" else "sni:${hosts.joinToString(",")}+direct"
-        }
+        3 -> sniHostSpec(draft.sni)
         4 -> {
             val text = draft.custom.trim()
             if (text.isEmpty()) throw IllegalArgumentException("请填写自定义线路")

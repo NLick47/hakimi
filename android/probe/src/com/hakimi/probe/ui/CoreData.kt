@@ -2,6 +2,7 @@ package com.hakimi.probe.ui
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.IDN
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
@@ -43,21 +44,65 @@ data class SiteInfo(
     val custom: Boolean,
 )
 
+fun isSniSpec(spec: String): Boolean {
+    val parts = spec.split('+').map { it.trim() }.filter { it.isNotEmpty() }
+    if (parts.isEmpty() || parts.size > 2) return false
+    val head = parts.first()
+    if (head != "sni" && !head.startsWith("sni:")) return false
+    return parts.drop(1).all { it == "direct" }
+}
+
+fun sniHosts(spec: String): List<String> =
+    spec.split('+')
+        .map { it.trim() }
+        .firstOrNull { it.startsWith("sni:") }
+        ?.substringAfter(':')
+        ?.split(',')
+        ?.map { it.trim() }
+        ?.filter { it.isNotEmpty() }
+        .orEmpty()
+
+fun sniHostSpec(raw: String): String {
+    val hosts = raw.split(',', '，', ';', '；', ' ', '\n', '\t')
+        .map { it.trim().lowercase() }
+        .filter { it.isNotEmpty() }
+        .map { host ->
+            val base = if (host.endsWith(".")) host.dropLast(1) else host
+            val ascii = try {
+                IDN.toASCII(base)
+            } catch (_: IllegalArgumentException) {
+                throw IllegalArgumentException("SNI 主机 $host 格式不正确")
+            }
+            if (ascii.length > 253) {
+                throw IllegalArgumentException("SNI 主机 $host 格式不正确")
+            }
+            for (label in ascii.split('.')) {
+                if (label.isEmpty() || label.length > 63 ||
+                    label.startsWith("-") || label.endsWith("-") ||
+                    label.any { !(it in 'a'..'z' || it in '0'..'9' || it == '-') }
+                ) {
+                    throw IllegalArgumentException("SNI 主机 $host 格式不正确")
+                }
+            }
+            ascii
+        }
+        .distinct()
+    return if (hosts.isEmpty()) "sni+direct" else "sni:${hosts.joinToString(",")}+direct"
+}
+
 /** Compact route syntax shared with the desktop editor. */
 fun routeLabel(spec: String): String = when (spec) {
     "", "auto" -> "自动"
     "direct" -> "直连"
     "ech+direct" -> "ECH"
-    "sni+direct" -> "SNI 伪装"
-    else -> "自定义"
+    else -> if (isSniSpec(spec)) "SNI 伪装" else "自定义"
 }
 
 fun routePresetIndex(spec: String): Int = when (spec) {
     "", "auto" -> 0
     "direct" -> 1
     "ech+direct" -> 2
-    "sni+direct" -> 3
-    else -> 4
+    else -> if (isSniSpec(spec)) 3 else 4
 }
 
 fun routePresetSpec(preset: Int): String = when (preset) {
