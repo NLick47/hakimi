@@ -53,7 +53,14 @@ class SitesScreen(private val context: Context, private val host: Host) {
         val sig = buildString {
             sites.forEach {
                 append(it.id).append(':').append(it.enabled).append(':')
-                    .append(it.summary).append(':').append(it.state).append(';')
+                    .append(it.summary).append(':').append(it.state).append(':')
+                    .append(it.name).append(':').append(it.homepage).append(':')
+                    .append(it.defaultRoute).append(':').append(it.verify).append(':')
+                    .append(it.custom).append(':')
+                it.domainRules.forEach { rule ->
+                    append(rule.pattern).append('=').append(rule.route).append(',')
+                }
+                append(';')
             }
         }
         if (sig == signature) return
