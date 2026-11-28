@@ -540,7 +540,7 @@ impl RoutePolicy {
         Self::new(vec![
             RouteAttempt::Direct,
             RouteAttempt::Ech {
-                ech: EchSource::Own,
+                ech: EchSource::Shared,
             },
             RouteAttempt::Sni { sni: Vec::new() },
         ])
